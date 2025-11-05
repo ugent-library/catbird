@@ -24,7 +24,7 @@ CREATE INDEX cb_queues_delete_at_idx ON cb_queues (delete_at);
 CREATE FUNCTION _cb_acquire_queue_lock(name text) 
 RETURNS void AS $$
 BEGIN
-  PERFORM pg_advisory_xact_lock(hashtext(_cb_queue_table(name)));
+  PERFORM pg_advisory_xact_lock(hashtext(_cb_queue_table(_cb_acquire_queue_lock.name)));
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -33,13 +33,13 @@ $$ LANGUAGE plpgsql;
 CREATE FUNCTION _cb_queue_table(name text)
 RETURNS text AS $$
 BEGIN
-    IF name !~ '^[a-z0-9_]+$' THEN
+    IF _cb_queue_table.name !~ '^[a-z0-9_]+$' THEN
         RAISE EXCEPTION 'cb: queue name can only contain characters: a-z, 0-9 or _';
     END IF;
-    IF length(name) >= 58 THEN
+    IF length(_cb_queue_table.name) >= 58 THEN
         raise exception 'cb: queue name is too long, maximum length is 58';
     END IF;
-    RETURN 'cb_q_' || lower(name);
+    RETURN 'cb_q_' || lower(_cb_queue_table.name);
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -57,7 +57,7 @@ DECLARE
 BEGIN
     PERFORM _cb_acquire_queue_lock(cb_create_queue.name);
 
-    IF unlogged THEN
+    IF cb_create_queue.unlogged THEN
         EXECUTE format(
             $QUERY$
             CREATE UNLOGGED TABLE IF NOT EXISTS %I (
@@ -109,13 +109,13 @@ DECLARE
 BEGIN
     PERFORM _cb_acquire_queue_lock(cb_delete_queue.name);
 
-    EXECUTE format('drop table if exists %I;', _q_table);
+    EXECUTE FORMAT('DROP TABLE IF EXISTS %i;', _Q_TABLE);
 
     DELETE FROM cb_queues q
     WHERE q.name = cb_delete_queue.name
     RETURNING true
     INTO _res;
-    
+ 
     RETURN coalesce(_res, false);
 end
 $$ LANGUAGE plpgsql;
@@ -135,7 +135,7 @@ BEGIN
         WHERE cb_send.topic = any(q.topics) AND (q.delete_at IS NULL OR q.delete_at > now())
     LOOP
         _q_table = _cb_queue_table(_rec.name);
-        EXECUTE format('insert into %I (topic, payload, deliver_at) values ($1, $2, $3);', _q_table)
+        EXECUTE format('INSERT INTO %I (topic, payload, deliver_at) VALUES ($1, $2, $3);', _q_table)
         USING cb_send.topic, cb_send.payload, _deliver_at;
     END LOOP;
 END
@@ -147,7 +147,7 @@ $$ LANGUAGE plpgsql;
 CREATE FUNCTION cb_read(queue text, quantity int = 1, hide_for int = 10)
 RETURNS SETOF cb_message as $$
 DECLARE
-    _q_table text = _cb_queue_table(queue);
+    _q_table text = _cb_queue_table(cb_read.queue);
     _q text;
 BEGIN
     _q = format(
@@ -177,10 +177,10 @@ $$ LANGUAGE plpgsql;
 CREATE FUNCTION cb_delete(queue text, id bigint)
 RETURNS boolean AS $$
 DECLARE
-    _q_table text = _cb_queue_table(queue);
+    _q_table text = _cb_queue_table(cb_delete.queue);
     _res boolean;
 BEGIN
-    EXECUTE format('delete from %I where id = $1 returning true;', _q_table)
+    EXECUTE format('DELETE FROM %I WHERE id = $1 RETURNING TRUE;', _q_table)
     USING cb_delete.id
     INTO _res;
     return coalesce(_res, false);
@@ -200,7 +200,7 @@ BEGIN
         RETURNING name
     LOOP
         PERFORM _cb_acquire_queue_lock(_rec.name);
-        EXECUTE format('drop table %I;', _cb_queue_table(_rec.name));
+        EXECUTE format('DROP TABLE %I;', _cb_queue_table(_rec.name));
     END LOOP;
 END
 $$ LANGUAGE plpgsql;

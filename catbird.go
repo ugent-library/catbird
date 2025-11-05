@@ -34,11 +34,11 @@ type Message struct {
 
 func CreateQueue(ctx context.Context, conn Conn, name string, topics []string, opts QueueOpts) error {
 	if opts.DeleteAt.IsZero() {
-		q := `SELECT * FROM cb_create_queue(name => $1, topics => $2, unlogged => $3);`
+		q := `SELECT cb_create_queue(name => $1, topics => $2, unlogged => $3);`
 		_, err := conn.Exec(ctx, q, name, topics, opts.Unlogged)
 		return err
 	} else {
-		q := `SELECT * FROM cb_create_queue(name => $1, topics => $2, delete_at => $3, unlogged => $4);`
+		q := `SELECT cb_create_queue(name => $1, topics => $2, delete_at => $3, unlogged => $4);`
 		_, err := conn.Exec(ctx, q, name, topics, opts.DeleteAt, opts.Unlogged)
 		return err
 	}
@@ -57,11 +57,11 @@ func Send(ctx context.Context, conn Conn, topic string, payload any, opts SendOp
 		return err
 	}
 	if opts.DeliverAt.IsZero() {
-		q := `SELECT * FROM cb_send(topic => $1, payload => $2);`
+		q := `SELECT cb_send(topic => $1, payload => $2);`
 		_, err := conn.Exec(ctx, q, topic, b)
 		return err
 	} else {
-		q := `SELECT * FROM cb_send(topic => $1, payload => $2, deliver_at => $3);`
+		q := `SELECT cb_send(topic => $1, payload => $2, deliver_at => $3);`
 		_, err := conn.Exec(ctx, q, topic, b, opts.DeliverAt)
 		return err
 	}
@@ -84,7 +84,7 @@ func Delete(ctx context.Context, conn Conn, queue string, id int64) (bool, error
 }
 
 func GC(ctx context.Context, conn Conn) error {
-	q := `SELECT * FROM cb_gc();`
+	q := `SELECT cb_gc();`
 	_, err := conn.Exec(ctx, q)
 	return err
 }
@@ -96,12 +96,12 @@ func EnqueueSend(batch *pgx.Batch, topic string, payload any, opts SendOpts) err
 	}
 	if opts.DeliverAt.IsZero() {
 		batch.Queue(
-			`SELECT * FROM cb_send(topic => $1, payload => $2);`,
+			`SELECT cb_send(topic => $1, payload => $2);`,
 			topic, b,
 		)
 	} else {
 		batch.Queue(
-			`SELECT * FROM cb_send(topic => $1, payload => $2, deliver_at => $3);`,
+			`SELECT cb_send(topic => $1, payload => $2, deliver_at => $3);`,
 			topic, b, opts.DeliverAt,
 		)
 	}
