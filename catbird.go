@@ -25,11 +25,11 @@ type SendOpts struct {
 }
 
 type Message struct {
-	ID        int64
-	Topic     string
-	Payload   json.RawMessage
-	CreatedAt time.Time
-	DeliverAt time.Time
+	ID        int64           `json:"id"`
+	Topic     string          `json:"topic"`
+	Payload   json.RawMessage `json:"payload"`
+	CreatedAt time.Time       `json:"created_at"`
+	DeliverAt time.Time       `json:"updated_at"`
 }
 
 func CreateQueue(ctx context.Context, conn Conn, name string, topics []string, opts QueueOpts) error {
