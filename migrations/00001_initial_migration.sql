@@ -215,5 +215,6 @@ DROP FUNCTION cb_read;
 DROP FUNCTION cb_delete;
 DROP FUNCTION cb_gc;
 DROP FUNCTION _cb_queue_table;
+DROP FUNCTION _cb_acquire_queue_lock;
 DROP TABLE cb_queues CASCADE;
 DROP TYPE cb_message;
