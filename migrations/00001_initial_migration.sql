@@ -1,4 +1,4 @@
--- SQL code is mostly taken or adapted from PGMQ https://github.com/pgmq/pgmq/blob/main/pgmq-extension/sql/pgmq.sql 
+-- SQL code is mostly taken or adapted from the excellent PGMQ https://github.com/pgmq/pgmq/blob/main/pgmq-extension/sql/pgmq.sql 
 
 -- +goose up
 
@@ -109,7 +109,7 @@ DECLARE
 BEGIN
     PERFORM _cb_acquire_queue_lock(cb_delete_queue.name);
 
-    EXECUTE FORMAT('DROP TABLE IF EXISTS %i;', _Q_TABLE);
+    EXECUTE FORMAT('DROP TABLE IF EXISTS %I;', _q_table);
 
     DELETE FROM cb_queues q
     WHERE q.name = cb_delete_queue.name
@@ -122,7 +122,11 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION cb_send(topic text, payload jsonb, deliver_at timestamptz = null)
+CREATE FUNCTION cb_send(
+    topic text,
+    payload jsonb,
+    deliver_at timestamptz = null
+)
 RETURNS void AS $$
 DECLARE
     _deliver_at timestamptz = coalesce(cb_send.deliver_at, now());
@@ -144,8 +148,12 @@ $$ LANGUAGE plpgsql;
 
 -- +goose statementbegin
 -- TODO return or error if deleted
-CREATE FUNCTION cb_read(queue text, quantity int = 1, hide_for int = 10)
-RETURNS SETOF cb_message as $$
+CREATE FUNCTION cb_read(
+    queue text,
+    quantity int = 1,
+    hide_for int = 10
+)
+RETURNS SETOF cb_message AS $$
 DECLARE
     _q_table text = _cb_queue_table(cb_read.queue);
     _q text;
@@ -174,6 +182,88 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
+CREATE FUNCTION cb_read_poll(
+    queue text,
+    quantity int = 1,
+    hide_for int = 10,
+    poll_for int = 5,
+    poll_interval double precision = 0.1
+)
+RETURNS SETOF cb_message AS $$
+DECLARE
+    _m cb_message;
+    _stop_at timestamp;
+    _q text;
+    _q_table text = _cb_queue_table(cb_read_poll.queue);
+BEGIN
+    _stop_at := clock_timestamp() + make_interval(secs => cb_read_poll.poll_for);
+    LOOP
+        IF (SELECT clock_timestamp() >= _stop_at) THEN
+            RETURN;
+        END IF;
+
+        _q = FORMAT(
+            $QUERY$
+            WITH msgs AS (
+                SELECT id
+                FROM %I
+                WHERE deliver_at <= clock_timestamp()
+                ORDER BY id ASC
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE %I m
+            SET deliver_at = clock_timestamp() + $2
+            FROM msgs
+            WHERE m.id = msgs.id
+            RETURNING m.id, m.topic, m.payload, m.created_at, m.deliver_at;
+            $QUERY$,
+            _q_table, _q_table
+      );
+
+      FOR _m IN
+        EXECUTE _q USING cb_read_poll.quantity, make_interval(secs => cb_read_poll.hide_for)
+      LOOP
+        RETURN NEXT _m;
+      END LOOP;
+      IF FOUND THEN
+        RETURN;
+      ELSE
+        PERFORM pg_sleep(cb_read_poll.poll_interval);
+      END IF;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE FUNCTION cb_hide(
+    queue text,
+    id bigint,
+    hide_for integer
+)
+RETURNS boolean AS $$
+DECLARE
+    _q_table text = _cb_queue_table(cb_hide.queue);
+    _res boolean;
+BEGIN
+    EXECUTE format(
+        $QUERY$
+        UPDATE %I
+        SET deliver_at = (clock_timestamp() + $2)
+        WHERE id = $1
+        RETURNING TRUE;
+        $QUERY$,
+        _q_table
+    )
+    USING cb_hide.id, make_interval(secs => cb_hide.hide_for)
+    INTO _res;
+    RETURN coalesce(_res, false);
+END;
+$$ LANGUAGE plpgsql;
+-- +goose statementend
+
+-- +goose statementbegin
 CREATE FUNCTION cb_delete(queue text, id bigint)
 RETURNS boolean AS $$
 DECLARE
@@ -183,7 +273,7 @@ BEGIN
     EXECUTE format('DELETE FROM %I WHERE id = $1 RETURNING TRUE;', _q_table)
     USING cb_delete.id
     INTO _res;
-    return coalesce(_res, false);
+    RETURN coalesce(_res, false);
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -208,10 +298,14 @@ $$ LANGUAGE plpgsql;
 
 -- +goose down
 
+SELECT cb_delete_queue(name) FROM cb_queues;
+
 DROP FUNCTION cb_create_queue;
 DROP FUNCTION cb_delete_queue;
 DROP FUNCTION cb_send;
 DROP FUNCTION cb_read;
+DROP FUNCTION cb_read_poll;
+DROP FUNCTION cb_hide;
 DROP FUNCTION cb_delete;
 DROP FUNCTION cb_gc;
 DROP FUNCTION _cb_queue_table;
