@@ -37,7 +37,7 @@ BEGIN
         RAISE EXCEPTION 'cb: queue name can only contain characters: a-z, 0-9 or _';
     END IF;
     IF length(_cb_queue_table.name) >= 58 THEN
-        raise exception 'cb: queue name is too long, maximum length is 58';
+        RAISE EXCEPTION 'cb: queue name is too long, maximum length is 58';
     END IF;
     RETURN 'cb_q_' || lower(_cb_queue_table.name);
 END;
