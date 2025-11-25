@@ -6,12 +6,11 @@ Postgres based message queue.
 
 ## Acknowledgments
 
-SQL code is mostly taken or adapted from [PGMQ](https://github.com/pgmq) but adds topic based multiplexing.
+SQL code is mostly taken or adapted from the excellent [PGMQ](https://github.com/pgmq) but adds topic based multiplexing.
 
 ## Roadmap
 
 * max retries
-* add long polling
 * add count
 * add metrics
 * add batch methods

@@ -76,6 +76,22 @@ func Read(ctx context.Context, conn Conn, queue string, quantity int, hideFor ti
 	return pgx.CollectRows(rows, pgx.RowToStructByPos[Message])
 }
 
+func ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]Message, error) {
+	q := `SELECT * FROM cb_read_poll(queue => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
+	rows, err := conn.Query(ctx, q, queue, quantity, hideFor.Seconds(), pollFor.Seconds(), pollInterval.Milliseconds())
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[Message])
+}
+
+func Hide(ctx context.Context, conn Conn, queue string, id int64, hideFor time.Duration) (bool, error) {
+	q := `SELECT * FROM cb_hide(queue => $1, id => $2, hide_for => $3);`
+	exists := false
+	err := conn.QueryRow(ctx, q, queue, id, hideFor.Seconds()).Scan(&exists)
+	return exists, err
+}
+
 func Delete(ctx context.Context, conn Conn, queue string, id int64) (bool, error) {
 	q := `SELECT * FROM cb_delete(queue => $1, id => $2);`
 	existed := false
@@ -131,6 +147,14 @@ func (c *Client) Send(ctx context.Context, topic string, payload any, opts SendO
 
 func (c *Client) Read(ctx context.Context, queue string, quantity int, hideFor time.Duration) ([]Message, error) {
 	return Read(ctx, c.conn, queue, quantity, hideFor)
+}
+
+func (c *Client) ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]Message, error) {
+	return ReadPoll(ctx, conn, queue, quantity, hideFor, pollFor, pollInterval)
+}
+
+func (c *Client) Hide(ctx context.Context, queue string, id int64, hideFor time.Duration) (bool, error) {
+	return Hide(ctx, c.conn, queue, id, hideFor)
 }
 
 func (c *Client) Delete(ctx context.Context, queue string, id int64) (bool, error) {
