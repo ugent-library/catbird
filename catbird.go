@@ -9,27 +9,29 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+var (
+	DefaultPollFor      = 5 * time.Second
+	DefaultPollInterval = 100 * time.Millisecond
+)
+
 type Conn interface {
-	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
-	Query(ctx context.Context, sql string, optionsAndArgs ...any) (pgx.Rows, error)
-	QueryRow(ctx context.Context, sql string, optionsAndArgs ...any) pgx.Row
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+type Message struct {
+	ID         int64           `json:"id"`
+	Topic      string          `json:"topic"`
+	Payload    json.RawMessage `json:"payload"`
+	Deliveries int             `json:"deliveries"`
+	CreatedAt  time.Time       `json:"created_at"`
+	DeliverAt  time.Time       `json:"updated_at"`
 }
 
 type QueueOpts struct {
 	DeleteAt time.Time
 	Unlogged bool
-}
-
-type SendOpts struct {
-	DeliverAt time.Time
-}
-
-type Message struct {
-	ID        int64           `json:"id"`
-	Topic     string          `json:"topic"`
-	Payload   json.RawMessage `json:"payload"`
-	CreatedAt time.Time       `json:"created_at"`
-	DeliverAt time.Time       `json:"updated_at"`
 }
 
 func CreateQueue(ctx context.Context, conn Conn, name string, topics []string, opts QueueOpts) error {
@@ -49,6 +51,10 @@ func DeleteQueue(ctx context.Context, conn Conn, name string) (bool, error) {
 	existed := false
 	err := conn.QueryRow(ctx, q, name).Scan(&existed)
 	return existed, err
+}
+
+type SendOpts struct {
+	DeliverAt time.Time
 }
 
 func Send(ctx context.Context, conn Conn, topic string, payload any, opts SendOpts) error {
@@ -76,12 +82,37 @@ func Read(ctx context.Context, conn Conn, queue string, quantity int, hideFor ti
 	return pgx.CollectRows(rows, pgx.RowToStructByPos[Message])
 }
 
-func ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]Message, error) {
-	q := `SELECT * FROM cb_read_poll(queue => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
-	rows, err := conn.Query(ctx, q, queue, quantity, hideFor.Seconds(), pollFor.Seconds(), pollInterval.Milliseconds())
+type ReadPollOpts struct {
+	PollFor      time.Duration
+	PollInterval time.Duration
+}
+
+func ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFor time.Duration, opts ReadPollOpts) ([]Message, error) {
+	if opts.PollFor == 0 {
+		opts.PollFor = DefaultPollFor
+	}
+	if opts.PollInterval == 0 {
+		opts.PollInterval = DefaultPollInterval
+	}
+
+	q := `SELECT * FROM cb_read_poll(
+			queue => $1,
+			quantity => $2,
+			hide_for => $3,
+			poll_for => $4,
+			poll_interval => $5);`
+
+	rows, err := conn.Query(ctx, q,
+		queue,
+		quantity,
+		hideFor.Seconds(),
+		opts.PollFor.Seconds(),
+		opts.PollInterval.Milliseconds(),
+	)
 	if err != nil {
 		return nil, err
 	}
+
 	return pgx.CollectRows(rows, pgx.RowToStructByPos[Message])
 }
 
@@ -149,8 +180,8 @@ func (c *Client) Read(ctx context.Context, queue string, quantity int, hideFor t
 	return Read(ctx, c.conn, queue, quantity, hideFor)
 }
 
-func (c *Client) ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]Message, error) {
-	return ReadPoll(ctx, conn, queue, quantity, hideFor, pollFor, pollInterval)
+func (c *Client) ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFor time.Duration, opts ReadPollOpts) ([]Message, error) {
+	return ReadPoll(ctx, conn, queue, quantity, hideFor, opts)
 }
 
 func (c *Client) Hide(ctx context.Context, queue string, id int64, hideFor time.Duration) (bool, error) {

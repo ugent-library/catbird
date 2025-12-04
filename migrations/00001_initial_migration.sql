@@ -5,7 +5,8 @@
 CREATE TYPE cb_message AS (
     id bigint,
     topic text,
-    payload jsonb,
+    payload json,
+    deliveries int,
     created_at timestamptz,
     deliver_at timestamptz
 );
@@ -63,7 +64,8 @@ BEGIN
             CREATE UNLOGGED TABLE IF NOT EXISTS %I (
                 id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
                 topic text NOT NULL,
-                payload jsonb NOT NULL,
+                payload json NOT NULL,
+                deliveries int NOT NULL DEFAULT 0,
                 created_at timestamptz NOT NULL DEFAULT now(),
                 deliver_at timestamptz NOT NULL DEFAULT now()
             )
@@ -76,14 +78,15 @@ BEGIN
             CREATE TABLE IF NOT EXISTS %I (
                 id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
                 topic text NOT NULL,
-                payload jsonb NOT NULL,
+                payload json NOT NULL,
+                deliveries int NOT NULL DEFAULT 0,
                 created_at timestamptz NOT NULL DEFAULT now(),
                 deliver_at timestamptz NOT NULL DEFAULT now()
             )
             $QUERY$,
             _q_table
         );
-    END IF;    
+    END IF;
 
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (deliver_at);', _q_table || '_deliver_at_idx', _q_table);
 
@@ -124,7 +127,7 @@ $$ LANGUAGE plpgsql;
 -- +goose statementbegin
 CREATE FUNCTION cb_send(
     topic text,
-    payload jsonb,
+    payload json,
     deliver_at timestamptz = null
 )
 RETURNS void AS $$
@@ -150,8 +153,8 @@ $$ LANGUAGE plpgsql;
 -- TODO return or error if deleted
 CREATE FUNCTION cb_read(
     queue text,
-    quantity int = 1,
-    hide_for int = 10
+    quantity int,
+    hide_for int
 )
 RETURNS SETOF cb_message AS $$
 DECLARE
@@ -169,10 +172,11 @@ BEGIN
 			FOR UPDATE SKIP LOCKED
 		)
 		UPDATE %I m
-		SET deliver_at = clock_timestamp() + $2
+		SET deliveries = deliveries + 1,
+            deliver_at = clock_timestamp() + $2
 		FROM msgs
 		WHERE m.id = msgs.id
-		RETURNING m.id, m.topic, m.payload, m.created_at, m.deliver_at;
+		RETURNING m.id, m.topic, m.payload, m.deliveries, m.created_at, m.deliver_at;
         $QUERY$,
         _q_table, _q_table
     );
@@ -184,15 +188,16 @@ $$ LANGUAGE plpgsql;
 -- +goose statementbegin
 CREATE FUNCTION cb_read_poll(
     queue text,
-    quantity int = 1,
-    hide_for int = 10,
+    quantity int,
+    hide_for int,
     poll_for int = 5,
-    poll_interval double precision = 0.1
+    poll_interval int = 100
 )
 RETURNS SETOF cb_message AS $$
 DECLARE
     _m cb_message;
     _stop_at timestamp;
+    _sleep_for double precision = cb_read_poll.poll_interval::numeric / 1000;
     _q text;
     _q_table text = _cb_queue_table(cb_read_poll.queue);
 BEGIN
@@ -213,10 +218,11 @@ BEGIN
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE %I m
-            SET deliver_at = clock_timestamp() + $2
+            SET deliveries = deliveries + 1,
+                deliver_at = clock_timestamp() + $2
             FROM msgs
             WHERE m.id = msgs.id
-            RETURNING m.id, m.topic, m.payload, m.created_at, m.deliver_at;
+            RETURNING m.id, m.topic, m.payload, m.deliveries, m.created_at, m.deliver_at;
             $QUERY$,
             _q_table, _q_table
       );
@@ -229,7 +235,7 @@ BEGIN
       IF FOUND THEN
         RETURN;
       ELSE
-        PERFORM pg_sleep(cb_read_poll.poll_interval);
+        PERFORM pg_sleep(_sleep_for);
       END IF;
     END LOOP;
 END;
