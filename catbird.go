@@ -180,8 +180,8 @@ func (c *Client) Read(ctx context.Context, queue string, quantity int, hideFor t
 	return Read(ctx, c.conn, queue, quantity, hideFor)
 }
 
-func (c *Client) ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFor time.Duration, opts ReadPollOpts) ([]Message, error) {
-	return ReadPoll(ctx, conn, queue, quantity, hideFor, opts)
+func (c *Client) ReadPoll(ctx context.Context, queue string, quantity int, hideFor time.Duration, opts ReadPollOpts) ([]Message, error) {
+	return ReadPoll(ctx, c.conn, queue, quantity, hideFor, opts)
 }
 
 func (c *Client) Hide(ctx context.Context, queue string, id int64, hideFor time.Duration) (bool, error) {

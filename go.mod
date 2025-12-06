@@ -2,7 +2,10 @@ module github.com/ugent-library/catbird
 
 go 1.25.3
 
-require github.com/jackc/pgx/v5 v5.7.6
+require (
+	github.com/jackc/pgx/v5 v5.7.6
+	golang.org/x/sync v0.18.0
+)
 
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
