@@ -15,12 +15,14 @@ type Task struct {
 	topics      []string
 	fn          func(context.Context, catbird.Message) error
 	concurrency int
-	maxRetries  int
+	hideFor     time.Duration
+	retries     int
 }
 
 type TaskOpts struct {
 	Concurrency int
-	MaxRetries  int
+	HideFor     time.Duration
+	Retries     int
 }
 
 func New(name string, topics []string, fn func(context.Context, catbird.Message) error, opts TaskOpts) *Task {
@@ -33,7 +35,8 @@ func New(name string, topics []string, fn func(context.Context, catbird.Message)
 		topics:      topics,
 		fn:          fn,
 		concurrency: opts.Concurrency,
-		maxRetries:  opts.MaxRetries,
+		hideFor:     opts.HideFor,
+		retries:     opts.Retries,
 	}
 }
 
@@ -74,7 +77,7 @@ func (r *Runner) Run(ctx context.Context) error {
 					case <-ctx.Done():
 						return nil
 					default:
-						msgs, err := r.client.ReadPoll(ctx, queue, 1, 1*time.Minute, catbird.ReadPollOpts{})
+						msgs, err := r.client.ReadPoll(ctx, queue, 1, t.hideFor, catbird.ReadPollOpts{})
 						if err != nil {
 							r.logger.Error("tasks: cannot read message", "task", t.name, "error", err)
 							continue
@@ -83,7 +86,8 @@ func (r *Runner) Run(ctx context.Context) error {
 							msg := msgs[0]
 							if err = t.fn(ctx, msg); err != nil {
 								r.logger.Error("tasks: task failed", "task", t.name, "error", err)
-								if t.maxRetries == 0 || msg.Deliveries < t.maxRetries {
+								// leave message in queue for next try
+								if t.retries == 0 || msg.Deliveries < t.retries {
 									continue
 								}
 							}
