@@ -12,17 +12,20 @@ import (
 
 type Task struct {
 	name        string
+	queue       string
 	topics      []string
 	fn          func(context.Context, catbird.Message) error
 	concurrency int
 	hideFor     time.Duration
 	retries     int
+	timeout     time.Duration
 }
 
 type TaskOpts struct {
 	Concurrency int
 	HideFor     time.Duration
 	Retries     int
+	Timeout     time.Duration
 }
 
 func New(name string, topics []string, fn func(context.Context, catbird.Message) error, opts TaskOpts) *Task {
@@ -32,11 +35,13 @@ func New(name string, topics []string, fn func(context.Context, catbird.Message)
 
 	return &Task{
 		name:        name,
+		queue:       "t_" + name,
 		topics:      topics,
 		fn:          fn,
 		concurrency: opts.Concurrency,
 		hideFor:     opts.HideFor,
 		retries:     opts.Retries,
+		timeout:     opts.Timeout,
 	}
 }
 
@@ -66,9 +71,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
 
 	for _, t := range r.tasks {
-		queue := "t_" + t.name
-
-		r.client.CreateQueue(ctx, queue, t.topics, catbird.QueueOpts{})
+		r.client.CreateQueue(ctx, t.queue, t.topics, catbird.QueueOpts{})
 
 		for i := 0; i < t.concurrency; i++ {
 			g.Go(func() error {
@@ -77,24 +80,7 @@ func (r *Runner) Run(ctx context.Context) error {
 					case <-ctx.Done():
 						return nil
 					default:
-						msgs, err := r.client.ReadPoll(ctx, queue, 1, t.hideFor, catbird.ReadPollOpts{})
-						if err != nil {
-							r.logger.Error("tasks: cannot read message", "task", t.name, "error", err)
-							continue
-						}
-						if len(msgs) > 0 {
-							msg := msgs[0]
-							if err = t.fn(ctx, msg); err != nil {
-								r.logger.Error("tasks: task failed", "task", t.name, "error", err)
-								// leave message in queue for next try
-								if t.retries == 0 || msg.Deliveries < t.retries {
-									continue
-								}
-							}
-							if _, err = r.client.Delete(ctx, queue, msg.ID); err != nil {
-								r.logger.Error("tasks: cannot delete message", "task", t.name, "error", err)
-							}
-						}
+						r.runTask(ctx, t)
 					}
 				}
 			})
@@ -102,4 +88,37 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 
 	return g.Wait()
+}
+
+func (r *Runner) runTask(ctx context.Context, t *Task) {
+	msgs, err := r.client.ReadPoll(ctx, t.queue, 1, t.hideFor, catbird.ReadPollOpts{})
+	if err != nil {
+		r.logger.Error("tasks: cannot read message", "task", t.name, "error", err)
+		return
+	}
+
+	if len(msgs) == 0 {
+		return
+	}
+
+	msg := msgs[0]
+
+	runCtx := ctx
+	if t.timeout > 0 {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, time.Duration(t.timeout))
+		defer cancel()
+	}
+
+	if err = t.fn(runCtx, msg); err != nil {
+		r.logger.Error("tasks: task failed", "task", t.name, "error", err)
+		// leave message in queue for next try
+		if t.retries == 0 || msg.Deliveries < t.retries {
+			return
+		}
+	}
+
+	if _, err = r.client.Delete(ctx, t.queue, msg.ID); err != nil {
+		r.logger.Error("tasks: cannot delete message", "task", t.name, "error", err)
+	}
 }
