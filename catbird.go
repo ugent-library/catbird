@@ -21,13 +21,13 @@ type Conn interface {
 }
 
 type Message struct {
-	ID            int64           `json:"id"`
-	DeplucationID string          `json:"deduplication_id,omitempty"`
-	Topic         string          `json:"topic"`
-	Payload       json.RawMessage `json:"payload"`
-	Deliveries    int             `json:"deliveries"`
-	CreatedAt     time.Time       `json:"created_at"`
-	DeliverAt     time.Time       `json:"updated_at"`
+	ID              int64           `json:"id"`
+	DeduplicationID string          `json:"deduplication_id,omitempty"`
+	Topic           string          `json:"topic"`
+	Payload         json.RawMessage `json:"payload"`
+	Deliveries      int             `json:"deliveries"`
+	CreatedAt       time.Time       `json:"created_at"`
+	DeliverAt       time.Time       `json:"updated_at"`
 }
 
 type QueueOpts struct {
@@ -180,7 +180,7 @@ func scanMessage(row pgx.Row) (Message, error) {
 	}
 
 	if deduplicationID != nil {
-		msg.DeplucationID = *deduplicationID
+		msg.DeduplicationID = *deduplicationID
 	}
 
 	return msg, nil
