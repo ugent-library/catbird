@@ -21,12 +21,13 @@ type Conn interface {
 }
 
 type Message struct {
-	ID         int64           `json:"id"`
-	Topic      string          `json:"topic"`
-	Payload    json.RawMessage `json:"payload"`
-	Deliveries int             `json:"deliveries"`
-	CreatedAt  time.Time       `json:"created_at"`
-	DeliverAt  time.Time       `json:"updated_at"`
+	ID            int64           `json:"id"`
+	DeplucationID string          `json:"deduplication_id"`
+	Topic         string          `json:"topic"`
+	Payload       json.RawMessage `json:"payload"`
+	Deliveries    int             `json:"deliveries"`
+	CreatedAt     time.Time       `json:"created_at"`
+	DeliverAt     time.Time       `json:"updated_at"`
 }
 
 type QueueOpts struct {
@@ -54,7 +55,8 @@ func DeleteQueue(ctx context.Context, conn Conn, name string) (bool, error) {
 }
 
 type SendOpts struct {
-	DeliverAt time.Time
+	DeduplicationID string
+	DeliverAt       time.Time
 }
 
 func Send(ctx context.Context, conn Conn, topic string, payload any, opts SendOpts) error {
@@ -63,12 +65,12 @@ func Send(ctx context.Context, conn Conn, topic string, payload any, opts SendOp
 		return err
 	}
 	if opts.DeliverAt.IsZero() {
-		q := `SELECT cb_send(topic => $1, payload => $2);`
-		_, err := conn.Exec(ctx, q, topic, b)
+		q := `SELECT cb_send(topic => $1, payload => $2, deduplication_id => nullif($3, ''));`
+		_, err := conn.Exec(ctx, q, topic, b, opts.DeduplicationID)
 		return err
 	} else {
-		q := `SELECT cb_send(topic => $1, payload => $2, deliver_at => $3);`
-		_, err := conn.Exec(ctx, q, topic, b, opts.DeliverAt)
+		q := `SELECT cb_send(topic => $1, payload => $2, deduplication_id => nullif($3, ''), deliver_at => $4);`
+		_, err := conn.Exec(ctx, q, topic, b, opts.DeduplicationID, opts.DeliverAt)
 		return err
 	}
 }
@@ -79,7 +81,7 @@ func Read(ctx context.Context, conn Conn, queue string, quantity int, hideFor ti
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowToStructByPos[Message])
+	return pgx.CollectRows(rows, scanCollectibleMessage)
 }
 
 type ReadPollOpts struct {
@@ -113,7 +115,7 @@ func ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFo
 		return nil, err
 	}
 
-	return pgx.CollectRows(rows, pgx.RowToStructByPos[Message])
+	return pgx.CollectRows(rows, scanCollectibleMessage)
 }
 
 func Hide(ctx context.Context, conn Conn, queue string, id int64, hideFor time.Duration) (bool, error) {
@@ -154,6 +156,34 @@ func EnqueueSend(batch *pgx.Batch, topic string, payload any, opts SendOpts) err
 	}
 
 	return nil
+}
+
+func scanCollectibleMessage(row pgx.CollectableRow) (Message, error) {
+	return scanMessage(row)
+}
+
+func scanMessage(row pgx.Row) (Message, error) {
+	msg := Message{}
+
+	var deduplicationID *string
+
+	if err := row.Scan(
+		&msg.ID,
+		&deduplicationID,
+		&msg.Topic,
+		&msg.Payload,
+		&msg.Deliveries,
+		&msg.CreatedAt,
+		&msg.DeliverAt,
+	); err != nil {
+		return msg, err
+	}
+
+	if deduplicationID != nil {
+		msg.DeplucationID = *deduplicationID
+	}
+
+	return msg, nil
 }
 
 type Client struct {

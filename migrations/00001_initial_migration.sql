@@ -4,6 +4,7 @@
 
 CREATE TYPE cb_message AS (
     id bigint,
+    deduplication_id text,
     topic text,
     payload json,
     deliveries int,
@@ -63,6 +64,7 @@ BEGIN
             $QUERY$
             CREATE UNLOGGED TABLE IF NOT EXISTS %I (
                 id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+                deduplication_id text,
                 topic text NOT NULL,
                 payload json NOT NULL,
                 deliveries int NOT NULL DEFAULT 0,
@@ -77,6 +79,7 @@ BEGIN
             $QUERY$
             CREATE TABLE IF NOT EXISTS %I (
                 id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+                deduplication_id text,
                 topic text NOT NULL,
                 payload json NOT NULL,
                 deliveries int NOT NULL DEFAULT 0,
@@ -88,6 +91,7 @@ BEGIN
         );
     END IF;
 
+    EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (deduplication_id);', _q_table || '_deduplication_id_idx', _q_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (deliver_at);', _q_table || '_deliver_at_idx', _q_table);
 
     -- TODO should check topic and delete_at is same
@@ -128,6 +132,7 @@ $$ LANGUAGE plpgsql;
 CREATE FUNCTION cb_send(
     topic text,
     payload json,
+    deduplication_id text = null,
     deliver_at timestamptz = null
 )
 RETURNS void AS $$
@@ -142,8 +147,18 @@ BEGIN
         WHERE cb_send.topic = any(q.topics) AND (q.delete_at IS NULL OR q.delete_at > now())
     LOOP
         _q_table = _cb_queue_table(_rec.name);
-        EXECUTE format('INSERT INTO %I (topic, payload, deliver_at) VALUES ($1, $2, $3);', _q_table)
-        USING cb_send.topic, cb_send.payload, _deliver_at;
+        EXECUTE format(
+            $QUERY$
+            INSERT INTO %I (topic, payload, deduplication_id, deliver_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (deduplication_id) DO NOTHING;
+            $QUERY$,
+            _q_table
+        )
+        USING cb_send.topic,
+              cb_send.payload,
+              cb_send.deduplication_id,
+              _deliver_at;
     END LOOP;
 END
 $$ LANGUAGE plpgsql;
@@ -176,7 +191,13 @@ BEGIN
             deliver_at = clock_timestamp() + $2
 		FROM msgs
 		WHERE m.id = msgs.id
-		RETURNING m.id, m.topic, m.payload, m.deliveries, m.created_at, m.deliver_at;
+		RETURNING m.id,
+                  m.deduplication_id,
+                  m.topic,
+                  m.payload,
+                  m.deliveries,
+                  m.created_at,
+                  m.deliver_at;
         $QUERY$,
         _q_table, _q_table
     );
@@ -222,7 +243,13 @@ BEGIN
                 deliver_at = clock_timestamp() + $2
             FROM msgs
             WHERE m.id = msgs.id
-            RETURNING m.id, m.topic, m.payload, m.deliveries, m.created_at, m.deliver_at;
+            RETURNING m.id,
+                      m.deduplication_id,
+                      m.topic,
+                      m.payload,
+                      m.deliveries,
+                      m.created_at,
+                      m.deliver_at;
             $QUERY$,
             _q_table, _q_table
       );
