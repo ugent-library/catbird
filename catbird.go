@@ -22,7 +22,7 @@ type Conn interface {
 
 type Message struct {
 	ID            int64           `json:"id"`
-	DeplucationID string          `json:"deduplication_id"`
+	DeplucationID string          `json:"deduplication_id,omitempty"`
 	Topic         string          `json:"topic"`
 	Payload       json.RawMessage `json:"payload"`
 	Deliveries    int             `json:"deliveries"`
