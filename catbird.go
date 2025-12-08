@@ -145,13 +145,13 @@ func EnqueueSend(batch *pgx.Batch, topic string, payload any, opts SendOpts) err
 	}
 	if opts.DeliverAt.IsZero() {
 		batch.Queue(
-			`SELECT cb_send(topic => $1, payload => $2);`,
-			topic, b,
+			`SELECT cb_send(topic => $1, payload => $2, deduplication_id => nullif($3, ''));`,
+			topic, b, opts.DeduplicationID,
 		)
 	} else {
 		batch.Queue(
-			`SELECT cb_send(topic => $1, payload => $2, deliver_at => $3);`,
-			topic, b, opts.DeliverAt,
+			`SELECT cb_send(topic => $1, payload => $2, deduplication_id => nullif($3, ''), deliver_at => $4);`,
+			topic, b, opts.DeduplicationID, opts.DeliverAt,
 		)
 	}
 
