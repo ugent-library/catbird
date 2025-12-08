@@ -46,7 +46,7 @@ func New(name string, topics []string, fn func(context.Context, catbird.Message)
 }
 
 type Runner struct {
-	client *catbird.Client
+	conn   catbird.Conn
 	tasks  []*Task
 	logger *slog.Logger
 }
@@ -56,9 +56,9 @@ type RunnerOpts struct {
 	Logger *slog.Logger
 }
 
-func NewRunner(client *catbird.Client, opts RunnerOpts) *Runner {
+func NewRunner(conn catbird.Conn, opts RunnerOpts) *Runner {
 	r := &Runner{
-		client: client,
+		conn:   conn,
 		tasks:  opts.Tasks,
 		logger: opts.Logger,
 	}
@@ -71,7 +71,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
 
 	for _, t := range r.tasks {
-		r.client.CreateQueue(ctx, t.queue, t.topics, catbird.QueueOpts{})
+		catbird.CreateQueue(ctx, r.conn, t.queue, t.topics, catbird.QueueOpts{})
 
 		for i := 0; i < t.concurrency; i++ {
 			g.Go(func() error {
@@ -91,7 +91,7 @@ func (r *Runner) Run(ctx context.Context) error {
 }
 
 func (r *Runner) runTask(ctx context.Context, t *Task) {
-	msgs, err := r.client.ReadPoll(ctx, t.queue, 1, t.hideFor, catbird.ReadPollOpts{})
+	msgs, err := catbird.ReadPoll(ctx, r.conn, t.queue, 1, t.hideFor, catbird.ReadPollOpts{})
 	if err != nil {
 		r.logger.Error("tasks: cannot read message", "task", t.name, "error", err)
 		return
@@ -118,7 +118,7 @@ func (r *Runner) runTask(ctx context.Context, t *Task) {
 		}
 	}
 
-	if _, err = r.client.Delete(ctx, t.queue, msg.ID); err != nil {
+	if _, err = catbird.Delete(ctx, r.conn, t.queue, msg.ID); err != nil {
 		r.logger.Error("tasks: cannot delete message", "task", t.name, "error", err)
 	}
 }
