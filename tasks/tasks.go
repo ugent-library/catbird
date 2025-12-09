@@ -2,11 +2,12 @@ package tasks
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
+	"github.com/robfig/cron/v3"
 	"github.com/ugent-library/catbird"
 )
 
@@ -19,6 +20,7 @@ type Task struct {
 	hideFor     time.Duration
 	retries     int
 	timeout     time.Duration
+	schedule    string
 }
 
 type TaskOpts struct {
@@ -26,6 +28,7 @@ type TaskOpts struct {
 	HideFor     time.Duration
 	Retries     int
 	Timeout     time.Duration
+	Schedule    string
 }
 
 func New(name string, topics []string, fn func(context.Context, catbird.Message) error, opts TaskOpts) *Task {
@@ -42,43 +45,82 @@ func New(name string, topics []string, fn func(context.Context, catbird.Message)
 		hideFor:     opts.HideFor,
 		retries:     opts.Retries,
 		timeout:     opts.Timeout,
+		schedule:    opts.Schedule,
 	}
 }
 
 type Runner struct {
-	conn   catbird.Conn
-	tasks  []*Task
-	logger *slog.Logger
+	conn      catbird.Conn
+	tasks     []*Task
+	logger    *slog.Logger
+	scheduler *cron.Cron
+	timeout   time.Duration
 }
 
 type RunnerOpts struct {
 	Tasks  []*Task
 	Logger *slog.Logger
+	Tmeout time.Duration
 }
 
-func NewRunner(conn catbird.Conn, opts RunnerOpts) *Runner {
+func NewRunner(conn catbird.Conn, opts RunnerOpts) (*Runner, error) {
 	r := &Runner{
-		conn:   conn,
-		tasks:  opts.Tasks,
-		logger: opts.Logger,
+		conn:    conn,
+		tasks:   opts.Tasks,
+		logger:  opts.Logger,
+		timeout: opts.Tmeout,
 	}
 
-	return r
+	for _, t := range opts.Tasks {
+		if t.schedule == "" {
+			continue
+		}
+		if r.scheduler == nil {
+			r.scheduler = cron.New(cron.WithSeconds())
+		}
+		_, err := r.scheduler.AddFunc(t.schedule, func() {
+			for _, topic := range t.topics {
+				err := catbird.Send(context.TODO(), r.conn, topic, &struct{}{}, catbird.SendOpts{DeduplicationID: "scheduled:" + t.name})
+				if err != nil {
+					r.logger.Error("tasks: failed to schedule task", "task", t.name, "error", err)
+				}
+			}
+		})
+		if err != nil {
+			return nil, fmt.Errorf("tasks: failed to register schedule for task %s: %w", t.name, err)
+		}
+	}
+
+	return r, nil
 }
 
-// TODO extend hide for
-func (r *Runner) Run(ctx context.Context) error {
-	g, ctx := errgroup.WithContext(ctx)
+// TODO extend hide_for if necessary
+func (r *Runner) Run(ctx context.Context) {
+	var wg sync.WaitGroup
+
+	if r.scheduler != nil {
+		r.scheduler.Start()
+
+		wg.Go(func() {
+			<-ctx.Done()
+
+			stopCtx := r.scheduler.Stop()
+			select {
+			case <-stopCtx.Done():
+			case <-time.After(r.timeout):
+			}
+		})
+	}
 
 	for _, t := range r.tasks {
 		catbird.CreateQueue(ctx, r.conn, t.queue, t.topics, catbird.QueueOpts{})
 
 		for i := 0; i < t.concurrency; i++ {
-			g.Go(func() error {
+			wg.Go(func() {
 				for {
 					select {
 					case <-ctx.Done():
-						return nil
+						return
 					default:
 						r.runTask(ctx, t)
 					}
@@ -87,7 +129,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
-	return g.Wait()
+	wg.Wait()
 }
 
 func (r *Runner) runTask(ctx context.Context, t *Task) {
