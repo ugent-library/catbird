@@ -244,6 +244,10 @@ func (c *Client) DeleteQueue(ctx context.Context, name string) (bool, error) {
 	return DeleteQueue(ctx, c.conn, name)
 }
 
+func (c *Client) ListQueues(ctx context.Context) ([]Queue, error) {
+	return ListQueues(ctx, c.conn)
+}
+
 func (c *Client) Send(ctx context.Context, topic string, payload any, opts SendOpts) error {
 	return Send(ctx, c.conn, topic, payload, opts)
 }
