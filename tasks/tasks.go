@@ -123,6 +123,7 @@ func (r *Runner) Run(ctx context.Context) {
 						return
 					default:
 						r.runTask(ctx, t)
+						time.Sleep(1 * time.Second) // TODO
 					}
 				}
 			})

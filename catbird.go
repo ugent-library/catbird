@@ -20,6 +20,13 @@ type Conn interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
+type Queue struct {
+	Name     string    `json:"name"`
+	Topics   []string  `json:"topics"`
+	Unlogged bool      `json:"unlogged"`
+	DeleteAt time.Time `json:"delete_at,omitzero"`
+}
+
 type Message struct {
 	ID              int64           `json:"id"`
 	DeduplicationID string          `json:"deduplication_id,omitempty"`
@@ -52,6 +59,16 @@ func DeleteQueue(ctx context.Context, conn Conn, name string) (bool, error) {
 	existed := false
 	err := conn.QueryRow(ctx, q, name).Scan(&existed)
 	return existed, err
+}
+
+func ListQueues(ctx context.Context, conn Conn) ([]Queue, error) {
+	q := `SELECT name, topics, unlogged, delete_at FROM cb_queues;`
+	rows, err := conn.Query(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, scanCollectibleQueue)
+
 }
 
 type SendOpts struct {
@@ -156,6 +173,31 @@ func EnqueueSend(batch *pgx.Batch, topic string, payload any, opts SendOpts) err
 	}
 
 	return nil
+}
+
+func scanCollectibleQueue(row pgx.CollectableRow) (Queue, error) {
+	return scanQueue(row)
+}
+
+func scanQueue(row pgx.Row) (Queue, error) {
+	q := Queue{}
+
+	var deleteAt *time.Time
+
+	if err := row.Scan(
+		&q.Name,
+		&q.Topics,
+		&q.Unlogged,
+		&deleteAt,
+	); err != nil {
+		return q, err
+	}
+
+	if deleteAt != nil {
+		q.DeleteAt = *deleteAt
+	}
+
+	return q, nil
 }
 
 func scanCollectibleMessage(row pgx.CollectableRow) (Message, error) {
