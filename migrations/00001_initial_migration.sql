@@ -26,22 +26,22 @@ CREATE INDEX cb_queues_delete_at_idx ON cb_queues (delete_at);
 CREATE FUNCTION _cb_acquire_queue_lock(name text) 
 RETURNS void AS $$
 BEGIN
-  PERFORM pg_advisory_xact_lock(hashtext(_cb_queue_table(_cb_acquire_queue_lock.name)));
+  PERFORM pg_advisory_xact_lock(hashtext(_cb_table_name(_cb_acquire_queue_lock.name, 'q')));
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION _cb_queue_table(name text)
+CREATE FUNCTION _cb_table_name(name text, prefix text)
 RETURNS text AS $$
 BEGIN
-    IF _cb_queue_table.name !~ '^[a-z0-9_]+$' THEN
+    IF _cb_table_name.name !~ '^[a-z0-9_]+$' THEN
         RAISE EXCEPTION 'cb: queue name can only contain characters: a-z, 0-9 or _';
     END IF;
-    IF length(_cb_queue_table.name) >= 58 THEN
+    IF length(_cb_table_name.name) >= 58 THEN
         RAISE EXCEPTION 'cb: queue name is too long, maximum length is 58';
     END IF;
-    RETURN 'cb_q_' || lower(_cb_queue_table.name);
+    RETURN 'cb_' || _cb_table_name.prefix || '_' || lower(_cb_table_name.name);
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -55,7 +55,8 @@ CREATE FUNCTION cb_create_queue(
 )
 RETURNS void AS $$
 DECLARE
-    _q_table text = _cb_queue_table(cb_create_queue.name);
+    _q_table text = _cb_table_name(cb_create_queue.name, 'q');
+    _a_table text = _cb_table_name(cb_create_queue.name, 'a');
 BEGIN
     PERFORM _cb_acquire_queue_lock(cb_create_queue.name);
 
@@ -89,6 +90,24 @@ BEGIN
             $QUERY$,
             _q_table
         );
+
+        EXECUTE format(
+            $QUERY$
+            CREATE TABLE IF NOT EXISTS %I (
+                id bigint PRIMARY KEY,
+                deduplication_id text,
+                topic text NOT NULL,
+                payload json NOT NULL,
+                deliveries int NOT NULL,
+                created_at timestamptz NOT NULL,
+                deliver_at timestamptz NOT NULL,
+                archived_at timestamptz NOT NULL DEFAULT now()
+            )
+            $QUERY$,
+            _a_table
+        );
+
+        EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (archived_at);', _a_table || '_archived_at_idx', _a_table);
     END IF;
 
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (deduplication_id);', _q_table || '_deduplication_id_idx', _q_table);
@@ -111,12 +130,15 @@ $$ LANGUAGE plpgsql;
 CREATE FUNCTION cb_delete_queue(name text)
 RETURNS boolean AS $$
 DECLARE
-    _q_table text = _cb_queue_table(cb_delete_queue.name);
+    _q_table text = _cb_table_name(cb_delete_queue.name, 'q');
+    _a_table text = _cb_table_name(cb_delete_queue.name, 'a');
     _res boolean;
 BEGIN
     PERFORM _cb_acquire_queue_lock(cb_delete_queue.name);
 
     EXECUTE FORMAT('DROP TABLE IF EXISTS %I;', _q_table);
+
+    EXECUTE FORMAT('DROP TABLE IF EXISTS %I;', _a_table);
 
     DELETE FROM cb_queues q
     WHERE q.name = cb_delete_queue.name
@@ -146,7 +168,7 @@ BEGIN
         FROM cb_queues q
         WHERE cb_send.topic = any(q.topics) AND (q.delete_at IS NULL OR q.delete_at > now())
     LOOP
-        _q_table = _cb_queue_table(_rec.name);
+        _q_table = _cb_table_name(_rec.name, 'q');
         EXECUTE format(
             $QUERY$
             INSERT INTO %I (topic, payload, deduplication_id, deliver_at)
@@ -173,7 +195,7 @@ CREATE FUNCTION cb_read(
 )
 RETURNS SETOF cb_message AS $$
 DECLARE
-    _q_table text = _cb_queue_table(cb_read.queue);
+    _q_table text = _cb_table_name(cb_read.queue, 'q');
     _q text;
 BEGIN
     _q = format(
@@ -220,7 +242,7 @@ DECLARE
     _stop_at timestamp;
     _sleep_for double precision = cb_read_poll.poll_interval::numeric / 1000;
     _q text;
-    _q_table text = _cb_queue_table(cb_read_poll.queue);
+    _q_table text = _cb_table_name(cb_read_poll.queue, 'q');
 BEGIN
     _stop_at := clock_timestamp() + make_interval(secs => cb_read_poll.poll_for);
     LOOP
@@ -277,7 +299,7 @@ CREATE FUNCTION cb_hide(
 )
 RETURNS boolean AS $$
 DECLARE
-    _q_table text = _cb_queue_table(cb_hide.queue);
+    _q_table text = _cb_table_name(cb_hide.queue, 'q');
     _res boolean;
 BEGIN
     EXECUTE format(
@@ -300,11 +322,52 @@ $$ LANGUAGE plpgsql;
 CREATE FUNCTION cb_delete(queue text, id bigint)
 RETURNS boolean AS $$
 DECLARE
-    _q_table text = _cb_queue_table(cb_delete.queue);
+    _q_table text = _cb_table_name(cb_delete.queue, 'q');
     _res boolean;
 BEGIN
-    EXECUTE format('DELETE FROM %I WHERE id = $1 RETURNING TRUE;', _q_table)
+    EXECUTE format(
+        $QUERY$
+        DELETE FROM %I WHERE id = $1 RETURNING TRUE;
+        $QUERY$,
+        _q_table
+    )
     USING cb_delete.id
+    INTO _res;
+    RETURN coalesce(_res, false);
+END;
+$$ LANGUAGE plpgsql;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE FUNCTION cb_archive(queue text, id bigint)
+RETURNS boolean AS $$
+DECLARE
+    _q_table text = _cb_table_name(cb_archive.queue, 'q');
+    _a_table text = _cb_table_name(cb_archive.queue, 'a');
+    _res boolean;
+BEGIN
+    EXECUTE format(
+        $QUERY$
+        WITH msgs AS (
+            DELETE FROM %I
+            WHERE id = $1
+            RETURNING id,
+                      deduplication_id,
+                      topic,
+                      payload,
+                      deliveries,
+                      created_at,
+                      deliver_at
+        )
+        INSERT INTO %I (id, deduplication_id, topic, payload, deliveries, created_at, deliver_at)
+        SELECT id, deduplication_id, topic, payload, deliveries, created_at, deliver_at
+        FROM msgs
+        RETURNING TRUE;
+        $QUERY$,
+        _q_table,
+        _a_table
+    )
+    USING cb_archive.id
     INTO _res;
     RETURN coalesce(_res, false);
 END;
@@ -315,16 +378,10 @@ $$ LANGUAGE plpgsql;
 CREATE FUNCTION cb_gc()
 RETURNS void AS $$
 DECLARE
-    _rec record;
 BEGIN
-    FOR _rec IN 
-        DELETE FROM cb_queues
-		WHERE delete_at IS NOT NULL AND delete_at <= now()
-        RETURNING name
-    LOOP
-        PERFORM _cb_acquire_queue_lock(_rec.name);
-        EXECUTE format('DROP TABLE %I;', _cb_queue_table(_rec.name));
-    END LOOP;
+    SELECT cb_delete_queue(name)
+    FROM cb_queues
+    WHERE delete_at IS NOT NULL AND delete_at <= now();
 END
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -340,8 +397,9 @@ DROP FUNCTION cb_read;
 DROP FUNCTION cb_read_poll;
 DROP FUNCTION cb_hide;
 DROP FUNCTION cb_delete;
+DROP FUNCTION cb_archive;
 DROP FUNCTION cb_gc;
-DROP FUNCTION _cb_queue_table;
+DROP FUNCTION _cb_table_name;
 DROP FUNCTION _cb_acquire_queue_lock;
 DROP TABLE cb_queues CASCADE;
 DROP TYPE cb_message;
