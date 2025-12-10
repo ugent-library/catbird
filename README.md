@@ -9,5 +9,6 @@ Postgres based message queue.
 SQL code is mostly taken or adapted from the excellent [PGMQ](https://github.com/pgmq) but adds:
 
 * topic based dispatch
-* dead letter tables
+* queues with expiration
+* fails
 * message priority
