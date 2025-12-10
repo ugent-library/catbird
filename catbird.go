@@ -22,7 +22,7 @@ type Conn interface {
 
 type Queue struct {
 	Name     string    `json:"name"`
-	Topics   []string  `json:"topics"`
+	Topics   []string  `json:"topics,omitempty"`
 	Unlogged bool      `json:"unlogged"`
 	DeleteAt time.Time `json:"delete_at,omitzero"`
 }
@@ -39,18 +39,19 @@ type Message struct {
 }
 
 type QueueOpts struct {
+	Topics   []string
 	DeleteAt time.Time
 	Unlogged bool
 }
 
-func CreateQueue(ctx context.Context, conn Conn, name string, topics []string, opts QueueOpts) error {
+func CreateQueue(ctx context.Context, conn Conn, name string, opts QueueOpts) error {
 	if opts.DeleteAt.IsZero() {
 		q := `SELECT cb_create_queue(name => $1, topics => $2, unlogged => $3);`
-		_, err := conn.Exec(ctx, q, name, topics, opts.Unlogged)
+		_, err := conn.Exec(ctx, q, name, opts.Topics, opts.Unlogged)
 		return err
 	} else {
 		q := `SELECT cb_create_queue(name => $1, topics => $2, delete_at => $3, unlogged => $4);`
-		_, err := conn.Exec(ctx, q, name, topics, opts.DeleteAt, opts.Unlogged)
+		_, err := conn.Exec(ctx, q, name, opts.Topics, opts.DeleteAt, opts.Unlogged)
 		return err
 	}
 }
@@ -72,24 +73,47 @@ func ListQueues(ctx context.Context, conn Conn) ([]Queue, error) {
 
 }
 
-type SendOpts struct {
+type DispatchOpts struct {
 	DeduplicationID string
 	Priority        int
 	DeliverAt       time.Time
 }
 
-func Send(ctx context.Context, conn Conn, topic string, payload any, opts SendOpts) error {
+func Dispatch(ctx context.Context, conn Conn, topic string, payload any, opts DispatchOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 	if opts.DeliverAt.IsZero() {
-		q := `SELECT cb_send(topic => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4);`
+		q := `SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4);`
 		_, err := conn.Exec(ctx, q, topic, b, opts.DeduplicationID, opts.Priority)
 		return err
 	} else {
-		q := `SELECT cb_send(topic => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4, deliver_at => $5);`
+		q := `SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4, deliver_at => $5);`
 		_, err := conn.Exec(ctx, q, topic, b, opts.DeduplicationID, opts.Priority, opts.DeliverAt)
+		return err
+	}
+}
+
+type SendOpts struct {
+	DeduplicationID string
+	Topic           string
+	Priority        int
+	DeliverAt       time.Time
+}
+
+func Send(ctx context.Context, conn Conn, queue string, payload any, opts SendOpts) error {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if opts.DeliverAt.IsZero() {
+		q := `SELECT cb_send(queue => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4);`
+		_, err := conn.Exec(ctx, q, queue, b, opts.DeduplicationID, opts.Priority)
+		return err
+	} else {
+		q := `SELECT cb_send(queue => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4, deliver_at => $5);`
+		_, err := conn.Exec(ctx, q, queue, b, opts.DeduplicationID, opts.Priority, opts.DeliverAt)
 		return err
 	}
 }
@@ -171,20 +195,40 @@ func GC(ctx context.Context, conn Conn) error {
 	return err
 }
 
-func EnqueueSend(batch *pgx.Batch, topic string, payload any, opts SendOpts) error {
+func EnqueueDispatch(batch *pgx.Batch, topic string, payload any, opts DispatchOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 	if opts.DeliverAt.IsZero() {
 		batch.Queue(
-			`SELECT cb_send(topic => $1, payload => $2, deduplication_id => nullif($3, ''));`,
-			topic, b, opts.DeduplicationID,
+			`SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4);`,
+			topic, b, opts.DeduplicationID, opts.Priority,
 		)
 	} else {
 		batch.Queue(
-			`SELECT cb_send(topic => $1, payload => $2, deduplication_id => nullif($3, ''), deliver_at => $4);`,
-			topic, b, opts.DeduplicationID, opts.DeliverAt,
+			`SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4, deliver_at => $5);`,
+			topic, b, opts.DeduplicationID, opts.Priority, opts.DeliverAt,
+		)
+	}
+
+	return nil
+}
+
+func EnqueueSend(batch *pgx.Batch, queue string, payload any, opts SendOpts) error {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if opts.DeliverAt.IsZero() {
+		batch.Queue(
+			`SELECT cb_send(topic => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4);`,
+			queue, b, opts.DeduplicationID, opts.Priority,
+		)
+	} else {
+		batch.Queue(
+			`SELECT cb_send(topic => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4, deliver_at => $5);`,
+			queue, b, opts.DeduplicationID, opts.Priority, opts.DeliverAt,
 		)
 	}
 
@@ -224,11 +268,12 @@ func scanMessage(row pgx.Row) (Message, error) {
 	msg := Message{}
 
 	var deduplicationID *string
+	var topic *string
 
 	if err := row.Scan(
 		&msg.ID,
 		&deduplicationID,
-		&msg.Topic,
+		&topic,
 		&msg.Payload,
 		&msg.Priority,
 		&msg.Deliveries,
@@ -238,6 +283,9 @@ func scanMessage(row pgx.Row) (Message, error) {
 		return msg, err
 	}
 
+	if topic != nil {
+		msg.Topic = *topic
+	}
 	if deduplicationID != nil {
 		msg.DeduplicationID = *deduplicationID
 	}
@@ -253,8 +301,8 @@ func New(conn Conn) *Client {
 	return &Client{conn: conn}
 }
 
-func (c *Client) CreateQueue(ctx context.Context, name string, topics []string, opts QueueOpts) error {
-	return CreateQueue(ctx, c.conn, name, topics, opts)
+func (c *Client) CreateQueue(ctx context.Context, name string, opts QueueOpts) error {
+	return CreateQueue(ctx, c.conn, name, opts)
 }
 
 func (c *Client) DeleteQueue(ctx context.Context, name string) (bool, error) {
@@ -265,8 +313,12 @@ func (c *Client) ListQueues(ctx context.Context) ([]Queue, error) {
 	return ListQueues(ctx, c.conn)
 }
 
-func (c *Client) Send(ctx context.Context, topic string, payload any, opts SendOpts) error {
-	return Send(ctx, c.conn, topic, payload, opts)
+func (c *Client) Dispatch(ctx context.Context, topic string, payload any, opts DispatchOpts) error {
+	return Dispatch(ctx, c.conn, topic, payload, opts)
+}
+
+func (c *Client) Send(ctx context.Context, queue string, payload any, opts SendOpts) error {
+	return Send(ctx, c.conn, queue, payload, opts)
 }
 
 func (c *Client) Read(ctx context.Context, queue string, quantity int, hideFor time.Duration) ([]Message, error) {

@@ -15,7 +15,7 @@ CREATE TYPE cb_message AS (
 
 CREATE TABLE cb_queues (
     name text UNIQUE NOT NULL,
-    topics text[] NOT NULL,
+    topics text[],
     unlogged boolean NOT null,
     delete_at timestamptz
 );
@@ -50,7 +50,7 @@ $$ LANGUAGE plpgsql;
 -- +goose statementbegin
 CREATE FUNCTION cb_create_queue(
     name text,
-    topics text[],
+    topics text[] = null,
     delete_at timestamptz = null,
     unlogged boolean = false
 )
@@ -68,7 +68,7 @@ BEGIN
             CREATE UNLOGGED TABLE IF NOT EXISTS %I (
                 id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
                 deduplication_id text,
-                topic text NOT NULL,
+                topic text,
                 payload json NOT NULL,
                 priority int NOT NULL DEFAULT 0,
                 deliveries int NOT NULL DEFAULT 0,
@@ -84,7 +84,7 @@ BEGIN
             CREATE TABLE IF NOT EXISTS %I (
                 id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
                 deduplication_id text,
-                topic text NOT NULL,
+                topic text,
                 payload json NOT NULL,
                 priority int NOT NULL DEFAULT 0,
                 deliveries int NOT NULL DEFAULT 0,
@@ -100,7 +100,7 @@ BEGIN
             CREATE TABLE IF NOT EXISTS %I (
                 id bigint PRIMARY KEY,
                 deduplication_id text,
-                topic text NOT NULL,
+                topic text,
                 payload json NOT NULL,
                 priority int NOT NULL DEFAULT 0,
                 deliveries int NOT NULL,
@@ -117,7 +117,7 @@ BEGIN
             CREATE TABLE IF NOT EXISTS %I (
                 id bigint PRIMARY KEY,
                 deduplication_id text,
-                topic text NOT NULL,
+                topic text,
                 payload json NOT NULL,
                 priority int NOT NULL DEFAULT 0,
                 deliveries int NOT NULL,
@@ -173,7 +173,7 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION cb_send(
+CREATE FUNCTION cb_dispatch(
     topic text,
     payload json,
     deduplication_id text = null,
@@ -182,14 +182,14 @@ CREATE FUNCTION cb_send(
 )
 RETURNS void AS $$
 DECLARE
-    _deliver_at timestamptz = coalesce(cb_send.deliver_at, now());
+    _deliver_at timestamptz = coalesce(cb_dispatch.deliver_at, now());
     _rec record;
     _q_table text;
 BEGIN
     FOR _rec IN 
         SELECT q.name
         FROM cb_queues q
-        WHERE cb_send.topic = any(q.topics) AND (q.delete_at IS NULL OR q.delete_at > now())
+        WHERE cb_dispatch.topic = any(q.topics) AND (q.delete_at IS NULL OR q.delete_at > now())
     LOOP
         _q_table = _cb_table_name(_rec.name, 'q');
         EXECUTE format(
@@ -200,12 +200,43 @@ BEGIN
             $QUERY$,
             _q_table
         )
-        USING cb_send.topic,
-              cb_send.payload,
-              cb_send.deduplication_id,
-              cb_send.priority,
+        USING cb_dispatch.topic,
+              cb_dispatch.payload,
+              cb_dispatch.deduplication_id,
+              cb_dispatch.priority,
               _deliver_at;
     END LOOP;
+END
+$$ LANGUAGE plpgsql;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE FUNCTION cb_send(
+    queue text,
+    payload json,
+    topic text = null,
+    deduplication_id text = null,
+    priority int = 0,
+    deliver_at timestamptz = null
+)
+RETURNS void AS $$
+DECLARE
+    _deliver_at timestamptz = coalesce(cb_send.deliver_at, now());
+    _q_table text = _cb_table_name(_rec.name, 'q');
+BEGIN
+    EXECUTE format(
+        $QUERY$
+        INSERT INTO %I (topic, payload, deduplication_id, priority, deliver_at)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (deduplication_id) DO NOTHING;
+        $QUERY$,
+        _q_table
+    )
+    USING cb_send.topic,
+          cb_send.payload,
+          cb_send.deduplication_id,
+          cb_send.priority,
+          _deliver_at;
 END
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -454,6 +485,7 @@ SELECT cb_delete_queue(name) FROM cb_queues;
 
 DROP FUNCTION cb_create_queue;
 DROP FUNCTION cb_delete_queue;
+DROP FUNCTION cb_dispatch;
 DROP FUNCTION cb_send;
 DROP FUNCTION cb_read;
 DROP FUNCTION cb_read_poll;

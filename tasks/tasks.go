@@ -80,7 +80,7 @@ func NewRunner(conn catbird.Conn, opts RunnerOpts) (*Runner, error) {
 		}
 		_, err := r.scheduler.AddFunc(t.schedule, func() {
 			for _, topic := range t.topics {
-				err := catbird.Send(context.TODO(), r.conn, topic, &struct{}{}, catbird.SendOpts{DeduplicationID: "scheduled:" + t.name})
+				err := catbird.Dispatch(context.TODO(), r.conn, topic, &struct{}{}, catbird.DispatchOpts{DeduplicationID: "scheduled:" + t.name})
 				if err != nil {
 					r.logger.Error("tasks: failed to schedule task", "task", t.name, "error", err)
 				}
@@ -113,7 +113,7 @@ func (r *Runner) Run(ctx context.Context) {
 	}
 
 	for _, t := range r.tasks {
-		catbird.CreateQueue(ctx, r.conn, t.queue, t.topics, catbird.QueueOpts{})
+		catbird.CreateQueue(ctx, r.conn, t.queue, catbird.QueueOpts{Topics: t.topics})
 
 		for i := 0; i < t.concurrency; i++ {
 			wg.Go(func() {

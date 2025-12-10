@@ -6,4 +6,8 @@ Postgres based message queue.
 
 ## Acknowledgments
 
-SQL code is mostly taken or adapted from the excellent [PGMQ](https://github.com/pgmq) but adds topic based multiplexing and dead letter tables.
+SQL code is mostly taken or adapted from the excellent [PGMQ](https://github.com/pgmq) but adds:
+
+* topic based dispatch
+* dead letter tables
+* message priority
