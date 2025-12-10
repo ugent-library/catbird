@@ -156,12 +156,16 @@ func (r *Runner) runTask(ctx context.Context, t *Task) {
 	if err = t.fn(runCtx, msg); err != nil {
 		r.logger.Error("tasks: task failed", "task", t.name, "error", err)
 		// leave message in queue for next try
-		if t.retries == 0 || msg.Deliveries < t.retries {
-			return
+		// TODO backoff
+		if t.retries > 0 && msg.Deliveries == t.retries {
+			if _, err = catbird.Fail(ctx, r.conn, t.queue, msg.ID); err != nil {
+				r.logger.Error("tasks: cannot fail message", "task", t.name, "error", err)
+			}
 		}
+		return
 	}
 
-	if _, err = catbird.Delete(ctx, r.conn, t.queue, msg.ID); err != nil {
-		r.logger.Error("tasks: cannot delete message", "task", t.name, "error", err)
+	if _, err = catbird.Archive(ctx, r.conn, t.queue, msg.ID); err != nil {
+		r.logger.Error("tasks: cannot archive message", "task", t.name, "error", err)
 	}
 }
