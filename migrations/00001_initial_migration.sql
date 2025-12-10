@@ -7,6 +7,7 @@ CREATE TYPE cb_message AS (
     deduplication_id text,
     topic text,
     payload json,
+    priority int,
     deliveries int,
     created_at timestamptz,
     deliver_at timestamptz
@@ -69,6 +70,7 @@ BEGIN
                 deduplication_id text,
                 topic text NOT NULL,
                 payload json NOT NULL,
+                priority int NOT NULL DEFAULT 0,
                 deliveries int NOT NULL DEFAULT 0,
                 created_at timestamptz NOT NULL DEFAULT now(),
                 deliver_at timestamptz NOT NULL DEFAULT now()
@@ -84,6 +86,7 @@ BEGIN
                 deduplication_id text,
                 topic text NOT NULL,
                 payload json NOT NULL,
+                priority int NOT NULL DEFAULT 0,
                 deliveries int NOT NULL DEFAULT 0,
                 created_at timestamptz NOT NULL DEFAULT now(),
                 deliver_at timestamptz NOT NULL DEFAULT now()
@@ -99,6 +102,7 @@ BEGIN
                 deduplication_id text,
                 topic text NOT NULL,
                 payload json NOT NULL,
+                priority int NOT NULL DEFAULT 0,
                 deliveries int NOT NULL,
                 created_at timestamptz NOT NULL,
                 deliver_at timestamptz NOT NULL,
@@ -115,6 +119,7 @@ BEGIN
                 deduplication_id text,
                 topic text NOT NULL,
                 payload json NOT NULL,
+                priority int NOT NULL DEFAULT 0,
                 deliveries int NOT NULL,
                 created_at timestamptz NOT NULL,
                 deliver_at timestamptz NOT NULL,
@@ -126,6 +131,7 @@ BEGIN
     END IF;
 
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (deduplication_id);', _q_table || '_deduplication_id_idx', _q_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (priority);', _q_table || '_priority_idx', _q_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (deliver_at);', _q_table || '_deliver_at_idx', _q_table);
 
     -- TODO should check topic and delete_at is same
@@ -171,6 +177,7 @@ CREATE FUNCTION cb_send(
     topic text,
     payload json,
     deduplication_id text = null,
+    priority int = 0,
     deliver_at timestamptz = null
 )
 RETURNS void AS $$
@@ -187,8 +194,8 @@ BEGIN
         _q_table = _cb_table_name(_rec.name, 'q');
         EXECUTE format(
             $QUERY$
-            INSERT INTO %I (topic, payload, deduplication_id, deliver_at)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO %I (topic, payload, deduplication_id, priority, deliver_at)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (deduplication_id) DO NOTHING;
             $QUERY$,
             _q_table
@@ -196,6 +203,7 @@ BEGIN
         USING cb_send.topic,
               cb_send.payload,
               cb_send.deduplication_id,
+              cb_send.priority,
               _deliver_at;
     END LOOP;
 END
@@ -220,7 +228,7 @@ BEGIN
 			SELECT id
 			FROM %I
 			WHERE deliver_at <= clock_timestamp()
-			ORDER BY id ASC
+			ORDER BY priority DESC, id ASC
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
 		)
@@ -233,6 +241,7 @@ BEGIN
                   m.deduplication_id,
                   m.topic,
                   m.payload,
+                  m.priority,
                   m.deliveries,
                   m.created_at,
                   m.deliver_at;
@@ -272,7 +281,7 @@ BEGIN
                 SELECT id
                 FROM %I
                 WHERE deliver_at <= clock_timestamp()
-                ORDER BY id ASC
+    			ORDER BY priority DESC, id ASC
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
             )
@@ -285,6 +294,7 @@ BEGIN
                       m.deduplication_id,
                       m.topic,
                       m.payload,
+                      m.priority,
                       m.deliveries,
                       m.created_at,
                       m.deliver_at;
