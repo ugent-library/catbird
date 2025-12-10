@@ -156,7 +156,6 @@ func Archive(ctx context.Context, conn Conn, queue string, id int64) (bool, erro
 	return existed, err
 }
 
-<<<<<<< HEAD
 func Fail(ctx context.Context, conn Conn, queue string, id int64) (bool, error) {
 	q := `SELECT * FROM cb_fail(queue => $1, id => $2);`
 	existed := false
@@ -164,8 +163,6 @@ func Fail(ctx context.Context, conn Conn, queue string, id int64) (bool, error) 
 	return existed, err
 }
 
-=======
->>>>>>> dc769f7e9ca1684f91d9c5d39870302700555ce8
 func GC(ctx context.Context, conn Conn) error {
 	q := `SELECT cb_gc();`
 	_, err := conn.Exec(ctx, q)
@@ -289,13 +286,10 @@ func (c *Client) Archive(ctx context.Context, queue string, id int64) (bool, err
 	return Archive(ctx, c.conn, queue, id)
 }
 
-<<<<<<< HEAD
 func (c *Client) Fail(ctx context.Context, queue string, id int64) (bool, error) {
 	return Fail(ctx, c.conn, queue, id)
 }
 
-=======
->>>>>>> dc769f7e9ca1684f91d9c5d39870302700555ce8
 func (c *Client) GC(ctx context.Context) error {
 	return GC(ctx, c.conn)
 }
