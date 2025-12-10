@@ -149,6 +149,20 @@ func Delete(ctx context.Context, conn Conn, queue string, id int64) (bool, error
 	return existed, err
 }
 
+func Archive(ctx context.Context, conn Conn, queue string, id int64) (bool, error) {
+	q := `SELECT * FROM cb_archive(queue => $1, id => $2);`
+	existed := false
+	err := conn.QueryRow(ctx, q, queue, id).Scan(&existed)
+	return existed, err
+}
+
+func Fail(ctx context.Context, conn Conn, queue string, id int64) (bool, error) {
+	q := `SELECT * FROM cb_fail(queue => $1, id => $2);`
+	existed := false
+	err := conn.QueryRow(ctx, q, queue, id).Scan(&existed)
+	return existed, err
+}
+
 func GC(ctx context.Context, conn Conn) error {
 	q := `SELECT cb_gc();`
 	_, err := conn.Exec(ctx, q)
@@ -266,6 +280,14 @@ func (c *Client) Hide(ctx context.Context, queue string, id int64, hideFor time.
 
 func (c *Client) Delete(ctx context.Context, queue string, id int64) (bool, error) {
 	return Delete(ctx, c.conn, queue, id)
+}
+
+func (c *Client) Archive(ctx context.Context, queue string, id int64) (bool, error) {
+	return Archive(ctx, c.conn, queue, id)
+}
+
+func (c *Client) Fail(ctx context.Context, queue string, id int64) (bool, error) {
+	return Fail(ctx, c.conn, queue, id)
 }
 
 func (c *Client) GC(ctx context.Context) error {
