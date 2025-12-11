@@ -2,29 +2,36 @@
 
 -- +goose up
 
-CREATE TYPE cb_message AS (
-    id bigint,
-    deduplication_id text,
-    topic text,
-    payload json,
-    priority int,
-    deliveries int,
-    created_at timestamptz,
-    deliver_at timestamptz
-);
+-- +goose statementbegin
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'cb_message') THEN
+        CREATE TYPE cb_message AS (
+            id bigint,
+            deduplication_id text,
+            topic text,
+            payload json,
+            priority int,
+            deliveries int,
+            created_at timestamptz,
+            deliver_at timestamptz
+        );
+    END IF;
+END$$;
+-- +goose statementend
 
-CREATE TABLE cb_queues (
-    name text UNIQUE NOT NULL,
+CREATE TABLE IF NOT EXISTS cb_queues (
+    name text PRIMARY KEY,
     topics text[],
     unlogged boolean NOT null,
     delete_at timestamptz
 );
 
-CREATE INDEX cb_queues_topics_idx ON cb_queues USING gin (topics);
-CREATE INDEX cb_queues_delete_at_idx ON cb_queues (delete_at);
+CREATE INDEX IF NOT EXISTS cb_queues_topics_idx ON cb_queues USING gin (topics);
+CREATE INDEX IF NOT EXISTS cb_queues_delete_at_idx ON cb_queues (delete_at);
 
 -- +goose statementbegin
-CREATE FUNCTION _cb_acquire_queue_lock(name text) 
+CREATE OR REPLACE FUNCTION _cb_acquire_queue_lock(name text) 
 RETURNS void AS $$
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext(_cb_table_name(_cb_acquire_queue_lock.name, 'q')));
@@ -33,7 +40,7 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION _cb_table_name(name text, prefix text)
+CREATE OR REPLACE FUNCTION _cb_table_name(name text, prefix text)
 RETURNS text AS $$
 BEGIN
     IF _cb_table_name.name !~ '^[a-z0-9_]+$' THEN
@@ -48,7 +55,7 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION cb_create_queue(
+CREATE OR REPLACE FUNCTION cb_create_queue(
     name text,
     topics text[] = null,
     delete_at timestamptz = null,
@@ -134,7 +141,7 @@ BEGIN
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (priority);', _q_table || '_priority_idx', _q_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (deliver_at);', _q_table || '_deliver_at_idx', _q_table);
 
-    -- TODO should check topic and delete_at is same
+    -- TODO should check attributes are same
     INSERT INTO cb_queues (name, topics, unlogged, delete_at)
     VALUES (
         cb_create_queue.name,
@@ -148,7 +155,7 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION cb_delete_queue(name text)
+CREATE OR REPLACE FUNCTION cb_delete_queue(name text)
 RETURNS boolean AS $$
 DECLARE
     _q_table text = _cb_table_name(cb_delete_queue.name, 'q');
@@ -173,7 +180,7 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION cb_dispatch(
+CREATE OR REPLACE FUNCTION cb_dispatch(
     topic text,
     payload json,
     deduplication_id text = null,
@@ -211,7 +218,7 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION cb_send(
+CREATE OR REPLACE FUNCTION cb_send(
     queue text,
     payload json,
     topic text = null,
@@ -219,16 +226,18 @@ CREATE FUNCTION cb_send(
     priority int = 0,
     deliver_at timestamptz = null
 )
-RETURNS void AS $$
+RETURNS bigint AS $$
 DECLARE
     _deliver_at timestamptz = coalesce(cb_send.deliver_at, now());
-    _q_table text = _cb_table_name(_rec.name, 'q');
+    _q_table text = _cb_table_name(cb_send.queue, 'q');
+    _id bigint;
 BEGIN
     EXECUTE format(
         $QUERY$
         INSERT INTO %I (topic, payload, deduplication_id, priority, deliver_at)
         VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (deduplication_id) DO NOTHING;
+        ON CONFLICT (deduplication_id) DO NOTHING
+        RETURNING id;
         $QUERY$,
         _q_table
     )
@@ -236,14 +245,17 @@ BEGIN
           cb_send.payload,
           cb_send.deduplication_id,
           cb_send.priority,
-          _deliver_at;
+          _deliver_at
+    INTO _id;
+
+    RETURN _id;
 END
 $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
 -- TODO return or error if deleted
-CREATE FUNCTION cb_read(
+CREATE OR REPLACE FUNCTION cb_read(
     queue text,
     quantity int,
     hide_for int
@@ -285,7 +297,7 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION cb_read_poll(
+CREATE OR REPLACE FUNCTION cb_read_poll(
     queue text,
     quantity int,
     hide_for int,
@@ -349,7 +361,7 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION cb_hide(
+CREATE OR REPLACE FUNCTION cb_hide(
     queue text,
     id bigint,
     hide_for integer
@@ -376,7 +388,7 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION cb_delete(queue text, id bigint)
+CREATE OR REPLACE FUNCTION cb_delete(queue text, id bigint)
 RETURNS boolean AS $$
 DECLARE
     _q_table text = _cb_table_name(cb_delete.queue, 'q');
@@ -396,7 +408,7 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION cb_archive(queue text, id bigint)
+CREATE OR REPLACE FUNCTION cb_archive(queue text, id bigint)
 RETURNS boolean AS $$
 DECLARE
     _q_table text = _cb_table_name(cb_archive.queue, 'q');
@@ -432,7 +444,7 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION cb_fail(queue text, id bigint)
+CREATE OR REPLACE FUNCTION cb_fail(queue text, id bigint)
 RETURNS boolean AS $$
 DECLARE
     _q_table text = _cb_table_name(cb_fail.queue, 'q');
@@ -468,7 +480,7 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION cb_gc()
+CREATE OR REPLACE FUNCTION cb_gc()
 RETURNS void AS $$
 DECLARE
 BEGIN
