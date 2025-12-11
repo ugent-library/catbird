@@ -140,7 +140,65 @@ BEGIN
   SELECT run_id FROM flow_run
   INTO _run_id;
 
+  PERFORM _cb_start_steps(_run_id);
+
   RETURN _run_id;
+END;
+$$ LANGUAGE plpgsql;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION _cb_start_steps(
+    flow_run_id uuid
+)
+RETURNS void AS $$
+DECLARE
+BEGIN
+
+-- ==========================================
+-- GUARD: No mutations on failed runs
+-- ==========================================
+IF EXISTS (SELECT 1 FROM cb_flow_runs f_r WHERE f_r.id = _cb_start_steps.flow_run_id AND f_r.status = 'failed') THEN
+  RETURN;
+END IF;
+
+WITH
+ready_steps AS (
+  SELECT *
+  FROM cb_step_runs AS s_r
+  WHERE s_r.flow_run_id = _cb_start_steps.flow_run_id
+    AND s_r.status = 'created'
+--    AND s_r.remaining_deps = 0
+--    AND step_state.initial_tasks IS NOT NULL   NEW: Cannot start with unknown count
+--    AND step_state.initial_tasks > 0   Don't start taskless steps
+    -- Exclude empty map steps already handled
+--    AND NOT EXISTS (
+--      SELECT 1 FROM empty_map_steps
+--      WHERE empty_map_steps.run_id = step_state.run_id
+--        AND empty_map_steps.step_slug = step_state.step_slug
+--    )
+  ORDER BY s_r.step_name
+  FOR UPDATE
+)
+-- ---------- Mark steps as started ----------
+  UPDATE cb_step_runs
+  SET status = 'started',
+      started_at = now(),
+      message_id = cb_send(
+      	queue => cb_step_runs.flow_name,
+      	payload => json_build_object(
+      		'flow_name', cb_step_runs.flow_name,
+      		'flow_run_id', cb_step_runs.flow_run_id,
+      		'step_name', cb_step_runs.step_name
+      	)
+      )
+--      remaining_tasks = ready_steps.initial_tasks  -- Copy initial_tasks to remaining_tasks when starting
+  FROM ready_steps
+  WHERE cb_step_runs.flow_run_id = _cb_start_steps.flow_run_id
+    AND cb_step_runs.step_name = ready_steps.step_name
+    ;
+
+
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -148,6 +206,7 @@ $$ LANGUAGE plpgsql;
 -- +goose down
 
 DROP FUNCTION cb_run_flow;
+DROP FUNCTION _cb_start_steps;
 DROP FUNCTION cb_create_flow;
 DROP TABLE cb_step_runs;
 DROP TABLE cb_flow_runs;
