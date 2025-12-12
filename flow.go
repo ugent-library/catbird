@@ -29,14 +29,14 @@ func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 	return nil
 }
 
-func RunFlow(ctx context.Context, conn Conn, flow *Flow) (string, error) {
-	b, err := json.Marshal(flow.Steps)
+func RunFlow(ctx context.Context, conn Conn, name string, input any) (string, error) {
+	b, err := json.Marshal(input)
 	if err != nil {
 		return "", err
 	}
-	q := `SELECT * FROM cb_run_flow(name => $1, steps => $2);`
+	q := `SELECT * FROM cb_run_flow(name => $1, input => $2);`
 	var runID string
-	err = conn.QueryRow(ctx, q, flow.Name, b).Scan(&runID)
+	err = conn.QueryRow(ctx, q, name, b).Scan(&runID)
 	if err != nil {
 		return "", err
 	}
