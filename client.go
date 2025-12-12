@@ -61,8 +61,12 @@ func (c *Client) CreateFlow(ctx context.Context, flow *Flow) error {
 	return CreateFlow(ctx, c.conn, flow)
 }
 
-func (c *Client) RunFlow(ctx context.Context, flowName string, input any) (string, error) {
-	return RunFlow(ctx, c.conn, flowName, input)
+func (c *Client) RunFlow(ctx context.Context, name string, input any) (string, error) {
+	return RunFlow(ctx, c.conn, name, input)
+}
+
+func (c *Client) NewWorker(opts WorkerOpts) (*Worker, error) {
+	return NewWorker(c.conn, opts)
 }
 
 func (c *Client) GC(ctx context.Context) error {
