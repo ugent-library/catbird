@@ -115,10 +115,10 @@ func (w *Worker) runTask(ctx context.Context, t *Task) {
 }
 
 type taskPayload struct {
-	FlowRunID string
-	FlowName  string
-	StepName  string
-	Input     json.RawMessage
+	FlowRunID string          `json:"flow_run_id"`
+	FlowName  string          `json:"flow_name"`
+	StepName  string          `json:"step_name"`
+	Input     json.RawMessage `json:"input"`
 }
 
 func completeStep(ctx context.Context, conn Conn, flowRunID string, stepName string, out []byte) error {
