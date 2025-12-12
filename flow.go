@@ -1,27 +1,31 @@
 package catbird
 
-type Flow struct {
-	name string
-}
+import (
+	"context"
+	"encoding/json"
+)
 
-func NewFlow(name string) *Flow {
-	return &Flow{
-		name: name,
-	}
+type Flow struct {
+	Name  string `json:"name"`
+	Steps []Step `json:"steps"`
 }
 
 type Step struct {
-	name      string
-	dependsOn []string
+	Name      string   `json:"name"`
+	TaskName  string   `json:"task_name,omitempty"`
+	DependsOn []string `json:"depends_on,omitempty"`
 }
 
-type StepOpts struct {
-	DependsOn []string
-}
-
-func NewStep(name string, opts StepOpts) *Step {
-	return &Step{
-		name:      name,
-		dependsOn: opts.DependsOn,
+func CreateFlow(ctx context.Context, conn Conn, flow *Flow) (string, error) {
+	b, err := json.Marshal(flow.Steps)
+	if err != nil {
+		return "", err
 	}
+	q := `SELECT * FROM cb_create_flow(name => $1, steps => $2);`
+	var runID string
+	err = conn.QueryRow(ctx, q, flow.Name, b).Scan(&runID)
+	if err != nil {
+		return "", err
+	}
+	return runID, err
 }

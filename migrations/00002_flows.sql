@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS cb_flows (
 CREATE TABLE IF NOT EXISTS cb_steps (
     flow_name text NOT NULL REFERENCES cb_flows (name),
     name text NOT NULL,
+    task_name text NOT NULL,
     idx int not null,
     PRIMARY KEY (flow_name, name)
 );
@@ -45,8 +46,10 @@ CREATE TABLE IF NOT EXISTS cb_step_runs (
   flow_run_id uuid not null references cb_flow_runs (id),
   flow_name text not null references cb_flows (name),
   step_name text not null,
+  task_name text NOT NULL,
   message_id bigint,  -- TODO constraint not null when started
   status text not null default 'created',
+  output jsonb,
   error_message text,
   created_at timestamptz not null default now(),
   started_at timestamptz,
@@ -85,21 +88,22 @@ BEGIN
         cb_create_flow.name
     )
     ON CONFLICT DO NOTHING;
-    
+
     FOR _step IN SELECT * FROM jsonb_array_elements(steps)
     loop
-        INSERT INTO cb_steps (flow_name, name, idx)
+        INSERT INTO cb_steps (flow_name, name, task_name, idx)
         VALUES (
             cb_create_flow.name,
             _step->>'name',
+            COALESCE(_step->>'task_name', _step->>'name'),
             _idx
         )
         ON CONFLICT DO NOTHING;
 
+        PERFORM cb_create_queue('t_' || COALESCE(_step->>'task_name', _step->>'name'));
+
         _idx = _idx + 1;
     end loop;
-
-    PERFORM cb_create_queue(cb_create_flow.name);
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -109,9 +113,9 @@ CREATE OR REPLACE FUNCTION cb_run_flow(
     name text,
     input jsonb
 )
-RETURNS text AS $$
+RETURNS uuid AS $$
 DECLARE
-    _run_id text;
+    _id uuid;
 BEGIN
     WITH
   -- ---------- Gather flow metadata ----------
@@ -130,19 +134,20 @@ BEGIN
     RETURNING *
   ),
   step_runs AS (
-    INSERT INTO cb_step_runs (flow_name, flow_run_id, step_name)
+    INSERT INTO cb_step_runs (flow_name, flow_run_id, step_name, task_name)
     SELECT
       s.flow_name,
       (SELECT flow_run.id FROM flow_run),
-      s.name
+      s.name,
+      s.task_name
     FROM cb_steps s
   )
-  SELECT run_id FROM flow_run
-  INTO _run_id;
+  SELECT id FROM flow_run
+  INTO _id;
 
-  PERFORM _cb_start_steps(_run_id);
+  PERFORM _cb_start_steps(_id);
 
-  RETURN _run_id;
+  RETURN _id;
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -163,6 +168,13 @@ IF EXISTS (SELECT 1 FROM cb_flow_runs f_r WHERE f_r.id = _cb_start_steps.flow_ru
 END IF;
 
 WITH
+flow_run as (
+    select
+      r.input
+    from cb_flow_runs r
+    where r.id = _cb_start_steps.flow_run_id
+  ),
+
 ready_steps AS (
   SELECT *
   FROM cb_step_runs AS s_r
@@ -185,26 +197,115 @@ ready_steps AS (
   SET status = 'started',
       started_at = now(),
       message_id = cb_send(
-      	queue => cb_step_runs.flow_name,
+      	queue => 't_' || cb_step_runs.task_name,
       	payload => json_build_object(
       		'flow_name', cb_step_runs.flow_name,
       		'flow_run_id', cb_step_runs.flow_run_id,
-      		'step_name', cb_step_runs.step_name
+      		'step_name', cb_step_runs.step_name,
+            'input', flow_run.input
       	)
       )
 --      remaining_tasks = ready_steps.initial_tasks  -- Copy initial_tasks to remaining_tasks when starting
-  FROM ready_steps
+  FROM ready_steps, flow_run
   WHERE cb_step_runs.flow_run_id = _cb_start_steps.flow_run_id
     AND cb_step_runs.step_name = ready_steps.step_name
     ;
-
 
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
 
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_fail_step(
+    flow_run_id uuid,
+    step_name text,
+    error_message text
+)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+BEGIN
+	-- fail step run
+	UPDATE cb_step_runs s_r
+  	SET status = 'failed',
+      failed_at = now(),
+      error_message = cb_fail_step.error_message
+  	WHERE s_r.flow_run_id = cb_fail_step.flow_run_id
+      AND s_r.step_name = cb_fail_step.step_name
+      AND s_r.status = 'started';
+
+	-- fail flow run
+    UPDATE cb_flow_runs
+    SET status = 'failed',
+        failed_at = now()
+	WHERE id = cb_fail_step.flow_run_id
+      AND status = 'started';
+
+	-- delete all queued task messages
+	PERFORM cb_delete('t_' || s_r.task_name, message_id)
+	FROM cb_step_runs s_r
+	WHERE s_r.flow_run_id = cb_fail_step.flow_run_id
+      AND s_r.message_id IS NOT NULL;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_complete_step(
+    flow_run_id uuid,
+    step_name text,
+    output json
+)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+BEGIN
+
+	-- ==========================================
+	-- GUARD: No mutations on failed runs
+	-- ==========================================
+	IF EXISTS (SELECT 1 FROM cb_flow_runs WHERE id = cb_complete_step.flow_run_id AND status = 'failed') THEN
+	  RETURN;
+	END IF;
+
+	WITH
+	-- complete step run
+	task AS (
+		UPDATE cb_step_runs s_r
+	  	SET status = 'completed',
+	      completed_at = now(),
+          output = cb_complete_step.output
+	  	WHERE s_r.flow_run_id = cb_complete_step.flow_run_id
+	      AND s_r.step_name = cb_complete_step.step_name
+	      AND s_r.status = 'started'
+		RETURNING *
+	)
+	UPDATE cb_flow_runs
+	SET remaining_steps = remaining_steps - 1
+	FROM task
+	WHERE id = task.flow_run_id;
+
+	-- delete queued task message
+	PERFORM cb_delete('t_' || s_r.task_name, message_id)
+	FROM cb_step_runs s_r
+	WHERE s_r.flow_run_id = cb_complete_step.flow_run_id
+      AND s_r.step_name = cb_complete_step.step_name;
+
+	-- maybe complete flow run
+    UPDATE cb_flow_runs
+    SET status = 'completed',
+        completed_at = now()
+	WHERE id = cb_complete_step.flow_run_id
+	  AND remaining_steps = 0
+      AND status != 'completed';
+END;
+$$;
+-- +goose statementend
+
 -- +goose down
 
+DROP FUNCTION cb_complete_step;
+DROP FUNCTION cb_fail_step;
 DROP FUNCTION cb_run_flow;
 DROP FUNCTION _cb_start_steps;
 DROP FUNCTION cb_create_flow;
