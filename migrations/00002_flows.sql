@@ -1,5 +1,7 @@
 -- +goose up
 
+-- TODO acquire locks where necessary
+
 CREATE TABLE IF NOT EXISTS cb_flows (
     name text PRIMARY KEY,
     created_at timestamptz NOT NULL DEFAULT now()
@@ -10,6 +12,7 @@ CREATE TABLE IF NOT EXISTS cb_steps (
     name text NOT NULL,
     task_name text NOT NULL,
     idx int not null,
+    dependency_count int not null default 0 check (dependency_count >= 0),
     PRIMARY KEY (flow_name, name)
 );
 
@@ -51,6 +54,7 @@ CREATE TABLE IF NOT EXISTS cb_step_runs (
   status text not null default 'created',
   output jsonb,
   error_message text,
+  remaining_dependencies int not null default 0 check (remaining_dependencies >= 0),
   created_at timestamptz not null default now(),
   started_at timestamptz,
   completed_at timestamptz,
@@ -91,15 +95,21 @@ BEGIN
 
     FOR _step IN SELECT * FROM jsonb_array_elements(steps)
     loop
-        INSERT INTO cb_steps (flow_name, name, task_name, idx)
+        INSERT INTO cb_steps (flow_name, name, task_name, idx, dependency_count)
         VALUES (
             cb_create_flow.name,
             _step->>'name',
             COALESCE(_step->>'task_name', _step->>'name'),
-            _idx
+            _idx,
+            COALESCE(jsonb_array_length(_step->'depends_on'), 0)
         )
         ON CONFLICT DO NOTHING;
 
+		INSERT INTO cb_step_dependencies (flow_name, step_name, dependency_name)
+		SELECT cb_create_flow.name, _step->>'name', dep
+		FROM jsonb_array_elements_text(COALESCE(_step->'depends_on', '[]'::jsonb)) AS dep
+		ON CONFLICT DO NOTHING;
+		
         PERFORM cb_create_queue('t_' || COALESCE(_step->>'task_name', _step->>'name'));
 
         _idx = _idx + 1;
@@ -134,12 +144,13 @@ BEGIN
     RETURNING *
   ),
   step_runs AS (
-    INSERT INTO cb_step_runs (flow_name, flow_run_id, step_name, task_name)
+    INSERT INTO cb_step_runs (flow_name, flow_run_id, step_name, task_name, remaining_dependencies)
     SELECT
       s.flow_name,
       (SELECT flow_run.id FROM flow_run),
       s.name,
-      s.task_name
+      s.task_name,
+      s.dependency_count
     FROM cb_steps s
   )
   SELECT id FROM flow_run
@@ -180,7 +191,8 @@ ready_steps AS (
   FROM cb_step_runs AS s_r
   WHERE s_r.flow_run_id = _cb_start_steps.flow_run_id
     AND s_r.status = 'created'
---    AND s_r.remaining_deps = 0
+    AND s_r.remaining_dependencies = 0
+    
 --    AND step_state.initial_tasks IS NOT NULL   NEW: Cannot start with unknown count
 --    AND step_state.initial_tasks > 0   Don't start taskless steps
     -- Exclude empty map steps already handled
@@ -268,9 +280,21 @@ BEGIN
 	  RETURN;
 	END IF;
 
+
+-- TODO
+  -- Acquire locks first to prevent race conditions
+-- SELECT * INTO v_run_record FROM pgflow.runs
+-- WHERE pgflow.runs.run_id = complete_task.run_id
+-- FOR UPDATE;
+
+-- SELECT * INTO v_step_record FROM pgflow.step_states
+-- WHERE pgflow.step_states.run_id = complete_task.run_id
+--   AND pgflow.step_states.step_slug = complete_task.step_slug
+-- FOR UPDATE;
+
 	WITH
 	-- complete step run
-	task AS (
+	step AS (
 		UPDATE cb_step_runs s_r
 	  	SET status = 'completed',
 	      completed_at = now(),
@@ -279,11 +303,33 @@ BEGIN
 	      AND s_r.step_name = cb_complete_step.step_name
 	      AND s_r.status = 'started'
 		RETURNING *
-	)
+	),
+  child_steps AS (
+    SELECT deps.step_name AS child_step_name
+    FROM cb_step_dependencies deps
+    JOIN step parent_step ON parent_step.status = 'completed' AND deps.flow_name = parent_step.flow_name
+    WHERE deps.dependency_name = cb_complete_step.step_name  -- dep_slug is the parent, step_slug is the child
+    ORDER BY deps.step_name  -- Ensure consistent ordering
+  ),
+  -- Acquire locks on all child steps before updating them
+  child_steps_lock AS (
+    SELECT * FROM cb_step_runs s_r
+    WHERE s_r.flow_run_id = cb_complete_step.flow_run_id
+      AND s_r.step_name IN (SELECT child_step_name FROM child_steps)
+    FOR UPDATE
+  ),
+  -- Decrement remaining_dependencies
+  child_steps_update AS (
+    UPDATE cb_step_runs s_r
+    SET remaining_dependencies = s_r.remaining_dependencies - 1
+      FROM child_steps children
+    WHERE s_r.flow_run_id = cb_complete_step.flow_run_id
+    AND s_r.step_name = children.child_step_name
+  )
 	UPDATE cb_flow_runs
 	SET remaining_steps = remaining_steps - 1
-	FROM task
-	WHERE id = task.flow_run_id;
+	FROM step
+	WHERE id = step.flow_run_id;
 
 	-- delete queued task message
 	PERFORM cb_delete('t_' || s_r.task_name, message_id)
@@ -298,6 +344,9 @@ BEGIN
 	WHERE id = cb_complete_step.flow_run_id
 	  AND remaining_steps = 0
       AND status != 'completed';
+
+  -- TODO only if needed
+  PERFORM _cb_start_steps(cb_complete_step.flow_run_id);
 END;
 $$;
 -- +goose statementend
