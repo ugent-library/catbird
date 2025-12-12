@@ -122,7 +122,7 @@ type taskPayload struct {
 }
 
 func completeStep(ctx context.Context, conn Conn, flowRunID string, stepName string, out []byte) error {
-	q := `SELECT * FROM cb_comoplete_step(flow_run_id => $1, step_name => $2, output => $3);`
+	q := `SELECT * FROM cb_complete_step(flow_run_id => $1, step_name => $2, output => $3);`
 	_, err := conn.Exec(ctx, q, flowRunID, stepName, out)
 	return err
 }

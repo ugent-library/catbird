@@ -192,15 +192,6 @@ ready_steps AS (
   WHERE s_r.flow_run_id = _cb_start_steps.flow_run_id
     AND s_r.status = 'created'
     AND s_r.remaining_dependencies = 0
-    
---    AND step_state.initial_tasks IS NOT NULL   NEW: Cannot start with unknown count
---    AND step_state.initial_tasks > 0   Don't start taskless steps
-    -- Exclude empty map steps already handled
---    AND NOT EXISTS (
---      SELECT 1 FROM empty_map_steps
---      WHERE empty_map_steps.run_id = step_state.run_id
---        AND empty_map_steps.step_slug = step_state.step_slug
---    )
   ORDER BY s_r.step_name
   FOR UPDATE
 )
@@ -217,7 +208,6 @@ ready_steps AS (
             'input', flow_run.input
       	)
       )
---      remaining_tasks = ready_steps.initial_tasks  -- Copy initial_tasks to remaining_tasks when starting
   FROM ready_steps, flow_run
   WHERE cb_step_runs.flow_run_id = _cb_start_steps.flow_run_id
     AND cb_step_runs.step_name = ready_steps.step_name
