@@ -57,8 +57,12 @@ func (c *Client) Fail(ctx context.Context, queue string, id int64) (bool, error)
 	return Fail(ctx, c.conn, queue, id)
 }
 
-func (c *Client) CreateFlow(ctx context.Context, flow *Flow) (string, error) {
+func (c *Client) CreateFlow(ctx context.Context, flow *Flow) error {
 	return CreateFlow(ctx, c.conn, flow)
+}
+
+func (c *Client) RunFlow(ctx context.Context, flowName string, input any) (string, error) {
+	return RunFlow(ctx, c.conn, flowName, input)
 }
 
 func (c *Client) GC(ctx context.Context) error {
