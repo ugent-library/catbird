@@ -32,10 +32,9 @@ type Message struct {
 	DeduplicationID string          `json:"deduplication_id,omitempty"`
 	Topic           string          `json:"topic"`
 	Payload         json.RawMessage `json:"payload"`
-	Priority        int             `json:"priority"`
 	Deliveries      int             `json:"deliveries"`
 	CreatedAt       time.Time       `json:"created_at"`
-	DeliverAt       time.Time       `json:"updated_at"`
+	DeliverAt       time.Time       `json:"deliver_at"`
 }
 
 type QueueOpts struct {
@@ -75,7 +74,6 @@ func ListQueues(ctx context.Context, conn Conn) ([]Queue, error) {
 
 type DispatchOpts struct {
 	DeduplicationID string
-	Priority        int
 	DeliverAt       time.Time
 }
 
@@ -85,12 +83,12 @@ func Dispatch(ctx context.Context, conn Conn, topic string, payload any, opts Di
 		return err
 	}
 	if opts.DeliverAt.IsZero() {
-		q := `SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4);`
-		_, err := conn.Exec(ctx, q, topic, b, opts.DeduplicationID, opts.Priority)
+		q := `SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''));`
+		_, err := conn.Exec(ctx, q, topic, b, opts.DeduplicationID)
 		return err
 	} else {
-		q := `SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4, deliver_at => $5);`
-		_, err := conn.Exec(ctx, q, topic, b, opts.DeduplicationID, opts.Priority, opts.DeliverAt)
+		q := `SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''), deliver_at => $4);`
+		_, err := conn.Exec(ctx, q, topic, b, opts.DeduplicationID, opts.DeliverAt)
 		return err
 	}
 }
@@ -98,7 +96,6 @@ func Dispatch(ctx context.Context, conn Conn, topic string, payload any, opts Di
 type SendOpts struct {
 	DeduplicationID string
 	Topic           string
-	Priority        int
 	DeliverAt       time.Time
 }
 
@@ -108,12 +105,12 @@ func Send(ctx context.Context, conn Conn, queue string, payload any, opts SendOp
 		return err
 	}
 	if opts.DeliverAt.IsZero() {
-		q := `SELECT cb_send(queue => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4);`
-		_, err := conn.Exec(ctx, q, queue, b, opts.DeduplicationID, opts.Priority)
+		q := `SELECT cb_send(queue => $1, payload => $2, deduplication_id => nullif($3, ''));`
+		_, err := conn.Exec(ctx, q, queue, b, opts.DeduplicationID)
 		return err
 	} else {
-		q := `SELECT cb_send(queue => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4, deliver_at => $5);`
-		_, err := conn.Exec(ctx, q, queue, b, opts.DeduplicationID, opts.Priority, opts.DeliverAt)
+		q := `SELECT cb_send(queue => $1, payload => $2, deduplication_id => nullif($3, ''), deliver_at => $4);`
+		_, err := conn.Exec(ctx, q, queue, b, opts.DeduplicationID, opts.DeliverAt)
 		return err
 	}
 }
@@ -175,20 +172,6 @@ func Delete(ctx context.Context, conn Conn, queue string, id int64) (bool, error
 	return existed, err
 }
 
-func Archive(ctx context.Context, conn Conn, queue string, id int64) (bool, error) {
-	q := `SELECT * FROM cb_archive(queue => $1, id => $2);`
-	existed := false
-	err := conn.QueryRow(ctx, q, queue, id).Scan(&existed)
-	return existed, err
-}
-
-func Fail(ctx context.Context, conn Conn, queue string, id int64) (bool, error) {
-	q := `SELECT * FROM cb_fail(queue => $1, id => $2);`
-	existed := false
-	err := conn.QueryRow(ctx, q, queue, id).Scan(&existed)
-	return existed, err
-}
-
 func GC(ctx context.Context, conn Conn) error {
 	q := `SELECT cb_gc();`
 	_, err := conn.Exec(ctx, q)
@@ -202,13 +185,13 @@ func EnqueueDispatch(batch *pgx.Batch, topic string, payload any, opts DispatchO
 	}
 	if opts.DeliverAt.IsZero() {
 		batch.Queue(
-			`SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4);`,
-			topic, b, opts.DeduplicationID, opts.Priority,
+			`SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''));`,
+			topic, b, opts.DeduplicationID,
 		)
 	} else {
 		batch.Queue(
-			`SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4, deliver_at => $5);`,
-			topic, b, opts.DeduplicationID, opts.Priority, opts.DeliverAt,
+			`SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''), deliver_at => $4);`,
+			topic, b, opts.DeduplicationID, opts.DeliverAt,
 		)
 	}
 
@@ -222,13 +205,13 @@ func EnqueueSend(batch *pgx.Batch, queue string, payload any, opts SendOpts) err
 	}
 	if opts.DeliverAt.IsZero() {
 		batch.Queue(
-			`SELECT cb_send(topic => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4);`,
-			queue, b, opts.DeduplicationID, opts.Priority,
+			`SELECT cb_send(topic => $1, payload => $2, deduplication_id => nullif($3, ''));`,
+			queue, b, opts.DeduplicationID,
 		)
 	} else {
 		batch.Queue(
-			`SELECT cb_send(topic => $1, payload => $2, deduplication_id => nullif($3, ''), priority => $4, deliver_at => $5);`,
-			queue, b, opts.DeduplicationID, opts.Priority, opts.DeliverAt,
+			`SELECT cb_send(topic => $1, payload => $2, deduplication_id => nullif($3, ''), deliver_at => $4);`,
+			queue, b, opts.DeduplicationID, opts.DeliverAt,
 		)
 	}
 
@@ -275,7 +258,6 @@ func scanMessage(row pgx.Row) (Message, error) {
 		&deduplicationID,
 		&topic,
 		&msg.Payload,
-		&msg.Priority,
 		&msg.Deliveries,
 		&msg.CreatedAt,
 		&msg.DeliverAt,

@@ -1,3 +1,5 @@
+-- SQL code is mostly taken or adapted from pgflow (https://github.com/pgflow-dev/pgflow)
+
 -- +goose up
 
 -- TODO acquire locks where necessary
@@ -269,7 +271,6 @@ BEGIN
 	IF EXISTS (SELECT 1 FROM cb_flow_runs WHERE id = cb_complete_step.flow_run_id AND status = 'failed') THEN
 	  RETURN;
 	END IF;
-
 
 -- TODO
   -- Acquire locks first to prevent race conditions

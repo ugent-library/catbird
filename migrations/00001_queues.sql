@@ -1,4 +1,4 @@
--- SQL code is mostly taken or adapted from the excellent PGMQ https://github.com/pgmq/pgmq/blob/main/pgmq-extension/sql/pgmq.sql 
+-- SQL code is mostly taken or adapted from pgmq (https://github.com/pgmq/pgmq) 
 
 -- +goose up
 
@@ -11,7 +11,6 @@ BEGIN
             deduplication_id text,
             topic text,
             payload json,
-            priority int,
             deliveries int,
             created_at timestamptz,
             deliver_at timestamptz
@@ -32,16 +31,18 @@ CREATE INDEX IF NOT EXISTS cb_queues_delete_at_idx ON cb_queues (delete_at);
 
 -- +goose statementbegin
 CREATE OR REPLACE FUNCTION _cb_acquire_queue_lock(name text) 
-RETURNS void AS $$
+RETURNS void
+LANGUAGE plpgsql AS $$
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext(_cb_table_name(_cb_acquire_queue_lock.name, 'q')));
 END;
-$$ LANGUAGE plpgsql;
+$$;
 -- +goose statementend
 
 -- +goose statementbegin
 CREATE OR REPLACE FUNCTION _cb_table_name(name text, prefix text)
-RETURNS text AS $$
+RETURNS text
+LANGUAGE plpgsql AS $$
 BEGIN
     IF _cb_table_name.name !~ '^[a-z0-9_]+$' THEN
         RAISE EXCEPTION 'cb: queue name can only contain characters: a-z, 0-9 or _';
@@ -51,7 +52,7 @@ BEGIN
     END IF;
     RETURN 'cb_' || _cb_table_name.prefix || '_' || lower(_cb_table_name.name);
 END;
-$$ LANGUAGE plpgsql;
+$$;
 -- +goose statementend
 
 -- +goose statementbegin
@@ -61,11 +62,10 @@ CREATE OR REPLACE FUNCTION cb_create_queue(
     delete_at timestamptz = null,
     unlogged boolean = false
 )
-RETURNS void AS $$
+RETURNS void
+LANGUAGE plpgsql AS $$
 DECLARE
     _q_table text = _cb_table_name(cb_create_queue.name, 'q');
-    _a_table text = _cb_table_name(cb_create_queue.name, 'a');
-    _f_table text = _cb_table_name(cb_create_queue.name, 'f');
 BEGIN
     PERFORM _cb_acquire_queue_lock(cb_create_queue.name);
 
@@ -77,7 +77,6 @@ BEGIN
                 deduplication_id text,
                 topic text,
                 payload json NOT NULL,
-                priority int NOT NULL DEFAULT 0,
                 deliveries int NOT NULL DEFAULT 0,
                 created_at timestamptz NOT NULL DEFAULT now(),
                 deliver_at timestamptz NOT NULL DEFAULT now()
@@ -93,7 +92,6 @@ BEGIN
                 deduplication_id text,
                 topic text,
                 payload json NOT NULL,
-                priority int NOT NULL DEFAULT 0,
                 deliveries int NOT NULL DEFAULT 0,
                 created_at timestamptz NOT NULL DEFAULT now(),
                 deliver_at timestamptz NOT NULL DEFAULT now()
@@ -101,44 +99,9 @@ BEGIN
             $QUERY$,
             _q_table
         );
-
-        EXECUTE format(
-            $QUERY$
-            CREATE TABLE IF NOT EXISTS %I (
-                id bigint PRIMARY KEY,
-                deduplication_id text,
-                topic text,
-                payload json NOT NULL,
-                priority int NOT NULL DEFAULT 0,
-                deliveries int NOT NULL,
-                created_at timestamptz NOT NULL,
-                deliver_at timestamptz NOT NULL,
-                archived_at timestamptz NOT NULL DEFAULT now()
-            )
-            $QUERY$,
-            _a_table
-        );
-
-        EXECUTE format(
-            $QUERY$
-            CREATE TABLE IF NOT EXISTS %I (
-                id bigint PRIMARY KEY,
-                deduplication_id text,
-                topic text,
-                payload json NOT NULL,
-                priority int NOT NULL DEFAULT 0,
-                deliveries int NOT NULL,
-                created_at timestamptz NOT NULL,
-                deliver_at timestamptz NOT NULL,
-                failed_at timestamptz NOT NULL DEFAULT now()
-            )
-            $QUERY$,
-            _f_table
-        );
     END IF;
 
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (deduplication_id);', _q_table || '_deduplication_id_idx', _q_table);
-    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (priority);', _q_table || '_priority_idx', _q_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (deliver_at);', _q_table || '_deliver_at_idx', _q_table);
 
     -- TODO should check attributes are same
@@ -151,23 +114,20 @@ BEGIN
     )
     ON CONFLICT DO NOTHING;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 -- +goose statementend
 
 -- +goose statementbegin
 CREATE OR REPLACE FUNCTION cb_delete_queue(name text)
-RETURNS boolean AS $$
+RETURNS boolean
+LANGUAGE plpgsql AS $$
 DECLARE
     _q_table text = _cb_table_name(cb_delete_queue.name, 'q');
-    _a_table text = _cb_table_name(cb_delete_queue.name, 'a');
-    _f_table text = _cb_table_name(cb_delete_queue.name, 'f');
     _res boolean;
 BEGIN
     PERFORM _cb_acquire_queue_lock(cb_delete_queue.name);
 
     EXECUTE FORMAT('DROP TABLE IF EXISTS %I;', _q_table);
-    EXECUTE FORMAT('DROP TABLE IF EXISTS %I;', _a_table);
-    EXECUTE FORMAT('DROP TABLE IF EXISTS %I;', _f_table);
 
     DELETE FROM cb_queues q
     WHERE q.name = cb_delete_queue.name
@@ -176,7 +136,7 @@ BEGIN
  
     RETURN coalesce(_res, false);
 end
-$$ LANGUAGE plpgsql;
+$$;
 -- +goose statementend
 
 -- +goose statementbegin
@@ -184,10 +144,10 @@ CREATE OR REPLACE FUNCTION cb_dispatch(
     topic text,
     payload json,
     deduplication_id text = null,
-    priority int = 0,
     deliver_at timestamptz = null
 )
-RETURNS void AS $$
+RETURNS void
+LANGUAGE plpgsql AS $$
 DECLARE
     _deliver_at timestamptz = coalesce(cb_dispatch.deliver_at, now());
     _rec record;
@@ -201,8 +161,8 @@ BEGIN
         _q_table = _cb_table_name(_rec.name, 'q');
         EXECUTE format(
             $QUERY$
-            INSERT INTO %I (topic, payload, deduplication_id, priority, deliver_at)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO %I (topic, payload, deduplication_id, deliver_at)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (deduplication_id) DO NOTHING;
             $QUERY$,
             _q_table
@@ -210,11 +170,10 @@ BEGIN
         USING cb_dispatch.topic,
               cb_dispatch.payload,
               cb_dispatch.deduplication_id,
-              cb_dispatch.priority,
               _deliver_at;
     END LOOP;
 END
-$$ LANGUAGE plpgsql;
+$$;
 -- +goose statementend
 
 -- +goose statementbegin
@@ -223,10 +182,10 @@ CREATE OR REPLACE FUNCTION cb_send(
     payload json,
     topic text = null,
     deduplication_id text = null,
-    priority int = 0,
     deliver_at timestamptz = null
 )
-RETURNS bigint AS $$
+RETURNS bigint
+LANGUAGE plpgsql AS $$
 DECLARE
     _deliver_at timestamptz = coalesce(cb_send.deliver_at, now());
     _q_table text = _cb_table_name(cb_send.queue, 'q');
@@ -234,8 +193,8 @@ DECLARE
 BEGIN
     EXECUTE format(
         $QUERY$
-        INSERT INTO %I (topic, payload, deduplication_id, priority, deliver_at)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO %I (topic, payload, deduplication_id, deliver_at)
+        VALUES ($1, $2, $3, $4)
         ON CONFLICT (deduplication_id) DO NOTHING
         RETURNING id;
         $QUERY$,
@@ -244,13 +203,12 @@ BEGIN
     USING cb_send.topic,
           cb_send.payload,
           cb_send.deduplication_id,
-          cb_send.priority,
           _deliver_at
     INTO _id;
 
     RETURN _id;
 END
-$$ LANGUAGE plpgsql;
+$$;
 -- +goose statementend
 
 -- +goose statementbegin
@@ -260,7 +218,8 @@ CREATE OR REPLACE FUNCTION cb_read(
     quantity int,
     hide_for int
 )
-RETURNS SETOF cb_message AS $$
+RETURNS SETOF cb_message
+LANGUAGE plpgsql AS $$
 DECLARE
     _q_table text = _cb_table_name(cb_read.queue, 'q');
     _q text;
@@ -271,7 +230,7 @@ BEGIN
 			SELECT id
 			FROM %I
 			WHERE deliver_at <= clock_timestamp()
-			ORDER BY priority DESC, id ASC
+			ORDER BY id ASC
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
 		)
@@ -284,7 +243,6 @@ BEGIN
                   m.deduplication_id,
                   m.topic,
                   m.payload,
-                  m.priority,
                   m.deliveries,
                   m.created_at,
                   m.deliver_at;
@@ -293,7 +251,7 @@ BEGIN
     );
     RETURN QUERY EXECUTE _q USING cb_read.quantity, make_interval(secs => cb_read.hide_for);
 end
-$$ LANGUAGE plpgsql;
+$$;
 -- +goose statementend
 
 -- +goose statementbegin
@@ -304,7 +262,8 @@ CREATE OR REPLACE FUNCTION cb_read_poll(
     poll_for int = 5,
     poll_interval int = 100
 )
-RETURNS SETOF cb_message AS $$
+RETURNS SETOF cb_message
+LANGUAGE plpgsql AS $$
 DECLARE
     _m cb_message;
     _stop_at timestamp;
@@ -324,7 +283,7 @@ BEGIN
                 SELECT id
                 FROM %I
                 WHERE deliver_at <= clock_timestamp()
-    			ORDER BY priority DESC, id ASC
+    			ORDER BY id ASC
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
             )
@@ -337,7 +296,6 @@ BEGIN
                       m.deduplication_id,
                       m.topic,
                       m.payload,
-                      m.priority,
                       m.deliveries,
                       m.created_at,
                       m.deliver_at;
@@ -357,7 +315,7 @@ BEGIN
       END IF;
     END LOOP;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 -- +goose statementend
 
 -- +goose statementbegin
@@ -366,7 +324,8 @@ CREATE OR REPLACE FUNCTION cb_hide(
     id bigint,
     hide_for integer
 )
-RETURNS boolean AS $$
+RETURNS boolean
+LANGUAGE plpgsql AS $$
 DECLARE
     _q_table text = _cb_table_name(cb_hide.queue, 'q');
     _res boolean;
@@ -384,7 +343,7 @@ BEGIN
     INTO _res;
     RETURN coalesce(_res, false);
 END;
-$$ LANGUAGE plpgsql;
+$$;
 -- +goose statementend
 
 -- +goose statementbegin
@@ -408,87 +367,16 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_archive(queue text, id bigint)
-RETURNS boolean AS $$
-DECLARE
-    _q_table text = _cb_table_name(cb_archive.queue, 'q');
-    _a_table text = _cb_table_name(cb_archive.queue, 'a');
-    _res boolean;
-BEGIN
-    EXECUTE format(
-        $QUERY$
-        WITH msgs AS (
-            DELETE FROM %I
-            WHERE id = $1
-            RETURNING id,
-                      deduplication_id,
-                      topic,
-                      payload,
-                      deliveries,
-                      created_at,
-                      deliver_at
-        )
-        INSERT INTO %I (id, deduplication_id, topic, payload, deliveries, created_at, deliver_at)
-        SELECT id, deduplication_id, topic, payload, deliveries, created_at, deliver_at
-        FROM msgs
-        RETURNING TRUE;
-        $QUERY$,
-        _q_table,
-        _a_table
-    )
-    USING cb_archive.id
-    INTO _res;
-    RETURN coalesce(_res, false);
-END;
-$$ LANGUAGE plpgsql;
--- +goose statementend
-
--- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_fail(queue text, id bigint)
-RETURNS boolean AS $$
-DECLARE
-    _q_table text = _cb_table_name(cb_fail.queue, 'q');
-    _f_table text = _cb_table_name(cb_fail.queue, 'f');
-    _res boolean;
-BEGIN
-    EXECUTE format(
-        $QUERY$
-        WITH msgs AS (
-            DELETE FROM %I
-            WHERE id = $1
-            RETURNING id,
-                      deduplication_id,
-                      topic,
-                      payload,
-                      deliveries,
-                      created_at,
-                      deliver_at
-        )
-        INSERT INTO %I (id, deduplication_id, topic, payload, deliveries, created_at, deliver_at)
-        SELECT id, deduplication_id, topic, payload, deliveries, created_at, deliver_at
-        FROM msgs
-        RETURNING TRUE;
-        $QUERY$,
-        _q_table,
-        _f_table
-    )
-    USING cb_fail.id
-    INTO _res;
-    RETURN coalesce(_res, false);
-END;
-$$ LANGUAGE plpgsql;
--- +goose statementend
-
--- +goose statementbegin
 CREATE OR REPLACE FUNCTION cb_gc()
-RETURNS void AS $$
+RETURNS void
+LANGUAGE plpgsql AS $$
 DECLARE
 BEGIN
     SELECT cb_delete_queue(name)
     FROM cb_queues
     WHERE delete_at IS NOT NULL AND delete_at <= now();
 END
-$$ LANGUAGE plpgsql;
+$$;
 -- +goose statementend
 
 -- +goose down
@@ -503,8 +391,6 @@ DROP FUNCTION cb_read;
 DROP FUNCTION cb_read_poll;
 DROP FUNCTION cb_hide;
 DROP FUNCTION cb_delete;
-DROP FUNCTION cb_archive;
-DROP FUNCTION cb_fail;
 DROP FUNCTION cb_gc;
 DROP FUNCTION _cb_table_name;
 DROP FUNCTION _cb_acquire_queue_lock;

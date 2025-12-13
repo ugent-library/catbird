@@ -2,13 +2,8 @@
 
 ![CatBird](catbird-banner.svg "CatBird banner")
 
-Postgres based message queue.
+Postgres based message queue with task and workflow runner.
 
 ## Acknowledgments
 
-SQL code is mostly taken or adapted from the excellent [PGMQ](https://github.com/pgmq) but adds:
-
-* topic based dispatch
-* queues with expiration
-* fails
-* message priority
+SQL code is mostly taken or adapted from the excellent [pgmq](https://github.com/pgmq) and [pgflow](https://github.com/pgflow-dev/pgflow) projects.

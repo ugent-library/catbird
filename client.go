@@ -49,14 +49,6 @@ func (c *Client) Delete(ctx context.Context, queue string, id int64) (bool, erro
 	return Delete(ctx, c.conn, queue, id)
 }
 
-func (c *Client) Archive(ctx context.Context, queue string, id int64) (bool, error) {
-	return Archive(ctx, c.conn, queue, id)
-}
-
-func (c *Client) Fail(ctx context.Context, queue string, id int64) (bool, error) {
-	return Fail(ctx, c.conn, queue, id)
-}
-
 func (c *Client) CreateFlow(ctx context.Context, flow *Flow) error {
 	return CreateFlow(ctx, c.conn, flow)
 }
