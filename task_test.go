@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"os"
-	"sync"
 	"testing"
 	"time"
 
@@ -51,21 +50,19 @@ func TestFlows(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var wg sync.WaitGroup
+	go worker.Start(t.Context())
 
-	wg.Go(func() {
-		worker.Start(t.Context())
-	})
+	id, err := client.RunTask(t.Context(), "step1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("task run id: %s", id)
 
-	wg.Go(func() {
-		id, err := client.RunFlow(t.Context(), "flow1", "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Logf("flow run id: %s", id)
-		time.Sleep(10 * time.Second)
-		wg.Done()
-	})
+	id, err = client.RunFlow(t.Context(), "flow1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("flow run id: %s", id)
 
-	wg.Wait()
+	time.Sleep(10 * time.Second)
 }

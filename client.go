@@ -49,6 +49,14 @@ func (c *Client) Delete(ctx context.Context, queue string, id int64) (bool, erro
 	return Delete(ctx, c.conn, queue, id)
 }
 
+func (c *Client) CreateTask(ctx context.Context, task *Task) error {
+	return CreateTask(ctx, c.conn, task)
+}
+
+func (c *Client) RunTask(ctx context.Context, name string, input any) (string, error) {
+	return RunTask(ctx, c.conn, name, input)
+}
+
 func (c *Client) CreateFlow(ctx context.Context, flow *Flow) error {
 	return CreateFlow(ctx, c.conn, flow)
 }
