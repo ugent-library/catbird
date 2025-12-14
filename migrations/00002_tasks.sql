@@ -9,6 +9,24 @@ CREATE TABLE IF NOT EXISTS cb_flows (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- TODO indexes
+CREATE TABLE IF NOT EXISTS cb_flow_runs (
+  id uuid primary key default gen_random_uuid(),
+  flow_name text not null references cb_flows (name),
+  status text not null default 'started',
+  input jsonb not null,
+  output jsonb,
+  remaining_steps int not null default 0 check (remaining_steps >= 0),
+  started_at timestamptz not null default now(),
+  completed_at timestamptz,
+  failed_at timestamptz,
+  constraint completed_at_or_failed_at check (not (completed_at is not null and failed_at is not null)),
+  constraint completed_at_is_after_started_at check (completed_at is null or completed_at >= started_at),
+  constraint failed_at_is_after_started_at check (failed_at is null or failed_at >= started_at),
+  constraint status_is_valid check (status in ('started', 'completed', 'failed'))
+);
+
+
 CREATE TABLE IF NOT EXISTS cb_steps (
     flow_name text NOT NULL REFERENCES cb_flows (name),
     name text NOT NULL,
@@ -29,61 +47,20 @@ CREATE TABLE IF NOT EXISTS cb_step_dependencies (
     check (step_name != dependency_name)
 );
 
-CREATE TABLE IF NOT EXISTS cb_tasks (
-    name text PRIMARY KEY,
-    created_at timestamptz NOT NULL DEFAULT now()
-);
-
--- TODO indexes
-CREATE TABLE IF NOT EXISTS cb_task_runs (
-  id uuid primary key default gen_random_uuid(),
-  task_name text not null references cb_tasks (name),
-  message_id bigint,  -- TODO constraint not null when started
-  status text not null default 'queued',
-  output jsonb,
-  error_message text,
-  started_at timestamptz not null default now(),
-  completed_at timestamptz,
-  failed_at timestamptz,
-  constraint status_is_valid check (status in ('queued', 'started', 'completed', 'failed')),
-  constraint completed_at_or_failed_at check (not (completed_at is not null and failed_at is not null)),
-  constraint completed_at_is_after_started_at check (completed_at is null or completed_at >= started_at),
-  constraint failed_at_is_after_started_at check (failed_at is null or failed_at >= started_at)
-);
-
--- TODO indexes
-CREATE TABLE IF NOT EXISTS cb_flow_runs (
-  id uuid primary key default gen_random_uuid(),
-  flow_name text not null references cb_flows (name),
-  status text not null default 'started',
-  input jsonb not null,
-  output jsonb,
-  remaining_steps int not null default 0 check (remaining_steps >= 0),
-  started_at timestamptz not null default now(),
-  completed_at timestamptz,
-  failed_at timestamptz,
-  constraint completed_at_or_failed_at check (not (completed_at is not null and failed_at is not null)),
-  constraint completed_at_is_after_started_at check (completed_at is null or completed_at >= started_at),
-  constraint failed_at_is_after_started_at check (failed_at is null or failed_at >= started_at),
-  constraint status_is_valid check (status in ('started', 'completed', 'failed'))
-);
-
 -- TODO indexes
 CREATE TABLE IF NOT EXISTS cb_step_runs (
+  id uuid primary key default gen_random_uuid(),
   flow_run_id uuid not null references cb_flow_runs (id),
   flow_name text not null references cb_flows (name),
   step_name text not null,
-  task_name text NOT NULL,
-  message_id bigint,  -- TODO constraint not null when started
   status text not null default 'created',
-  output jsonb,
   error_message text,
   remaining_dependencies int not null default 0 check (remaining_dependencies >= 0),
+  remaining_tasks int not null default 0 check (remaining_tasks >= 0),
   created_at timestamptz not null default now(),
   started_at timestamptz,
   completed_at timestamptz,
   failed_at timestamptz,
-  primary key (flow_run_id, step_name),
   foreign key (flow_name, step_name) references cb_steps (flow_name, name),
   constraint status_is_valid check (status in ('created', 'started', 'completed', 'failed')),
 --   constraint status_and_remaining_tasks_match check (status != 'completed' or remaining_tasks = 0),
@@ -96,6 +73,30 @@ CREATE TABLE IF NOT EXISTS cb_step_runs (
 --   ),
   constraint completed_at_or_failed_at check (not (completed_at is not null and failed_at is not null)),
   constraint started_at_is_after_created_at check (started_at is null or started_at >= created_at),
+  constraint completed_at_is_after_started_at check (completed_at is null or completed_at >= started_at),
+  constraint failed_at_is_after_started_at check (failed_at is null or failed_at >= started_at)
+);
+
+CREATE TABLE IF NOT EXISTS cb_tasks (
+    name text PRIMARY KEY,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- TODO indexes
+CREATE TABLE IF NOT EXISTS cb_task_runs (
+  id uuid primary key default gen_random_uuid(),
+  step_run_id uuid references cb_step_runs (id), -- if task is part of a flow
+  task_name text not null references cb_tasks (name),
+  message_id bigint, -- TODO constraint not null when started
+  status text not null default 'created',
+  output jsonb,
+  error_message text,
+  created_at timestamptz not null default now(),
+  started_at timestamptz,
+  completed_at timestamptz,
+  failed_at timestamptz,
+  constraint status_is_valid check (status in ('created', 'started', 'completed', 'failed')),
+  constraint completed_at_or_failed_at check (not (completed_at is not null and failed_at is not null)),
   constraint completed_at_is_after_started_at check (completed_at is null or completed_at >= started_at),
   constraint failed_at_is_after_started_at check (failed_at is null or failed_at >= started_at)
 );
@@ -127,17 +128,18 @@ RETURNS uuid AS $$
 DECLARE
     _id uuid = gen_random_uuid();
 BEGIN
-    INSERT INTO cb_task_runs (id, task_name, status, message_id)
+    INSERT INTO cb_task_runs (id, task_name, status, started_at, message_id)
     VALUES (
       _id,
       cb_run_task.name,
       'started',
+      now(),
       cb_send(
       	queue => 't_' || cb_run_task.name,
       	payload => json_build_object(
           'run_id', _id,
       		'input', cb_run_task.input
-        )	
+        )
       )
     );
     RETURN _id;
@@ -223,14 +225,22 @@ BEGIN
     RETURNING *
   ),
   step_runs AS (
-    INSERT INTO cb_step_runs (flow_name, flow_run_id, step_name, task_name, remaining_dependencies)
+    INSERT INTO cb_step_runs (flow_name, flow_run_id, step_name, remaining_dependencies, remaining_tasks)
     SELECT
       s.flow_name,
       (SELECT flow_run.id FROM flow_run),
       s.name,
-      s.task_name,
-      s.dependency_count
-    FROM cb_steps s
+      s.dependency_count,
+      1
+    FROM flow_steps s
+    RETURNING *
+  ),
+  task_runs AS (
+    INSERT INTO cb_task_runs (step_run_id, task_name)
+    SELECT
+      s_r.id,
+      s.task_name
+    FROM flow_steps s, step_runs s_r
   )
   SELECT id FROM flow_run
   INTO _id;
@@ -360,25 +370,29 @@ ready_steps AS (
     AND s_r.remaining_dependencies = 0
   ORDER BY s_r.step_name
   FOR UPDATE
-)
+), step_runs AS (
 -- ---------- Mark steps as started ----------
   UPDATE cb_step_runs
   SET status = 'started',
-      started_at = now(),
-      message_id = cb_send(
-      	queue => 't_' || cb_step_runs.task_name,
-      	payload => json_build_object(
-      		'flow_run_id', cb_step_runs.flow_run_id,
-      		'flow_name', cb_step_runs.flow_name,
-      		'step_name', cb_step_runs.step_name,
-          'input', flow_run.input
-      	)
-      )
+      started_at = now()
   FROM ready_steps, flow_run
   WHERE cb_step_runs.flow_run_id = _cb_start_steps.flow_run_id
     AND cb_step_runs.step_name = ready_steps.step_name
-    ;
-
+  RETURNING *
+)
+  UPDATE cb_task_runs
+  SET status = 'started',
+      started_at = now(),
+      message_id = cb_send(
+      	queue => 't_' || cb_task_runs.task_name,
+      	payload => json_build_object(
+      		'run_id', cb_task_runs.run_id,
+          'input', flow_run.input
+      	)
+      )
+  FROM step_runs
+  WHERE cb_task_runs.step_run_id = step_runs.id
+    AND cb_task_runs.status = 'created';
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -517,10 +531,10 @@ DROP FUNCTION cb_complete_task;
 DROP FUNCTION cb_fail_task;
 DROP FUNCTION cb_run_task;
 DROP FUNCTION cb_create_task;
+DROP TABLE cb_task_runs;
+DROP TABLE cb_tasks;
 DROP TABLE cb_step_runs;
 DROP TABLE cb_flow_runs;
 DROP TABLE cb_step_dependencies;
 DROP TABLE cb_steps;
 DROP TABLE cb_flows;
-DROP TABLE cb_task_runs;
-DROP TABLE cb_tasks;
