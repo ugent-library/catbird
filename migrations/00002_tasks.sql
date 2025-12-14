@@ -200,59 +200,6 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_run_flow(
-    name text,
-    input jsonb
-)
-RETURNS uuid AS $$
-DECLARE
-    _id uuid;
-BEGIN
-    WITH
-  -- ---------- Gather flow metadata ----------
-  flow_steps AS (
-    SELECT s.flow_name, s.name
-    FROM cb_steps s
-    WHERE s.flow_name = cb_run_flow.name
-  ),
-  flow_run AS (
-    INSERT INTO cb_flow_runs (flow_name, input, remaining_steps)
-    VALUES (
-      cb_run_flow.name,
-      cb_run_flow.input,
-      (SELECT count(*) FROM flow_steps)
-    )
-    RETURNING *
-  ),
-  step_runs AS (
-    INSERT INTO cb_step_runs (flow_name, flow_run_id, step_name, remaining_dependencies, remaining_tasks)
-    SELECT
-      s.flow_name,
-      (SELECT flow_run.id FROM flow_run),
-      s.name,
-      s.dependency_count,
-      1
-    FROM flow_steps s
-    RETURNING *
-  ),
-  task_runs AS (
-    INSERT INTO cb_task_runs (step_run_id, task_name)
-    SELECT
-      s_r.id,
-      s.task_name
-    FROM flow_steps s, step_runs s_r
-  )
-  SELECT id FROM flow_run
-  INTO _id;
-
-  PERFORM _cb_start_steps(_id);
-
-  RETURN _id;
-END;
-$$ LANGUAGE plpgsql;
--- +goose statementend
-
--- +goose statementbegin
 CREATE OR REPLACE FUNCTION cb_create_flow(
     name text,
     steps jsonb
@@ -306,7 +253,7 @@ BEGIN
     WITH
   -- ---------- Gather flow metadata ----------
   flow_steps AS (
-    SELECT s.flow_name, s.name
+    SELECT *
     FROM cb_steps s
     WHERE s.flow_name = cb_run_flow.name
   ),
@@ -320,14 +267,22 @@ BEGIN
     RETURNING *
   ),
   step_runs AS (
-    INSERT INTO cb_step_runs (flow_name, flow_run_id, step_name, task_name, remaining_dependencies)
+    INSERT INTO cb_step_runs (flow_name, flow_run_id, step_name, remaining_dependencies, remaining_tasks)
     SELECT
       s.flow_name,
       (SELECT flow_run.id FROM flow_run),
       s.name,
-      s.task_name,
-      s.dependency_count
-    FROM cb_steps s
+      s.dependency_count,
+      1
+    FROM flow_steps s
+    RETURNING *
+  ),
+  task_runs AS (
+    INSERT INTO cb_task_runs (step_run_id, task_name)
+    SELECT
+      s_r.id,
+      s.task_name
+    FROM flow_steps s, step_runs s_r
   )
   SELECT id FROM flow_run
   INTO _id;
@@ -378,21 +333,21 @@ ready_steps AS (
   FROM ready_steps, flow_run
   WHERE cb_step_runs.flow_run_id = _cb_start_steps.flow_run_id
     AND cb_step_runs.step_name = ready_steps.step_name
-  RETURNING *
+  RETURNING cb_step_runs.id
 )
-  UPDATE cb_task_runs
+  UPDATE cb_task_runs t_r
   SET status = 'started',
       started_at = now(),
       message_id = cb_send(
-      	queue => 't_' || cb_task_runs.task_name,
+      	queue => 't_' || t_r.task_name,
       	payload => json_build_object(
-      		'run_id', cb_task_runs.run_id,
+      		'run_id', t_r.id,
           'input', flow_run.input
       	)
       )
-  FROM step_runs
-  WHERE cb_task_runs.step_run_id = step_runs.id
-    AND cb_task_runs.status = 'created';
+  FROM step_runs, flow_run
+  WHERE t_r.step_run_id = step_runs.id
+    AND t_r.status = 'created';
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
