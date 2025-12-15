@@ -165,11 +165,23 @@ func Hide(ctx context.Context, conn Conn, queue string, id int64, hideFor time.D
 	return exists, err
 }
 
+func HideMany(ctx context.Context, conn Conn, queue string, ids []int64, hideFor time.Duration) error {
+	q := `SELECT * FROM cb_hide_many(queue => $1, ids => $2, hide_for => $3);`
+	_, err := conn.Exec(ctx, q, queue, ids, hideFor.Seconds())
+	return err
+}
+
 func Delete(ctx context.Context, conn Conn, queue string, id int64) (bool, error) {
 	q := `SELECT * FROM cb_delete(queue => $1, id => $2);`
 	existed := false
 	err := conn.QueryRow(ctx, q, queue, id).Scan(&existed)
 	return existed, err
+}
+
+func DeleteMany(ctx context.Context, conn Conn, queue string, ids []int64) error {
+	q := `SELECT * FROM cb_delete(queue => $1, ids => $2);`
+	_, err := conn.Exec(ctx, q, queue, ids)
+	return err
 }
 
 func GC(ctx context.Context, conn Conn) error {

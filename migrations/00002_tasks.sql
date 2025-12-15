@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS cb_step_runs (
   flow_run_id uuid not null references cb_flow_runs (id),
   flow_name text not null references cb_flows (name),
   step_name text not null,
+  task_name text not null references cb_tasks (name),
   status text not null default 'created',
   error_message text,
   remaining_dependencies int not null default 0 check (remaining_dependencies >= 0),
@@ -88,14 +89,13 @@ CREATE TABLE IF NOT EXISTS cb_task_runs (
   step_run_id uuid references cb_step_runs (id), -- if task is part of a flow
   task_name text not null references cb_tasks (name),
   message_id bigint, -- TODO constraint not null when started
-  status text not null default 'created',
+  status text not null default 'started',
   output jsonb,
   error_message text,
-  created_at timestamptz not null default now(),
-  started_at timestamptz,
+  started_at timestamptz not null default now(),
   completed_at timestamptz,
   failed_at timestamptz,
-  constraint status_is_valid check (status in ('created', 'started', 'completed', 'failed')),
+  constraint status_is_valid check (status in ('started', 'completed', 'failed')),
   constraint completed_at_or_failed_at check (not (completed_at is not null and failed_at is not null)),
   constraint completed_at_is_after_started_at check (completed_at is null or completed_at >= started_at),
   constraint failed_at_is_after_started_at check (failed_at is null or failed_at >= started_at)
@@ -155,6 +155,8 @@ CREATE OR REPLACE FUNCTION cb_complete_task(
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
+  _step_run_id uuid;
+  _flow_run_id uuid;
 BEGIN
   -- TODO all in one query 
 	-- fail task run
@@ -163,12 +165,73 @@ BEGIN
       completed_at = now(),
       output = cb_complete_task.output
   	WHERE id = cb_complete_task.run_id
-      AND status = 'started';
+      AND status = 'started'
+  RETURNING step_run_id
+  INTO _step_run_id;
 
 	-- delete queued task message
 	PERFORM cb_delete('t_' || task_name, message_id)
 	FROM cb_task_runs
 	WHERE id = cb_complete_task.run_id AND message_id IS NOT NULL;
+
+  -- maybe complete step and flow run if part of a flow
+  IF _step_run_id IS NOT NULL THEN
+
+    -- TODO GUARD: No mutations on failed runs
+
+    WITH
+    -- complete step run
+    step AS (
+      UPDATE cb_step_runs s_r
+        SET status = 'completed',
+          completed_at = now(),
+          remaining_tasks = s_r.remaining_tasks - 1
+        WHERE s_r.id = _step_run_id
+          AND s_r.status = 'started'
+        RETURNING s_r.*
+    ),
+    child_steps AS (
+      SELECT deps.step_name AS child_step_name
+      FROM cb_step_dependencies deps
+      JOIN step parent_step ON parent_step.status = 'completed' AND deps.flow_name = parent_step.flow_name
+      WHERE deps.dependency_name = parent_step.step_name  -- dep_slug is the parent, step_slug is the child
+      ORDER BY deps.step_name  -- Ensure consistent ordering
+    ),
+    -- Acquire locks on all child steps before updating them
+    child_steps_lock AS (
+      SELECT * FROM cb_step_runs s_r, step
+      WHERE s_r.flow_run_id = step.flow_run_id
+        AND s_r.step_name IN (SELECT child_step_name FROM child_steps)
+      FOR UPDATE
+    ),
+    -- Decrement remaining_dependencies
+    child_steps_update AS (
+      UPDATE cb_step_runs s_r
+      SET remaining_dependencies = s_r.remaining_dependencies - 1
+        FROM child_steps children, step
+      WHERE s_r.flow_run_id = step.flow_run_id
+      AND s_r.step_name = children.child_step_name
+    )
+    UPDATE cb_flow_runs f_r
+    SET remaining_steps = remaining_steps - 1
+    FROM step
+    WHERE f_r.id = step.flow_run_id
+    RETURNING f_r.id
+    INTO _flow_run_id;
+
+    -- maybe complete flow run
+      UPDATE cb_flow_runs
+      SET status = 'completed',
+          completed_at = now()
+    WHERE id = _flow_run_id
+      AND remaining_steps = 0
+        AND status != 'completed';
+
+    -- TODO only if needed
+    PERFORM _cb_start_steps(_flow_run_id);
+
+  END IF;
+
 END;
 $$;
 -- +goose statementend
@@ -181,6 +244,8 @@ CREATE OR REPLACE FUNCTION cb_fail_task(
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
+  _step_run_id uuid;
+  _flow_run_id uuid;
 BEGIN
   -- TODO all in one query 
 	-- fail task run
@@ -189,12 +254,46 @@ BEGIN
       failed_at = now(),
       error_message = cb_fail_task.error_message
   	WHERE id = cb_fail_task.run_id
-      AND status = 'started';
+      AND status = 'started'
+  RETURNING step_run_id
+  INTO _step_run_id;
 
-	-- delete queued task message
-	PERFORM cb_delete('t_' || task_name, message_id)
-	FROM cb_task_runs
-	WHERE id = cb_fail_task.run_id AND message_id IS NOT NULL;
+  -- delete queued task message
+    PERFORM cb_delete('t_' || task_name, message_id)
+    FROM cb_task_runs
+    WHERE id = cb_fail_task.run_id AND message_id IS NOT NULL;
+
+  -- fail step and flow run if part of a flow
+  IF _step_run_id IS NOT NULL THEN
+    WITH step_run AS (
+    	UPDATE cb_step_runs s_r
+  	  SET status = 'failed',
+        failed_at = now(),
+        error_message = cb_fail_task.error_message
+      WHERE s_r.id = _step_run_id
+        AND s_r.status = 'started'
+      RETURNING s_r.flow_run_id
+    )
+    UPDATE cb_flow_runs
+    SET status = 'failed',
+        failed_at = now()
+    FROM step_run
+    WHERE cb_flow_runs.id = step_run.flow_run_id
+      AND cb_flow_runs.status = 'started'
+      RETURNING step_run.flow_run_id
+      INTO _flow_run_id;
+
+    -- DELETE ALL ACTIVE MESSAGES IN QUEUE
+      PERFORM cb_delete_many('t_' || t_r.task_name, ARRAY_AGG(t_r.message_id))
+      FROM cb_step_runs s_r
+      JOIN cb_task_runs t_r ON t_r.step_run_id = s_r.id
+      WHERE s_r.flow_run_id = _flow_run_id
+        AND s_r.status IN ('queued', 'started')
+        AND t_r.message_id IS NOT NULL
+      GROUP BY t_r.task_name
+      HAVING COUNT(t_r.message_id) > 0;
+  END IF;
+
 END;
 $$;
 -- +goose statementend
@@ -267,22 +366,16 @@ BEGIN
     RETURNING *
   ),
   step_runs AS (
-    INSERT INTO cb_step_runs (flow_name, flow_run_id, step_name, remaining_dependencies, remaining_tasks)
+    INSERT INTO cb_step_runs (flow_name, flow_run_id, step_name, task_name, remaining_dependencies, remaining_tasks)
     SELECT
       s.flow_name,
       (SELECT flow_run.id FROM flow_run),
       s.name,
+      s.task_name,
       s.dependency_count,
       1
     FROM flow_steps s
     RETURNING *
-  ),
-  task_runs AS (
-    INSERT INTO cb_task_runs (step_run_id, task_name)
-    SELECT
-      s_r.id,
-      s.task_name
-    FROM flow_steps s, step_runs s_r
   )
   SELECT id FROM flow_run
   INTO _id;
@@ -333,152 +426,31 @@ ready_steps AS (
   FROM ready_steps, flow_run
   WHERE cb_step_runs.flow_run_id = _cb_start_steps.flow_run_id
     AND cb_step_runs.step_name = ready_steps.step_name
-  RETURNING cb_step_runs.id
-)
+  RETURNING cb_step_runs.id, cb_step_runs.task_name
+), task_runs AS ( --TODO combine this and thew following into one statement
+    INSERT INTO cb_task_runs (step_run_id, task_name)
+    SELECT
+      s_r.id,
+      s_r.task_name
+    FROM step_runs s_r
+    RETURNING id
+  )
   UPDATE cb_task_runs t_r
-  SET status = 'started',
-      started_at = now(),
-      message_id = cb_send(
+  SET message_id = cb_send(
       	queue => 't_' || t_r.task_name,
       	payload => json_build_object(
       		'run_id', t_r.id,
           'input', flow_run.input
       	)
       )
-  FROM step_runs, flow_run
-  WHERE t_r.step_run_id = step_runs.id
-    AND t_r.status = 'created';
+  FROM task_runs, flow_run
+  WHERE t_r.id = task_runs.id;
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
 
--- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_fail_step(
-    flow_run_id uuid,
-    step_name text,
-    error_message text
-)
-RETURNS void
-LANGUAGE plpgsql AS $$
-DECLARE
-BEGIN
-	-- fail step run
-	UPDATE cb_step_runs s_r
-  	SET status = 'failed',
-      failed_at = now(),
-      error_message = cb_fail_step.error_message
-  	WHERE s_r.flow_run_id = cb_fail_step.flow_run_id
-      AND s_r.step_name = cb_fail_step.step_name
-      AND s_r.status = 'started';
-
-	-- fail flow run
-    UPDATE cb_flow_runs
-    SET status = 'failed',
-        failed_at = now()
-	WHERE id = cb_fail_step.flow_run_id
-      AND status = 'started';
-
-	-- delete all queued task messages
-	PERFORM cb_delete('t_' || s_r.task_name, message_id)
-	FROM cb_step_runs s_r
-	WHERE s_r.flow_run_id = cb_fail_step.flow_run_id
-      AND s_r.message_id IS NOT NULL;
-END;
-$$;
--- +goose statementend
-
--- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_complete_step(
-    flow_run_id uuid,
-    step_name text,
-    output json
-)
-RETURNS void
-LANGUAGE plpgsql AS $$
-DECLARE
-BEGIN
-
-	-- ==========================================
-	-- GUARD: No mutations on failed runs
-	-- ==========================================
-	IF EXISTS (SELECT 1 FROM cb_flow_runs WHERE id = cb_complete_step.flow_run_id AND status = 'failed') THEN
-	  RETURN;
-	END IF;
-
--- TODO
-  -- Acquire locks first to prevent race conditions
--- SELECT * INTO v_run_record FROM pgflow.runs
--- WHERE pgflow.runs.run_id = complete_task.run_id
--- FOR UPDATE;
-
--- SELECT * INTO v_step_record FROM pgflow.step_states
--- WHERE pgflow.step_states.run_id = complete_task.run_id
---   AND pgflow.step_states.step_slug = complete_task.step_slug
--- FOR UPDATE;
-
-	WITH
-	-- complete step run
-	step AS (
-		UPDATE cb_step_runs s_r
-	  	SET status = 'completed',
-	      completed_at = now(),
-          output = cb_complete_step.output
-	  	WHERE s_r.flow_run_id = cb_complete_step.flow_run_id
-	      AND s_r.step_name = cb_complete_step.step_name
-	      AND s_r.status = 'started'
-		RETURNING *
-	),
-  child_steps AS (
-    SELECT deps.step_name AS child_step_name
-    FROM cb_step_dependencies deps
-    JOIN step parent_step ON parent_step.status = 'completed' AND deps.flow_name = parent_step.flow_name
-    WHERE deps.dependency_name = cb_complete_step.step_name  -- dep_slug is the parent, step_slug is the child
-    ORDER BY deps.step_name  -- Ensure consistent ordering
-  ),
-  -- Acquire locks on all child steps before updating them
-  child_steps_lock AS (
-    SELECT * FROM cb_step_runs s_r
-    WHERE s_r.flow_run_id = cb_complete_step.flow_run_id
-      AND s_r.step_name IN (SELECT child_step_name FROM child_steps)
-    FOR UPDATE
-  ),
-  -- Decrement remaining_dependencies
-  child_steps_update AS (
-    UPDATE cb_step_runs s_r
-    SET remaining_dependencies = s_r.remaining_dependencies - 1
-      FROM child_steps children
-    WHERE s_r.flow_run_id = cb_complete_step.flow_run_id
-    AND s_r.step_name = children.child_step_name
-  )
-	UPDATE cb_flow_runs
-	SET remaining_steps = remaining_steps - 1
-	FROM step
-	WHERE id = step.flow_run_id;
-
-	-- delete queued task message
-	PERFORM cb_delete('t_' || s_r.task_name, message_id)
-	FROM cb_step_runs s_r
-	WHERE s_r.flow_run_id = cb_complete_step.flow_run_id
-      AND s_r.step_name = cb_complete_step.step_name;
-
-	-- maybe complete flow run
-    UPDATE cb_flow_runs
-    SET status = 'completed',
-        completed_at = now()
-	WHERE id = cb_complete_step.flow_run_id
-	  AND remaining_steps = 0
-      AND status != 'completed';
-
-  -- TODO only if needed
-  PERFORM _cb_start_steps(cb_complete_step.flow_run_id);
-END;
-$$;
--- +goose statementend
-
 -- +goose down
 
-DROP FUNCTION cb_complete_step;
-DROP FUNCTION cb_fail_step;
 DROP FUNCTION cb_run_flow;
 DROP FUNCTION _cb_start_steps;
 DROP FUNCTION cb_create_flow;
@@ -487,9 +459,9 @@ DROP FUNCTION cb_fail_task;
 DROP FUNCTION cb_run_task;
 DROP FUNCTION cb_create_task;
 DROP TABLE cb_task_runs;
-DROP TABLE cb_tasks;
 DROP TABLE cb_step_runs;
 DROP TABLE cb_flow_runs;
+DROP TABLE cb_tasks;
 DROP TABLE cb_step_dependencies;
 DROP TABLE cb_steps;
 DROP TABLE cb_flows;

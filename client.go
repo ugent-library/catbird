@@ -45,8 +45,16 @@ func (c *Client) Hide(ctx context.Context, queue string, id int64, hideFor time.
 	return Hide(ctx, c.conn, queue, id, hideFor)
 }
 
+func (c *Client) HideMany(ctx context.Context, queue string, ids []int64, hideFor time.Duration) error {
+	return HideMany(ctx, c.conn, queue, ids, hideFor)
+}
+
 func (c *Client) Delete(ctx context.Context, queue string, id int64) (bool, error) {
 	return Delete(ctx, c.conn, queue, id)
+}
+
+func (c *Client) DeleteMany(ctx context.Context, queue string, ids []int64) error {
+	return DeleteMany(ctx, c.conn, queue, ids)
 }
 
 func (c *Client) CreateTask(ctx context.Context, task *Task) error {

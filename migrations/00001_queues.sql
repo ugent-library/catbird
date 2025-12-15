@@ -1,4 +1,5 @@
 -- SQL code is mostly taken or adapted from pgmq (https://github.com/pgmq/pgmq) 
+-- TODO better return values
 
 -- +goose up
 
@@ -347,6 +348,30 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_hide_many(
+    queue text,
+    ids bigint[],
+    hide_for integer
+)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    _q_table text = _cb_table_name(cb_hide_many.queue, 'q');
+BEGIN
+    EXECUTE format(
+        $QUERY$
+        UPDATE %I
+        SET deliver_at = (clock_timestamp() + $2)
+        WHERE id = any($1);
+        $QUERY$,
+        _q_table
+    )
+    USING cb_hide_many.ids, make_interval(secs => cb_hide_many.hide_for);
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
 CREATE OR REPLACE FUNCTION cb_delete(queue text, id bigint)
 RETURNS boolean AS $$
 DECLARE
@@ -362,6 +387,23 @@ BEGIN
     USING cb_delete.id
     INTO _res;
     RETURN coalesce(_res, false);
+END;
+$$ LANGUAGE plpgsql;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_delete_many(queue text, ids bigint[])
+RETURNS void AS $$
+DECLARE
+    _q_table text = _cb_table_name(cb_delete_many.queue, 'q');
+BEGIN
+    EXECUTE format(
+        $QUERY$
+        DELETE FROM %I WHERE id = any($1);
+        $QUERY$,
+        _q_table
+    )
+    USING cb_delete_many.ids;
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -390,7 +432,9 @@ DROP FUNCTION cb_send;
 DROP FUNCTION cb_read;
 DROP FUNCTION cb_read_poll;
 DROP FUNCTION cb_hide;
+DROP FUNCTION cb_hide_many;
 DROP FUNCTION cb_delete;
+DROP FUNCTION cb_delete_many;
 DROP FUNCTION cb_gc;
 DROP FUNCTION _cb_table_name;
 DROP FUNCTION _cb_acquire_queue_lock;
