@@ -120,7 +120,7 @@ CREATE TABLE IF NOT EXISTS cb_task_runs (
 );
 
 -- TODO what other indexes are needed? 
-CREATE UNIQUE INDEX IF NOT EXISTS cb_task_runs_deduplication_id_idx ON cb_task_runs (deduplication_id) WHERE deduplication_id IS NOT NULL AND status = 'started';
+CREATE UNIQUE INDEX IF NOT EXISTS cb_task_runs_task_name_deduplication_id_idx ON cb_task_runs (task_name, deduplication_id) WHERE deduplication_id IS NOT NULL AND status = 'started';
 CREATE INDEX IF NOT EXISTS cb_task_runs_step_run_fk on cb_task_runs (step_run_id);
 
 CREATE TABLE IF NOT EXISTS cb_workers (

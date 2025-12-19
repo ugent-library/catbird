@@ -15,3 +15,4 @@ SQL code is mostly taken or adapted from the excellent [pgmq](https://github.com
 * finish dashboard
 * type safe task/flow input/output
 * split tasks into standalone tasks and step tasks?
+* use split tables for task runs like queues?
