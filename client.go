@@ -65,6 +65,10 @@ func (c *Client) RunTask(ctx context.Context, name string, input any, opts RunTa
 	return RunTask(ctx, c.conn, name, input, opts)
 }
 
+func (c *Client) GetTaskRun(ctx context.Context, id string) (*TaskRunInfo, error) {
+	return GetTaskRun(ctx, c.conn, id)
+}
+
 func (c *Client) CreateFlow(ctx context.Context, flow *Flow) error {
 	return CreateFlow(ctx, c.conn, flow)
 }

@@ -11,8 +11,11 @@ SQL code is mostly taken or adapted from the excellent [pgmq](https://github.com
 ## TODO
 
 * worker concurrency
+* add task and flow description fields
+* add queue created_at field
 * fair queueing? https://docs.hatchet.run/blog/multi-tenant-queues
 * finish dashboard
 * type safe task/flow input/output
 * split tasks into standalone tasks and step tasks?
 * use split tables for task runs like queues?
+* put logger in Context?

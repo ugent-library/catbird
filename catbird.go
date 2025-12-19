@@ -66,6 +66,15 @@ type WorkerInfo struct {
 	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
 }
 
+type TaskRunInfo struct {
+	ID          string          `json:"id"`
+	Status      string          `json:"status"`
+	Output      json.RawMessage `json:"output"`
+	StartedAt   time.Time       `json:"started_at"`
+	CompletedAt time.Time       `json:"completed_at"`
+	FailedAt    time.Time       `json:"failed_at"`
+}
+
 type QueueOpts struct {
 	Topics   []string
 	DeleteAt time.Time
@@ -98,7 +107,6 @@ func ListQueues(ctx context.Context, conn Conn) ([]QueueInfo, error) {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, scanCollectibleQueue)
-
 }
 
 type DispatchOpts struct {
@@ -271,6 +279,14 @@ func RunTask(ctx context.Context, conn Conn, name string, input any, opts RunTas
 	return runID, err
 }
 
+func GetTaskRun(ctx context.Context, conn Conn, id string) (*TaskRunInfo, error) {
+	q := `
+		SELECT id, status, output, started_at, completed_at, failed_at
+		FROM cb_task_runs
+		WHERE id = $1;`
+	return scanTaskRun(conn.QueryRow(ctx, q, id))
+}
+
 func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 	b, err := json.Marshal(flow.Steps)
 	if err != nil {
@@ -374,31 +390,31 @@ func scanCollectibleMessage(row pgx.CollectableRow) (Message, error) {
 }
 
 func scanMessage(row pgx.Row) (Message, error) {
-	msg := Message{}
+	rec := Message{}
 
 	var deduplicationID *string
 	var topic *string
 
 	if err := row.Scan(
-		&msg.ID,
+		&rec.ID,
 		&deduplicationID,
 		&topic,
-		&msg.Payload,
-		&msg.Deliveries,
-		&msg.CreatedAt,
-		&msg.DeliverAt,
+		&rec.Payload,
+		&rec.Deliveries,
+		&rec.CreatedAt,
+		&rec.DeliverAt,
 	); err != nil {
-		return msg, err
+		return rec, err
 	}
 
 	if topic != nil {
-		msg.Topic = *topic
+		rec.Topic = *topic
 	}
 	if deduplicationID != nil {
-		msg.DeduplicationID = *deduplicationID
+		rec.DeduplicationID = *deduplicationID
 	}
 
-	return msg, nil
+	return rec, nil
 }
 
 func scanCollectibleQueue(row pgx.CollectableRow) (QueueInfo, error) {
@@ -406,24 +422,24 @@ func scanCollectibleQueue(row pgx.CollectableRow) (QueueInfo, error) {
 }
 
 func scanQueue(row pgx.Row) (QueueInfo, error) {
-	q := QueueInfo{}
+	rec := QueueInfo{}
 
 	var deleteAt *time.Time
 
 	if err := row.Scan(
-		&q.Name,
-		&q.Topics,
-		&q.Unlogged,
+		&rec.Name,
+		&rec.Topics,
+		&rec.Unlogged,
 		&deleteAt,
 	); err != nil {
-		return q, err
+		return rec, err
 	}
 
 	if deleteAt != nil {
-		q.DeleteAt = *deleteAt
+		rec.DeleteAt = *deleteAt
 	}
 
-	return q, nil
+	return rec, nil
 }
 
 func scanCollectibleWorker(row pgx.CollectableRow) (WorkerInfo, error) {
@@ -431,16 +447,46 @@ func scanCollectibleWorker(row pgx.CollectableRow) (WorkerInfo, error) {
 }
 
 func scanWorker(row pgx.Row) (WorkerInfo, error) {
-	q := WorkerInfo{}
+	rec := WorkerInfo{}
 
 	if err := row.Scan(
-		&q.ID,
-		&q.Tasks,
-		&q.StartedAt,
-		&q.LastHeartbeatAt,
+		&rec.ID,
+		&rec.Tasks,
+		&rec.StartedAt,
+		&rec.LastHeartbeatAt,
 	); err != nil {
-		return q, err
+		return rec, err
 	}
 
-	return q, nil
+	return rec, nil
+}
+
+func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
+	rec := TaskRunInfo{}
+
+	var output *json.RawMessage
+	var completedAt *time.Time
+	var failedAt *time.Time
+
+	if err := row.Scan(
+		&rec.ID,
+		&rec.Status,
+		&output,
+		&completedAt,
+		&failedAt,
+	); err != nil {
+		return nil, err
+	}
+
+	if output != nil {
+		rec.Output = *output
+	}
+	if completedAt != nil {
+		rec.CompletedAt = *completedAt
+	}
+	if failedAt != nil {
+		rec.FailedAt = *failedAt
+	}
+
+	return &rec, nil
 }
