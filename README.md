@@ -19,3 +19,4 @@ SQL code is mostly taken or adapted from the excellent [pgmq](https://github.com
 * split tasks into standalone tasks and step tasks?
 * use split tables for task runs like queues?
 * put logger in Context?
+* pause flows - wait for for signal
