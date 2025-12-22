@@ -38,15 +38,17 @@ type Message struct {
 }
 
 type Task struct {
-	name     string
-	queue    string
-	hideFor  time.Duration
-	retries  int
-	delay    time.Duration
-	jitter   time.Duration
-	timeout  time.Duration
-	schedule string
-	fn       func(context.Context, []byte) ([]byte, error)
+	name        string
+	queue       string
+	batchSize   int
+	hideFor     time.Duration
+	concurrency int
+	retries     int
+	delay       time.Duration
+	jitter      time.Duration
+	timeout     time.Duration
+	schedule    string
+	fn          func(context.Context, []byte) ([]byte, error)
 }
 
 type Flow struct {
@@ -232,24 +234,35 @@ func DeleteMany(ctx context.Context, conn Conn, queue string, ids []int64) error
 }
 
 type TaskOpts struct {
-	HideFor  time.Duration
-	Retries  int
-	Delay    time.Duration
-	Jitter   time.Duration
-	Timeout  time.Duration
-	Schedule string
+	BatchSize   int
+	HideFor     time.Duration
+	Concurrency int
+	Retries     int
+	Delay       time.Duration
+	Jitter      time.Duration
+	Timeout     time.Duration
+	Schedule    string
 }
 
 func NewTask[Input, Output any](name string, fn func(context.Context, Input) (Output, error), opts TaskOpts) *Task {
+	if opts.BatchSize == 0 {
+		opts.BatchSize = 10
+	}
+	if opts.Concurrency == 0 {
+		opts.Concurrency = 1
+	}
+
 	return &Task{
-		name:     name,
-		queue:    "t_" + name,
-		hideFor:  opts.HideFor,
-		retries:  opts.Retries,
-		delay:    opts.Delay,
-		jitter:   opts.Jitter,
-		timeout:  opts.Timeout,
-		schedule: opts.Schedule,
+		name:        name,
+		queue:       "t_" + name,
+		batchSize:   opts.BatchSize,
+		hideFor:     opts.HideFor,
+		concurrency: opts.Concurrency,
+		retries:     opts.Retries,
+		delay:       opts.Delay,
+		jitter:      opts.Jitter,
+		timeout:     opts.Timeout,
+		schedule:    opts.Schedule,
 		fn: func(ctx context.Context, b []byte) ([]byte, error) {
 			var in Input
 			if err := json.Unmarshal(b, &in); err != nil {
