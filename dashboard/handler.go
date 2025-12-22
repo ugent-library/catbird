@@ -20,7 +20,7 @@ type App struct {
 
 type Config struct {
 	Client     *catbird.Client
-	Logger     *slog.Logger
+	Log        *slog.Logger
 	PathPrefix string
 }
 
@@ -33,7 +33,7 @@ func New(config Config) *App {
 
 	return &App{
 		client:    config.Client,
-		logger:    config.Logger,
+		logger:    config.Log,
 		templates: t,
 	}
 }

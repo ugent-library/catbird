@@ -11,6 +11,8 @@ SQL code is mostly taken or adapted from the excellent [pgmq](https://github.com
 ## TODO
 
 * worker concurrency
+* GetFlowInfo / RunFlowWait
+* RunTaskWait / RunFlowWait long polling
 * add task and flow description fields
 * add queue created_at field
 * fair queueing? https://docs.hatchet.run/blog/multi-tenant-queues
