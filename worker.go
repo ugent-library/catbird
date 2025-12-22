@@ -135,17 +135,18 @@ type taskPayload struct {
 }
 
 func (w *Worker) runTask(ctx context.Context, t *Task) {
-	msgs, err := ReadPoll(ctx, w.conn, t.queue, 1, t.hideFor, ReadPollOpts{})
+	msgs, err := ReadPoll(ctx, w.conn, t.queue, t.batchSize, t.hideFor, ReadPollOpts{})
 	if err != nil {
 		w.log.Error("task: cannot read message", "task", t.name, "error", err)
 		return
 	}
 
 	if len(msgs) == 0 {
-		time.Sleep(1 * time.Second) // TODO backoff etc
+		time.Sleep(1 * time.Second) // TODO
 		return
 	}
 
+	// TODO concurrency
 	for _, msg := range msgs {
 		log.Printf("message payload for task %s: %s", t.name, msg.Payload) // remove or log debug
 
