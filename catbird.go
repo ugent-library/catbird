@@ -42,6 +42,8 @@ type Task struct {
 	queue    string
 	hideFor  time.Duration
 	retries  int
+	delay    time.Duration
+	jitter   time.Duration
 	timeout  time.Duration
 	schedule string
 	fn       func(context.Context, []byte) ([]byte, error)
@@ -232,6 +234,8 @@ func DeleteMany(ctx context.Context, conn Conn, queue string, ids []int64) error
 type TaskOpts struct {
 	HideFor  time.Duration
 	Retries  int
+	Delay    time.Duration
+	Jitter   time.Duration
 	Timeout  time.Duration
 	Schedule string
 }
@@ -242,6 +246,8 @@ func NewTask[Input, Output any](name string, fn func(context.Context, Input) (Ou
 		queue:    "t_" + name,
 		hideFor:  opts.HideFor,
 		retries:  opts.Retries,
+		delay:    opts.Delay,
+		jitter:   opts.Jitter,
 		timeout:  opts.Timeout,
 		schedule: opts.Schedule,
 		fn: func(ctx context.Context, b []byte) ([]byte, error) {
