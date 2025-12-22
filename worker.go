@@ -5,10 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"sync"
 	"time"
-
-	"log/slog"
 
 	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
@@ -18,14 +17,14 @@ type Worker struct {
 	id        string
 	conn      Conn
 	tasks     []*Task
-	logger    *slog.Logger
+	log       *slog.Logger
 	timeout   time.Duration
 	scheduler *cron.Cron
 }
 
 type WorkerOpts struct {
 	Tasks   []*Task
-	Logger  *slog.Logger
+	Log     *slog.Logger
 	Timeout time.Duration
 }
 
@@ -34,7 +33,7 @@ func NewWorker(conn Conn, opts WorkerOpts) (*Worker, error) {
 		id:      uuid.NewString(),
 		conn:    conn,
 		tasks:   opts.Tasks,
-		logger:  opts.Logger,
+		log:     opts.Log,
 		timeout: opts.Timeout,
 	}
 
@@ -48,7 +47,7 @@ func NewWorker(conn Conn, opts WorkerOpts) (*Worker, error) {
 		_, err := r.scheduler.AddFunc(t.schedule, func() {
 			_, err := RunTask(context.TODO(), r.conn, t.name, struct{}{}, RunTaskOpts{DeduplicationID: "cron-" + t.name})
 			if err != nil {
-				r.logger.Error("worker: failed to schedule task", "task", t.name, "error", err)
+				r.log.Error("worker: failed to schedule task", "task", t.name, "error", err)
 			}
 		})
 		if err != nil {
@@ -86,7 +85,7 @@ func (w *Worker) Start(ctx context.Context) error {
 				return
 			case <-ticker.C:
 				if _, err := w.conn.Exec(ctx, `SELECT * FROM cb_worker_heartbeat(id => $1);`, w.id); err != nil {
-					w.logger.Error("worker: cannot send heartbeat", "error", err)
+					w.log.Error("worker: cannot send heartbeat", "error", err)
 				}
 			}
 		}
@@ -132,7 +131,7 @@ type taskPayload struct {
 func (w *Worker) runTask(ctx context.Context, t *Task) {
 	msgs, err := ReadPoll(ctx, w.conn, t.queue, 1, t.hideFor, ReadPollOpts{})
 	if err != nil {
-		w.logger.Error("task: cannot read message", "task", t.name, "error", err)
+		w.log.Error("task: cannot read message", "task", t.name, "error", err)
 		return
 	}
 
@@ -153,24 +152,24 @@ func (w *Worker) runTask(ctx context.Context, t *Task) {
 
 		var p taskPayload
 		if err := json.Unmarshal(msg.Payload, &p); err != nil {
-			w.logger.Error("task: cannot decode payload", "task", t.name, "error", err)
+			w.log.Error("task: cannot decode payload", "task", t.name, "error", err)
 		}
 
 		out, err := t.fn(runCtx, p.Input)
 
 		if err != nil {
-			w.logger.Error("task: failed", "task", t.name, "error", err)
+			w.log.Error("task: failed", "task", t.name, "error", err)
 
 			if msg.Deliveries > t.retries {
 				q := `SELECT * FROM cb_fail_task(run_id => $1, error_message => $2);`
 				if _, err := w.conn.Exec(ctx, q, p.RunID, err.Error()); err != nil {
-					w.logger.Error("task: cannot mark task as failed", "task", t.name, "error", err)
+					w.log.Error("task: cannot mark task as failed", "task", t.name, "error", err)
 				}
 			}
 		} else {
 			q := `SELECT * FROM cb_complete_task(run_id => $1, output => $2);`
 			if _, err := w.conn.Exec(ctx, q, p.RunID, out); err != nil {
-				w.logger.Error("task: cannot mark task as completed", "task", t.name, "error", err)
+				w.log.Error("task: cannot mark task as completed", "task", t.name, "error", err)
 			}
 		}
 	}

@@ -126,8 +126,8 @@ func TestFlows(t *testing.T) {
 	}
 
 	worker, err := client.NewWorker(WorkerOpts{
-		Logger: slog.Default(),
-		Tasks:  []*Task{task1, step1, step2, flow2step1, flow2step2, flow2step3},
+		Log:   slog.Default(),
+		Tasks: []*Task{task1, step1, step2, flow2step1, flow2step2, flow2step3},
 	})
 	if err != nil {
 		t.Fatal(err)

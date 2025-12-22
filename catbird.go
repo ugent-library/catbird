@@ -9,6 +9,13 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+const (
+	StatusCreated   = "created"
+	StatusStarted   = "started"
+	StatusCompleted = "completed"
+	StatusFailed    = "failed"
+)
+
 var (
 	DefaultPollFor      = 5 * time.Second
 	DefaultPollInterval = 100 * time.Millisecond
@@ -67,12 +74,13 @@ type WorkerInfo struct {
 }
 
 type TaskRunInfo struct {
-	ID          string          `json:"id"`
-	Status      string          `json:"status"`
-	Output      json.RawMessage `json:"output"`
-	StartedAt   time.Time       `json:"started_at"`
-	CompletedAt time.Time       `json:"completed_at"`
-	FailedAt    time.Time       `json:"failed_at"`
+	ID           string          `json:"id"`
+	Status       string          `json:"status"`
+	Output       json.RawMessage `json:"output,omitempty"`
+	ErrorMessage string          `json:"error_message,omitempty"`
+	StartedAt    time.Time       `json:"started_at,omitzero"`
+	CompletedAt  time.Time       `json:"completed_at,omitzero"`
+	FailedAt     time.Time       `json:"failed_at,omitzero"`
 }
 
 type QueueOpts struct {
@@ -281,10 +289,36 @@ func RunTask(ctx context.Context, conn Conn, name string, input any, opts RunTas
 
 func GetTaskRun(ctx context.Context, conn Conn, id string) (*TaskRunInfo, error) {
 	q := `
-		SELECT id, status, output, started_at, completed_at, failed_at
+		SELECT id, status, output, error_message, started_at, completed_at, failed_at
 		FROM cb_task_runs
 		WHERE id = $1;`
 	return scanTaskRun(conn.QueryRow(ctx, q, id))
+}
+
+func RunTaskWait(ctx context.Context, conn Conn, name string, input any, opts RunTaskOpts) (*TaskRunInfo, error) {
+	id, err := RunTask(ctx, conn, name, input, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+			info, err := GetTaskRun(ctx, conn, id)
+			if err != nil {
+				return nil, err
+			}
+			if info.Status == StatusStarted {
+				continue
+			}
+			return info, nil
+		}
+	}
 }
 
 func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
@@ -465,6 +499,7 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 	rec := TaskRunInfo{}
 
 	var output *json.RawMessage
+	var errorMessage *string
 	var completedAt *time.Time
 	var failedAt *time.Time
 
@@ -472,6 +507,8 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 		&rec.ID,
 		&rec.Status,
 		&output,
+		&errorMessage,
+		&rec.StartedAt,
 		&completedAt,
 		&failedAt,
 	); err != nil {
@@ -480,6 +517,9 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 
 	if output != nil {
 		rec.Output = *output
+	}
+	if errorMessage != nil {
+		rec.ErrorMessage = *errorMessage
 	}
 	if completedAt != nil {
 		rec.CompletedAt = *completedAt
