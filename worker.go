@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -14,12 +15,11 @@ import (
 )
 
 type Worker struct {
-	id        string
-	conn      Conn
-	tasks     []*Task
-	log       *slog.Logger
-	timeout   time.Duration
-	scheduler *cron.Cron
+	id      string
+	conn    Conn
+	tasks   []*Task
+	log     *slog.Logger
+	timeout time.Duration
 }
 
 type WorkerOpts struct {
@@ -29,7 +29,7 @@ type WorkerOpts struct {
 }
 
 func NewWorker(conn Conn, opts WorkerOpts) (*Worker, error) {
-	r := &Worker{
+	w := &Worker{
 		id:      uuid.NewString(),
 		conn:    conn,
 		tasks:   opts.Tasks,
@@ -37,40 +37,46 @@ func NewWorker(conn Conn, opts WorkerOpts) (*Worker, error) {
 		timeout: opts.Timeout,
 	}
 
-	for _, t := range opts.Tasks {
-		if t.schedule == "" {
-			continue
-		}
-		if r.scheduler == nil {
-			r.scheduler = cron.New(cron.WithSeconds())
-		}
-		_, err := r.scheduler.AddFunc(t.schedule, func() {
-			_, err := RunTask(context.TODO(), r.conn, t.name, struct{}{}, RunTaskOpts{DeduplicationID: "cron-" + t.name})
-			if err != nil {
-				r.log.Error("worker: failed to schedule task", "task", t.name, "error", err)
-			}
-		})
-		if err != nil {
-			return nil, fmt.Errorf("worker: failed to register schedule for task %s: %w", t.name, err)
-		}
-	}
-
-	return r, nil
+	return w, nil
 }
 
 func (w *Worker) Start(ctx context.Context) error {
+	var scheduler *cron.Cron
+	var taskNames []string
 	var wg sync.WaitGroup
 
 	for _, t := range w.tasks {
+		taskNames = append(taskNames, t.name)
+
+		if t.schedule != "" {
+			if scheduler == nil {
+				scheduler = cron.New(cron.WithSeconds())
+			}
+
+			var entryID cron.EntryID
+			entryID, err := scheduler.AddFunc(t.schedule, func() {
+				entry := scheduler.Entry(entryID)
+				scheduledTime := entry.Prev
+				if scheduledTime.IsZero() {
+					// use Next if Prev is not set, which will only happen for the first run
+					scheduledTime = entry.Next
+				}
+				dedupID := fmt.Sprintf("%s-cron-%s", t.name, scheduledTime)
+				_, err := RunTask(ctx, w.conn, t.name, struct{}{}, RunTaskOpts{dedupID})
+				if err != nil {
+					w.log.Error("worker: failed to schedule task", "task", t.name, "error", err)
+				}
+			})
+			if err != nil {
+				return fmt.Errorf("worker: failed to register schedule for task %s: %w", t.name, err)
+			}
+		}
+
 		if err := CreateTask(ctx, w.conn, t); err != nil {
 			return err
 		}
 	}
 
-	taskNames := make([]string, len(w.tasks))
-	for i, t := range w.tasks {
-		taskNames[i] = t.name
-	}
 	if _, err := w.conn.Exec(ctx, `SELECT * FROM cb_worker_started(id => $1, tasks => $2);`, w.id, taskNames); err != nil {
 		return err
 	}
@@ -91,13 +97,13 @@ func (w *Worker) Start(ctx context.Context) error {
 		}
 	})
 
-	if w.scheduler != nil {
-		w.scheduler.Start()
+	if scheduler != nil {
+		scheduler.Start()
 
 		wg.Go(func() {
 			<-ctx.Done()
 
-			stopCtx := w.scheduler.Stop()
+			stopCtx := scheduler.Stop()
 			select {
 			case <-stopCtx.Done():
 			case <-time.After(w.timeout):
@@ -164,6 +170,15 @@ func (w *Worker) runTask(ctx context.Context, t *Task) {
 				q := `SELECT * FROM cb_fail_task(run_id => $1, error_message => $2);`
 				if _, err := w.conn.Exec(ctx, q, p.RunID, err.Error()); err != nil {
 					w.log.Error("task: cannot mark task as failed", "task", t.name, "error", err)
+				}
+			} else if t.delay > 0 {
+				delay := t.delay
+				if t.jitter > 0 {
+					delay += time.Duration((1 - rand.Float64()*2) * float64(t.jitter))
+				}
+
+				if _, err := Hide(ctx, w.conn, t.queue, msg.ID, delay); err != nil {
+					w.log.Error("task: cannot delay next task run", "task", t.name, "error", err)
 				}
 			}
 		} else {
