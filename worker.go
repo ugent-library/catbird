@@ -112,16 +112,41 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 
 	for _, t := range w.tasks {
+		msgChan := make(chan Message, t.concurrency)
+
+		// producer
 		wg.Go(func() {
 			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					w.runTask(ctx, t)
+				msgs, err := ReadPoll(ctx, w.conn, t.queue, t.batchSize, t.hideFor, ReadPollOpts{})
+				if err != nil {
+					w.log.Error("task: cannot read messages", "task", t.name, "error", err)
+					return // TODO
+				}
+
+				for _, msg := range msgs {
+					select {
+					case <-ctx.Done():
+						close(msgChan)
+						return
+					default:
+						msgChan <- msg
+					}
+				}
+
+				if len(msgs) < t.batchSize {
+					time.Sleep(1 * time.Second) // TODO
 				}
 			}
 		})
+
+		// consumers
+		for i := 0; i < t.concurrency; i++ {
+			wg.Go(func() {
+				for msg := range msgChan {
+					w.runTask(ctx, t, msg)
+				}
+			})
+		}
 	}
 
 	wg.Wait()
@@ -134,59 +159,45 @@ type taskPayload struct {
 	Input json.RawMessage `json:"input"`
 }
 
-func (w *Worker) runTask(ctx context.Context, t *Task) {
-	msgs, err := ReadPoll(ctx, w.conn, t.queue, t.batchSize, t.hideFor, ReadPollOpts{})
+func (w *Worker) runTask(ctx context.Context, t *Task, msg Message) {
+	log.Printf("message payload for task %s: %s", t.name, msg.Payload) // remove or log debug
+
+	runCtx := ctx
+	if t.timeout > 0 {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, time.Duration(t.timeout))
+		defer cancel()
+	}
+
+	var p taskPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		w.log.Error("task: cannot decode payload", "task", t.name, "error", err)
+	}
+
+	out, err := t.fn(runCtx, p.Input)
+
 	if err != nil {
-		w.log.Error("task: cannot read message", "task", t.name, "error", err)
-		return
-	}
+		w.log.Error("task: failed", "task", t.name, "error", err)
 
-	if len(msgs) == 0 {
-		time.Sleep(1 * time.Second) // TODO
-		return
-	}
-
-	// TODO concurrency
-	for _, msg := range msgs {
-		log.Printf("message payload for task %s: %s", t.name, msg.Payload) // remove or log debug
-
-		runCtx := ctx
-		if t.timeout > 0 {
-			var cancel context.CancelFunc
-			runCtx, cancel = context.WithTimeout(ctx, time.Duration(t.timeout))
-			defer cancel()
-		}
-
-		var p taskPayload
-		if err := json.Unmarshal(msg.Payload, &p); err != nil {
-			w.log.Error("task: cannot decode payload", "task", t.name, "error", err)
-		}
-
-		out, err := t.fn(runCtx, p.Input)
-
-		if err != nil {
-			w.log.Error("task: failed", "task", t.name, "error", err)
-
-			if msg.Deliveries > t.retries {
-				q := `SELECT * FROM cb_fail_task(run_id => $1, error_message => $2);`
-				if _, err := w.conn.Exec(ctx, q, p.RunID, err.Error()); err != nil {
-					w.log.Error("task: cannot mark task as failed", "task", t.name, "error", err)
-				}
-			} else if t.delay > 0 {
-				delay := t.delay
-				if t.jitter > 0 {
-					delay += time.Duration((1 - rand.Float64()*2) * float64(t.jitter))
-				}
-
-				if _, err := Hide(ctx, w.conn, t.queue, msg.ID, delay); err != nil {
-					w.log.Error("task: cannot delay next task run", "task", t.name, "error", err)
-				}
+		if msg.Deliveries > t.retries {
+			q := `SELECT * FROM cb_fail_task(run_id => $1, error_message => $2);`
+			if _, err := w.conn.Exec(ctx, q, p.RunID, err.Error()); err != nil {
+				w.log.Error("task: cannot mark task as failed", "task", t.name, "error", err)
 			}
-		} else {
-			q := `SELECT * FROM cb_complete_task(run_id => $1, output => $2);`
-			if _, err := w.conn.Exec(ctx, q, p.RunID, out); err != nil {
-				w.log.Error("task: cannot mark task as completed", "task", t.name, "error", err)
+		} else if t.delay > 0 {
+			delay := t.delay
+			if t.jitter > 0 {
+				delay += time.Duration((1 - rand.Float64()*2) * float64(t.jitter))
 			}
+
+			if _, err := Hide(ctx, w.conn, t.queue, msg.ID, delay); err != nil {
+				w.log.Error("task: cannot delay next task run", "task", t.name, "error", err)
+			}
+		}
+	} else {
+		q := `SELECT * FROM cb_complete_task(run_id => $1, output => $2);`
+		if _, err := w.conn.Exec(ctx, q, p.RunID, out); err != nil {
+			w.log.Error("task: cannot mark task as completed", "task", t.name, "error", err)
 		}
 	}
 }
