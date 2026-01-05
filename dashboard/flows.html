@@ -1,0 +1,19 @@
+{{ define "content" }}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+  <h1 class="h2">Flows</h1>
+</div>
+
+<table class="table">
+  <tbody>
+    <tr>
+      <th scope="col">Name</th>
+      <th scope="col">Created at</th>
+      {{ range .Flows }}
+    <tr>
+      <th><a href="{{ route `flow` .Name `runs` }}">{{ .Name }}</a></th>
+      <td>{{ formatTime .CreatedAt }}</td>
+    </tr>
+    {{ end }}
+  </tbody>
+</table>
+{{ end }}

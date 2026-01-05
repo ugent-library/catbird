@@ -75,13 +75,6 @@ type TaskInfo struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-type WorkerInfo struct {
-	ID              string    `json:"id"`
-	Tasks           []string  `json:"tasks"`
-	StartedAt       time.Time `json:"started_at"`
-	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
-}
-
 type TaskRunInfo struct {
 	ID           string          `json:"id"`
 	Status       string          `json:"status"`
@@ -90,6 +83,29 @@ type TaskRunInfo struct {
 	StartedAt    time.Time       `json:"started_at,omitzero"`
 	CompletedAt  time.Time       `json:"completed_at,omitzero"`
 	FailedAt     time.Time       `json:"failed_at,omitzero"`
+}
+
+type FlowInfo struct {
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type FlowRunInfo struct {
+	ID           string          `json:"id"`
+	Status       string          `json:"status"`
+	Input        json.RawMessage `json:"input,omitempty"`
+	Output       json.RawMessage `json:"output,omitempty"`
+	ErrorMessage string          `json:"error_message,omitempty"`
+	StartedAt    time.Time       `json:"started_at,omitzero"`
+	CompletedAt  time.Time       `json:"completed_at,omitzero"`
+	FailedAt     time.Time       `json:"failed_at,omitzero"`
+}
+
+type WorkerInfo struct {
+	ID              string    `json:"id"`
+	Tasks           []string  `json:"tasks"`
+	StartedAt       time.Time `json:"started_at"`
+	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
 }
 
 type QueueOpts struct {
@@ -381,6 +397,15 @@ func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 	return nil
 }
 
+func ListFlows(ctx context.Context, conn Conn) ([]FlowInfo, error) {
+	q := `SELECT name, created_at FROM cb_flows;`
+	rows, err := conn.Query(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[FlowInfo])
+}
+
 func RunFlow(ctx context.Context, conn Conn, name string, input any) (string, error) {
 	b, err := json.Marshal(input)
 	if err != nil {
@@ -393,6 +418,28 @@ func RunFlow(ctx context.Context, conn Conn, name string, input any) (string, er
 		return "", err
 	}
 	return runID, err
+}
+
+func GetFlowRun(ctx context.Context, conn Conn, id string) (*FlowRunInfo, error) {
+	q := `
+		SELECT id, status, input, output, error_message, started_at, completed_at, failed_at
+		FROM cb_flow_runs
+		WHERE id = $1;`
+	return scanFlowRun(conn.QueryRow(ctx, q, id))
+}
+
+func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunInfo, error) {
+	q := `
+		SELECT id, status, input, output, error_message, started_at, completed_at, failed_at
+		FROM cb_flow_runs
+		WHERE flow_name = $1
+		ORDER BY started_at DESC
+		LIMIT 20;`
+	rows, err := conn.Query(ctx, q, flowName)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, scanCollectibleFlowRun)
 }
 
 func ListWorkers(ctx context.Context, conn Conn) ([]WorkerInfo, error) {
@@ -523,25 +570,6 @@ func scanQueue(row pgx.Row) (QueueInfo, error) {
 	return rec, nil
 }
 
-func scanCollectibleWorker(row pgx.CollectableRow) (WorkerInfo, error) {
-	return scanWorker(row)
-}
-
-func scanWorker(row pgx.Row) (WorkerInfo, error) {
-	rec := WorkerInfo{}
-
-	if err := row.Scan(
-		&rec.ID,
-		&rec.Tasks,
-		&rec.StartedAt,
-		&rec.LastHeartbeatAt,
-	); err != nil {
-		return rec, err
-	}
-
-	return rec, nil
-}
-
 func scanCollectibleTaskRun(row pgx.CollectableRow) (*TaskRunInfo, error) {
 	return scanTaskRun(row)
 }
@@ -580,4 +608,64 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 	}
 
 	return &rec, nil
+}
+
+func scanCollectibleFlowRun(row pgx.CollectableRow) (*FlowRunInfo, error) {
+	return scanFlowRun(row)
+}
+
+func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
+	rec := FlowRunInfo{}
+
+	var output *json.RawMessage
+	var errorMessage *string
+	var completedAt *time.Time
+	var failedAt *time.Time
+
+	if err := row.Scan(
+		&rec.ID,
+		&rec.Status,
+		&rec.Input,
+		&output,
+		&errorMessage,
+		&rec.StartedAt,
+		&completedAt,
+		&failedAt,
+	); err != nil {
+		return nil, err
+	}
+
+	if output != nil {
+		rec.Output = *output
+	}
+	if errorMessage != nil {
+		rec.ErrorMessage = *errorMessage
+	}
+	if completedAt != nil {
+		rec.CompletedAt = *completedAt
+	}
+	if failedAt != nil {
+		rec.FailedAt = *failedAt
+	}
+
+	return &rec, nil
+}
+
+func scanCollectibleWorker(row pgx.CollectableRow) (WorkerInfo, error) {
+	return scanWorker(row)
+}
+
+func scanWorker(row pgx.Row) (WorkerInfo, error) {
+	rec := WorkerInfo{}
+
+	if err := row.Scan(
+		&rec.ID,
+		&rec.Tasks,
+		&rec.StartedAt,
+		&rec.LastHeartbeatAt,
+	); err != nil {
+		return rec, err
+	}
+
+	return rec, nil
 }

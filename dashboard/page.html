@@ -146,6 +146,12 @@
               </button>
             </li>
             <li class="nav-item">
+              <button class="nav-link" hx-get="{{ route `flows` }}" hx-target="main" hx-push-url="true">
+                <span data-feather="divide"></span>
+                Flows
+              </button>
+            </li>
+            <li class="nav-item">
               <button class="nav-link" hx-get="{{ route `workers` }}" hx-target="main" hx-push-url="true">
                 <span data-feather="tool"></span>
                 Workers
