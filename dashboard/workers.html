@@ -1,4 +1,4 @@
-{{define "content"}}
+{{ define "content" }}
 <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
   <h1 class="h2">Workers</h1>
 </div>
@@ -10,7 +10,7 @@
       <th scope="col">Tasks</th>
       <th scope="col">Started at</th>
       <th scope="col">Last heartbeat at</th>
-    {{ range .Workers }}
+      {{ range .Workers }}
     <tr>
       <th>{{ .ID }}</th>
       <td>
@@ -18,10 +18,10 @@
         <span class="badge bg-secondary">{{ . }}</span>
         {{ end }}
       </td>
-      <td>{{ .StartedAt }}</td>
-      <td>{{ .LastHeartbeatAt }}</td>
+      <td>{{ formatTime .StartedAt }}</td>
+      <td>{{ formatTime .LastHeartbeatAt }}</td>
     </tr>
     {{ end }}
   </tbody>
 </table>
-{{end}}
+{{ end }}

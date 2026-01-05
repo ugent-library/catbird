@@ -5,6 +5,8 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/ugent-library/catbird"
 )
@@ -13,11 +15,13 @@ import (
 var templatesFS embed.FS
 
 type App struct {
-	client  *catbird.Client
-	logger  *slog.Logger
-	index   *template.Template
-	queues  *template.Template
-	workers *template.Template
+	client   *catbird.Client
+	logger   *slog.Logger
+	index    *template.Template
+	queues   *template.Template
+	tasks    *template.Template
+	taskRuns *template.Template
+	workers  *template.Template
 }
 
 type Config struct {
@@ -28,24 +32,35 @@ type Config struct {
 
 func New(config Config) *App {
 	funcs := template.FuncMap{
-		"route": func(path string) string {
-			return config.PathPrefix + path
+		"route": func(pathParts ...string) string {
+			return config.PathPrefix + "/" + strings.Join(pathParts, "/")
+		},
+		"formatTime": func(t time.Time) string {
+			if t.IsZero() {
+				return "-"
+			}
+			return t.Format(time.RFC3339)
 		},
 	}
 
 	return &App{
-		client:  config.Client,
-		logger:  config.Log,
-		index:   template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "index.html")),
-		queues:  template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "queues.html")),
-		workers: template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "workers.html")),
+		client:   config.Client,
+		logger:   config.Log,
+		index:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "index.html")),
+		queues:   template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "queues.html")),
+		tasks:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "tasks.html")),
+		taskRuns: template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "task_runs.html")),
+		workers:  template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "workers.html")),
 	}
 }
 
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
+
 	mux.HandleFunc("GET /", a.handleIndex)
 	mux.HandleFunc("GET /queues", a.handleQueues)
+	mux.HandleFunc("GET /tasks", a.handleTasks)
+	mux.HandleFunc("GET /task/{task_name}/runs", a.handleTaskRuns)
 	mux.HandleFunc("GET /workers", a.handleWorkers)
 
 	return mux
@@ -84,6 +99,38 @@ func (a *App) handleQueues(w http.ResponseWriter, r *http.Request) {
 		Queues []catbird.QueueInfo
 	}{
 		Queues: queues,
+	})
+}
+
+func (a *App) handleTasks(w http.ResponseWriter, r *http.Request) {
+	tasks, err := a.client.ListTasks(r.Context())
+	if err != nil {
+		a.handeError(w, r, err)
+		return
+	}
+
+	a.render(w, r, a.tasks, struct {
+		Tasks []catbird.TaskInfo
+	}{
+		Tasks: tasks,
+	})
+}
+
+func (a *App) handleTaskRuns(w http.ResponseWriter, r *http.Request) {
+	taskName := r.PathValue("task_name")
+
+	taskRuns, err := a.client.ListTaskRuns(r.Context(), taskName)
+	if err != nil {
+		a.handeError(w, r, err)
+		return
+	}
+
+	a.render(w, r, a.taskRuns, struct {
+		TaskName string
+		TaskRuns []*catbird.TaskRunInfo
+	}{
+		TaskName: taskName,
+		TaskRuns: taskRuns,
 	})
 }
 

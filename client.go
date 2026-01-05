@@ -61,6 +61,10 @@ func (c *Client) CreateTask(ctx context.Context, task *Task) error {
 	return CreateTask(ctx, c.conn, task)
 }
 
+func (c *Client) ListTasks(ctx context.Context) ([]TaskInfo, error) {
+	return ListTasks(ctx, c.conn)
+}
+
 func (c *Client) RunTask(ctx context.Context, name string, input any, opts RunTaskOpts) (string, error) {
 	return RunTask(ctx, c.conn, name, input, opts)
 }
@@ -71,6 +75,10 @@ func (c *Client) RunTaskWait(ctx context.Context, name string, input any, opts R
 
 func (c *Client) GetTaskRun(ctx context.Context, id string) (*TaskRunInfo, error) {
 	return GetTaskRun(ctx, c.conn, id)
+}
+
+func (c *Client) ListTaskRuns(ctx context.Context, taskName string) ([]*TaskRunInfo, error) {
+	return ListTaskRuns(ctx, c.conn, taskName)
 }
 
 func (c *Client) CreateFlow(ctx context.Context, flow *Flow) error {

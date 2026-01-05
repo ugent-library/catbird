@@ -1,4 +1,4 @@
-{{define "content"}}
+{{ define "content" }}
 <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
   <h1 class="h2">Queues</h1>
   <div class="btn-toolbar mb-2 mb-md-0">
@@ -18,18 +18,18 @@
       <th scope="col">Topics</th>
       <th scope="col">Unlogged</th>
       <th scope="col">Delete at</th>
-    {{ range .Queues }}
+      {{ range .Queues }}
     <tr>
       <th>{{ .Name }}</th>
       <td>
-        {{ range .Topics}}
+        {{ range .Topics }}
         <span class="badge bg-secondary">{{ . }}</span>
         {{ end }}
       </td>
       <td>{{ if .Unlogged }}Unlogged{{ end }}</td>
-      <td>{{ if not .DeleteAt.IsZero }}{{ .DeleteAt }}{{ end }}</td>
+      <td>{{ formatTime .DeleteAt }}</td>
     </tr>
     {{ end }}
   </tbody>
 </table>
-{{end}}
+{{ end }}

@@ -1,4 +1,4 @@
-{{define "page"}}
+{{ define "page" }}
 <!doctype html>
 <html lang="en">
 
@@ -9,6 +9,8 @@
   <title>Catbird</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet"
     integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
+  <link rel="stylesheet"
+    href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.11.1/build/styles/default.min.css">
   <meta name="theme-color" content="#7952b3">
 
   <style>
@@ -132,13 +134,19 @@
         <div class="position-sticky pt-3">
           <ul class="nav flex-column">
             <li class="nav-item">
-              <button class="nav-link" hx-get="{{ route "/queues" }}" hx-target="main" hx-push-url="true">
+              <button class="nav-link" hx-get="{{ route `queues` }}" hx-target="main" hx-push-url="true">
                 <span data-feather="message-square"></span>
                 Queues
               </button>
             </li>
             <li class="nav-item">
-              <button class="nav-link" hx-get="{{ route "/workers" }}" hx-target="main" hx-push-url="true">
+              <button class="nav-link" hx-get="{{ route `tasks` }}" hx-target="main" hx-push-url="true">
+                <span data-feather="clipboard"></span>
+                Tasks
+              </button>
+            </li>
+            <li class="nav-item">
+              <button class="nav-link" hx-get="{{ route `workers` }}" hx-target="main" hx-push-url="true">
                 <span data-feather="tool"></span>
                 Workers
               </button>
@@ -148,7 +156,7 @@
       </nav>
 
       <main class="col-md-9 ms-sm-auto col-lg-10 px-md-4">
-        {{template "content" .}}
+        {{ template "content" . }}
       </main>
     </div>
   </div>
@@ -160,12 +168,21 @@
   <script src="https://cdn.jsdelivr.net/npm/feather-icons@4.28.0/dist/feather.min.js"
     integrity="sha384-uO3SXW5IuS1ZpFPKugNNWqTZRRglnUJK6UAZ/gxOX80nxEkN9NcGZTftn6RzhGWE"
     crossorigin="anonymous"></script>
-  <script>
-    htmx.onLoad(function () {
+
+  <script type="module">
+    import hljs from 'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.11.1/build/es/highlight.min.js';
+    import hljson from 'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.11.1/build/es/languages/json.min.js';
+    hljs.registerLanguage('json', hljson);
+
+    htmx.onLoad(function (rootEl) {
       feather.replace();
+
+      rootEl.querySelectorAll('pre code').forEach((el) => {
+        hljs.highlightElement(el);
+      });
     });
   </script>
 </body>
 
 </html>
-{{end}}
+{{ end }}
