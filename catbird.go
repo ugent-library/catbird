@@ -70,6 +70,11 @@ type QueueInfo struct {
 	DeleteAt time.Time `json:"delete_at,omitzero"`
 }
 
+type TaskInfo struct {
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type WorkerInfo struct {
 	ID              string    `json:"id"`
 	Tasks           []string  `json:"tasks"`
@@ -288,6 +293,15 @@ func CreateTask(ctx context.Context, conn Conn, task *Task) error {
 	return nil
 }
 
+func ListTasks(ctx context.Context, conn Conn) ([]TaskInfo, error) {
+	q := `SELECT name, created_at FROM cb_tasks;`
+	rows, err := conn.Query(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[TaskInfo])
+}
+
 type RunTaskOpts struct {
 	DeduplicationID string
 }
@@ -304,14 +318,6 @@ func RunTask(ctx context.Context, conn Conn, name string, input any, opts RunTas
 		return "", err
 	}
 	return runID, err
-}
-
-func GetTaskRun(ctx context.Context, conn Conn, id string) (*TaskRunInfo, error) {
-	q := `
-		SELECT id, status, output, error_message, started_at, completed_at, failed_at
-		FROM cb_task_runs
-		WHERE id = $1;`
-	return scanTaskRun(conn.QueryRow(ctx, q, id))
 }
 
 func RunTaskWait(ctx context.Context, conn Conn, name string, input any, opts RunTaskOpts) (*TaskRunInfo, error) {
@@ -338,6 +344,28 @@ func RunTaskWait(ctx context.Context, conn Conn, name string, input any, opts Ru
 			return info, nil
 		}
 	}
+}
+
+func GetTaskRun(ctx context.Context, conn Conn, id string) (*TaskRunInfo, error) {
+	q := `
+		SELECT id, status, output, error_message, started_at, completed_at, failed_at
+		FROM cb_task_runs
+		WHERE id = $1;`
+	return scanTaskRun(conn.QueryRow(ctx, q, id))
+}
+
+func ListTaskRuns(ctx context.Context, conn Conn, taskName string) ([]*TaskRunInfo, error) {
+	q := `
+		SELECT id, status, output, error_message, started_at, completed_at, failed_at
+		FROM cb_task_runs
+		WHERE task_name = $1
+		ORDER BY started_at DESC
+		LIMIT 20;`
+	rows, err := conn.Query(ctx, q, taskName)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, scanCollectibleTaskRun)
 }
 
 func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
@@ -512,6 +540,10 @@ func scanWorker(row pgx.Row) (WorkerInfo, error) {
 	}
 
 	return rec, nil
+}
+
+func scanCollectibleTaskRun(row pgx.CollectableRow) (*TaskRunInfo, error) {
+	return scanTaskRun(row)
 }
 
 func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
