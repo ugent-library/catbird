@@ -7,10 +7,23 @@
   <tbody>
     <tr>
       <th scope="col">Name</th>
+      <th scope="col">Steps</th>
       <th scope="col">Created at</th>
       {{ range .Flows }}
     <tr>
       <th><a href="{{ route `flow` .Name `runs` }}">{{ .Name }}</a></th>
+      <td>
+        <ul class="list-group">
+          {{ range .Steps }}
+          <li class="list-group-item">
+            {{ .Name }}
+            {{ if .DependsOn }}
+              (depends on {{ join .DependsOn ", " }})
+            {{ end }}
+          </li>
+          {{ end }}
+        </ul>
+      </td>
       <td>{{ formatTime .CreatedAt }}</td>
     </tr>
     {{ end }}

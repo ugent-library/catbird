@@ -46,15 +46,13 @@
       </div>
       <div class="modal-body">
         <h5>Input</h5>
-        <pre><code class="language-json">{{ printf "%s" .Input }}</code></pre>
+        <pre><code class="language-json">{{ prettyJSON .Input }}</code></pre>
         <h5>Output</h5>
         {{ with .Output }}
-        <pre><code class="language-json">{{ printf "%s" . }}</code></pre>
+        <pre><code class="language-json">{{ prettyJSON . }}</code></pre>
         {{ else }}
         -
         {{ end }}
-        <h5>Error message</h5>
-        {{ with .ErrorMessage }}{{ . }}{{ else }}-{{ end }}
       </div>
       <div class="modal-footer">
         <button type="button" class="btn btn-link" data-bs-dismiss="modal">Close</button>

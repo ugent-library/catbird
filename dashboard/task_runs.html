@@ -47,7 +47,7 @@
       <div class="modal-body">
         <h5>Output</h5>
         {{ with .Output }}
-        <pre><code class="language-json">{{ printf "%s" . }}</code></pre>
+        <pre><code class="language-json">{{ prettyJSON . }}</code></pre>
         {{ else }}
         -
         {{ end }}

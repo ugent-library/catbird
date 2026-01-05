@@ -12,7 +12,7 @@ import (
 )
 
 func TestFlows(t *testing.T) {
-	pool, err := pgxpool.New(t.Context(), os.Getenv("TEST_PG_CONN"))
+	pool, err := pgxpool.New(t.Context(), os.Getenv("TEST_CB_CONN"))
 	if err != nil {
 		t.Fatal(err)
 	}
