@@ -85,8 +85,20 @@ func (c *Client) CreateFlow(ctx context.Context, flow *Flow) error {
 	return CreateFlow(ctx, c.conn, flow)
 }
 
+func (c *Client) ListFlows(ctx context.Context) ([]FlowInfo, error) {
+	return ListFlows(ctx, c.conn)
+}
+
 func (c *Client) RunFlow(ctx context.Context, name string, input any) (string, error) {
 	return RunFlow(ctx, c.conn, name, input)
+}
+
+func (c *Client) GetFlowRun(ctx context.Context, id string) (*FlowRunInfo, error) {
+	return GetFlowRun(ctx, c.conn, id)
+}
+
+func (c *Client) ListFlowRuns(ctx context.Context, taskName string) ([]*FlowRunInfo, error) {
+	return ListFlowRuns(ctx, c.conn, taskName)
 }
 
 func (c *Client) NewWorker(opts WorkerOpts) (*Worker, error) {

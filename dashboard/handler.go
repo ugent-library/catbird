@@ -21,6 +21,8 @@ type App struct {
 	queues   *template.Template
 	tasks    *template.Template
 	taskRuns *template.Template
+	flows    *template.Template
+	flowRuns *template.Template
 	workers  *template.Template
 }
 
@@ -50,6 +52,8 @@ func New(config Config) *App {
 		queues:   template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "queues.html")),
 		tasks:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "tasks.html")),
 		taskRuns: template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "task_runs.html")),
+		flows:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flows.html")),
+		flowRuns: template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flow_runs.html")),
 		workers:  template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "workers.html")),
 	}
 }
@@ -61,6 +65,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /queues", a.handleQueues)
 	mux.HandleFunc("GET /tasks", a.handleTasks)
 	mux.HandleFunc("GET /task/{task_name}/runs", a.handleTaskRuns)
+	mux.HandleFunc("GET /flows", a.handleFlows)
 	mux.HandleFunc("GET /workers", a.handleWorkers)
 
 	return mux
@@ -131,6 +136,20 @@ func (a *App) handleTaskRuns(w http.ResponseWriter, r *http.Request) {
 	}{
 		TaskName: taskName,
 		TaskRuns: taskRuns,
+	})
+}
+
+func (a *App) handleFlows(w http.ResponseWriter, r *http.Request) {
+	flows, err := a.client.ListFlows(r.Context())
+	if err != nil {
+		a.handeError(w, r, err)
+		return
+	}
+
+	a.render(w, r, a.flows, struct {
+		Flows []catbird.FlowInfo
+	}{
+		Flows: flows,
 	})
 }
 

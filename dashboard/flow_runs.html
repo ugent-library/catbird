@@ -1,0 +1,66 @@
+{{ define "content" }}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+  <h1 class="h2">{{ .FlowName }}</h1>
+</div>
+
+<table class="table">
+  <tbody>
+    <tr>
+      <th scope="col">ID</th>
+      <th scope="col">Status</th>
+      <th scope="col">Started at</th>
+      <th scope="col">Completed at</th>
+      <th scope="col">Failed at</th>
+    </tr>
+    {{ range .FlowRuns }}
+    <tr>
+      <td>
+        <button type="button" class="btn btn-link" data-bs-toggle="modal" data-bs-target="#flow-run-{{ .ID }}">
+          {{ .ID }}
+        </button>
+      </td>
+      <td>
+        {{ if eq .Status "started" }}
+        <span class="badge text-bg-info">started</span>
+        {{ else if eq .Status "completed" }}
+        <span class="badge text-bg-success">completed</span>
+        {{ else if eq .Status "failed" }}
+        <span class="badge text-bg-danger">failed</span>
+        {{ end }}
+      </td>
+      <td>{{ formatTime .StartedAt }}</td>
+      <td>{{ formatTime .CompletedAt }}</td>
+      <td>{{ formatTime .FailedAt }}</td>
+    </tr>
+    {{ end }}
+  </tbody>
+</table>
+
+{{ range .FlowRuns }}
+<div id="flow-run-{{ .ID }}" class="modal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">{{ $.FlowName }} - {{ .ID }}</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <h5>Input</h5>
+        <pre><code class="language-json">{{ printf "%s" .Input }}</code></pre>
+        <h5>Output</h5>
+        {{ with .Output }}
+        <pre><code class="language-json">{{ printf "%s" . }}</code></pre>
+        {{ else }}
+        -
+        {{ end }}
+        <h5>Error message</h5>
+        {{ with .ErrorMessage }}{{ . }}{{ else }}-{{ end }}
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-link" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+{{ end }}
+{{ end }}
