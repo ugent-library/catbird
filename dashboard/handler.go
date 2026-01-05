@@ -66,6 +66,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /tasks", a.handleTasks)
 	mux.HandleFunc("GET /task/{task_name}/runs", a.handleTaskRuns)
 	mux.HandleFunc("GET /flows", a.handleFlows)
+	mux.HandleFunc("GET /flow/{flow_name}/runs", a.handleFlowRuns)
 	mux.HandleFunc("GET /workers", a.handleWorkers)
 
 	return mux
@@ -150,6 +151,24 @@ func (a *App) handleFlows(w http.ResponseWriter, r *http.Request) {
 		Flows []catbird.FlowInfo
 	}{
 		Flows: flows,
+	})
+}
+
+func (a *App) handleFlowRuns(w http.ResponseWriter, r *http.Request) {
+	flowName := r.PathValue("flow_name")
+
+	flowRuns, err := a.client.ListFlowRuns(r.Context(), flowName)
+	if err != nil {
+		a.handeError(w, r, err)
+		return
+	}
+
+	a.render(w, r, a.flowRuns, struct {
+		FlowName string
+		FlowRuns []*catbird.FlowRunInfo
+	}{
+		FlowName: flowName,
+		FlowRuns: flowRuns,
 	})
 }
 
