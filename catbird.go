@@ -87,18 +87,18 @@ type TaskRunInfo struct {
 
 type FlowInfo struct {
 	Name      string    `json:"name"`
+	Steps     []Step    `json:"steps"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
 type FlowRunInfo struct {
-	ID           string          `json:"id"`
-	Status       string          `json:"status"`
-	Input        json.RawMessage `json:"input,omitempty"`
-	Output       json.RawMessage `json:"output,omitempty"`
-	ErrorMessage string          `json:"error_message,omitempty"`
-	StartedAt    time.Time       `json:"started_at,omitzero"`
-	CompletedAt  time.Time       `json:"completed_at,omitzero"`
-	FailedAt     time.Time       `json:"failed_at,omitzero"`
+	ID          string          `json:"id"`
+	Status      string          `json:"status"`
+	Input       json.RawMessage `json:"input,omitempty"`
+	Output      json.RawMessage `json:"output,omitempty"`
+	StartedAt   time.Time       `json:"started_at,omitzero"`
+	CompletedAt time.Time       `json:"completed_at,omitzero"`
+	FailedAt    time.Time       `json:"failed_at,omitzero"`
 }
 
 type WorkerInfo struct {
@@ -397,13 +397,32 @@ func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 	return nil
 }
 
-func ListFlows(ctx context.Context, conn Conn) ([]FlowInfo, error) {
-	q := `SELECT name, created_at FROM cb_flows;`
+func ListFlows(ctx context.Context, conn Conn) ([]*FlowInfo, error) {
+	q := `
+		SELECT f.name, s.steps AS steps, f.created_at
+		FROM cb_flows f
+		LEFT JOIN LATERAL (
+			SELECT s.flow_name,
+				json_agg(json_strip_nulls(json_build_object(
+					'name', s.name,
+					'task_name', s.task_name,
+					'depends_on', (
+						SELECT json_agg(s_d.dependency_name)
+						FROM cb_step_dependencies AS s_d
+						WHERE s_d.flow_name = s.flow_name
+						AND s_d.step_name = s.name
+					),
+					'map', s.map
+				)) ORDER BY s.idx) FILTER (WHERE s.idx IS NOT NULL) AS steps
+			FROM cb_steps s
+			WHERE s.flow_name = f.name
+			GROUP BY flow_name
+		) s ON s.flow_name = f.name;`
 	rows, err := conn.Query(ctx, q)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowToStructByPos[FlowInfo])
+	return pgx.CollectRows(rows, scanCollectibleFlow)
 }
 
 func RunFlow(ctx context.Context, conn Conn, name string, input any) (string, error) {
@@ -422,7 +441,7 @@ func RunFlow(ctx context.Context, conn Conn, name string, input any) (string, er
 
 func GetFlowRun(ctx context.Context, conn Conn, id string) (*FlowRunInfo, error) {
 	q := `
-		SELECT id, status, input, output, error_message, started_at, completed_at, failed_at
+		SELECT id, status, input, output, started_at, completed_at, failed_at
 		FROM cb_flow_runs
 		WHERE id = $1;`
 	return scanFlowRun(conn.QueryRow(ctx, q, id))
@@ -430,7 +449,7 @@ func GetFlowRun(ctx context.Context, conn Conn, id string) (*FlowRunInfo, error)
 
 func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunInfo, error) {
 	q := `
-		SELECT id, status, input, output, error_message, started_at, completed_at, failed_at
+		SELECT id, status, input, output, started_at, completed_at, failed_at
 		FROM cb_flow_runs
 		WHERE flow_name = $1
 		ORDER BY started_at DESC
@@ -610,6 +629,30 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 	return &rec, nil
 }
 
+func scanCollectibleFlow(row pgx.CollectableRow) (*FlowInfo, error) {
+	return scanFlow(row)
+}
+
+func scanFlow(row pgx.Row) (*FlowInfo, error) {
+	rec := FlowInfo{}
+
+	var steps json.RawMessage
+
+	if err := row.Scan(
+		&rec.Name,
+		&steps,
+		&rec.CreatedAt,
+	); err != nil {
+		return nil, err
+	}
+
+	if err := json.Unmarshal(steps, &rec.Steps); err != nil {
+		return nil, err
+	}
+
+	return &rec, nil
+}
+
 func scanCollectibleFlowRun(row pgx.CollectableRow) (*FlowRunInfo, error) {
 	return scanFlowRun(row)
 }
@@ -618,7 +661,6 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 	rec := FlowRunInfo{}
 
 	var output *json.RawMessage
-	var errorMessage *string
 	var completedAt *time.Time
 	var failedAt *time.Time
 
@@ -627,7 +669,6 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 		&rec.Status,
 		&rec.Input,
 		&output,
-		&errorMessage,
 		&rec.StartedAt,
 		&completedAt,
 		&failedAt,
@@ -637,9 +678,6 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 
 	if output != nil {
 		rec.Output = *output
-	}
-	if errorMessage != nil {
-		rec.ErrorMessage = *errorMessage
 	}
 	if completedAt != nil {
 		rec.CompletedAt = *completedAt

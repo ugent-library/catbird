@@ -85,7 +85,7 @@ func (c *Client) CreateFlow(ctx context.Context, flow *Flow) error {
 	return CreateFlow(ctx, c.conn, flow)
 }
 
-func (c *Client) ListFlows(ctx context.Context) ([]FlowInfo, error) {
+func (c *Client) ListFlows(ctx context.Context) ([]*FlowInfo, error) {
 	return ListFlows(ctx, c.conn)
 }
 

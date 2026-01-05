@@ -1,7 +1,9 @@
 package dashboard
 
 import (
+	"bytes"
 	"embed"
+	"encoding/json"
 	"html/template"
 	"log/slog"
 	"net/http"
@@ -37,11 +39,19 @@ func New(config Config) *App {
 		"route": func(pathParts ...string) string {
 			return config.PathPrefix + "/" + strings.Join(pathParts, "/")
 		},
+		"join": strings.Join,
 		"formatTime": func(t time.Time) string {
 			if t.IsZero() {
 				return "-"
 			}
 			return t.Format(time.RFC3339)
+		},
+		"prettyJSON": func(b []byte) (string, error) {
+			var buf bytes.Buffer
+			if err := json.Indent(&buf, b, "", "  "); err != nil {
+				return "", err
+			}
+			return buf.String(), nil
 		},
 	}
 
@@ -148,7 +158,7 @@ func (a *App) handleFlows(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.render(w, r, a.flows, struct {
-		Flows []catbird.FlowInfo
+		Flows []*catbird.FlowInfo
 	}{
 		Flows: flows,
 	})

@@ -116,6 +116,10 @@ func (w *Worker) Start(ctx context.Context) error {
 
 		// producer
 		wg.Go(func() {
+			defer func() {
+				close(msgChan)
+			}()
+
 			for {
 				msgs, err := ReadPoll(ctx, w.conn, t.queue, t.batchSize, t.hideFor, ReadPollOpts{})
 				if err != nil {
@@ -126,7 +130,6 @@ func (w *Worker) Start(ctx context.Context) error {
 				for _, msg := range msgs {
 					select {
 					case <-ctx.Done():
-						close(msgChan)
 						return
 					default:
 						msgChan <- msg
