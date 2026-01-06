@@ -50,7 +50,7 @@ func (w *Worker) Start(ctx context.Context) error {
 
 		if t.schedule != "" {
 			if scheduler == nil {
-				scheduler = cron.New(cron.WithSeconds())
+				scheduler = cron.New()
 			}
 
 			var entryID cron.EntryID
