@@ -11,7 +11,7 @@ SQL code is mostly taken or adapted from the excellent [pgmq](https://github.com
 ## TODO
 
 * hide message for as long as task is running?
-* GetFlowInfo / RunFlowWait
+* RunFlowWait
 * RunTaskWait / RunFlowWait long polling
 * add task and flow description fields
 * add queue created_at field
@@ -20,5 +20,7 @@ SQL code is mostly taken or adapted from the excellent [pgmq](https://github.com
 * type safe task/flow input/output
 * split tasks into standalone tasks and step tasks?
 * use split tables for task runs like queues?
+* put other step outputs in context and simplify step task inputs?
+* flow onfail task?
 * put logger in Context?
-* pause flows - wait for for signal
+* pause tasks - wait for for signal
