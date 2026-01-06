@@ -439,6 +439,32 @@ func RunFlow(ctx context.Context, conn Conn, name string, input any) (string, er
 	return runID, err
 }
 
+func RunFlowWait(ctx context.Context, conn Conn, name string, input any) (*FlowRunInfo, error) {
+	id, err := RunFlow(ctx, conn, name, input)
+	if err != nil {
+		return nil, err
+	}
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+			info, err := GetFlowRun(ctx, conn, id)
+			if err != nil {
+				return nil, err
+			}
+			if info.Status == StatusStarted {
+				continue
+			}
+			return info, nil
+		}
+	}
+}
+
 func GetFlowRun(ctx context.Context, conn Conn, id string) (*FlowRunInfo, error) {
 	q := `
 		SELECT id, status, input, output, started_at, completed_at, failed_at
