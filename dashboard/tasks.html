@@ -8,7 +8,8 @@
     <tr>
       <th scope="col">Name</th>
       <th scope="col">Created at</th>
-      {{ range .Tasks }}
+    </tr>
+    {{ range .Tasks }}
     <tr>
       <th><a href="{{ route `task` .Name `runs` }}">{{ .Name }}</a></th>
       <td>{{ formatTime .CreatedAt }}</td>
