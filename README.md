@@ -11,7 +11,6 @@ SQL code is mostly taken or adapted from the excellent [pgmq](https://github.com
 ## TODO
 
 * hide message for as long as task is running?
-* RunFlowWait
 * RunTaskWait / RunFlowWait long polling
 * add task and flow description fields
 * add queue created_at field

@@ -93,6 +93,10 @@ func (c *Client) RunFlow(ctx context.Context, name string, input any) (string, e
 	return RunFlow(ctx, c.conn, name, input)
 }
 
+func (c *Client) RunFlowWait(ctx context.Context, name string, input any) (*FlowRunInfo, error) {
+	return RunFlowWait(ctx, c.conn, name, input)
+}
+
 func (c *Client) GetFlowRun(ctx context.Context, id string) (*FlowRunInfo, error) {
 	return GetFlowRun(ctx, c.conn, id)
 }
