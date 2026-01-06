@@ -3,8 +3,8 @@ package catbird
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
 	"log/slog"
 	"math/rand/v2"
 	"sync"
@@ -64,7 +64,7 @@ func (w *Worker) Start(ctx context.Context) error {
 				dedupID := fmt.Sprintf("%s-cron-%s", t.name, scheduledTime)
 				_, err := RunTask(ctx, w.conn, t.name, struct{}{}, RunTaskOpts{dedupID})
 				if err != nil {
-					w.log.Error("worker: failed to schedule task", "task", t.name, "error", err)
+					w.log.ErrorContext(ctx, "worker: failed to schedule task", "task", t.name, "error", err)
 				}
 			})
 			if err != nil {
@@ -91,7 +91,7 @@ func (w *Worker) Start(ctx context.Context) error {
 				return
 			case <-ticker.C:
 				if _, err := w.conn.Exec(ctx, `SELECT * FROM cb_worker_heartbeat(id => $1);`, w.id); err != nil {
-					w.log.Error("worker: cannot send heartbeat", "error", err)
+					w.log.ErrorContext(ctx, "worker: cannot send heartbeat", "error", err)
 				}
 			}
 		}
@@ -123,8 +123,10 @@ func (w *Worker) Start(ctx context.Context) error {
 			for {
 				msgs, err := ReadPoll(ctx, w.conn, t.queue, t.batchSize, t.hideFor, ReadPollOpts{})
 				if err != nil {
-					w.log.Error("task: cannot read messages", "task", t.name, "error", err)
-					return // TODO
+					if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+						w.log.ErrorContext(ctx, "task: cannot read messages", "task", t.name, "error", err)
+					}
+					return
 				}
 
 				for _, msg := range msgs {
@@ -163,7 +165,7 @@ type taskPayload struct {
 }
 
 func (w *Worker) runTask(ctx context.Context, t *Task, msg Message) {
-	log.Printf("message payload for task %s: %s", t.name, msg.Payload) // remove or log debug
+	w.log.DebugContext(ctx, "task: run", "task", t.name, "payload", msg.Payload)
 
 	runCtx := ctx
 	if t.timeout > 0 {
@@ -174,18 +176,18 @@ func (w *Worker) runTask(ctx context.Context, t *Task, msg Message) {
 
 	var p taskPayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		w.log.Error("task: cannot decode payload", "task", t.name, "error", err)
+		w.log.ErrorContext(ctx, "task: cannot decode payload", "task", t.name, "error", err)
 	}
 
 	out, err := t.fn(runCtx, p.Input)
 
 	if err != nil {
-		w.log.Error("task: failed", "task", t.name, "error", err)
+		w.log.ErrorContext(ctx, "task: failed", "task", t.name, "error", err)
 
 		if msg.Deliveries > t.retries {
 			q := `SELECT * FROM cb_fail_task(run_id => $1, error_message => $2);`
 			if _, err := w.conn.Exec(ctx, q, p.RunID, err.Error()); err != nil {
-				w.log.Error("task: cannot mark task as failed", "task", t.name, "error", err)
+				w.log.ErrorContext(ctx, "task: cannot mark task as failed", "task", t.name, "error", err)
 			}
 		} else if t.delay > 0 {
 			delay := t.delay
@@ -194,13 +196,13 @@ func (w *Worker) runTask(ctx context.Context, t *Task, msg Message) {
 			}
 
 			if _, err := Hide(ctx, w.conn, t.queue, msg.ID, delay); err != nil {
-				w.log.Error("task: cannot delay next task run", "task", t.name, "error", err)
+				w.log.ErrorContext(ctx, "task: cannot delay next task run", "task", t.name, "error", err)
 			}
 		}
 	} else {
 		q := `SELECT * FROM cb_complete_task(run_id => $1, output => $2);`
 		if _, err := w.conn.Exec(ctx, q, p.RunID, out); err != nil {
-			w.log.Error("task: cannot mark task as completed", "task", t.name, "error", err)
+			w.log.ErrorContext(ctx, "task: cannot mark task as completed", "task", t.name, "error", err)
 		}
 	}
 }
