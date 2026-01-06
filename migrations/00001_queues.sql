@@ -408,19 +408,6 @@ END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
 
--- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_gc()
-RETURNS void
-LANGUAGE plpgsql AS $$
-DECLARE
-BEGIN
-    PERFORM cb_delete_queue(name)
-    FROM cb_queues
-    WHERE delete_at IS NOT NULL AND delete_at <= now();
-END
-$$;
--- +goose statementend
-
 -- +goose down
 
 SELECT cb_delete_queue(name) FROM cb_queues;
@@ -435,7 +422,6 @@ DROP FUNCTION cb_hide;
 DROP FUNCTION cb_hide_many;
 DROP FUNCTION cb_delete;
 DROP FUNCTION cb_delete_many;
-DROP FUNCTION cb_gc;
 DROP FUNCTION _cb_table_name;
 DROP FUNCTION _cb_acquire_queue_lock;
 

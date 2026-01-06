@@ -129,6 +129,8 @@ CREATE TABLE IF NOT EXISTS cb_workers (
   last_heartbeat_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE INDEX IF NOT EXISTS cb_workers_last_heartbeat_at_idx on cb_workers (last_heartbeat_at);
+
 CREATE TABLE IF NOT EXISTS cb_worker_tasks (
   worker_id uuid NOT NULL REFERENCES cb_workers (id) ON DELETE CASCADE,
   task_name text NOT NULL REFERENCES cb_tasks (name),
