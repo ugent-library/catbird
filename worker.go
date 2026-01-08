@@ -165,7 +165,7 @@ type taskPayload struct {
 }
 
 func (w *Worker) runTask(ctx context.Context, t *Task, msg Message) {
-	w.log.DebugContext(ctx, "task: run", "task", t.name, "payload", msg.Payload)
+	w.log.DebugContext(ctx, "task: run", "task", t.name, "payload", string(msg.Payload))
 
 	runCtx := ctx
 	if t.timeout > 0 {
