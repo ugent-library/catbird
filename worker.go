@@ -165,18 +165,25 @@ type taskPayload struct {
 }
 
 func (w *Worker) runTask(ctx context.Context, t *Task, msg Message) {
-	w.log.DebugContext(ctx, "task: run", "task", t.name, "payload", string(msg.Payload))
+	var p taskPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		w.log.ErrorContext(ctx, "task: cannot decode payload", "task", t.name, "error", err)
+		return // TODO
+	}
+
+	w.log.DebugContext(ctx, "task: run",
+		"task", t.name,
+		"message_id", msg.ID,
+		"deduplication_id", msg.DeduplicationID,
+		"run_id", p.RunID,
+		"input", string(p.Input),
+	)
 
 	runCtx := ctx
 	if t.timeout > 0 {
 		var cancel context.CancelFunc
 		runCtx, cancel = context.WithTimeout(ctx, time.Duration(t.timeout))
 		defer cancel()
-	}
-
-	var p taskPayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		w.log.ErrorContext(ctx, "task: cannot decode payload", "task", t.name, "error", err)
 	}
 
 	out, err := t.fn(runCtx, p.Input)
