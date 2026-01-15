@@ -24,7 +24,7 @@ type App struct {
 	tasks    *template.Template
 	taskRuns *template.Template
 	flows    *template.Template
-	flowRuns *template.Template
+	flow     *template.Template
 	workers  *template.Template
 }
 
@@ -46,12 +46,19 @@ func New(config Config) *App {
 			}
 			return t.Format(time.RFC3339)
 		},
-		"prettyJSON": func(b []byte) (string, error) {
+		"toJSON": func(v any) (template.JS, error) {
+			b, err := json.Marshal(v)
+			if err != nil {
+				return "", err
+			}
+			return template.JS(b), nil
+		},
+		"prettyJSON": func(b []byte) (template.JS, error) {
 			var buf bytes.Buffer
 			if err := json.Indent(&buf, b, "", "  "); err != nil {
 				return "", err
 			}
-			return buf.String(), nil
+			return template.JS(buf.String()), nil
 		},
 	}
 
@@ -63,7 +70,7 @@ func New(config Config) *App {
 		tasks:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "tasks.html")),
 		taskRuns: template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "task_runs.html")),
 		flows:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flows.html")),
-		flowRuns: template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flow_runs.html")),
+		flow:     template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flow.html")),
 		workers:  template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "workers.html")),
 	}
 }
@@ -76,7 +83,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /tasks", a.handleTasks)
 	mux.HandleFunc("GET /task/{task_name}/runs", a.handleTaskRuns)
 	mux.HandleFunc("GET /flows", a.handleFlows)
-	mux.HandleFunc("GET /flow/{flow_name}/runs", a.handleFlowRuns)
+	mux.HandleFunc("GET /flow/{flow_name}", a.handleFlow)
 	mux.HandleFunc("GET /workers", a.handleWorkers)
 
 	return mux
@@ -164,8 +171,14 @@ func (a *App) handleFlows(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *App) handleFlowRuns(w http.ResponseWriter, r *http.Request) {
+func (a *App) handleFlow(w http.ResponseWriter, r *http.Request) {
 	flowName := r.PathValue("flow_name")
+
+	flow, err := a.client.GetFlow(r.Context(), flowName)
+	if err != nil {
+		a.handeError(w, r, err)
+		return
+	}
 
 	flowRuns, err := a.client.ListFlowRuns(r.Context(), flowName)
 	if err != nil {
@@ -173,11 +186,11 @@ func (a *App) handleFlowRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.render(w, r, a.flowRuns, struct {
-		FlowName string
+	a.render(w, r, a.flow, struct {
+		Flow     *catbird.FlowInfo
 		FlowRuns []*catbird.FlowRunInfo
 	}{
-		FlowName: flowName,
+		Flow:     flow,
 		FlowRuns: flowRuns,
 	})
 }
