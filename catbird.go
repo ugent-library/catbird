@@ -397,6 +397,31 @@ func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 	return nil
 }
 
+func GetFlow(ctx context.Context, conn Conn, name string) (*FlowInfo, error) {
+	q := `
+		SELECT f.name, s.steps AS steps, f.created_at
+		FROM cb_flows f
+		LEFT JOIN LATERAL (
+			SELECT s.flow_name,
+				json_agg(json_strip_nulls(json_build_object(
+					'name', s.name,
+					'task_name', s.task_name,
+					'depends_on', (
+						SELECT json_agg(s_d.dependency_name)
+						FROM cb_step_dependencies AS s_d
+						WHERE s_d.flow_name = s.flow_name
+						AND s_d.step_name = s.name
+					),
+					'map', s.map
+				)) ORDER BY s.idx) FILTER (WHERE s.idx IS NOT NULL) AS steps
+			FROM cb_steps s
+			WHERE s.flow_name = f.name
+			GROUP BY flow_name
+		) s ON s.flow_name = f.name
+		WHERE f.name = $1;`
+	return scanFlow(conn.QueryRow(ctx, q, name))
+}
+
 func ListFlows(ctx context.Context, conn Conn) ([]*FlowInfo, error) {
 	q := `
 		SELECT f.name, s.steps AS steps, f.created_at
