@@ -395,6 +395,10 @@ BEGIN
 
   FOR _step IN SELECT * FROM json_array_elements(steps)
   LOOP
+    IF _step->>'name' = cb_create_flow.name THEN
+      RAISE EXCEPTION 'cb: step name %s cannot be the same as flow name', _step->>'name';
+    END IF;
+
     INSERT INTO cb_steps (flow_name, name, task_name, idx, map, dependency_name_count)
     VALUES (
       cb_create_flow.name,
