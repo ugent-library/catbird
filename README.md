@@ -19,7 +19,11 @@ SQL code is mostly taken or adapted from the excellent [pgmq](https://github.com
 * type safe task/flow input/output
 * split tasks into standalone tasks and step tasks?
 * use split tables for task runs like queues?
-* put other step outputs in context and simplify step task inputs?
 * flow onfail task?
 * put logger in Context?
 * pause tasks - wait for for signal
+* only give the array member as input in map tasks instead of the whole array + index
+* flatten flow step input
+* enforce step name is not the same as flow name
+* map and depends_on should be mutually exclusive
+* only include direct dependency steps in step input
