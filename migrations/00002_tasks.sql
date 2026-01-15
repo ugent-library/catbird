@@ -399,6 +399,20 @@ BEGIN
       RAISE EXCEPTION 'cb: step name %s cannot be the same as flow name', _step->>'name';
     END IF;
 
+    IF _step->'map' IS NOT NULL AND _step->'depends_on' IS NULL THEN
+      _step = _step || json_build_object('depends_on', json_build_array(_step->>'map'));
+    ELSIF _step->'map' IS NOT NULL THEN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM json_array_elements_text(_step->'depends_on') AS depends_on
+        WHERE depends_on = _step->>'map'
+      ) THEN
+        _step = _step || json_build_object('depends_on', _step->'depends_on' || _step->>'map');
+      END IF; 
+    ELSIF _step->'depends_on' IS NULL THEN
+      _step = _step || json_build_object('depends_on', '[]'::json);
+    END IF;
+
     INSERT INTO cb_steps (flow_name, name, task_name, idx, map, dependency_name_count)
     VALUES (
       cb_create_flow.name,
@@ -406,13 +420,13 @@ BEGIN
       coalesce(_step->>'task_name', _step->>'name'),
       _idx,
       _step->>'map',
-      coalesce(json_array_length(_step->'depends_on'), 0)
+      json_array_length(_step->'depends_on')
     )
     ON CONFLICT DO NOTHING;
 
 		INSERT INTO cb_step_dependencies (flow_name, step_name, dependency_name)
 		SELECT cb_create_flow.name, _step->>'name', depends_on
-		FROM json_array_elements_text(coalesce(_step->'depends_on', '[]'::json)) AS depends_on
+		FROM json_array_elements_text(_step->'depends_on') AS depends_on
 		ON CONFLICT DO NOTHING;
 
     PERFORM cb_create_queue('t_' || coalesce(_step->>'task_name', _step->>'name'));
