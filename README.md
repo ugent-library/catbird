@@ -24,5 +24,4 @@ SQL code is mostly taken or adapted from the excellent [pgmq](https://github.com
 * pause tasks - wait for for signal
 * only give the array member as input in map tasks instead of the whole array + index
 * flatten flow step input
-* map and depends_on should be mutually exclusive
 * only include direct dependency steps in step input
