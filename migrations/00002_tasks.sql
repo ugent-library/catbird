@@ -18,8 +18,8 @@ CREATE TABLE IF NOT EXISTS cb_flow_runs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   flow_name text NOT NULL REFERENCES cb_flows (name),
   status text NOT NULL DEFAULT 'started',
-  input json NOT NULL,
-  output json,
+  input jsonb NOT NULL,
+  output jsonb,
   remaining_steps int NOT NULL DEFAULT 0,
   started_at timestamptz NOT NULL DEFAULT now(),
   completed_at timestamptz,
@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS cb_steps (
     PRIMARY KEY (flow_name, name),
     UNIQUE (flow_name, idx),
     FOREIGN KEY (flow_name, map) REFERENCES cb_steps (flow_name, name),
-    CONSTRAINT name_not_empty CHECK (name <> '' ),
+    CONSTRAINT name_valid CHECK (name <> '' AND name <> 'flow_input'),
     CONSTRAINT idx_valid CHECK (idx >= 0),
     CONSTRAINT map_is_different CHECK (map IS NULL OR map != name),
     CONSTRAINT dependency_name_count_valid CHECK (dependency_name_count >= 0)
@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS cb_task_runs (
   idx int,  -- not null if task is part of a flow
   message_id bigint NOT NULL,
   status text NOT NULL DEFAULT 'started',
-  output json,
+  output jsonb,
   error_message text,
   started_at timestamptz NOT NULL DEFAULT now(),
   completed_at timestamptz,
@@ -156,7 +156,7 @@ $$;
 -- +goose statementbegin
 CREATE OR REPLACE FUNCTION cb_run_task(
   name text,
-  input json,
+  input jsonb,
   deduplication_id text = NULL
 )
 RETURNS uuid
@@ -172,7 +172,7 @@ BEGIN
       cb_run_task.name,
       cb_send(
         queue => 't_' || cb_run_task.name,
-        payload => json_build_object(
+        payload => jsonb_build_object(
           'run_id', _id,
           'input', cb_run_task.input
         )
@@ -195,7 +195,7 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_complete_task(run_id uuid, output json)
+CREATE OR REPLACE FUNCTION cb_complete_task(run_id uuid, output jsonb)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -287,9 +287,9 @@ BEGIN
     SET status = 'completed',
         completed_at = now(),
         output = (
-          SELECT json_object_agg(o.step_name, o.output)
+          SELECT jsonb_object_agg(o.step_name, o.output)
           FROM (
-            SELECT s_r.step_name, (CASE WHEN s_r.map IS NOT NULL THEN json_agg(t_r.output ORDER BY t_r.idx) ELSE any_value(t_r.output) END) as output
+            SELECT s_r.step_name, (CASE WHEN s_r.map IS NOT NULL THEN jsonb_agg(t_r.output ORDER BY t_r.idx) ELSE any_value(t_r.output) END) as output
             FROM cb_task_runs t_r
             JOIN cb_step_runs s_r ON s_r.id = t_r.step_run_id
             WHERE s_r.flow_run_id = _flow_run_id
@@ -382,35 +382,31 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_create_flow(name text, steps json)
+CREATE OR REPLACE FUNCTION cb_create_flow(name text, steps jsonb)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
   _idx int = 0;
-  _step json;
+  _step jsonb;
 BEGIN
   INSERT INTO cb_flows (name)
   VALUES (cb_create_flow.name)
   ON CONFLICT DO NOTHING;
 
-  FOR _step IN SELECT * FROM json_array_elements(steps)
+  FOR _step IN SELECT * FROM jsonb_array_elements(steps)
   LOOP
-    IF _step->>'name' = cb_create_flow.name THEN
-      RAISE EXCEPTION 'cb: step name %s cannot be the same as flow name', _step->>'name';
-    END IF;
-
     IF _step->'map' IS NOT NULL AND _step->'depends_on' IS NULL THEN
-      _step = _step || json_build_object('depends_on', json_build_array(_step->>'map'));
+      _step = _step || jsonb_build_object('depends_on', jsonb_build_array(_step->>'map'));
     ELSIF _step->'map' IS NOT NULL THEN
       IF NOT EXISTS (
         SELECT 1
-        FROM json_array_elements_text(_step->'depends_on') AS depends_on
+        FROM jsonb_array_elements_text(_step->'depends_on') AS depends_on
         WHERE depends_on = _step->>'map'
       ) THEN
-        _step = _step || json_build_object('depends_on', _step->'depends_on' || _step->>'map');
+        _step = _step || jsonb_build_object('depends_on', _step->'depends_on' || _step->>'map');
       END IF; 
     ELSIF _step->'depends_on' IS NULL THEN
-      _step = _step || json_build_object('depends_on', '[]'::json);
+      _step = _step || jsonb_build_object('depends_on', '[]'::jsonb);
     END IF;
 
     INSERT INTO cb_steps (flow_name, name, task_name, idx, map, dependency_name_count)
@@ -420,13 +416,13 @@ BEGIN
       coalesce(_step->>'task_name', _step->>'name'),
       _idx,
       _step->>'map',
-      json_array_length(_step->'depends_on')
+      jsonb_array_length(_step->'depends_on')
     )
     ON CONFLICT DO NOTHING;
 
 		INSERT INTO cb_step_dependencies (flow_name, step_name, dependency_name)
 		SELECT cb_create_flow.name, _step->>'name', depends_on
-		FROM json_array_elements_text(_step->'depends_on') AS depends_on
+		FROM jsonb_array_elements_text(_step->'depends_on') AS depends_on
 		ON CONFLICT DO NOTHING;
 
     PERFORM cb_create_queue('t_' || coalesce(_step->>'task_name', _step->>'name'));
@@ -438,7 +434,7 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_run_flow(name text, input json)
+CREATE OR REPLACE FUNCTION cb_run_flow(name text, input jsonb)
 RETURNS uuid
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -502,9 +498,9 @@ BEGIN
     WHERE f_r.id = _cb_start_steps.flow_run_id
   ),
   step_run_outputs AS (
-    SELECT json_object_agg(o.step_name, o.output) as outputs
+    SELECT jsonb_object_agg(o.step_name, o.output) as outputs
     FROM (
-      SELECT s_r.step_name, (CASE WHEN s_r.map IS NOT NULL THEN json_agg(t_r.output ORDER BY t_r.idx) ELSE any_value(t_r.output) END) AS output
+      SELECT s_r.step_name, (CASE WHEN s_r.map IS NOT NULL THEN jsonb_agg(t_r.output ORDER BY t_r.idx) ELSE any_value(t_r.output) END) AS output
       FROM cb_task_runs t_r
       JOIN cb_step_runs s_r ON s_r.id = t_r.step_run_id
       WHERE s_r.flow_run_id = _cb_start_steps.flow_run_id
@@ -526,15 +522,15 @@ BEGIN
     SET status = 'started',
         started_at = now(),
         remaining_tasks = (
-          -- TODO use json_array_length?
+          -- TODO use jsonb_array_length?
           CASE WHEN ready_step_runs.map IS NOT NULL
           THEN
             (
               SELECT COUNT(*)
-              FROM json_array_elements(
+              FROM jsonb_array_elements(
                 coalesce(
                   (SELECT step_run_outputs.outputs->ready_step_runs.map),
-                  '[]'::json
+                  '[]'::jsonb
                 )
               ) AS elem
             )
@@ -554,23 +550,27 @@ BEGIN
          t.idx,
          cb_send(
            queue => 't_' || t.task_name,
-           payload => json_build_object(
-             'run_id', t.task_id,
-             'input', json_build_object(
-               'idx', t.idx,
-               'flow', flow_run.input,
-               'steps', coalesce(step_run_outputs.outputs, '{}'::json)
-             )
+           payload => jsonb_build_object(
+              'run_id', t.task_id,
+              'input', jsonb_build_object(
+                'flow_input', flow_run.input
+              ) || coalesce((step_run_outputs.outputs), '{}'::jsonb) || (
+                CASE
+                  WHEN t.map IS NOT NULL
+                  THEN jsonb_build_object(t.map, step_run_outputs.outputs->t.map->t.idx)
+                  ELSE '{}'::jsonb
+                END
+              )
            )
          )
   FROM flow_run, 
   	   step_run_outputs,
-  	   (SELECT id AS step_run_id, task_name, task_indexes.task_index AS idx, gen_random_uuid() AS task_id
+  	   (SELECT id AS step_run_id, task_name, map, task_indexes.task_index AS idx, gen_random_uuid() AS task_id
   	    FROM ready_step_runs, step_run_outputs
   	    CROSS JOIN LATERAL generate_series(
           0,
           (CASE
-           WHEN ready_step_runs.map IS NOT NULL THEN json_array_length(step_run_outputs.outputs->ready_step_runs.map) - 1
+           WHEN ready_step_runs.map IS NOT NULL THEN jsonb_array_length(step_run_outputs.outputs->ready_step_runs.map) - 1
            ELSE 0
            END)
          ) AS task_indexes(task_index)
