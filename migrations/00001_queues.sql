@@ -11,7 +11,7 @@ BEGIN
             id bigint,
             deduplication_id text,
             topic text,
-            payload json,
+            payload jsonb,
             deliveries int,
             created_at timestamptz,
             deliver_at timestamptz
@@ -77,7 +77,7 @@ BEGIN
                 id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
                 deduplication_id text,
                 topic text,
-                payload json NOT NULL,
+                payload jsonb NOT NULL,
                 deliveries int NOT NULL DEFAULT 0,
                 created_at timestamptz NOT NULL DEFAULT now(),
                 deliver_at timestamptz NOT NULL DEFAULT now()
@@ -92,7 +92,7 @@ BEGIN
                 id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
                 deduplication_id text,
                 topic text,
-                payload json NOT NULL,
+                payload jsonb NOT NULL,
                 deliveries int NOT NULL DEFAULT 0,
                 created_at timestamptz NOT NULL DEFAULT now(),
                 deliver_at timestamptz NOT NULL DEFAULT now()
@@ -143,7 +143,7 @@ $$;
 -- +goose statementbegin
 CREATE OR REPLACE FUNCTION cb_dispatch(
     topic text,
-    payload json,
+    payload jsonb,
     deduplication_id text = null,
     deliver_at timestamptz = null
 )
@@ -180,7 +180,7 @@ $$;
 -- +goose statementbegin
 CREATE OR REPLACE FUNCTION cb_send(
     queue text,
-    payload json,
+    payload jsonb,
     topic text = null,
     deduplication_id text = null,
     deliver_at timestamptz = null

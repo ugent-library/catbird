@@ -85,6 +85,10 @@ type TaskRunInfo struct {
 	FailedAt     time.Time       `json:"failed_at,omitzero"`
 }
 
+func (info *TaskRunInfo) OutputAs(o any) error {
+	return json.Unmarshal(info.Output, o)
+}
+
 type FlowInfo struct {
 	Name      string    `json:"name"`
 	Steps     []Step    `json:"steps"`
@@ -99,6 +103,10 @@ type FlowRunInfo struct {
 	StartedAt   time.Time       `json:"started_at,omitzero"`
 	CompletedAt time.Time       `json:"completed_at,omitzero"`
 	FailedAt    time.Time       `json:"failed_at,omitzero"`
+}
+
+func (info *FlowRunInfo) OutputAs(o any) error {
+	return json.Unmarshal(info.Output, o)
 }
 
 type WorkerInfo struct {
@@ -403,11 +411,11 @@ func GetFlow(ctx context.Context, conn Conn, name string) (*FlowInfo, error) {
 		FROM cb_flows f
 		LEFT JOIN LATERAL (
 			SELECT s.flow_name,
-				json_agg(json_strip_nulls(json_build_object(
+				jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
 					'name', s.name,
 					'task_name', s.task_name,
 					'depends_on', (
-						SELECT json_agg(s_d.dependency_name)
+						SELECT jsonb_agg(s_d.dependency_name)
 						FROM cb_step_dependencies AS s_d
 						WHERE s_d.flow_name = s.flow_name
 						AND s_d.step_name = s.name
@@ -428,11 +436,11 @@ func ListFlows(ctx context.Context, conn Conn) ([]*FlowInfo, error) {
 		FROM cb_flows f
 		LEFT JOIN LATERAL (
 			SELECT s.flow_name,
-				json_agg(json_strip_nulls(json_build_object(
+				jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
 					'name', s.name,
 					'task_name', s.task_name,
 					'depends_on', (
-						SELECT json_agg(s_d.dependency_name)
+						SELECT jsonb_agg(s_d.dependency_name)
 						FROM cb_step_dependencies AS s_d
 						WHERE s_d.flow_name = s.flow_name
 						AND s_d.step_name = s.name
