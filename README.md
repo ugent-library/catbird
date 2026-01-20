@@ -23,4 +23,3 @@ SQL code is mostly taken or adapted from the excellent [pgmq](https://github.com
 * put logger in Context?
 * pause tasks - wait for for signal
 * empty map step array folding
-* only include direct dependency steps in step input
