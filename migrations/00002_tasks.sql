@@ -497,18 +497,7 @@ BEGIN
     FROM cb_flow_runs f_r
     WHERE f_r.id = _cb_start_steps.flow_run_id
   ),
-  step_run_outputs AS (
-    SELECT jsonb_object_agg(o.step_name, o.output) as outputs
-    FROM (
-      SELECT s_r.step_name, (CASE WHEN s_r.map IS NOT NULL THEN jsonb_agg(t_r.output ORDER BY t_r.idx) ELSE any_value(t_r.output) END) AS output
-      FROM cb_task_runs t_r
-      JOIN cb_step_runs s_r ON s_r.id = t_r.step_run_id
-      WHERE s_r.flow_run_id = _cb_start_steps.flow_run_id
-        AND s_r.status = 'completed'
-      GROUP BY s_r.step_name, s_r.map
-    ) o
-  ),
-  ready_step_runs AS (
+  step_runs AS (
     SELECT *
     FROM cb_step_runs AS s_r
     WHERE s_r.flow_run_id = _cb_start_steps.flow_run_id
@@ -517,64 +506,71 @@ BEGIN
     ORDER BY s_r.step_name
     FOR UPDATE
   ),
-  start_step_runs AS (
-    UPDATE cb_step_runs
-    SET status = 'started',
-        started_at = now(),
-        remaining_tasks = (
-          -- TODO use jsonb_array_length?
-          CASE WHEN ready_step_runs.map IS NOT NULL
-          THEN
-            (
-              SELECT COUNT(*)
-              FROM jsonb_array_elements(
-                coalesce(
-                  (SELECT step_run_outputs.outputs->ready_step_runs.map),
-                  '[]'::jsonb
-                )
-              ) AS elem
+  inputs AS (
+    SELECT
+      step_runs.id AS step_run_id,
+      step_runs.step_name,
+      step_runs.task_name,
+      step_runs.map,
+      jsonb_build_object(
+        'flow_input', flow_run.input
+      ) || coalesce((
+        SELECT jsonb_object_agg(o.step_name, o.output)
+        FROM (
+          SELECT s_r.step_name, (CASE WHEN s_r.map IS NOT NULL THEN jsonb_agg(t_r.output ORDER BY t_r.idx) ELSE any_value(t_r.output) END) AS output
+          FROM cb_task_runs t_r
+          JOIN cb_step_runs s_r ON s_r.id = t_r.step_run_id
+          WHERE s_r.flow_run_id = flow_run.id
+            AND EXISTS (
+              SELECT 1
+              FROM cb_step_dependencies s_d
+              WHERE s_d.flow_name = s_r.flow_name
+                AND s_d.step_name = step_runs.step_name
+                AND s_d.dependency_name = s_r.step_name
             )
-          ELSE
-            1
-          END
-        )
-    FROM ready_step_runs, flow_run, step_run_outputs
-    WHERE cb_step_runs.flow_run_id = _cb_start_steps.flow_run_id
-    AND cb_step_runs.step_name = ready_step_runs.step_name
-  )
-
-  INSERT INTO cb_task_runs (id, step_run_id, task_name, idx, message_id)
-  SELECT t.task_id,
-         t.step_run_id,
-         t.task_name,
-         t.idx,
-         cb_send(
-           queue => 't_' || t.task_name,
-           payload => jsonb_build_object(
-              'run_id', t.task_id,
-              'input', jsonb_build_object(
-                'flow_input', flow_run.input
-              ) || coalesce((step_run_outputs.outputs), '{}'::jsonb) || (
-                CASE
+          GROUP BY s_r.step_name, s_r.map
+        ) o
+      ), '{}'::jsonb) AS input
+    FROM step_runs, flow_run
+  ),
+  task_runs AS (
+      INSERT INTO cb_task_runs (id, step_run_id, task_name, idx, message_id)
+      SELECT t.id,
+             t.step_run_id,
+             t.task_name,
+             t.idx,
+             cb_send(
+              queue   => 't_' || t.task_name,
+              payload => jsonb_build_object(
+                'run_id', t.id,
+                'input', (CASE
                   WHEN t.map IS NOT NULL
-                  THEN jsonb_build_object(t.map, step_run_outputs.outputs->t.map->t.idx)
-                  ELSE '{}'::jsonb
-                END
+                  THEN t.input || jsonb_build_object(t.map, t.input->t.map->t.idx)
+                  ELSE t.input
+                  END)
               )
-           )
-         )
-  FROM flow_run, 
-  	   step_run_outputs,
-  	   (SELECT id AS step_run_id, task_name, map, task_indexes.task_index AS idx, gen_random_uuid() AS task_id
-  	    FROM ready_step_runs, step_run_outputs
+             )
+  	   FROM (SELECT inputs.*, gen_random_uuid() AS id, task_indexes.task_index AS idx
+  	    FROM inputs
   	    CROSS JOIN LATERAL generate_series(
           0,
           (CASE
-           WHEN ready_step_runs.map IS NOT NULL THEN jsonb_array_length(step_run_outputs.outputs->ready_step_runs.map) - 1
+           WHEN inputs.map IS NOT NULL THEN jsonb_array_length(inputs.input->inputs.map) - 1
            ELSE 0
            END)
          ) AS task_indexes(task_index)
-  	   ) t;
+  	   ) t
+       RETURNING step_run_id
+  )
+  
+  UPDATE cb_step_runs
+  SET status = 'started',
+      started_at = now(),
+      remaining_tasks = t_r.task_count
+  FROM (SELECT step_run_id, COUNT(step_run_id) AS task_count
+        FROM task_runs
+        GROUP BY step_run_id) t_r
+  WHERE id = t_r.step_run_id;
 END;
 $$;
 -- +goose statementend
