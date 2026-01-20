@@ -15,7 +15,7 @@ import (
 )
 
 func TestFlows(t *testing.T) {
-	dsn := os.Getenv("TEST_CB_CONN")
+	dsn := os.Getenv("CB_TEST_CONN")
 
 	func() {
 		db, err := sql.Open("pgx", dsn)
@@ -149,8 +149,10 @@ func TestFlows(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
 	worker, err := client.NewWorker(WorkerOpts{
-		Log:   slog.Default(),
+		Log:   logger,
 		Tasks: []*Task{task1, step1, step2, flow2step1, flow2step2, flow2step3},
 	})
 	if err != nil {
