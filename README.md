@@ -16,7 +16,7 @@ SQL code is mostly taken or adapted from the excellent [pgmq](https://github.com
 * add queue created_at field
 * fair queueing? https://docs.hatchet.run/blog/multi-tenant-queues
 * finish dashboard
-* schemas for task/flow input/output 
+* schemas for task/flow input/output
 * split tasks into standalone tasks and step tasks?
 * use split tables for task runs like queues?
 * flow onfail task?
