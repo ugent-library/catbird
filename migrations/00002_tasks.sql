@@ -275,6 +275,9 @@ BEGIN
       WHERE s_r.flow_run_id = step_run.flow_run_id
       AND s_r.step_name = dependent_step_runs.dependent_step_name
     )
+
+    -- TODO recursively complete dependent map steps that have empty inputs
+
     -- decrement flow_run remaining_steps
     UPDATE cb_flow_runs f_r
     SET remaining_steps = remaining_steps - 1
