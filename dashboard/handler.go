@@ -17,15 +17,15 @@ import (
 var templatesFS embed.FS
 
 type App struct {
-	client   *catbird.Client
-	logger   *slog.Logger
-	index    *template.Template
-	queues   *template.Template
-	tasks    *template.Template
-	taskRuns *template.Template
-	flows    *template.Template
-	flow     *template.Template
-	workers  *template.Template
+	client  *catbird.Client
+	logger  *slog.Logger
+	index   *template.Template
+	queues  *template.Template
+	tasks   *template.Template
+	task    *template.Template
+	flows   *template.Template
+	flow    *template.Template
+	workers *template.Template
 }
 
 type Config struct {
@@ -63,15 +63,15 @@ func New(config Config) *App {
 	}
 
 	return &App{
-		client:   config.Client,
-		logger:   config.Log,
-		index:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "index.html")),
-		queues:   template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "queues.html")),
-		tasks:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "tasks.html")),
-		taskRuns: template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "task_runs.html")),
-		flows:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flows.html")),
-		flow:     template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flow.html")),
-		workers:  template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "workers.html")),
+		client:  config.Client,
+		logger:  config.Log,
+		index:   template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "index.html")),
+		queues:  template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "queues.html")),
+		tasks:   template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "tasks.html")),
+		task:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "task.html")),
+		flows:   template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flows.html")),
+		flow:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flow.html")),
+		workers: template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "workers.html")),
 	}
 }
 
@@ -81,7 +81,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /", a.handleIndex)
 	mux.HandleFunc("GET /queues", a.handleQueues)
 	mux.HandleFunc("GET /tasks", a.handleTasks)
-	mux.HandleFunc("GET /task/{task_name}/runs", a.handleTaskRuns)
+	mux.HandleFunc("GET /task/{task_name}", a.handleTask)
 	mux.HandleFunc("GET /flows", a.handleFlows)
 	mux.HandleFunc("GET /flow/{flow_name}", a.handleFlow)
 	mux.HandleFunc("GET /workers", a.handleWorkers)
@@ -104,6 +104,7 @@ func (a *App) render(w http.ResponseWriter, r *http.Request, t *template.Templat
 }
 
 func (a *App) handeError(w http.ResponseWriter, r *http.Request, err error) {
+	a.logger.Error("handler error", "error", err)
 	http.Error(w, err.Error(), http.StatusInternalServerError)
 }
 
@@ -119,7 +120,7 @@ func (a *App) handleQueues(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.render(w, r, a.queues, struct {
-		Queues []catbird.QueueInfo
+		Queues []*catbird.QueueInfo
 	}{
 		Queues: queues,
 	})
@@ -133,14 +134,20 @@ func (a *App) handleTasks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.render(w, r, a.tasks, struct {
-		Tasks []catbird.TaskInfo
+		Tasks []*catbird.TaskInfo
 	}{
 		Tasks: tasks,
 	})
 }
 
-func (a *App) handleTaskRuns(w http.ResponseWriter, r *http.Request) {
+func (a *App) handleTask(w http.ResponseWriter, r *http.Request) {
 	taskName := r.PathValue("task_name")
+
+	task, err := a.client.GetTask(r.Context(), taskName)
+	if err != nil {
+		a.handeError(w, r, err)
+		return
+	}
 
 	taskRuns, err := a.client.ListTaskRuns(r.Context(), taskName)
 	if err != nil {
@@ -148,11 +155,11 @@ func (a *App) handleTaskRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.render(w, r, a.taskRuns, struct {
-		TaskName string
+	a.render(w, r, a.task, struct {
+		Task     *catbird.TaskInfo
 		TaskRuns []*catbird.TaskRunInfo
 	}{
-		TaskName: taskName,
+		Task:     task,
 		TaskRuns: taskRuns,
 	})
 }
@@ -203,7 +210,7 @@ func (a *App) handleWorkers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.render(w, r, a.workers, struct {
-		Workers []catbird.WorkerInfo
+		Workers []*catbird.WorkerInfo
 	}{
 		Workers: workers,
 	})

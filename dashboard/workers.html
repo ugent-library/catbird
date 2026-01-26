@@ -7,7 +7,7 @@
   <tbody>
     <tr>
       <th scope="col">ID</th>
-      <th scope="col">Tasks</th>
+      <th scope="col">Handlers</th>
       <th scope="col">Started at</th>
       <th scope="col">Last heartbeat at</th>
     </tr>
@@ -15,8 +15,11 @@
     <tr>
       <th>{{ .ID }}</th>
       <td>
-        {{ range .Tasks}}
-        <span class="badge bg-secondary">{{ . }}</span>
+        {{ range .TaskHandlers}}
+        <span class="badge bg-secondary">{{ .TaskName }}</span>
+        {{ end }}
+        {{ range .StepHandlers}}
+        <span class="badge bg-secondary">{{ .FlowName }}/{{ .StepName }}</span>
         {{ end }}
       </td>
       <td>{{ formatTime .StartedAt }}</td>

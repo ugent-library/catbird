@@ -11,7 +11,7 @@
     </tr>
     {{ range .Tasks }}
     <tr>
-      <th><a href="{{ route `task` .Name `runs` }}">{{ .Name }}</a></th>
+      <th><a href="{{ route `task` .Name }}">{{ .Name }}</a></th>
       <td>{{ formatTime .CreatedAt }}</td>
     </tr>
     {{ end }}

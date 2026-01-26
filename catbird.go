@@ -3,6 +3,7 @@ package catbird
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -27,6 +28,77 @@ type Conn interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
+type FlowOpt interface {
+	applyToFlow(*Flow)
+}
+
+type WorkerOpt interface {
+	applyToWorker(*Worker)
+}
+
+type stepOpt struct {
+	step *Step
+}
+
+func WithStep(name string) *stepOpt {
+	return &stepOpt{step: &Step{Name: name}}
+}
+
+func (o *stepOpt) DependsOn(steps ...string) *stepOpt {
+	o.step.DependsOn = append(o.step.DependsOn, steps...)
+	return o
+}
+
+func (o *stepOpt) applyToFlow(f *Flow) {
+	f.Steps = append(f.Steps, o.step)
+}
+
+type loggerOpt struct {
+	logger *slog.Logger
+}
+
+func (o loggerOpt) applyToWorker(w *Worker) {
+	w.logger = o.logger
+}
+
+func WithLogger(logger *slog.Logger) *loggerOpt {
+	return &loggerOpt{logger: logger}
+}
+
+type timeoutOpt struct {
+	timeout time.Duration
+}
+
+func (o timeoutOpt) applyToWorker(w *Worker) {
+	w.timeout = o.timeout
+}
+
+func WithTimeout(timeout time.Duration) *timeoutOpt {
+	return &timeoutOpt{timeout: timeout}
+}
+
+type gcOpt struct {
+	schedule string
+}
+
+func (o *gcOpt) Schedule(schedule string) *gcOpt {
+	o.schedule = schedule
+	return o
+}
+
+func (o gcOpt) applyToWorker(w *Worker) {
+	w.handlers = append(w.handlers, TaskHandler("gc", func(ctx context.Context, input struct{}) (struct{}, error) {
+		return struct{}{}, GC(ctx, w.conn)
+	}, TaskHandlerOpts{
+		Schedule: o.schedule,
+		HideFor:  10 * time.Second,
+	}))
+}
+
+func WithGC() *gcOpt {
+	return &gcOpt{schedule: "@every 10m"}
+}
+
 type Message struct {
 	ID              int64           `json:"id"`
 	DeduplicationID string          `json:"deduplication_id,omitempty"`
@@ -37,37 +109,32 @@ type Message struct {
 	DeliverAt       time.Time       `json:"deliver_at"`
 }
 
-type Task struct {
-	name        string
-	queue       string
-	batchSize   int
-	hideFor     time.Duration
-	concurrency int
-	retries     int
-	delay       time.Duration
-	jitter      time.Duration
-	timeout     time.Duration
-	schedule    string
-	fn          func(context.Context, []byte) ([]byte, error)
-}
-
 type Flow struct {
-	Name  string `json:"name"`
-	Steps []Step `json:"steps"`
+	Name  string  `json:"name"`
+	Steps []*Step `json:"steps"`
 }
 
 type Step struct {
 	Name      string   `json:"name"`
-	TaskName  string   `json:"task_name,omitempty"`
 	DependsOn []string `json:"depends_on,omitempty"`
-	Map       string   `json:"map,omitempty"`
+}
+
+func NewFlow(name string, opts ...FlowOpt) *Flow {
+	f := &Flow{
+		Name: name,
+	}
+	for _, opt := range opts {
+		opt.applyToFlow(f)
+	}
+	return f
 }
 
 type QueueInfo struct {
-	Name     string    `json:"name"`
-	Topics   []string  `json:"topics,omitempty"`
-	Unlogged bool      `json:"unlogged"`
-	DeleteAt time.Time `json:"delete_at,omitzero"`
+	Name      string    `json:"name"`
+	Topics    []string  `json:"topics,omitempty"`
+	Unlogged  bool      `json:"unlogged"`
+	CreatedAt time.Time `json:"created_at"`
+	DeleteAt  time.Time `json:"delete_at,omitzero"`
 }
 
 type TaskInfo struct {
@@ -76,13 +143,14 @@ type TaskInfo struct {
 }
 
 type TaskRunInfo struct {
-	ID           string          `json:"id"`
-	Status       string          `json:"status"`
-	Output       json.RawMessage `json:"output,omitempty"`
-	ErrorMessage string          `json:"error_message,omitempty"`
-	StartedAt    time.Time       `json:"started_at,omitzero"`
-	CompletedAt  time.Time       `json:"completed_at,omitzero"`
-	FailedAt     time.Time       `json:"failed_at,omitzero"`
+	ID              string          `json:"id"`
+	DeduplicationID string          `json:"deduplication_id,omitempty"`
+	Status          string          `json:"status"`
+	Output          json.RawMessage `json:"output,omitempty"`
+	ErrorMessage    string          `json:"error_message,omitempty"`
+	StartedAt       time.Time       `json:"started_at,omitzero"`
+	CompletedAt     time.Time       `json:"completed_at,omitzero"`
+	FailedAt        time.Time       `json:"failed_at,omitzero"`
 }
 
 func (info *TaskRunInfo) OutputAs(o any) error {
@@ -96,13 +164,14 @@ type FlowInfo struct {
 }
 
 type FlowRunInfo struct {
-	ID          string          `json:"id"`
-	Status      string          `json:"status"`
-	Input       json.RawMessage `json:"input,omitempty"`
-	Output      json.RawMessage `json:"output,omitempty"`
-	StartedAt   time.Time       `json:"started_at,omitzero"`
-	CompletedAt time.Time       `json:"completed_at,omitzero"`
-	FailedAt    time.Time       `json:"failed_at,omitzero"`
+	ID              string          `json:"id"`
+	DeduplicationID string          `json:"deduplication_id,omitempty"`
+	Status          string          `json:"status"`
+	Input           json.RawMessage `json:"input,omitempty"`
+	Output          json.RawMessage `json:"output,omitempty"`
+	StartedAt       time.Time       `json:"started_at,omitzero"`
+	CompletedAt     time.Time       `json:"completed_at,omitzero"`
+	FailedAt        time.Time       `json:"failed_at,omitzero"`
 }
 
 func (info *FlowRunInfo) OutputAs(o any) error {
@@ -110,10 +179,20 @@ func (info *FlowRunInfo) OutputAs(o any) error {
 }
 
 type WorkerInfo struct {
-	ID              string    `json:"id"`
-	Tasks           []string  `json:"tasks"`
-	StartedAt       time.Time `json:"started_at"`
-	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
+	ID              string             `json:"id"`
+	TaskHandlers    []*TaskhandlerInfo `json:"task_handlers"`
+	StepHandlers    []*StephandlerInfo `json:"step_handlers"`
+	StartedAt       time.Time          `json:"started_at"`
+	LastHeartbeatAt time.Time          `json:"last_heartbeat_at"`
+}
+
+type TaskhandlerInfo struct {
+	TaskName string `json:"task_name"`
+}
+
+type StephandlerInfo struct {
+	FlowName string `json:"flow_name"`
+	StepName string `json:"step_name"`
 }
 
 type QueueOpts struct {
@@ -134,6 +213,11 @@ func CreateQueue(ctx context.Context, conn Conn, name string, opts QueueOpts) er
 	}
 }
 
+func GetQueue(ctx context.Context, conn Conn, name string) (*QueueInfo, error) {
+	q := `SELECT name, topics, unlogged, created_at, delete_at FROM cb_queues WHERE name = $1;`
+	return scanQueue(conn.QueryRow(ctx, q, name))
+}
+
 func DeleteQueue(ctx context.Context, conn Conn, name string) (bool, error) {
 	q := `SELECT * FROM cb_delete_queue(name => $1);`
 	existed := false
@@ -141,34 +225,13 @@ func DeleteQueue(ctx context.Context, conn Conn, name string) (bool, error) {
 	return existed, err
 }
 
-func ListQueues(ctx context.Context, conn Conn) ([]QueueInfo, error) {
-	q := `SELECT name, topics, unlogged, delete_at FROM cb_queues;`
+func ListQueues(ctx context.Context, conn Conn) ([]*QueueInfo, error) {
+	q := `SELECT name, topics, unlogged, created_at, delete_at FROM cb_queues;`
 	rows, err := conn.Query(ctx, q)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, scanCollectibleQueue)
-}
-
-type DispatchOpts struct {
-	DeduplicationID string
-	DeliverAt       time.Time
-}
-
-func Dispatch(ctx context.Context, conn Conn, topic string, payload any, opts DispatchOpts) error {
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	if opts.DeliverAt.IsZero() {
-		q := `SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''));`
-		_, err := conn.Exec(ctx, q, topic, b, opts.DeduplicationID)
-		return err
-	} else {
-		q := `SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''), deliver_at => $4);`
-		_, err := conn.Exec(ctx, q, topic, b, opts.DeduplicationID, opts.DeliverAt)
-		return err
-	}
 }
 
 type SendOpts struct {
@@ -189,6 +252,27 @@ func Send(ctx context.Context, conn Conn, queue string, payload any, opts SendOp
 	} else {
 		q := `SELECT cb_send(queue => $1, payload => $2, deduplication_id => nullif($3, ''), deliver_at => $4);`
 		_, err := conn.Exec(ctx, q, queue, b, opts.DeduplicationID, opts.DeliverAt)
+		return err
+	}
+}
+
+type DispatchOpts struct {
+	DeduplicationID string
+	DeliverAt       time.Time
+}
+
+func Dispatch(ctx context.Context, conn Conn, topic string, payload any, opts DispatchOpts) error {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if opts.DeliverAt.IsZero() {
+		q := `SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''));`
+		_, err := conn.Exec(ctx, q, topic, b, opts.DeduplicationID)
+		return err
+	} else {
+		q := `SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''), deliver_at => $4);`
+		_, err := conn.Exec(ctx, q, topic, b, opts.DeduplicationID, opts.DeliverAt)
 		return err
 	}
 }
@@ -262,68 +346,27 @@ func DeleteMany(ctx context.Context, conn Conn, queue string, ids []int64) error
 	return err
 }
 
-type TaskOpts struct {
-	BatchSize   int
-	HideFor     time.Duration
-	Concurrency int
-	Retries     int
-	Delay       time.Duration
-	Jitter      time.Duration
-	Timeout     time.Duration
-	Schedule    string
-}
-
-func NewTask[Input, Output any](name string, fn func(context.Context, Input) (Output, error), opts TaskOpts) *Task {
-	if opts.BatchSize == 0 {
-		opts.BatchSize = 10
-	}
-	if opts.Concurrency == 0 {
-		opts.Concurrency = 1
-	}
-
-	return &Task{
-		name:        name,
-		queue:       "t_" + name,
-		batchSize:   opts.BatchSize,
-		hideFor:     opts.HideFor,
-		concurrency: opts.Concurrency,
-		retries:     opts.Retries,
-		delay:       opts.Delay,
-		jitter:      opts.Jitter,
-		timeout:     opts.Timeout,
-		schedule:    opts.Schedule,
-		fn: func(ctx context.Context, b []byte) ([]byte, error) {
-			var in Input
-			if err := json.Unmarshal(b, &in); err != nil {
-				return nil, err
-			}
-
-			out, err := fn(ctx, in)
-			if err != nil {
-				return nil, err
-			}
-
-			return json.Marshal(out)
-		},
-	}
-}
-
-func CreateTask(ctx context.Context, conn Conn, task *Task) error {
+func CreateTask(ctx context.Context, conn Conn, name string) error {
 	q := `SELECT * FROM cb_create_task(name => $1);`
-	_, err := conn.Exec(ctx, q, task.name)
+	_, err := conn.Exec(ctx, q, name)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func ListTasks(ctx context.Context, conn Conn) ([]TaskInfo, error) {
+func GetTask(ctx context.Context, conn Conn, name string) (*TaskInfo, error) {
+	q := `SELECT name, created_at FROM cb_tasks WHERE name = $1;`
+	return scanTask(conn.QueryRow(ctx, q, name))
+}
+
+func ListTasks(ctx context.Context, conn Conn) ([]*TaskInfo, error) {
 	q := `SELECT name, created_at FROM cb_tasks;`
 	rows, err := conn.Query(ctx, q)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowToStructByPos[TaskInfo])
+	return pgx.CollectRows(rows, scanCollectibleTask)
 }
 
 type RunTaskOpts struct {
@@ -372,7 +415,7 @@ func RunTaskWait(ctx context.Context, conn Conn, name string, input any, opts Ru
 
 func GetTaskRun(ctx context.Context, conn Conn, id string) (*TaskRunInfo, error) {
 	q := `
-		SELECT id, status, output, error_message, started_at, completed_at, failed_at
+		SELECT id, deduplication_id, status, output, error_message, started_at, completed_at, failed_at
 		FROM cb_task_runs
 		WHERE id = $1;`
 	return scanTaskRun(conn.QueryRow(ctx, q, id))
@@ -380,7 +423,7 @@ func GetTaskRun(ctx context.Context, conn Conn, id string) (*TaskRunInfo, error)
 
 func ListTaskRuns(ctx context.Context, conn Conn, taskName string) ([]*TaskRunInfo, error) {
 	q := `
-		SELECT id, status, output, error_message, started_at, completed_at, failed_at
+		SELECT id, deduplication_id, status, output, error_message, started_at, completed_at, failed_at
 		FROM cb_task_runs
 		WHERE task_name = $1
 		ORDER BY started_at DESC
@@ -413,14 +456,12 @@ func GetFlow(ctx context.Context, conn Conn, name string) (*FlowInfo, error) {
 			SELECT s.flow_name,
 				jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
 					'name', s.name,
-					'task_name', s.task_name,
 					'depends_on', (
 						SELECT jsonb_agg(s_d.dependency_name)
 						FROM cb_step_dependencies AS s_d
 						WHERE s_d.flow_name = s.flow_name
 						AND s_d.step_name = s.name
-					),
-					'map', s.map
+					)
 				)) ORDER BY s.idx) FILTER (WHERE s.idx IS NOT NULL) AS steps
 			FROM cb_steps s
 			WHERE s.flow_name = f.name
@@ -438,14 +479,12 @@ func ListFlows(ctx context.Context, conn Conn) ([]*FlowInfo, error) {
 			SELECT s.flow_name,
 				jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
 					'name', s.name,
-					'task_name', s.task_name,
 					'depends_on', (
 						SELECT jsonb_agg(s_d.dependency_name)
 						FROM cb_step_dependencies AS s_d
 						WHERE s_d.flow_name = s.flow_name
 						AND s_d.step_name = s.name
-					),
-					'map', s.map
+					)
 				)) ORDER BY s.idx) FILTER (WHERE s.idx IS NOT NULL) AS steps
 			FROM cb_steps s
 			WHERE s.flow_name = f.name
@@ -458,22 +497,26 @@ func ListFlows(ctx context.Context, conn Conn) ([]*FlowInfo, error) {
 	return pgx.CollectRows(rows, scanCollectibleFlow)
 }
 
-func RunFlow(ctx context.Context, conn Conn, name string, input any) (string, error) {
+type RunFlowOpts struct {
+	DeduplicationID string
+}
+
+func RunFlow(ctx context.Context, conn Conn, name string, input any, opts RunFlowOpts) (string, error) {
 	b, err := json.Marshal(input)
 	if err != nil {
 		return "", err
 	}
-	q := `SELECT * FROM cb_run_flow(name => $1, input => $2);`
+	q := `SELECT * FROM cb_run_flow(name => $1, input => $2, deduplication_id => nullif($3, ''));`
 	var runID string
-	err = conn.QueryRow(ctx, q, name, b).Scan(&runID)
+	err = conn.QueryRow(ctx, q, name, b, opts.DeduplicationID).Scan(&runID)
 	if err != nil {
 		return "", err
 	}
 	return runID, err
 }
 
-func RunFlowWait(ctx context.Context, conn Conn, name string, input any) (*FlowRunInfo, error) {
-	id, err := RunFlow(ctx, conn, name, input)
+func RunFlowWait(ctx context.Context, conn Conn, name string, input any, opts RunFlowOpts) (*FlowRunInfo, error) {
+	id, err := RunFlow(ctx, conn, name, input, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -500,7 +543,7 @@ func RunFlowWait(ctx context.Context, conn Conn, name string, input any) (*FlowR
 
 func GetFlowRun(ctx context.Context, conn Conn, id string) (*FlowRunInfo, error) {
 	q := `
-		SELECT id, status, input, output, started_at, completed_at, failed_at
+		SELECT id, deduplication_id, status, input, output, started_at, completed_at, failed_at
 		FROM cb_flow_runs
 		WHERE id = $1;`
 	return scanFlowRun(conn.QueryRow(ctx, q, id))
@@ -508,7 +551,7 @@ func GetFlowRun(ctx context.Context, conn Conn, id string) (*FlowRunInfo, error)
 
 func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunInfo, error) {
 	q := `
-		SELECT id, status, input, output, started_at, completed_at, failed_at
+		SELECT id, deduplication_id, status, input, output, started_at, completed_at, failed_at
 		FROM cb_flow_runs
 		WHERE flow_name = $1
 		ORDER BY started_at DESC
@@ -520,12 +563,24 @@ func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunIn
 	return pgx.CollectRows(rows, scanCollectibleFlowRun)
 }
 
-func ListWorkers(ctx context.Context, conn Conn) ([]WorkerInfo, error) {
+func ListWorkers(ctx context.Context, conn Conn) ([]*WorkerInfo, error) {
 	q := `
-		SELECT w.id, array_agg(w_t.task_name) AS tasks, w.started_at, w.last_heartbeat_at
+		SELECT w.id, w.started_at, w.last_heartbeat_at, t.task_handlers AS task_handlers, s.step_handlers AS step_handlers
 		FROM cb_workers w
-		JOIN cb_worker_tasks w_t ON w_t.worker_id = w.id
-		GROUP BY w.id
+		LEFT JOIN LATERAL (
+			SELECT t.worker_id,
+   			       json_agg(json_build_object('task_name', t.task_name) ORDER BY t.task_name) FILTER (WHERE t.worker_id IS NOT NULL) AS task_handlers
+			FROM cb_task_handlers t
+			WHERE t.worker_id = w.id
+			GROUP BY worker_id
+		) t ON t.worker_id = w.id
+		LEFT JOIN LATERAL (
+			SELECT s.worker_id,
+   			       json_agg(json_build_object('flow_name', s.flow_name, 'step_name', s.step_name) ORDER BY s.flow_name, s.step_name) FILTER (WHERE s.worker_id IS NOT NULL) AS step_handlers
+			FROM cb_step_handlers s
+			WHERE s.worker_id = w.id
+			GROUP BY worker_id
+		) s ON s.worker_id = w.id
 		ORDER BY w.started_at DESC;`
 
 	rows, err := conn.Query(ctx, q)
@@ -540,15 +595,6 @@ func GC(ctx context.Context, conn Conn) error {
 	q := `SELECT cb_gc();`
 	_, err := conn.Exec(ctx, q)
 	return err
-}
-
-func GCTask(conn Conn) *Task {
-	return NewTask("gc", func(ctx context.Context, input struct{}) (struct{}, error) {
-		return struct{}{}, GC(ctx, conn)
-	}, TaskOpts{
-		HideFor:  10 * time.Second,
-		Schedule: "@every 10m",
-	})
 }
 
 func EnqueueDispatch(batch *pgx.Batch, topic string, payload any, opts DispatchOpts) error {
@@ -623,11 +669,11 @@ func scanMessage(row pgx.Row) (Message, error) {
 	return rec, nil
 }
 
-func scanCollectibleQueue(row pgx.CollectableRow) (QueueInfo, error) {
+func scanCollectibleQueue(row pgx.CollectableRow) (*QueueInfo, error) {
 	return scanQueue(row)
 }
 
-func scanQueue(row pgx.Row) (QueueInfo, error) {
+func scanQueue(row pgx.Row) (*QueueInfo, error) {
 	rec := QueueInfo{}
 
 	var deleteAt *time.Time
@@ -636,16 +682,34 @@ func scanQueue(row pgx.Row) (QueueInfo, error) {
 		&rec.Name,
 		&rec.Topics,
 		&rec.Unlogged,
+		&rec.CreatedAt,
 		&deleteAt,
 	); err != nil {
-		return rec, err
+		return nil, err
 	}
 
 	if deleteAt != nil {
 		rec.DeleteAt = *deleteAt
 	}
 
-	return rec, nil
+	return &rec, nil
+}
+
+func scanCollectibleTask(row pgx.CollectableRow) (*TaskInfo, error) {
+	return scanTask(row)
+}
+
+func scanTask(row pgx.Row) (*TaskInfo, error) {
+	rec := TaskInfo{}
+
+	if err := row.Scan(
+		&rec.Name,
+		&rec.CreatedAt,
+	); err != nil {
+		return nil, err
+	}
+
+	return &rec, nil
 }
 
 func scanCollectibleTaskRun(row pgx.CollectableRow) (*TaskRunInfo, error) {
@@ -655,6 +719,7 @@ func scanCollectibleTaskRun(row pgx.CollectableRow) (*TaskRunInfo, error) {
 func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 	rec := TaskRunInfo{}
 
+	var deduplicationID *string
 	var output *json.RawMessage
 	var errorMessage *string
 	var completedAt *time.Time
@@ -662,6 +727,7 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 
 	if err := row.Scan(
 		&rec.ID,
+		&deduplicationID,
 		&rec.Status,
 		&output,
 		&errorMessage,
@@ -672,6 +738,9 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 		return nil, err
 	}
 
+	if deduplicationID != nil {
+		rec.DeduplicationID = *deduplicationID
+	}
 	if output != nil {
 		rec.Output = *output
 	}
@@ -719,12 +788,14 @@ func scanCollectibleFlowRun(row pgx.CollectableRow) (*FlowRunInfo, error) {
 func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 	rec := FlowRunInfo{}
 
+	var deduplicationID *string
 	var output *json.RawMessage
 	var completedAt *time.Time
 	var failedAt *time.Time
 
 	if err := row.Scan(
 		&rec.ID,
+		&deduplicationID,
 		&rec.Status,
 		&rec.Input,
 		&output,
@@ -735,6 +806,9 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 		return nil, err
 	}
 
+	if deduplicationID != nil {
+		rec.DeduplicationID = *deduplicationID
+	}
 	if output != nil {
 		rec.Output = *output
 	}
@@ -748,21 +822,36 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 	return &rec, nil
 }
 
-func scanCollectibleWorker(row pgx.CollectableRow) (WorkerInfo, error) {
+func scanCollectibleWorker(row pgx.CollectableRow) (*WorkerInfo, error) {
 	return scanWorker(row)
 }
 
-func scanWorker(row pgx.Row) (WorkerInfo, error) {
+func scanWorker(row pgx.Row) (*WorkerInfo, error) {
 	rec := WorkerInfo{}
+
+	var taskHandlers json.RawMessage
+	var stepHandlers json.RawMessage
 
 	if err := row.Scan(
 		&rec.ID,
-		&rec.Tasks,
 		&rec.StartedAt,
 		&rec.LastHeartbeatAt,
+		&taskHandlers,
+		&stepHandlers,
 	); err != nil {
-		return rec, err
+		return nil, err
 	}
 
-	return rec, nil
+	if taskHandlers != nil {
+		if err := json.Unmarshal(taskHandlers, &rec.TaskHandlers); err != nil {
+			return nil, err
+		}
+	}
+	if stepHandlers != nil {
+		if err := json.Unmarshal(stepHandlers, &rec.StepHandlers); err != nil {
+			return nil, err
+		}
+	}
+
+	return &rec, nil
 }

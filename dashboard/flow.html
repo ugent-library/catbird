@@ -5,6 +5,8 @@
 
 <div data-cy="{{ toJSON .Flow.Steps }}" style="min-height:300px;"></div>
 
+<h2>Runs</h2>
+
 <table class="table">
   <tbody>
     <tr>
@@ -37,8 +39,6 @@
     {{ end }}
   </tbody>
 </table>
-
-<h2>Runs</h2>
 
 {{ range .FlowRuns }}
 <div id="flow-run-{{ .ID }}" class="modal" tabindex="-1">
