@@ -14,27 +14,141 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
+const (
+	handlerTypeTask = iota
+	handlerTypeStep
+)
+
+type Handler struct {
+	handlerType int
+	name        string
+	taskName    string
+	flowName    string
+	stepName    string
+	queue       string
+	batchSize   int
+	hideFor     time.Duration
+	concurrency int
+	retries     int
+	delay       time.Duration
+	jitter      time.Duration
+	timeout     time.Duration
+	schedule    string
+	fn          func(context.Context, []byte) ([]byte, error)
+}
+
+type TaskHandlerOpts struct {
+	BatchSize   int
+	HideFor     time.Duration
+	Concurrency int
+	Retries     int
+	Delay       time.Duration
+	Jitter      time.Duration
+	Timeout     time.Duration
+	Schedule    string
+}
+
+func TaskHandler[Input, Output any](taskName string, fn func(context.Context, Input) (Output, error), opts TaskHandlerOpts) *Handler {
+	if opts.BatchSize == 0 {
+		opts.BatchSize = 10
+	}
+	if opts.Concurrency == 0 {
+		opts.Concurrency = 1
+	}
+
+	return &Handler{
+		handlerType: handlerTypeTask,
+		name:        taskName,
+		taskName:    taskName,
+		queue:       "t_" + taskName,
+		batchSize:   opts.BatchSize,
+		hideFor:     opts.HideFor,
+		concurrency: opts.Concurrency,
+		retries:     opts.Retries,
+		delay:       opts.Delay,
+		jitter:      opts.Jitter,
+		timeout:     opts.Timeout,
+		schedule:    opts.Schedule,
+		fn: func(ctx context.Context, b []byte) ([]byte, error) {
+			var in Input
+			if err := json.Unmarshal(b, &in); err != nil {
+				return nil, err
+			}
+
+			out, err := fn(ctx, in)
+			if err != nil {
+				return nil, err
+			}
+
+			return json.Marshal(out)
+		},
+	}
+}
+
+type StepHandlerOpts struct {
+	BatchSize   int
+	HideFor     time.Duration
+	Concurrency int
+	Retries     int
+	Delay       time.Duration
+	Jitter      time.Duration
+	Timeout     time.Duration
+}
+
+func StepHandler[Input, Output any](flowName, stepName string, fn func(context.Context, Input) (Output, error), opts StepHandlerOpts) *Handler {
+	if opts.BatchSize == 0 {
+		opts.BatchSize = 10
+	}
+	if opts.Concurrency == 0 {
+		opts.Concurrency = 1
+	}
+
+	return &Handler{
+		handlerType: handlerTypeStep,
+		name:        flowName + "/" + stepName,
+		flowName:    flowName,
+		stepName:    stepName,
+		queue:       "f_" + flowName + "_" + stepName,
+		batchSize:   opts.BatchSize,
+		hideFor:     opts.HideFor,
+		concurrency: opts.Concurrency,
+		retries:     opts.Retries,
+		delay:       opts.Delay,
+		jitter:      opts.Jitter,
+		timeout:     opts.Timeout,
+		fn: func(ctx context.Context, b []byte) ([]byte, error) {
+			var in Input
+			if err := json.Unmarshal(b, &in); err != nil {
+				return nil, err
+			}
+
+			out, err := fn(ctx, in)
+			if err != nil {
+				return nil, err
+			}
+
+			return json.Marshal(out)
+		},
+	}
+}
+
 type Worker struct {
-	id      string
-	conn    Conn
-	tasks   []*Task
-	log     *slog.Logger
-	timeout time.Duration
+	id       string
+	conn     Conn
+	handlers []*Handler
+	logger   *slog.Logger
+	timeout  time.Duration
 }
 
-type WorkerOpts struct {
-	Tasks   []*Task
-	Log     *slog.Logger
-	Timeout time.Duration
-}
-
-func NewWorker(conn Conn, opts WorkerOpts) (*Worker, error) {
+func NewWorker(conn Conn, handlers []*Handler, opts ...WorkerOpt) (*Worker, error) {
 	w := &Worker{
-		id:      uuid.NewString(),
-		conn:    conn,
-		tasks:   opts.Tasks,
-		log:     opts.Log,
-		timeout: opts.Timeout,
+		id:       uuid.NewString(),
+		conn:     conn,
+		handlers: handlers,
+		logger:   slog.Default(),
+	}
+	for _, opt := range opts {
+		opt.applyToWorker(w)
 	}
 
 	return w, nil
@@ -42,42 +156,45 @@ func NewWorker(conn Conn, opts WorkerOpts) (*Worker, error) {
 
 func (w *Worker) Start(ctx context.Context) error {
 	var scheduler *cron.Cron
-	var taskNames []string
+	var handlerNames []string
 	var wg sync.WaitGroup
 
-	for _, t := range w.tasks {
-		taskNames = append(taskNames, t.name)
+	for _, h := range w.handlers {
+		handlerNames = append(handlerNames, h.name)
 
-		if t.schedule != "" {
-			if scheduler == nil {
-				scheduler = cron.New()
+		if h.handlerType == handlerTypeTask {
+			if err := CreateTask(ctx, w.conn, h.taskName); err != nil {
+				return err
 			}
 
-			var entryID cron.EntryID
-			entryID, err := scheduler.AddFunc(t.schedule, func() {
-				entry := scheduler.Entry(entryID)
-				scheduledTime := entry.Prev
-				if scheduledTime.IsZero() {
-					// use Next if Prev is not set, which will only happen for the first run
-					scheduledTime = entry.Next
+			if h.schedule != "" {
+				if scheduler == nil {
+					scheduler = cron.New()
 				}
-				dedupID := fmt.Sprintf("%s-cron-%s", t.name, scheduledTime)
-				_, err := RunTask(ctx, w.conn, t.name, struct{}{}, RunTaskOpts{dedupID})
+
+				var entryID cron.EntryID
+				entryID, err := scheduler.AddFunc(h.schedule, func() {
+					entry := scheduler.Entry(entryID)
+					scheduledTime := entry.Prev
+					if scheduledTime.IsZero() {
+						// use Next if Prev is not set, which will only happen for the first run
+						scheduledTime = entry.Next
+					}
+					dedupID := fmt.Sprintf("%s-cron-%s", h.name, scheduledTime)
+					_, err := RunTask(ctx, w.conn, h.name, struct{}{}, RunTaskOpts{dedupID})
+					if err != nil {
+						w.logger.ErrorContext(ctx, "worker: failed to schedule task", "task", h.name, "error", err)
+					}
+				})
 				if err != nil {
-					w.log.ErrorContext(ctx, "worker: failed to schedule task", "task", t.name, "error", err)
+					return fmt.Errorf("worker: failed to register schedule for task %s: %w", h.name, err)
 				}
-			})
-			if err != nil {
-				return fmt.Errorf("worker: failed to register schedule for task %s: %w", t.name, err)
 			}
 		}
 
-		if err := CreateTask(ctx, w.conn, t); err != nil {
-			return err
-		}
 	}
 
-	if _, err := w.conn.Exec(ctx, `SELECT * FROM cb_worker_started(id => $1, tasks => $2);`, w.id, taskNames); err != nil {
+	if _, err := w.conn.Exec(ctx, `SELECT * FROM cb_worker_started(id => $1, handlers => $2);`, w.id, handlerNames); err != nil {
 		return err
 	}
 
@@ -91,7 +208,7 @@ func (w *Worker) Start(ctx context.Context) error {
 				return
 			case <-ticker.C:
 				if _, err := w.conn.Exec(ctx, `SELECT * FROM cb_worker_heartbeat(id => $1);`, w.id); err != nil {
-					w.log.ErrorContext(ctx, "worker: cannot send heartbeat", "error", err)
+					w.logger.ErrorContext(ctx, "worker: cannot send heartbeat", "error", err)
 				}
 			}
 		}
@@ -111,8 +228,8 @@ func (w *Worker) Start(ctx context.Context) error {
 		})
 	}
 
-	for _, t := range w.tasks {
-		msgChan := make(chan Message, t.concurrency)
+	for _, h := range w.handlers {
+		msgChan := make(chan Message, h.concurrency)
 
 		// producer
 		wg.Go(func() {
@@ -121,10 +238,10 @@ func (w *Worker) Start(ctx context.Context) error {
 			}()
 
 			for {
-				msgs, err := ReadPoll(ctx, w.conn, t.queue, t.batchSize, t.hideFor, ReadPollOpts{})
+				msgs, err := ReadPoll(ctx, w.conn, h.queue, h.batchSize, h.hideFor, ReadPollOpts{})
 				if err != nil {
 					if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-						w.log.ErrorContext(ctx, "task: cannot read messages", "task", t.name, "error", err)
+						w.logger.ErrorContext(ctx, "worker: cannot read messages", "handler", h.name, "error", err)
 					}
 					return
 				}
@@ -138,17 +255,17 @@ func (w *Worker) Start(ctx context.Context) error {
 					}
 				}
 
-				if len(msgs) < t.batchSize {
+				if len(msgs) < h.batchSize {
 					time.Sleep(1 * time.Second) // TODO
 				}
 			}
 		})
 
 		// consumers
-		for i := 0; i < t.concurrency; i++ {
+		for i := 0; i < h.concurrency; i++ {
 			wg.Go(func() {
 				for msg := range msgChan {
-					w.runTask(ctx, t, msg)
+					w.handle(ctx, h, msg)
 				}
 			})
 		}
@@ -159,57 +276,69 @@ func (w *Worker) Start(ctx context.Context) error {
 	return nil
 }
 
-type taskPayload struct {
-	RunID string          `json:"run_id"`
+type handlerPayload struct {
+	ID    string          `json:"id,omitempty"`
 	Input json.RawMessage `json:"input"`
 }
 
-func (w *Worker) runTask(ctx context.Context, t *Task, msg Message) {
-	var p taskPayload
+func (w *Worker) handle(ctx context.Context, h *Handler, msg Message) {
+	var p handlerPayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		w.log.ErrorContext(ctx, "task: cannot decode payload", "task", t.name, "error", err)
+		w.logger.ErrorContext(ctx, "worker: cannot decode payload", "handler", h.name, "error", err)
 		return // TODO
 	}
 
-	w.log.DebugContext(ctx, "task: run",
-		"task", t.name,
-		"message_id", msg.ID,
+	w.logger.DebugContext(ctx, "worker: handle",
+		"handler", h.name,
+		"id", p.ID,
 		"deduplication_id", msg.DeduplicationID,
-		"run_id", p.RunID,
+		"message_id", msg.ID,
 		"input", string(p.Input),
 	)
 
-	runCtx := ctx
-	if t.timeout > 0 {
+	fnCtx := ctx
+	if h.timeout > 0 {
 		var cancel context.CancelFunc
-		runCtx, cancel = context.WithTimeout(ctx, time.Duration(t.timeout))
+		fnCtx, cancel = context.WithTimeout(ctx, time.Duration(h.timeout))
 		defer cancel()
 	}
 
-	out, err := t.fn(runCtx, p.Input)
+	out, err := h.fn(fnCtx, p.Input)
 
 	if err != nil {
-		w.log.ErrorContext(ctx, "task: failed", "task", t.name, "error", err)
+		w.logger.ErrorContext(ctx, "worker: failed", "handler", h.name, "error", err)
 
-		if msg.Deliveries > t.retries {
-			q := `SELECT * FROM cb_fail_task(run_id => $1, error_message => $2);`
-			if _, err := w.conn.Exec(ctx, q, p.RunID, err.Error()); err != nil {
-				w.log.ErrorContext(ctx, "task: cannot mark task as failed", "task", t.name, "error", err)
+		if msg.Deliveries > h.retries {
+			if h.handlerType == handlerTypeTask {
+				q := `SELECT * FROM cb_fail_task(id => $1, error_message => $2);`
+				if _, err := w.conn.Exec(ctx, q, p.ID, err.Error()); err != nil {
+					w.logger.ErrorContext(ctx, "worker: cannot mark task as failed", "handler", h.name, "error", err)
+				}
+			} else {
+				q := `SELECT * FROM cb_fail_step(id => $1, error_message => $2);`
+				if _, err := w.conn.Exec(ctx, q, p.ID, err.Error()); err != nil {
+					w.logger.ErrorContext(ctx, "worker: cannot mark step as failed", "handler", h.name, "error", err)
+				}
 			}
-		} else if t.delay > 0 {
-			delay := t.delay
-			if t.jitter > 0 {
-				delay += time.Duration((1 - rand.Float64()*2) * float64(t.jitter))
+		} else if h.delay > 0 {
+			delay := h.delay
+			if h.jitter > 0 {
+				delay += time.Duration((1 - rand.Float64()*2) * float64(h.jitter))
 			}
 
-			if _, err := Hide(ctx, w.conn, t.queue, msg.ID, delay); err != nil {
-				w.log.ErrorContext(ctx, "task: cannot delay next task run", "task", t.name, "error", err)
+			if _, err := Hide(ctx, w.conn, h.queue, msg.ID, delay); err != nil {
+				w.logger.ErrorContext(ctx, "worker: cannot delay next run", "handler", h.name, "error", err)
 			}
 		}
+	} else if h.handlerType == handlerTypeTask {
+		q := `SELECT * FROM cb_complete_task(id => $1, output => $2);`
+		if _, err := w.conn.Exec(ctx, q, p.ID, out); err != nil {
+			w.logger.ErrorContext(ctx, "worker: cannot mark task as completed", "handler", h.name, "error", err)
+		}
 	} else {
-		q := `SELECT * FROM cb_complete_task(run_id => $1, output => $2);`
-		if _, err := w.conn.Exec(ctx, q, p.RunID, out); err != nil {
-			w.log.ErrorContext(ctx, "task: cannot mark task as completed", "task", t.name, "error", err)
+		q := `SELECT * FROM cb_complete_step(id => $1, output => $2);`
+		if _, err := w.conn.Exec(ctx, q, p.ID, out); err != nil {
+			w.logger.ErrorContext(ctx, "worker: cannot mark step as completed", "handler", h.name, "error", err)
 		}
 	}
 }

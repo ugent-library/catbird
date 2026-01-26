@@ -12,6 +12,10 @@ import (
 	"github.com/ugent-library/catbird/dashboard"
 )
 
+var logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+	Level: slog.LevelInfo,
+}))
+
 func main() {
 	dashboardCmd.Flags().Int("port", 8080, "port to listen on")
 
@@ -41,8 +45,10 @@ var dashboardCmd = &cobra.Command{
 
 		h := dashboard.New(dashboard.Config{
 			Client: catbird.New(pool),
-			Log:    slog.Default(),
+			Log:    logger,
 		}).Handler()
+
+		logger.Info("starting dashboard", "port", port)
 
 		return http.ListenAndServe(fmt.Sprintf(":%d", port), h)
 	},

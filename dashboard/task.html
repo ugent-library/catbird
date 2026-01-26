@@ -1,7 +1,9 @@
 {{ define "content" }}
 <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
-  <h1>{{ .TaskName }}</h1>
+  <h1>{{ .Task.Name }}</h1>
 </div>
+
+<h2>Runs</h2>
 
 <table class="table">
   <tbody>
@@ -41,7 +43,7 @@
   <div class="modal-dialog">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title">{{ $.TaskName }} - {{ .ID }}</h5>
+        <h5 class="modal-title">{{ $.Task.Name }} - {{ .ID }}</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body">

@@ -17,6 +17,7 @@
       <th scope="col">Name</th>
       <th scope="col">Topics</th>
       <th scope="col">Unlogged</th>
+      <th scope="col">Created at</th>
       <th scope="col">Delete at</th>
     </tr>
     {{ range .Queues }}
@@ -28,6 +29,7 @@
         {{ end }}
       </td>
       <td>{{ if .Unlogged }}Unlogged{{ end }}</td>
+      <td>{{ formatTime .CreatedAt }}</td>
       <td>{{ formatTime .DeleteAt }}</td>
     </tr>
     {{ end }}

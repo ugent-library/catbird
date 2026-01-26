@@ -24,7 +24,9 @@ CREATE TABLE IF NOT EXISTS cb_queues (
     name text PRIMARY KEY,
     topics text[],
     unlogged boolean NOT null,
-    delete_at timestamptz
+    created_at timestamptz NOT NULL DEFAULT now(),
+    delete_at timestamptz,
+    CONSTRAINT delete_at_is_valid CHECK (delete_at IS NULL OR delete_at > created_at)
 );
 
 CREATE INDEX IF NOT EXISTS cb_queues_topics_idx ON cb_queues USING gin (topics);
