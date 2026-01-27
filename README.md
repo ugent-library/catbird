@@ -19,4 +19,3 @@ SQL code is mostly taken or adapted from the excellent [pgmq](https://github.com
 * schemas for task/flow input/output https://opensource.googleblog.com/2026/01/a-json-schema-package-for-go.html
 * use split tables for task runs like queues?
 * flow onfail task
-* put logger in Context?
