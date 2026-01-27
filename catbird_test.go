@@ -36,7 +36,7 @@ func TestFlows(t *testing.T) {
 		Str string `json:"str"`
 	}
 
-	task1 := TaskHandler("task1", func(ctx context.Context, in Task1Input) (string, error) {
+	task1 := NewTaskHandler("task1", func(ctx context.Context, in Task1Input) (string, error) {
 		return in.Str + " processed by task 1", nil
 	}, TaskHandlerOpts{
 		HideFor: 10 * time.Second,
@@ -66,7 +66,7 @@ func TestFlows(t *testing.T) {
 		FlowInput string `json:"flow_input"`
 	}
 
-	step1 := StepHandler("flow1", "step1", func(ctx context.Context, in step1Input) (string, error) {
+	step1 := NewStepHandler("flow1", "step1", func(ctx context.Context, in step1Input) (string, error) {
 		return in.FlowInput + " processed by step 1", nil
 	}, StepHandlerOpts{
 		HideFor: 10 * time.Second,
@@ -77,7 +77,7 @@ func TestFlows(t *testing.T) {
 		Step1     string `json:"step1"`
 	}
 
-	step2 := StepHandler("flow1", "step2", func(ctx context.Context, in step2Input) (string, error) {
+	step2 := NewStepHandler("flow1", "step2", func(ctx context.Context, in step2Input) (string, error) {
 		return in.Step1 + " and by step 2", nil
 	}, StepHandlerOpts{
 		HideFor: 10 * time.Second,
@@ -88,7 +88,7 @@ func TestFlows(t *testing.T) {
 		Step2     string `json:"step2"`
 	}
 
-	step3 := StepHandler("flow1", "step3", func(ctx context.Context, in step3Input) (string, error) {
+	step3 := NewStepHandler("flow1", "step3", func(ctx context.Context, in step3Input) (string, error) {
 		return in.Step2 + " and by step 3", nil
 	}, StepHandlerOpts{
 		HideFor: 10 * time.Second,

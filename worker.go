@@ -48,7 +48,7 @@ type TaskHandlerOpts struct {
 	Schedule    string
 }
 
-func TaskHandler[Input, Output any](taskName string, fn func(context.Context, Input) (Output, error), opts TaskHandlerOpts) *Handler {
+func NewTaskHandler[Input, Output any](taskName string, fn func(context.Context, Input) (Output, error), opts TaskHandlerOpts) *Handler {
 	if opts.BatchSize == 0 {
 		opts.BatchSize = 10
 	}
@@ -95,7 +95,7 @@ type StepHandlerOpts struct {
 	Timeout     time.Duration
 }
 
-func StepHandler[Input, Output any](flowName, stepName string, fn func(context.Context, Input) (Output, error), opts StepHandlerOpts) *Handler {
+func NewStepHandler[Input, Output any](flowName, stepName string, fn func(context.Context, Input) (Output, error), opts StepHandlerOpts) *Handler {
 	if opts.BatchSize == 0 {
 		opts.BatchSize = 10
 	}

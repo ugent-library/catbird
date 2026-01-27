@@ -87,7 +87,7 @@ func (o *gcOpt) Schedule(schedule string) *gcOpt {
 }
 
 func (o gcOpt) applyToWorker(w *Worker) {
-	w.handlers = append(w.handlers, TaskHandler("gc", func(ctx context.Context, input struct{}) (struct{}, error) {
+	w.handlers = append(w.handlers, NewTaskHandler("gc", func(ctx context.Context, input struct{}) (struct{}, error) {
 		return struct{}{}, GC(ctx, w.conn)
 	}, TaskHandlerOpts{
 		Schedule: o.schedule,
