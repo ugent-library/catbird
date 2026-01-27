@@ -27,7 +27,6 @@ type Handler struct {
 	stepName    string
 	queue       string
 	batchSize   int
-	hideFor     time.Duration
 	concurrency int
 	retries     int
 	delay       time.Duration
@@ -39,7 +38,6 @@ type Handler struct {
 
 type TaskHandlerOpts struct {
 	BatchSize   int
-	HideFor     time.Duration
 	Concurrency int
 	Retries     int
 	Delay       time.Duration
@@ -62,7 +60,6 @@ func NewTaskHandler[Input, Output any](taskName string, fn func(context.Context,
 		taskName:    taskName,
 		queue:       "t_" + taskName,
 		batchSize:   opts.BatchSize,
-		hideFor:     opts.HideFor,
 		concurrency: opts.Concurrency,
 		retries:     opts.Retries,
 		delay:       opts.Delay,
@@ -87,7 +84,6 @@ func NewTaskHandler[Input, Output any](taskName string, fn func(context.Context,
 
 type StepHandlerOpts struct {
 	BatchSize   int
-	HideFor     time.Duration
 	Concurrency int
 	Retries     int
 	Delay       time.Duration
@@ -110,7 +106,6 @@ func NewStepHandler[Input, Output any](flowName, stepName string, fn func(contex
 		stepName:    stepName,
 		queue:       "f_" + flowName + "_" + stepName,
 		batchSize:   opts.BatchSize,
-		hideFor:     opts.HideFor,
 		concurrency: opts.Concurrency,
 		retries:     opts.Retries,
 		delay:       opts.Delay,
@@ -231,20 +226,76 @@ func (w *Worker) Start(ctx context.Context) error {
 	for _, h := range w.handlers {
 		msgChan := make(chan Message, h.concurrency)
 
+		hideTicker := time.NewTicker(1 * time.Minute)
+		defer hideTicker.Stop()
+
+		idsToHide := map[int64]struct{}{}
+		idsToHideMu := sync.Mutex{}
+
+		stopHiding := func(id int64) {
+			idsToHideMu.Lock()
+			delete(idsToHide, id)
+			idsToHideMu.Unlock()
+		}
+
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-hideTicker.C:
+					idsToHideMu.Lock()
+					numIDs := len(idsToHide)
+					if numIDs == 0 {
+						idsToHideMu.Unlock()
+						continue
+					}
+					ids := make([]int64, 0, numIDs)
+					for id := range idsToHide {
+						ids = append(ids, id)
+					}
+					idsToHideMu.Unlock()
+
+					hideFor := 10 * time.Minute
+					if h.jitter > 0 {
+						hideFor += time.Duration((1 - rand.Float64()*2) * float64(h.jitter))
+					}
+
+					if err := HideMany(ctx, w.conn, h.queue, ids, hideFor); err != nil {
+						if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+							w.logger.ErrorContext(ctx, "worker: cannot hide messages", "handler", h.name, "error", err)
+						}
+					}
+				}
+			}
+		}()
+
 		// producer
 		wg.Go(func() {
-			defer func() {
-				close(msgChan)
-			}()
+			defer close(msgChan)
 
 			for {
-				msgs, err := ReadPoll(ctx, w.conn, h.queue, h.batchSize, h.hideFor, ReadPollOpts{})
+				hideFor := 10 * time.Minute
+				if h.jitter > 0 {
+					hideFor += time.Duration((1 - rand.Float64()*2) * float64(h.jitter))
+				}
+
+				msgs, err := ReadPoll(ctx, w.conn, h.queue, h.batchSize, hideFor, ReadPollOpts{})
 				if err != nil {
 					if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 						w.logger.ErrorContext(ctx, "worker: cannot read messages", "handler", h.name, "error", err)
 					}
 					return
 				}
+				if len(msgs) == 0 {
+					continue
+				}
+
+				idsToHideMu.Lock()
+				for _, msg := range msgs {
+					idsToHide[msg.ID] = struct{}{}
+				}
+				idsToHideMu.Unlock()
 
 				for _, msg := range msgs {
 					select {
@@ -254,10 +305,6 @@ func (w *Worker) Start(ctx context.Context) error {
 						msgChan <- msg
 					}
 				}
-
-				if len(msgs) < h.batchSize {
-					time.Sleep(1 * time.Second) // TODO
-				}
 			}
 		})
 
@@ -265,7 +312,7 @@ func (w *Worker) Start(ctx context.Context) error {
 		for i := 0; i < h.concurrency; i++ {
 			wg.Go(func() {
 				for msg := range msgChan {
-					w.handle(ctx, h, msg)
+					w.handle(ctx, h, msg, stopHiding)
 				}
 			})
 		}
@@ -281,7 +328,7 @@ type handlerPayload struct {
 	Input json.RawMessage `json:"input"`
 }
 
-func (w *Worker) handle(ctx context.Context, h *Handler, msg Message) {
+func (w *Worker) handle(ctx context.Context, h *Handler, msg Message, stopHiding func(id int64)) {
 	var p handlerPayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		w.logger.ErrorContext(ctx, "worker: cannot decode payload", "handler", h.name, "error", err)
@@ -304,6 +351,8 @@ func (w *Worker) handle(ctx context.Context, h *Handler, msg Message) {
 	}
 
 	out, err := h.fn(fnCtx, p.Input)
+
+	stopHiding(msg.ID) // TODO race condition, message might delivered again before we call fail or complete
 
 	if err != nil {
 		w.logger.ErrorContext(ctx, "worker: failed", "handler", h.name, "error", err)

@@ -91,7 +91,6 @@ func (o gcOpt) applyToWorker(w *Worker) {
 		return struct{}{}, GC(ctx, w.conn)
 	}, TaskHandlerOpts{
 		Schedule: o.schedule,
-		HideFor:  10 * time.Second,
 	}))
 }
 

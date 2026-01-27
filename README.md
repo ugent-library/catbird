@@ -10,7 +10,8 @@ SQL code is mostly taken or adapted from the excellent [pgmq](https://github.com
 
 ## TODO
 
-* hide message for as long as task is running
+* move jitter and jitter factor to postgres?
+* handle panics in worker
 * pause tasks - wait for for signal
 * RunTaskWait / RunFlowWait long polling
 * add queue, task, flow and step description fields

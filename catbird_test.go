@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -38,9 +37,7 @@ func TestFlows(t *testing.T) {
 
 	task1 := NewTaskHandler("task1", func(ctx context.Context, in Task1Input) (string, error) {
 		return in.Str + " processed by task 1", nil
-	}, TaskHandlerOpts{
-		HideFor: 10 * time.Second,
-	})
+	}, TaskHandlerOpts{})
 
 	err = client.CreateTask(t.Context(), "task1")
 	if err != nil {
@@ -68,9 +65,7 @@ func TestFlows(t *testing.T) {
 
 	step1 := NewStepHandler("flow1", "step1", func(ctx context.Context, in step1Input) (string, error) {
 		return in.FlowInput + " processed by step 1", nil
-	}, StepHandlerOpts{
-		HideFor: 10 * time.Second,
-	})
+	}, StepHandlerOpts{})
 
 	type step2Input struct {
 		FlowInput string `json:"flow_input"`
@@ -79,9 +74,7 @@ func TestFlows(t *testing.T) {
 
 	step2 := NewStepHandler("flow1", "step2", func(ctx context.Context, in step2Input) (string, error) {
 		return in.Step1 + " and by step 2", nil
-	}, StepHandlerOpts{
-		HideFor: 10 * time.Second,
-	})
+	}, StepHandlerOpts{})
 
 	type step3Input struct {
 		FlowInput string `json:"flow_input"`
@@ -90,9 +83,7 @@ func TestFlows(t *testing.T) {
 
 	step3 := NewStepHandler("flow1", "step3", func(ctx context.Context, in step3Input) (string, error) {
 		return in.Step2 + " and by step 3", nil
-	}, StepHandlerOpts{
-		HideFor: 10 * time.Second,
-	})
+	}, StepHandlerOpts{})
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
