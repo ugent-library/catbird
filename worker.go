@@ -20,20 +20,20 @@ const (
 )
 
 type Handler struct {
-	handlerType int
-	name        string
-	taskName    string
-	flowName    string
-	stepName    string
-	queue       string
-	batchSize   int
-	concurrency int
-	retries     int
-	delay       time.Duration
-	jitter      time.Duration
-	timeout     time.Duration
-	schedule    string
-	fn          func(context.Context, []byte) ([]byte, error)
+	handlerType  int
+	name         string
+	taskName     string
+	flowName     string
+	stepName     string
+	queue        string
+	batchSize    int
+	concurrency  int
+	retries      int
+	delay        time.Duration
+	jitterFactor float64
+	timeout      time.Duration
+	schedule     string
+	fn           func(context.Context, []byte) ([]byte, error)
 }
 
 type TaskHandlerOpts struct {
@@ -41,7 +41,6 @@ type TaskHandlerOpts struct {
 	Concurrency int
 	Retries     int
 	Delay       time.Duration
-	Jitter      time.Duration
 	Timeout     time.Duration
 	Schedule    string
 }
@@ -55,17 +54,17 @@ func NewTaskHandler[Input, Output any](taskName string, fn func(context.Context,
 	}
 
 	return &Handler{
-		handlerType: handlerTypeTask,
-		name:        taskName,
-		taskName:    taskName,
-		queue:       "t_" + taskName,
-		batchSize:   opts.BatchSize,
-		concurrency: opts.Concurrency,
-		retries:     opts.Retries,
-		delay:       opts.Delay,
-		jitter:      opts.Jitter,
-		timeout:     opts.Timeout,
-		schedule:    opts.Schedule,
+		handlerType:  handlerTypeTask,
+		name:         taskName,
+		taskName:     taskName,
+		queue:        "t_" + taskName,
+		batchSize:    opts.BatchSize,
+		concurrency:  opts.Concurrency,
+		retries:      opts.Retries,
+		delay:        opts.Delay,
+		jitterFactor: 0.1, // 10% jitter hardcoded for now
+		timeout:      opts.Timeout,
+		schedule:     opts.Schedule,
 		fn: func(ctx context.Context, b []byte) ([]byte, error) {
 			var in Input
 			if err := json.Unmarshal(b, &in); err != nil {
@@ -87,7 +86,6 @@ type StepHandlerOpts struct {
 	Concurrency int
 	Retries     int
 	Delay       time.Duration
-	Jitter      time.Duration
 	Timeout     time.Duration
 }
 
@@ -100,17 +98,17 @@ func NewStepHandler[Input, Output any](flowName, stepName string, fn func(contex
 	}
 
 	return &Handler{
-		handlerType: handlerTypeStep,
-		name:        flowName + "/" + stepName,
-		flowName:    flowName,
-		stepName:    stepName,
-		queue:       "f_" + flowName + "_" + stepName,
-		batchSize:   opts.BatchSize,
-		concurrency: opts.Concurrency,
-		retries:     opts.Retries,
-		delay:       opts.Delay,
-		jitter:      opts.Jitter,
-		timeout:     opts.Timeout,
+		handlerType:  handlerTypeStep,
+		name:         flowName + "/" + stepName,
+		flowName:     flowName,
+		stepName:     stepName,
+		queue:        "f_" + flowName + "_" + stepName,
+		batchSize:    opts.BatchSize,
+		concurrency:  opts.Concurrency,
+		retries:      opts.Retries,
+		delay:        opts.Delay,
+		jitterFactor: 0.1, // 10% jitter hardcoded for now
+		timeout:      opts.Timeout,
 		fn: func(ctx context.Context, b []byte) ([]byte, error) {
 			var in Input
 			if err := json.Unmarshal(b, &in); err != nil {
@@ -225,6 +223,7 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	for _, h := range w.handlers {
 		msgChan := make(chan Message, h.concurrency)
+		hideFor := 10 * time.Minute
 
 		hideTicker := time.NewTicker(1 * time.Minute)
 		defer hideTicker.Stop()
@@ -256,12 +255,7 @@ func (w *Worker) Start(ctx context.Context) error {
 					}
 					idsToHideMu.Unlock()
 
-					hideFor := 10 * time.Minute
-					if h.jitter > 0 {
-						hideFor += time.Duration((1 - rand.Float64()*2) * float64(h.jitter))
-					}
-
-					if err := HideMany(ctx, w.conn, h.queue, ids, hideFor); err != nil {
+					if err := HideMany(ctx, w.conn, h.queue, ids, delayWithJitter(hideFor, h.jitterFactor)); err != nil {
 						if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 							w.logger.ErrorContext(ctx, "worker: cannot hide messages", "handler", h.name, "error", err)
 						}
@@ -275,12 +269,7 @@ func (w *Worker) Start(ctx context.Context) error {
 			defer close(msgChan)
 
 			for {
-				hideFor := 10 * time.Minute
-				if h.jitter > 0 {
-					hideFor += time.Duration((1 - rand.Float64()*2) * float64(h.jitter))
-				}
-
-				msgs, err := ReadPoll(ctx, w.conn, h.queue, h.batchSize, hideFor, ReadPollOpts{})
+				msgs, err := ReadPoll(ctx, w.conn, h.queue, h.batchSize, delayWithJitter(hideFor, h.jitterFactor), ReadPollOpts{})
 				if err != nil {
 					if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 						w.logger.ErrorContext(ctx, "worker: cannot read messages", "handler", h.name, "error", err)
@@ -370,12 +359,7 @@ func (w *Worker) handle(ctx context.Context, h *Handler, msg Message, stopHiding
 				}
 			}
 		} else if h.delay > 0 {
-			delay := h.delay
-			if h.jitter > 0 {
-				delay += time.Duration((1 - rand.Float64()*2) * float64(h.jitter))
-			}
-
-			if _, err := Hide(ctx, w.conn, h.queue, msg.ID, delay); err != nil {
+			if _, err := Hide(ctx, w.conn, h.queue, msg.ID, delayWithJitter(h.delay, h.jitterFactor)); err != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot delay next run", "handler", h.name, "error", err)
 			}
 		}
@@ -390,4 +374,12 @@ func (w *Worker) handle(ctx context.Context, h *Handler, msg Message, stopHiding
 			w.logger.ErrorContext(ctx, "worker: cannot mark step as completed", "handler", h.name, "error", err)
 		}
 	}
+}
+
+func delayWithJitter(delay time.Duration, jitterFactor float64) time.Duration {
+	if jitterFactor == 0 {
+		return delay
+	}
+	randomFactor := 1 + (1-rand.Float64()*2)*jitterFactor
+	return time.Duration(float64(delay) * randomFactor)
 }

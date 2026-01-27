@@ -12,7 +12,7 @@ import (
 )
 
 func TestFlows(t *testing.T) {
-	dsn := os.Getenv("CB_TEST_CONN")
+	dsn := os.Getenv("CB_CONN")
 
 	func() {
 		db, err := sql.Open("pgx", dsn)
