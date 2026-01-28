@@ -13,8 +13,8 @@ func New(conn Conn) *Client {
 	return &Client{Conn: conn}
 }
 
-func (c *Client) CreateQueue(ctx context.Context, name string, opts QueueOpts) error {
-	return CreateQueue(ctx, c.Conn, name, opts)
+func (c *Client) CreateQueue(ctx context.Context, name string, opts ...QueueOpt) error {
+	return CreateQueue(ctx, c.Conn, name, opts...)
 }
 
 func (c *Client) GetQueue(ctx context.Context, name string) (*QueueInfo, error) {

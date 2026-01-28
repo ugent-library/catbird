@@ -28,12 +28,62 @@ type Conn interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
+type queueOpts struct {
+	topics   []string
+	deleteAt *time.Time
+	unlogged bool
+}
+
+type QueueOpt interface {
+	applyToQueueOpts(*queueOpts)
+}
+
 type FlowOpt interface {
 	applyToFlow(*Flow)
 }
 
 type WorkerOpt interface {
 	applyToWorker(*Worker)
+}
+
+type HandlerOpt interface {
+	applyToHandler(*Handler)
+}
+
+type topicsOpt struct {
+	topics []string
+}
+
+func WithTopics(topics ...string) *topicsOpt {
+	return &topicsOpt{topics: topics}
+}
+
+func (o topicsOpt) applyToQueueOpts(opts *queueOpts) {
+	opts.topics = append(opts.topics, o.topics...)
+}
+
+type unloggedOpt struct {
+	unlogged bool
+}
+
+func WithUnlogged(unlogged bool) *unloggedOpt {
+	return &unloggedOpt{unlogged: unlogged}
+}
+
+func (o unloggedOpt) applyToQueueOpts(opts *queueOpts) {
+	opts.unlogged = o.unlogged
+}
+
+type deleteAtOpt struct {
+	deleteAt time.Time
+}
+
+func WithDeleteAt(deleteAt time.Time) *deleteAtOpt {
+	return &deleteAtOpt{deleteAt: deleteAt}
+}
+
+func (o deleteAtOpt) applyToQueueOpts(opts *queueOpts) {
+	opts.deleteAt = &o.deleteAt
 }
 
 type stepOpt struct {
@@ -57,28 +107,79 @@ type loggerOpt struct {
 	logger *slog.Logger
 }
 
-func (o loggerOpt) applyToWorker(w *Worker) {
-	w.logger = o.logger
-}
-
 func WithLogger(logger *slog.Logger) *loggerOpt {
 	return &loggerOpt{logger: logger}
+}
+
+func (o loggerOpt) applyToWorker(w *Worker) {
+	w.logger = o.logger
 }
 
 type timeoutOpt struct {
 	timeout time.Duration
 }
 
-func (o timeoutOpt) applyToWorker(w *Worker) {
-	w.timeout = o.timeout
-}
-
 func WithTimeout(timeout time.Duration) *timeoutOpt {
 	return &timeoutOpt{timeout: timeout}
 }
 
+func (o timeoutOpt) applyToWorker(w *Worker) {
+	w.timeout = o.timeout
+}
+
+func (o timeoutOpt) applyToHandler(h *Handler) {
+	h.timeout = o.timeout
+}
+
+type concurrencyOpt struct {
+	concurrency int
+}
+
+func WithConcurrency(concurrency int) *concurrencyOpt {
+	return &concurrencyOpt{concurrency: concurrency}
+}
+
+func (o concurrencyOpt) applyToHandler(h *Handler) {
+	h.concurrency = o.concurrency
+}
+
+type batchSizeOpt struct {
+	batchSize int
+}
+
+func WithBatchSize(batchSize int) *batchSizeOpt {
+	return &batchSizeOpt{batchSize: batchSize}
+}
+
+func (o batchSizeOpt) applyToHandler(h *Handler) {
+	h.batchSize = o.batchSize
+}
+
+type retriesOpt struct {
+	retries int
+	delay   time.Duration
+}
+
+func WithRetries(retries int) *retriesOpt {
+	return &retriesOpt{retries: retries}
+}
+
+func (o *retriesOpt) Delay(delay time.Duration) *retriesOpt {
+	o.delay = delay
+	return o
+}
+
+func (o retriesOpt) applyToHandler(h *Handler) {
+	h.retries = o.retries
+	h.delay = o.delay
+}
+
 type gcOpt struct {
 	schedule string
+}
+
+func WithGC() *gcOpt {
+	return &gcOpt{schedule: "@every 10m"}
 }
 
 func (o *gcOpt) Schedule(schedule string) *gcOpt {
@@ -87,15 +188,9 @@ func (o *gcOpt) Schedule(schedule string) *gcOpt {
 }
 
 func (o gcOpt) applyToWorker(w *Worker) {
-	w.handlers = append(w.handlers, NewTaskHandler("gc", func(ctx context.Context, input struct{}) (struct{}, error) {
+	w.handlers = append(w.handlers, NewPeriodicTaskHandler("gc", o.schedule, func(ctx context.Context, input struct{}) (struct{}, error) {
 		return struct{}{}, GC(ctx, w.conn)
-	}, TaskHandlerOpts{
-		Schedule: o.schedule,
 	}))
-}
-
-func WithGC() *gcOpt {
-	return &gcOpt{schedule: "@every 10m"}
 }
 
 type Message struct {
@@ -179,37 +274,30 @@ func (info *FlowRunInfo) OutputAs(o any) error {
 
 type WorkerInfo struct {
 	ID              string             `json:"id"`
-	TaskHandlers    []*TaskhandlerInfo `json:"task_handlers"`
-	StepHandlers    []*StephandlerInfo `json:"step_handlers"`
+	TaskHandlers    []*TaskHandlerInfo `json:"task_handlers"`
+	StepHandlers    []*StepHandlerInfo `json:"step_handlers"`
 	StartedAt       time.Time          `json:"started_at"`
 	LastHeartbeatAt time.Time          `json:"last_heartbeat_at"`
 }
 
-type TaskhandlerInfo struct {
+type TaskHandlerInfo struct {
 	TaskName string `json:"task_name"`
 }
 
-type StephandlerInfo struct {
+type StepHandlerInfo struct {
 	FlowName string `json:"flow_name"`
 	StepName string `json:"step_name"`
 }
 
-type QueueOpts struct {
-	Topics   []string
-	DeleteAt time.Time
-	Unlogged bool
-}
-
-func CreateQueue(ctx context.Context, conn Conn, name string, opts QueueOpts) error {
-	if opts.DeleteAt.IsZero() {
-		q := `SELECT cb_create_queue(name => $1, topics => $2, unlogged => $3);`
-		_, err := conn.Exec(ctx, q, name, opts.Topics, opts.Unlogged)
-		return err
-	} else {
-		q := `SELECT cb_create_queue(name => $1, topics => $2, delete_at => $3, unlogged => $4);`
-		_, err := conn.Exec(ctx, q, name, opts.Topics, opts.DeleteAt, opts.Unlogged)
-		return err
+func CreateQueue(ctx context.Context, conn Conn, name string, opts ...QueueOpt) error {
+	o := queueOpts{}
+	for _, opt := range opts {
+		opt.applyToQueueOpts(&o)
 	}
+
+	q := `SELECT cb_create_queue(name => $1, topics => $2, delete_at => $3, unlogged => $4);`
+	_, err := conn.Exec(ctx, q, name, o.topics, o.deleteAt, o.unlogged)
+	return err
 }
 
 func GetQueue(ctx context.Context, conn Conn, name string) (*QueueInfo, error) {

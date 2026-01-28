@@ -10,7 +10,7 @@ SQL code is mostly taken or adapted from the excellent [pgmq](https://github.com
 
 ## TODO
 
-* move jitter and jitter factor to postgres?
+* move jitter factor to postgres queue definition?
 * handle panics in worker
 * pause tasks - wait for for signal
 * RunTaskWait / RunFlowWait long polling
