@@ -5,31 +5,64 @@ import (
 	"database/sql"
 	"log/slog"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-func TestFlows(t *testing.T) {
-	dsn := os.Getenv("CB_CONN")
+var testClient *Client
+var testOnce sync.Once
 
-	func() {
+func getTestClient(t *testing.T) *Client {
+	testOnce.Do(func() {
+		dsn := os.Getenv("CB_CONN")
+
 		db, err := sql.Open("pgx", dsn)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer db.Close()
+
 		MigrateDownTo(t.Context(), db, 0)
 		MigrateUpTo(t.Context(), db, SchemaVersion)
-	}()
 
-	pool, err := pgxpool.New(t.Context(), dsn)
+		pool, err := pgxpool.New(t.Context(), dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		testClient = New(pool)
+	})
+
+	return testClient
+}
+
+func TestQueues(t *testing.T) {
+	client := getTestClient(t)
+
+	err := client.CreateQueue(t.Context(), "test_queue",
+		WithTopics("topic1", "topic2"),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	client := New(pool)
+	info, err := client.GetQueue(t.Context(), "test_queue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Name != "test_queue" {
+		t.Fatalf("unexpected queue name: %s", info.Name)
+	}
+	if len(info.Topics) != 2 || info.Topics[0] != "topic1" || info.Topics[1] != "topic2" {
+		t.Fatalf("unexpected queue topics: %v", info.Topics)
+	}
+}
+
+func TestFlows(t *testing.T) {
+	client := getTestClient(t)
 
 	type Task1Input struct {
 		Str string `json:"str"`
@@ -39,7 +72,7 @@ func TestFlows(t *testing.T) {
 		return in.Str + " processed by task 1", nil
 	})
 
-	err = client.CreateTask(t.Context(), "task1")
+	err := client.CreateTask(t.Context(), "task1")
 	if err != nil {
 		t.Fatal(err)
 	}
