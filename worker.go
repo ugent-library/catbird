@@ -223,53 +223,18 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	for _, h := range w.handlers {
 		msgChan := make(chan Message, h.concurrency)
-		hideFor := 10 * time.Minute
+		messageHider := newMessageHider(w.conn, h, w.logger)
 
-		hideTicker := time.NewTicker(1 * time.Minute)
-		defer hideTicker.Stop()
-
-		idsToHide := map[int64]struct{}{}
-		idsToHideMu := sync.Mutex{}
-
-		stopHiding := func(id int64) {
-			idsToHideMu.Lock()
-			delete(idsToHide, id)
-			idsToHideMu.Unlock()
-		}
-
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-hideTicker.C:
-					idsToHideMu.Lock()
-					numIDs := len(idsToHide)
-					if numIDs == 0 {
-						idsToHideMu.Unlock()
-						continue
-					}
-					ids := make([]int64, 0, numIDs)
-					for id := range idsToHide {
-						ids = append(ids, id)
-					}
-					idsToHideMu.Unlock()
-
-					if err := HideMany(ctx, w.conn, h.queue, ids, delayWithJitter(hideFor, h.jitterFactor)); err != nil {
-						if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-							w.logger.ErrorContext(ctx, "worker: cannot hide messages", "handler", h.name, "error", err)
-						}
-					}
-				}
-			}
-		}()
+		wg.Go(func() {
+			messageHider.start(ctx)
+		})
 
 		// producer
 		wg.Go(func() {
 			defer close(msgChan)
 
 			for {
-				msgs, err := ReadPoll(ctx, w.conn, h.queue, h.batchSize, delayWithJitter(hideFor, h.jitterFactor), ReadPollOpts{})
+				msgs, err := ReadPoll(ctx, w.conn, h.queue, h.batchSize, delayWithJitter(10*time.Minute, h.jitterFactor), ReadPollOpts{})
 				if err != nil {
 					if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 						w.logger.ErrorContext(ctx, "worker: cannot read messages", "handler", h.name, "error", err)
@@ -280,11 +245,7 @@ func (w *Worker) Start(ctx context.Context) error {
 					continue
 				}
 
-				idsToHideMu.Lock()
-				for _, msg := range msgs {
-					idsToHide[msg.ID] = struct{}{}
-				}
-				idsToHideMu.Unlock()
+				messageHider.hideMessages(msgs)
 
 				for _, msg := range msgs {
 					select {
@@ -301,7 +262,7 @@ func (w *Worker) Start(ctx context.Context) error {
 		for i := 0; i < h.concurrency; i++ {
 			wg.Go(func() {
 				for msg := range msgChan {
-					w.handle(ctx, h, msg, stopHiding)
+					w.handle(ctx, h, msg, messageHider.stopHiding)
 				}
 			})
 		}
@@ -341,7 +302,7 @@ func (w *Worker) handle(ctx context.Context, h *Handler, msg Message, stopHiding
 
 	out, err := h.fn(fnCtx, p.Input)
 
-	stopHiding(msg.ID) // TODO race condition, message might delivered again before we call fail or complete
+	stopHiding(msg.ID)
 
 	if err != nil {
 		w.logger.ErrorContext(ctx, "worker: failed", "handler", h.name, "error", err)
@@ -374,6 +335,68 @@ func (w *Worker) handle(ctx context.Context, h *Handler, msg Message, stopHiding
 			w.logger.ErrorContext(ctx, "worker: cannot mark step as completed", "handler", h.name, "error", err)
 		}
 	}
+}
+
+type messageHider struct {
+	conn   Conn
+	h      *Handler
+	logger *slog.Logger
+	ids    map[int64]struct{}
+	mu     sync.Mutex
+}
+
+func newMessageHider(conn Conn, h *Handler, logger *slog.Logger) *messageHider {
+	return &messageHider{
+		conn:   conn,
+		h:      h,
+		logger: logger,
+		ids:    make(map[int64]struct{}),
+	}
+}
+
+func (mh *messageHider) start(ctx context.Context) {
+	hideFor := 10 * time.Minute
+	hideTicker := time.NewTicker(1 * time.Minute)
+	defer hideTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-hideTicker.C:
+			mh.mu.Lock()
+			numIDs := len(mh.ids)
+			if numIDs == 0 {
+				mh.mu.Unlock()
+				continue
+			}
+			ids := make([]int64, 0, numIDs)
+			for id := range mh.ids {
+				ids = append(ids, id)
+			}
+			mh.mu.Unlock()
+
+			if err := HideMany(ctx, mh.conn, mh.h.queue, ids, delayWithJitter(hideFor, mh.h.jitterFactor)); err != nil {
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					mh.logger.ErrorContext(ctx, "worker: cannot hide messages", "handler", mh.h.name, "error", err)
+				}
+			}
+		}
+	}
+}
+
+func (mh *messageHider) hideMessages(msgs []Message) {
+	mh.mu.Lock()
+	for _, msg := range msgs {
+		mh.ids[msg.ID] = struct{}{}
+	}
+	mh.mu.Unlock()
+}
+
+func (mh *messageHider) stopHiding(id int64) {
+	mh.mu.Lock()
+	delete(mh.ids, id)
+	mh.mu.Unlock()
 }
 
 func delayWithJitter(delay time.Duration, jitterFactor float64) time.Duration {
