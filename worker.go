@@ -36,35 +36,15 @@ type Handler struct {
 	fn           func(context.Context, []byte) ([]byte, error)
 }
 
-type TaskHandlerOpts struct {
-	BatchSize   int
-	Concurrency int
-	Retries     int
-	Delay       time.Duration
-	Timeout     time.Duration
-	Schedule    string
-}
-
-func NewTaskHandler[Input, Output any](taskName string, fn func(context.Context, Input) (Output, error), opts TaskHandlerOpts) *Handler {
-	if opts.BatchSize == 0 {
-		opts.BatchSize = 10
-	}
-	if opts.Concurrency == 0 {
-		opts.Concurrency = 1
-	}
-
-	return &Handler{
+func NewTaskHandler[Input, Output any](taskName string, fn func(context.Context, Input) (Output, error), opts ...HandlerOpt) *Handler {
+	h := &Handler{
 		handlerType:  handlerTypeTask,
 		name:         taskName,
 		taskName:     taskName,
 		queue:        "t_" + taskName,
-		batchSize:    opts.BatchSize,
-		concurrency:  opts.Concurrency,
-		retries:      opts.Retries,
-		delay:        opts.Delay,
+		batchSize:    10,
+		concurrency:  1,
 		jitterFactor: 0.1, // 10% jitter hardcoded for now
-		timeout:      opts.Timeout,
-		schedule:     opts.Schedule,
 		fn: func(ctx context.Context, b []byte) ([]byte, error) {
 			var in Input
 			if err := json.Unmarshal(b, &in); err != nil {
@@ -79,36 +59,29 @@ func NewTaskHandler[Input, Output any](taskName string, fn func(context.Context,
 			return json.Marshal(out)
 		},
 	}
-}
-
-type StepHandlerOpts struct {
-	BatchSize   int
-	Concurrency int
-	Retries     int
-	Delay       time.Duration
-	Timeout     time.Duration
-}
-
-func NewStepHandler[Input, Output any](flowName, stepName string, fn func(context.Context, Input) (Output, error), opts StepHandlerOpts) *Handler {
-	if opts.BatchSize == 0 {
-		opts.BatchSize = 10
-	}
-	if opts.Concurrency == 0 {
-		opts.Concurrency = 1
+	for _, opt := range opts {
+		opt.applyToHandler(h)
 	}
 
-	return &Handler{
+	return h
+}
+
+func NewPeriodicTaskHandler[Input, Output any](taskName, schedule string, fn func(context.Context, Input) (Output, error), opts ...HandlerOpt) *Handler {
+	t := NewTaskHandler(taskName, fn, opts...)
+	t.schedule = schedule
+	return t
+}
+
+func NewStepHandler[Input, Output any](flowName, stepName string, fn func(context.Context, Input) (Output, error), opts ...HandlerOpt) *Handler {
+	h := &Handler{
 		handlerType:  handlerTypeStep,
 		name:         flowName + "/" + stepName,
 		flowName:     flowName,
 		stepName:     stepName,
 		queue:        "f_" + flowName + "_" + stepName,
-		batchSize:    opts.BatchSize,
-		concurrency:  opts.Concurrency,
-		retries:      opts.Retries,
-		delay:        opts.Delay,
+		batchSize:    10,
+		concurrency:  1,
 		jitterFactor: 0.1, // 10% jitter hardcoded for now
-		timeout:      opts.Timeout,
 		fn: func(ctx context.Context, b []byte) ([]byte, error) {
 			var in Input
 			if err := json.Unmarshal(b, &in); err != nil {
@@ -123,6 +96,11 @@ func NewStepHandler[Input, Output any](flowName, stepName string, fn func(contex
 			return json.Marshal(out)
 		},
 	}
+	for _, opt := range opts {
+		opt.applyToHandler(h)
+	}
+
+	return h
 }
 
 type Worker struct {
@@ -223,10 +201,10 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	for _, h := range w.handlers {
 		msgChan := make(chan Message, h.concurrency)
-		messageHider := newMessageHider(w.conn, h, w.logger)
+		msgHider := newMessageHider(w.conn, h, w.logger)
 
 		wg.Go(func() {
-			messageHider.start(ctx)
+			msgHider.start(ctx)
 		})
 
 		// producer
@@ -245,7 +223,7 @@ func (w *Worker) Start(ctx context.Context) error {
 					continue
 				}
 
-				messageHider.hideMessages(msgs)
+				msgHider.hideMessages(msgs)
 
 				for _, msg := range msgs {
 					select {
@@ -262,7 +240,7 @@ func (w *Worker) Start(ctx context.Context) error {
 		for i := 0; i < h.concurrency; i++ {
 			wg.Go(func() {
 				for msg := range msgChan {
-					w.handle(ctx, h, msg, messageHider.stopHiding)
+					w.handle(ctx, h, msg, msgHider.stopHiding)
 				}
 			})
 		}
@@ -356,7 +334,7 @@ func newMessageHider(conn Conn, h *Handler, logger *slog.Logger) *messageHider {
 
 func (mh *messageHider) start(ctx context.Context) {
 	hideFor := 10 * time.Minute
-	hideTicker := time.NewTicker(1 * time.Minute)
+	hideTicker := time.NewTicker(30 * time.Second)
 	defer hideTicker.Stop()
 
 	for {
