@@ -131,7 +131,7 @@ func TestFlows(t *testing.T) {
 
 	func() {
 		var out string
-		info, err := client.RunTaskWait(t.Context(), "task1", Task1Input{Str: "input"}, RunTaskOpts{})
+		info, err := client.RunTaskWait(t.Context(), "task1", Task1Input{Str: "input"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -145,7 +145,7 @@ func TestFlows(t *testing.T) {
 
 	func() {
 		var out flow1Output
-		info, err := client.RunFlowWait(t.Context(), "flow1", "input", RunFlowOpts{})
+		info, err := client.RunFlowWait(t.Context(), "flow1", "input")
 		if err != nil {
 			t.Fatal(err)
 		}
