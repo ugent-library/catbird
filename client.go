@@ -13,8 +13,12 @@ func New(conn Conn) *Client {
 	return &Client{Conn: conn}
 }
 
-func (c *Client) CreateQueue(ctx context.Context, name string, opts ...QueueOpt) error {
-	return CreateQueue(ctx, c.Conn, name, opts...)
+func (c *Client) CreateQueue(ctx context.Context, name string) error {
+	return CreateQueue(ctx, c.Conn, name)
+}
+
+func (c *Client) CreateQueueWithOpts(ctx context.Context, name string, opts QueueOpts) error {
+	return CreateQueueWithOpts(ctx, c.Conn, name, opts)
 }
 
 func (c *Client) GetQueue(ctx context.Context, name string) (*QueueInfo, error) {
@@ -29,20 +33,28 @@ func (c *Client) ListQueues(ctx context.Context) ([]*QueueInfo, error) {
 	return ListQueues(ctx, c.Conn)
 }
 
-func (c *Client) Send(ctx context.Context, queue string, payload any, opts ...SendOpt) error {
-	return Send(ctx, c.Conn, queue, payload, opts...)
+func (c *Client) Send(ctx context.Context, queue string, payload any) error {
+	return Send(ctx, c.Conn, queue, payload)
 }
 
-func (c *Client) Dispatch(ctx context.Context, topic string, payload any, opts ...DispatchOpt) error {
-	return Dispatch(ctx, c.Conn, topic, payload, opts...)
+func (c *Client) SendWithOpts(ctx context.Context, queue string, payload any, opts SendOpts) error {
+	return SendWithOpts(ctx, c.Conn, queue, payload, opts)
+}
+
+func (c *Client) Dispatch(ctx context.Context, topic string, payload any) error {
+	return Dispatch(ctx, c.Conn, topic, payload)
+}
+
+func (c *Client) DispatchWithOpts(ctx context.Context, topic string, payload any, opts DispatchOpts) error {
+	return DispatchWithOpts(ctx, c.Conn, topic, payload, opts)
 }
 
 func (c *Client) Read(ctx context.Context, queue string, quantity int, hideFor time.Duration) ([]Message, error) {
 	return Read(ctx, c.Conn, queue, quantity, hideFor)
 }
 
-func (c *Client) ReadPoll(ctx context.Context, queue string, quantity int, hideFor time.Duration, opts ...ReadPollOpt) ([]Message, error) {
-	return ReadPoll(ctx, c.Conn, queue, quantity, hideFor, opts...)
+func (c *Client) ReadPoll(ctx context.Context, queue string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]Message, error) {
+	return ReadPoll(ctx, c.Conn, queue, quantity, hideFor, pollFor, pollInterval)
 }
 
 func (c *Client) Hide(ctx context.Context, queue string, id int64, hideFor time.Duration) (bool, error) {
@@ -73,12 +85,12 @@ func (c *Client) ListTasks(ctx context.Context) ([]*TaskInfo, error) {
 	return ListTasks(ctx, c.Conn)
 }
 
-func (c *Client) RunTask(ctx context.Context, name string, input any, opts ...RunTaskOpt) (string, error) {
-	return RunTask(ctx, c.Conn, name, input, opts...)
+func (c *Client) RunTask(ctx context.Context, name string, input any) (*TaskHandle, error) {
+	return RunTask(ctx, c.Conn, name, input)
 }
 
-func (c *Client) RunTaskWait(ctx context.Context, name string, input any, opts ...RunTaskOpt) (*TaskRunInfo, error) {
-	return RunTaskWait(ctx, c.Conn, name, input, opts...)
+func (c *Client) RunTaskWithOpts(ctx context.Context, name string, input any, opts RunTaskOpts) (*TaskHandle, error) {
+	return RunTaskWithOpts(ctx, c.Conn, name, input, opts)
 }
 
 func (c *Client) GetTaskRun(ctx context.Context, id string) (*TaskRunInfo, error) {
@@ -101,12 +113,12 @@ func (c *Client) ListFlows(ctx context.Context) ([]*FlowInfo, error) {
 	return ListFlows(ctx, c.Conn)
 }
 
-func (c *Client) RunFlow(ctx context.Context, name string, input any, opts ...RunFlowOpt) (string, error) {
-	return RunFlow(ctx, c.Conn, name, input, opts...)
+func (c *Client) RunFlow(ctx context.Context, name string, input any) (*FlowHandle, error) {
+	return RunFlow(ctx, c.Conn, name, input)
 }
 
-func (c *Client) RunFlowWait(ctx context.Context, name string, input any, opts ...RunFlowOpt) (*FlowRunInfo, error) {
-	return RunFlowWait(ctx, c.Conn, name, input, opts...)
+func (c *Client) RunFlowWithOpts(ctx context.Context, name string, input any, opts RunFlowOpts) (*FlowHandle, error) {
+	return RunFlowWithOpts(ctx, c.Conn, name, input, opts)
 }
 
 func (c *Client) GetFlowRun(ctx context.Context, id string) (*FlowRunInfo, error) {

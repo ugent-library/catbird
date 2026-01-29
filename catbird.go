@@ -3,6 +3,7 @@ package catbird
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -18,8 +19,8 @@ const (
 )
 
 var (
-	DefaultPollDuration = 5 * time.Second
-	DefaultPollInterval = 100 * time.Millisecond
+	ErrTaskFailed = fmt.Errorf("task failed")
+	ErrFlowFailed = fmt.Errorf("flow failed")
 )
 
 type Conn interface {
@@ -28,199 +29,12 @@ type Conn interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-type queueOpts struct {
-	topics   []string
-	deleteAt *time.Time
-	unlogged bool
-}
-
-type QueueOpt interface {
-	applyToQueueOpts(*queueOpts)
-}
-
-type dispatchOpts struct {
-	deliverAt       *time.Time
-	deduplicationID string
-}
-
-type DispatchOpt interface {
-	applyToDispatchOpts(*dispatchOpts)
-}
-
-type readPollOpts struct {
-	duration time.Duration
-	interval time.Duration
-}
-
-type ReadPollOpt interface {
-	applyToReadPollOpts(*readPollOpts)
-}
-
-type sendOpts struct {
-	topic           string
-	deliverAt       *time.Time
-	deduplicationID string
-}
-
-type SendOpt interface {
-	applyToSendOpts(*sendOpts)
-}
-
-type FlowOpt interface {
-	applyToFlow(*Flow)
-}
-
 type WorkerOpt interface {
 	applyToWorker(*Worker)
 }
 
 type HandlerOpt interface {
 	applyToHandler(*Handler)
-}
-
-type runTaskOpts struct {
-	deduplicationID string
-}
-
-type RunTaskOpt interface {
-	applyToRunTaskOpts(*runTaskOpts)
-}
-
-type runFlowOpts struct {
-	deduplicationID string
-}
-
-type RunFlowOpt interface {
-	applyToRunFlowOpts(*runFlowOpts)
-}
-
-type durationOpt struct {
-	duration time.Duration
-}
-
-func WithDuration(d time.Duration) *durationOpt {
-	return &durationOpt{duration: d}
-}
-
-func (o durationOpt) applyToReadPollOpts(opts *readPollOpts) {
-	opts.duration = o.duration
-}
-
-type intervalOpt struct {
-	interval time.Duration
-}
-
-func WithInterval(d time.Duration) *intervalOpt {
-	return &intervalOpt{interval: d}
-}
-
-func (o intervalOpt) applyToReadPollOpts(opts *readPollOpts) {
-	opts.interval = o.interval
-}
-
-type topicOpt struct {
-	topic string
-}
-
-func WithTopic(topic string) *topicOpt {
-	return &topicOpt{topic: topic}
-}
-
-func (o topicOpt) applyToSendOpts(opts *sendOpts) {
-	opts.topic = o.topic
-}
-
-type topicsOpt struct {
-	topics []string
-}
-
-func WithTopics(topics ...string) *topicsOpt {
-	return &topicsOpt{topics: topics}
-}
-
-func (o topicsOpt) applyToQueueOpts(opts *queueOpts) {
-	opts.topics = append(opts.topics, o.topics...)
-}
-
-type unloggedOpt struct {
-	unlogged bool
-}
-
-func WithUnlogged(unlogged bool) *unloggedOpt {
-	return &unloggedOpt{unlogged: unlogged}
-}
-
-func (o unloggedOpt) applyToQueueOpts(opts *queueOpts) {
-	opts.unlogged = o.unlogged
-}
-
-type deleteAtOpt struct {
-	deleteAt time.Time
-}
-
-func WithDeleteAt(t time.Time) *deleteAtOpt {
-	return &deleteAtOpt{deleteAt: t}
-}
-
-func (o deleteAtOpt) applyToQueueOpts(opts *queueOpts) {
-	opts.deleteAt = &o.deleteAt
-}
-
-type deduplicationIDOpt struct {
-	deduplicationID string
-}
-
-func WithDeduplicationID(id string) *deduplicationIDOpt {
-	return &deduplicationIDOpt{deduplicationID: id}
-}
-
-func (o deduplicationIDOpt) applyToSendOpts(opts *sendOpts) {
-	opts.deduplicationID = o.deduplicationID
-}
-
-func (o deduplicationIDOpt) applyToDispatchOpts(opts *dispatchOpts) {
-	opts.deduplicationID = o.deduplicationID
-}
-
-func (o deduplicationIDOpt) applyToRunTaskOpts(opts *runTaskOpts) {
-	opts.deduplicationID = o.deduplicationID
-}
-
-func (o deduplicationIDOpt) applyToRunFlowOpts(opts *runFlowOpts) {
-	opts.deduplicationID = o.deduplicationID
-}
-
-type deliverAtOpt struct {
-	deliverAt time.Time
-}
-
-func WithDeliverAt(deliverAt time.Time) *deliverAtOpt {
-	return &deliverAtOpt{deliverAt: deliverAt}
-}
-
-func (o deliverAtOpt) applyToSendOpts(opts *sendOpts) {
-	opts.deliverAt = &o.deliverAt
-}
-
-func (o deliverAtOpt) applyToDispatchOpts(opts *dispatchOpts) {
-	opts.deliverAt = &o.deliverAt
-}
-
-type stepOpt struct {
-	step *Step
-}
-
-func WithStep(name string) *stepOpt {
-	return &stepOpt{step: &Step{Name: name}}
-}
-
-func (o *stepOpt) DependsOn(steps ...string) *stepOpt {
-	o.step.DependsOn = append(o.step.DependsOn, steps...)
-	return o
-}
-
-func (o *stepOpt) applyToFlow(f *Flow) {
-	f.Steps = append(f.Steps, o.step)
 }
 
 type loggerOpt struct {
@@ -333,14 +147,25 @@ type Step struct {
 	DependsOn []string `json:"depends_on,omitempty"`
 }
 
-func NewFlow(name string, opts ...FlowOpt) *Flow {
-	f := &Flow{
+func NewFlow(name string) *Flow {
+	return &Flow{
 		Name: name,
 	}
-	for _, opt := range opts {
-		opt.applyToFlow(f)
-	}
-	return f
+}
+
+func (f *Flow) AddStep(name string) *StepBuilder {
+	step := &Step{Name: name}
+	f.Steps = append(f.Steps, step)
+	return &StepBuilder{step: step}
+}
+
+type StepBuilder struct {
+	step *Step
+}
+
+func (b *StepBuilder) DependsOn(stepNames ...string) *StepBuilder {
+	b.step.DependsOn = append(b.step.DependsOn, stepNames...)
+	return b
 }
 
 type QueueInfo struct {
@@ -367,10 +192,6 @@ type TaskRunInfo struct {
 	FailedAt        time.Time       `json:"failed_at,omitzero"`
 }
 
-func (info *TaskRunInfo) OutputAs(o any) error {
-	return json.Unmarshal(info.Output, o)
-}
-
 type FlowInfo struct {
 	Name      string    `json:"name"`
 	Steps     []Step    `json:"steps"`
@@ -381,15 +202,11 @@ type FlowRunInfo struct {
 	ID              string          `json:"id"`
 	DeduplicationID string          `json:"deduplication_id,omitempty"`
 	Status          string          `json:"status"`
-	Input           json.RawMessage `json:"input,omitempty"`
 	Output          json.RawMessage `json:"output,omitempty"`
+	ErrorMessage    string          `json:"error_message,omitempty"`
 	StartedAt       time.Time       `json:"started_at,omitzero"`
 	CompletedAt     time.Time       `json:"completed_at,omitzero"`
 	FailedAt        time.Time       `json:"failed_at,omitzero"`
-}
-
-func (info *FlowRunInfo) OutputAs(o any) error {
-	return json.Unmarshal(info.Output, o)
 }
 
 type WorkerInfo struct {
@@ -409,14 +226,19 @@ type StepHandlerInfo struct {
 	StepName string `json:"step_name"`
 }
 
-func CreateQueue(ctx context.Context, conn Conn, name string, opts ...QueueOpt) error {
-	o := queueOpts{}
-	for _, opt := range opts {
-		opt.applyToQueueOpts(&o)
-	}
+type QueueOpts struct {
+	Topics   []string
+	DeleteAt time.Time
+	Unlogged bool
+}
 
+func CreateQueue(ctx context.Context, conn Conn, name string) error {
+	return CreateQueueWithOpts(ctx, conn, name, QueueOpts{})
+}
+
+func CreateQueueWithOpts(ctx context.Context, conn Conn, name string, opts QueueOpts) error {
 	q := `SELECT cb_create_queue(name => $1, topics => $2, delete_at => $3, unlogged => $4);`
-	_, err := conn.Exec(ctx, q, name, o.topics, o.deleteAt, o.unlogged)
+	_, err := conn.Exec(ctx, q, name, opts.Topics, ptrOrNil(opts.DeleteAt), opts.Unlogged)
 	return err
 }
 
@@ -441,35 +263,44 @@ func ListQueues(ctx context.Context, conn Conn) ([]*QueueInfo, error) {
 	return pgx.CollectRows(rows, scanCollectibleQueue)
 }
 
-func Send(ctx context.Context, conn Conn, queue string, payload any, opts ...SendOpt) error {
-	o := sendOpts{}
-	for _, opt := range opts {
-		opt.applyToSendOpts(&o)
-	}
+type SendOpts struct {
+	Topic           string
+	DeduplicationID string
+	DeliverAt       time.Time
+}
 
+func Send(ctx context.Context, conn Conn, queue string, payload any) error {
+	return SendWithOpts(ctx, conn, queue, payload, SendOpts{})
+}
+
+func SendWithOpts(ctx context.Context, conn Conn, queue string, payload any, opts SendOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 
-	q := `SELECT cb_send(queue => $1, payload => $2, deduplication_id => nullif($3, ''), deliver_at => $4);`
-	_, err = conn.Exec(ctx, q, queue, b, o.deduplicationID, o.deliverAt)
+	q := `SELECT cb_send(queue => $1, payload => $2, topic => $3, deduplication_id => $4, deliver_at => $5);`
+	_, err = conn.Exec(ctx, q, queue, b, ptrOrNil(opts.Topic), ptrOrNil(opts.DeduplicationID), ptrOrNil(opts.DeliverAt))
 	return err
 }
 
-func Dispatch(ctx context.Context, conn Conn, topic string, payload any, opts ...DispatchOpt) error {
-	o := dispatchOpts{}
-	for _, opt := range opts {
-		opt.applyToDispatchOpts(&o)
-	}
+type DispatchOpts struct {
+	DeduplicationID string
+	DeliverAt       *time.Time
+}
 
+func Dispatch(ctx context.Context, conn Conn, topic string, payload any) error {
+	return DispatchWithOpts(ctx, conn, topic, payload, DispatchOpts{})
+}
+
+func DispatchWithOpts(ctx context.Context, conn Conn, topic string, payload any, opts DispatchOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 
-	q := `SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''), deliver_at => $4);`
-	_, err = conn.Exec(ctx, q, topic, b, o.deduplicationID, o.deliverAt)
+	q := `SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => $3, deliver_at => $4);`
+	_, err = conn.Exec(ctx, q, topic, b, ptrOrNil(opts.DeduplicationID), ptrOrNil(opts.DeliverAt))
 	return err
 }
 
@@ -482,18 +313,10 @@ func Read(ctx context.Context, conn Conn, queue string, quantity int, hideFor ti
 	return pgx.CollectRows(rows, scanCollectibleMessage)
 }
 
-func ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFor time.Duration, opts ...ReadPollOpt) ([]Message, error) {
-	o := readPollOpts{
-		duration: DefaultPollDuration,
-		interval: DefaultPollInterval,
-	}
-	for _, opt := range opts {
-		opt.applyToReadPollOpts(&o)
-	}
-
+func ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]Message, error) {
 	q := `SELECT * FROM cb_read_poll(queue => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
 
-	rows, err := conn.Query(ctx, q, queue, quantity, hideFor.Seconds(), o.duration.Seconds(), o.interval.Milliseconds())
+	rows, err := conn.Query(ctx, q, queue, quantity, hideFor.Seconds(), pollFor.Seconds(), pollInterval.Milliseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -550,47 +373,58 @@ func ListTasks(ctx context.Context, conn Conn) ([]*TaskInfo, error) {
 	return pgx.CollectRows(rows, scanCollectibleTask)
 }
 
-func RunTask(ctx context.Context, conn Conn, name string, input any, opts ...RunTaskOpt) (string, error) {
-	o := runTaskOpts{}
-	for _, opt := range opts {
-		opt.applyToRunTaskOpts(&o)
-	}
-
-	b, err := json.Marshal(input)
-	if err != nil {
-		return "", err
-	}
-	q := `SELECT * FROM cb_run_task(name => $1, input => $2, deduplication_id => nullif($3, ''));`
-	var runID string
-	err = conn.QueryRow(ctx, q, name, b, o.deduplicationID).Scan(&runID)
-	if err != nil {
-		return "", err
-	}
-	return runID, err
+type RunTaskOpts struct {
+	DeduplicationID string
 }
 
-func RunTaskWait(ctx context.Context, conn Conn, name string, input any, opts ...RunTaskOpt) (*TaskRunInfo, error) {
-	id, err := RunTask(ctx, conn, name, input, opts...)
+func RunTask(ctx context.Context, conn Conn, name string, input any) (*TaskHandle, error) {
+	return RunTaskWithOpts(ctx, conn, name, input, RunTaskOpts{})
+}
+
+func RunTaskWithOpts(ctx context.Context, conn Conn, name string, input any, opts RunTaskOpts) (*TaskHandle, error) {
+	b, err := json.Marshal(input)
 	if err != nil {
 		return nil, err
 	}
 
+	q := `SELECT * FROM cb_run_task(name => $1, input => $2, deduplication_id => $3);`
+	var id string
+	err = conn.QueryRow(ctx, q, name, b, ptrOrNil(opts.DeduplicationID)).Scan(&id)
+	if err != nil {
+		return nil, err
+	}
+
+	return &TaskHandle{conn: conn, id: id}, nil
+}
+
+type TaskHandle struct {
+	conn Conn
+	id   string
+}
+
+func (h *TaskHandle) ID() string {
+	return h.id
+}
+
+func (h *TaskHandle) WaitForOutput(ctx context.Context, out any) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		case <-ticker.C:
-			info, err := GetTaskRun(ctx, conn, id)
+			info, err := GetTaskRun(ctx, h.conn, h.id)
 			if err != nil {
-				return nil, err
+				return err
 			}
-			if info.Status == StatusStarted {
-				continue
+			switch info.Status {
+			case StatusCompleted:
+				return json.Unmarshal(info.Output, out)
+			case StatusFailed:
+				return fmt.Errorf("%w: %s", ErrTaskFailed, info.ErrorMessage)
 			}
-			return info, nil
 		}
 	}
 }
@@ -679,54 +513,63 @@ func ListFlows(ctx context.Context, conn Conn) ([]*FlowInfo, error) {
 	return pgx.CollectRows(rows, scanCollectibleFlow)
 }
 
-func RunFlow(ctx context.Context, conn Conn, name string, input any, opts ...RunFlowOpt) (string, error) {
-	o := runFlowOpts{}
-	for _, opt := range opts {
-		opt.applyToRunFlowOpts(&o)
-	}
-
-	b, err := json.Marshal(input)
-	if err != nil {
-		return "", err
-	}
-	q := `SELECT * FROM cb_run_flow(name => $1, input => $2, deduplication_id => nullif($3, ''));`
-	var runID string
-	err = conn.QueryRow(ctx, q, name, b, o.deduplicationID).Scan(&runID)
-	if err != nil {
-		return "", err
-	}
-	return runID, err
+type RunFlowOpts struct {
+	DeduplicationID string
 }
 
-func RunFlowWait(ctx context.Context, conn Conn, name string, input any, opts ...RunFlowOpt) (*FlowRunInfo, error) {
-	id, err := RunFlow(ctx, conn, name, input, opts...)
+func RunFlow(ctx context.Context, conn Conn, name string, input any) (*FlowHandle, error) {
+	return RunFlowWithOpts(ctx, conn, name, input, RunFlowOpts{})
+}
+
+func RunFlowWithOpts(ctx context.Context, conn Conn, name string, input any, opts RunFlowOpts) (*FlowHandle, error) {
+	b, err := json.Marshal(input)
 	if err != nil {
 		return nil, err
 	}
+	q := `SELECT * FROM cb_run_flow(name => $1, input => $2, deduplication_id => $3);`
+	var id string
+	err = conn.QueryRow(ctx, q, name, b, ptrOrNil(opts.DeduplicationID)).Scan(&id)
+	if err != nil {
+		return nil, err
+	}
+	return &FlowHandle{id: id, conn: conn}, nil
+}
 
+type FlowHandle struct {
+	id   string
+	conn Conn
+}
+
+func (h *FlowHandle) ID() string {
+	return h.id
+}
+
+func (h *FlowHandle) WaitForOutput(ctx context.Context, out any) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		case <-ticker.C:
-			info, err := GetFlowRun(ctx, conn, id)
+			info, err := GetFlowRun(ctx, h.conn, h.id)
 			if err != nil {
-				return nil, err
+				return err
 			}
-			if info.Status == StatusStarted {
-				continue
+			switch info.Status {
+			case StatusCompleted:
+				return json.Unmarshal(info.Output, out)
+			case StatusFailed:
+				return fmt.Errorf("%w: %s", ErrFlowFailed, info.ErrorMessage)
 			}
-			return info, nil
 		}
 	}
 }
 
 func GetFlowRun(ctx context.Context, conn Conn, id string) (*FlowRunInfo, error) {
 	q := `
-		SELECT id, deduplication_id, status, input, output, started_at, completed_at, failed_at
+		SELECT id, deduplication_id, status, output, error_message, started_at, completed_at, failed_at
 		FROM cb_flow_runs
 		WHERE id = $1;`
 	return scanFlowRun(conn.QueryRow(ctx, q, id))
@@ -734,7 +577,7 @@ func GetFlowRun(ctx context.Context, conn Conn, id string) (*FlowRunInfo, error)
 
 func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunInfo, error) {
 	q := `
-		SELECT id, deduplication_id, status, input, output, started_at, completed_at, failed_at
+		SELECT id, deduplication_id, status, output, error_message, started_at, completed_at, failed_at
 		FROM cb_flow_runs
 		WHERE flow_name = $1
 		ORDER BY started_at DESC
@@ -780,39 +623,29 @@ func GC(ctx context.Context, conn Conn) error {
 	return err
 }
 
-func EnqueueSend(batch *pgx.Batch, queue string, payload any, opts ...SendOpt) error {
-	o := sendOpts{}
-	for _, opt := range opts {
-		opt.applyToSendOpts(&o)
-	}
-
+func EnqueueSend(batch *pgx.Batch, queue string, payload any, opts SendOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 
 	batch.Queue(
-		`SELECT cb_send(topic => $1, payload => $2, deduplication_id => nullif($3, ''), deliver_at => $4);`,
-		queue, b, o.deduplicationID, o.deliverAt,
+		`SELECT cb_send(queue => $1, payload => $2, topic => $3, deduplication_id => $4, deliver_at => $5);`,
+		queue, b, ptrOrNil(opts.Topic), ptrOrNil(opts.DeduplicationID), ptrOrNil(opts.DeliverAt),
 	)
 
 	return nil
 }
 
-func EnqueueDispatch(batch *pgx.Batch, topic string, payload any, opts ...DispatchOpt) error {
-	o := dispatchOpts{}
-	for _, opt := range opts {
-		opt.applyToDispatchOpts(&o)
-	}
-
+func EnqueueDispatch(batch *pgx.Batch, topic string, payload any, opts DispatchOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 
 	batch.Queue(
-		`SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => nullif($3, ''), deliver_at => $4);`,
-		topic, b, o.deduplicationID, o.deliverAt,
+		`SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => $3, deliver_at => $4);`,
+		topic, b, ptrOrNil(opts.DeduplicationID), ptrOrNil(opts.DeliverAt),
 	)
 
 	return nil
@@ -971,6 +804,7 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 
 	var deduplicationID *string
 	var output *json.RawMessage
+	var errorMessage *string
 	var completedAt *time.Time
 	var failedAt *time.Time
 
@@ -978,8 +812,8 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 		&rec.ID,
 		&deduplicationID,
 		&rec.Status,
-		&rec.Input,
 		&output,
+		&errorMessage,
 		&rec.StartedAt,
 		&completedAt,
 		&failedAt,
@@ -992,6 +826,9 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 	}
 	if output != nil {
 		rec.Output = *output
+	}
+	if errorMessage != nil {
+		rec.ErrorMessage = *errorMessage
 	}
 	if completedAt != nil {
 		rec.CompletedAt = *completedAt
@@ -1035,4 +872,12 @@ func scanWorker(row pgx.Row) (*WorkerInfo, error) {
 	}
 
 	return &rec, nil
+}
+
+func ptrOrNil[T comparable](t T) *T {
+	var tt T
+	if t == tt {
+		return nil
+	}
+	return &t
 }

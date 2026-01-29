@@ -10,6 +10,8 @@ SQL code is mostly taken or adapted from the excellent [pgmq](https://github.com
 
 ## TODO
 
+* RunPeriodicFlow
+* split queues into queues and exchanges?
 * move jitter factor to postgres queue definition?
 * handle panics in worker
 * pause tasks - wait for for signal
