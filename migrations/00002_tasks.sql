@@ -42,17 +42,19 @@ CREATE TABLE IF NOT EXISTS cb_flow_runs (
   flow_name text NOT NULL REFERENCES cb_flows (name),
   status text NOT NULL DEFAULT 'started',
   input jsonb NOT NULL,
+  error_message text,
   output jsonb,
   remaining_steps int NOT NULL DEFAULT 0,
   started_at timestamptz NOT NULL DEFAULT now(),
   completed_at timestamptz,
   failed_at timestamptz,
+  CONSTRAINT status_is_valid CHECK (status IN ('started', 'completed', 'failed')),
   CONSTRAINT remaining_steps_valid CHECK (remaining_steps >= 0),
   CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
   CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
-  CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
   CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
-  CONSTRAINT status_valid CHECK (status IN ('started', 'completed', 'failed'))
+  CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
+  CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = '')))
 );
 
 CREATE INDEX IF NOT EXISTS cb_flow_runs_flow_name_idx ON cb_flow_runs (flow_name);
@@ -470,7 +472,8 @@ BEGIN
   -- fail flow run
   UPDATE cb_flow_runs f_r
   SET status = 'failed',
-      failed_at = now()
+      failed_at = now(),
+      error_message = cb_fail_step.error_message
   WHERE f_r.id = _flow_run_id
     AND f_r.status = 'started';
 

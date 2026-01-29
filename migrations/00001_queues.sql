@@ -262,19 +262,33 @@ CREATE OR REPLACE FUNCTION cb_read_poll(
     queue text,
     quantity int,
     hide_for int,
-    poll_for int = 5,
-    poll_interval int = 100
+    poll_for int,
+    poll_interval int
 )
 RETURNS SETOF cb_message
 LANGUAGE plpgsql AS $$
 DECLARE
     _m cb_message;
+    _sleep_for double precision;
     _stop_at timestamp;
-    _sleep_for double precision = cb_read_poll.poll_interval::numeric / 1000;
     _q text;
     _q_table text = _cb_table_name(cb_read_poll.queue, 'q');
 BEGIN
-    _stop_at := clock_timestamp() + make_interval(secs => cb_read_poll.poll_for);
+    IF cb_read_poll.poll_for <= 0 THEN
+        RAISE EXCEPTION 'cb: poll_for must be greater than 0';
+    END IF;
+    IF cb_read_poll.poll_interval <= 0 THEN
+        RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
+    END IF;
+
+    _sleep_for = cb_read_poll.poll_interval::numeric / 1000;
+
+    IF _sleep_for >= cb_read_poll.poll_for THEN
+        RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
+    END IF;
+
+    _stop_at = clock_timestamp() + make_interval(secs => cb_read_poll.poll_for);
+
     LOOP
         IF (SELECT clock_timestamp() >= _stop_at) THEN
             RETURN;

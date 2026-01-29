@@ -151,8 +151,10 @@ func (w *Worker) Start(ctx context.Context) error {
 						// use Next if Prev is not set, which will only happen for the first run
 						scheduledTime = entry.Next
 					}
-					dedupID := fmt.Sprintf("%s-cron-%s", h.name, scheduledTime)
-					_, err := RunTask(ctx, w.conn, h.name, struct{}{}, WithDeduplicationID(dedupID))
+
+					_, err := RunTaskWithOpts(ctx, w.conn, h.name, struct{}{}, RunTaskOpts{
+						DeduplicationID: fmt.Sprint(scheduledTime),
+					})
 					if err != nil {
 						w.logger.ErrorContext(ctx, "worker: failed to schedule task", "task", h.name, "error", err)
 					}
@@ -162,7 +164,6 @@ func (w *Worker) Start(ctx context.Context) error {
 				}
 			}
 		}
-
 	}
 
 	if _, err := w.conn.Exec(ctx, `SELECT * FROM cb_worker_started(id => $1, handlers => $2);`, w.id, handlerNames); err != nil {
@@ -200,7 +201,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 
 	for _, h := range w.handlers {
-		msgChan := make(chan Message, h.concurrency)
+		msgChan := make(chan Message)
 		msgHider := newMessageHider(w.conn, h, w.logger)
 
 		wg.Go(func() {
@@ -212,7 +213,7 @@ func (w *Worker) Start(ctx context.Context) error {
 			defer close(msgChan)
 
 			for {
-				msgs, err := ReadPoll(ctx, w.conn, h.queue, h.batchSize, delayWithJitter(10*time.Minute, h.jitterFactor))
+				msgs, err := ReadPoll(ctx, w.conn, h.queue, h.batchSize, withJitter(10*time.Minute, h.jitterFactor), 10*time.Second, 100*time.Millisecond)
 				if err != nil {
 					if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 						w.logger.ErrorContext(ctx, "worker: cannot read messages", "handler", h.name, "error", err)
@@ -298,7 +299,7 @@ func (w *Worker) handle(ctx context.Context, h *Handler, msg Message, stopHiding
 				}
 			}
 		} else if h.delay > 0 {
-			if _, err := Hide(ctx, w.conn, h.queue, msg.ID, delayWithJitter(h.delay, h.jitterFactor)); err != nil {
+			if _, err := Hide(ctx, w.conn, h.queue, msg.ID, withJitter(h.delay, h.jitterFactor)); err != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot delay next run", "handler", h.name, "error", err)
 			}
 		}
@@ -354,7 +355,7 @@ func (mh *messageHider) start(ctx context.Context) {
 			}
 			mh.mu.Unlock()
 
-			if err := HideMany(ctx, mh.conn, mh.h.queue, ids, delayWithJitter(hideFor, mh.h.jitterFactor)); err != nil {
+			if err := HideMany(ctx, mh.conn, mh.h.queue, ids, withJitter(hideFor, mh.h.jitterFactor)); err != nil {
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 					mh.logger.ErrorContext(ctx, "worker: cannot hide messages", "handler", mh.h.name, "error", err)
 				}
@@ -377,7 +378,7 @@ func (mh *messageHider) stopHiding(id int64) {
 	mh.mu.Unlock()
 }
 
-func delayWithJitter(delay time.Duration, jitterFactor float64) time.Duration {
+func withJitter(delay time.Duration, jitterFactor float64) time.Duration {
 	if jitterFactor == 0 {
 		return delay
 	}

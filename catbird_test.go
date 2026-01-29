@@ -42,9 +42,9 @@ func getTestClient(t *testing.T) *Client {
 func TestQueues(t *testing.T) {
 	client := getTestClient(t)
 
-	err := client.CreateQueue(t.Context(), "test_queue",
-		WithTopics("topic1", "topic2"),
-	)
+	err := client.CreateQueueWithOpts(t.Context(), "test_queue", QueueOpts{
+		Topics: []string{"topic1", "topic2"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,11 +77,12 @@ func TestFlows(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = client.CreateFlow(t.Context(), NewFlow("flow1",
-		WithStep("step1"),
-		WithStep("step2").DependsOn("step1"),
-		WithStep("step3").DependsOn("step2"),
-	))
+	flow := NewFlow("flow1")
+	flow.AddStep("step1")
+	flow.AddStep("step2").DependsOn("step1")
+	flow.AddStep("step3").DependsOn("step2")
+
+	err = client.CreateFlow(t.Context(), flow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,36 +131,36 @@ func TestFlows(t *testing.T) {
 	}()
 
 	func() {
-		var out string
-		info, err := client.RunTaskWait(t.Context(), "task1", Task1Input{Str: "input"})
+		h, err := client.RunTask(t.Context(), "task1", Task1Input{Str: "input"})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := info.OutputAs(&out); err != nil {
+		var out string
+		if err := h.WaitForOutput(t.Context(), &out); err != nil {
 			t.Fatal(err)
 		}
 		if out != "input processed by task 1" {
-			t.Fatalf("unexpected task output: %s", info.Output)
+			t.Fatalf("unexpected task output: %s", out)
 		}
 	}()
 
 	func() {
-		var out flow1Output
-		info, err := client.RunFlowWait(t.Context(), "flow1", "input")
+		h, err := client.RunFlow(t.Context(), "flow1", "input")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := info.OutputAs(&out); err != nil {
+		var out flow1Output
+		if err := h.WaitForOutput(t.Context(), &out); err != nil {
 			t.Fatal(err)
 		}
 		if out.Step1 != "input processed by step 1" {
-			t.Fatalf("unexpected flow output: %s", info.Output)
+			t.Fatalf("unexpected flow output for step1: %s", out.Step1)
 		}
 		if out.Step2 != "input processed by step 1 and by step 2" {
-			t.Fatalf("unexpected flow output: %s", info.Output)
+			t.Fatalf("unexpected flow output for step2: %s", out.Step2)
 		}
 		if out.Step3 != "input processed by step 1 and by step 2 and by step 3" {
-			t.Fatalf("unexpected flow output: %s", info.Output)
+			t.Fatalf("unexpected flow output for step3: %s", out.Step3)
 		}
 	}()
 }
