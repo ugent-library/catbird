@@ -193,9 +193,14 @@ type TaskRunInfo struct {
 }
 
 type FlowInfo struct {
-	Name      string    `json:"name"`
-	Steps     []Step    `json:"steps"`
-	CreatedAt time.Time `json:"created_at"`
+	Name      string     `json:"name"`
+	Steps     []StepInfo `json:"steps"`
+	CreatedAt time.Time  `json:"created_at"`
+}
+
+type StepInfo struct {
+	Name      string   `json:"name"`
+	DependsOn []string `json:"depends_on,omitempty"`
 }
 
 type FlowRunInfo struct {
