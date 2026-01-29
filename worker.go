@@ -152,7 +152,7 @@ func (w *Worker) Start(ctx context.Context) error {
 						scheduledTime = entry.Next
 					}
 					dedupID := fmt.Sprintf("%s-cron-%s", h.name, scheduledTime)
-					_, err := RunTask(ctx, w.conn, h.name, struct{}{}, RunTaskOpts{dedupID})
+					_, err := RunTask(ctx, w.conn, h.name, struct{}{}, WithDeduplicationID(dedupID))
 					if err != nil {
 						w.logger.ErrorContext(ctx, "worker: failed to schedule task", "task", h.name, "error", err)
 					}
@@ -212,7 +212,7 @@ func (w *Worker) Start(ctx context.Context) error {
 			defer close(msgChan)
 
 			for {
-				msgs, err := ReadPoll(ctx, w.conn, h.queue, h.batchSize, delayWithJitter(10*time.Minute, h.jitterFactor), ReadPollOpts{})
+				msgs, err := ReadPoll(ctx, w.conn, h.queue, h.batchSize, delayWithJitter(10*time.Minute, h.jitterFactor))
 				if err != nil {
 					if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 						w.logger.ErrorContext(ctx, "worker: cannot read messages", "handler", h.name, "error", err)
