@@ -73,8 +73,8 @@ func (c *Client) DeleteMany(ctx context.Context, queue string, ids []int64) erro
 	return DeleteMany(ctx, c.Conn, queue, ids)
 }
 
-func (c *Client) CreateTask(ctx context.Context, name string) error {
-	return CreateTask(ctx, c.Conn, name)
+func (c *Client) CreateTask(ctx context.Context, task *Task) error {
+	return CreateTask(ctx, c.Conn, task)
 }
 
 func (c *Client) GetTask(ctx context.Context, name string) (*TaskInfo, error) {
@@ -97,8 +97,8 @@ func (c *Client) GetTaskRun(ctx context.Context, id string) (*TaskRunInfo, error
 	return GetTaskRun(ctx, c.Conn, id)
 }
 
-func (c *Client) ListTaskRuns(ctx context.Context, taskName string) ([]*TaskRunInfo, error) {
-	return ListTaskRuns(ctx, c.Conn, taskName)
+func (c *Client) ListTaskRuns(ctx context.Context, name string) ([]*TaskRunInfo, error) {
+	return ListTaskRuns(ctx, c.Conn, name)
 }
 
 func (c *Client) CreateFlow(ctx context.Context, flow *Flow) error {
@@ -125,20 +125,20 @@ func (c *Client) GetFlowRun(ctx context.Context, id string) (*FlowRunInfo, error
 	return GetFlowRun(ctx, c.Conn, id)
 }
 
-func (c *Client) ListFlowRuns(ctx context.Context, taskName string) ([]*FlowRunInfo, error) {
-	return ListFlowRuns(ctx, c.Conn, taskName)
-}
-
-func (c *Client) NewWorker(tasks []*Handler, opts ...WorkerOpt) (*Worker, error) {
-	return NewWorker(c.Conn, tasks, opts...)
+func (c *Client) ListFlowRuns(ctx context.Context, name string) ([]*FlowRunInfo, error) {
+	return ListFlowRuns(ctx, c.Conn, name)
 }
 
 func (c *Client) ListWorkers(ctx context.Context) ([]*WorkerInfo, error) {
 	return ListWorkers(ctx, c.Conn)
 }
 
-func (c *Client) StartWorker(ctx context.Context, tasks []*Handler, opts ...WorkerOpt) error {
-	worker, err := NewWorker(c.Conn, tasks, opts...)
+func (c *Client) NewWorker(opts ...WorkerOpt) (*Worker, error) {
+	return NewWorker(c.Conn, opts...)
+}
+
+func (c *Client) StartWorker(ctx context.Context, opts ...WorkerOpt) error {
+	worker, err := NewWorker(c.Conn, opts...)
 	if err != nil {
 		return err
 	}

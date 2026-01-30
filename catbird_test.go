@@ -68,24 +68,9 @@ func TestFlows(t *testing.T) {
 		Str string `json:"str"`
 	}
 
-	task1 := NewTaskHandler("task1", func(ctx context.Context, in Task1Input) (string, error) {
+	task1 := NewTask("task1", TaskHandler(func(ctx context.Context, in Task1Input) (string, error) {
 		return in.Str + " processed by task 1", nil
-	})
-
-	err := client.CreateTask(t.Context(), "task1")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	flow := NewFlow("flow1")
-	flow.AddStep("step1")
-	flow.AddStep("step2").DependsOn("step1")
-	flow.AddStep("step3").DependsOn("step2")
-
-	err = client.CreateFlow(t.Context(), flow)
-	if err != nil {
-		t.Fatal(err)
-	}
+	}))
 
 	type flow1Output struct {
 		Step1 string `json:"step1"`
@@ -97,33 +82,34 @@ func TestFlows(t *testing.T) {
 		FlowInput string `json:"flow_input"`
 	}
 
-	step1 := NewStepHandler("flow1", "step1", func(ctx context.Context, in step1Input) (string, error) {
-		return in.FlowInput + " processed by step 1", nil
-	})
-
 	type step2Input struct {
 		FlowInput string `json:"flow_input"`
 		Step1     string `json:"step1"`
 	}
-
-	step2 := NewStepHandler("flow1", "step2", func(ctx context.Context, in step2Input) (string, error) {
-		return in.Step1 + " and by step 2", nil
-	})
 
 	type step3Input struct {
 		FlowInput string `json:"flow_input"`
 		Step2     string `json:"step2"`
 	}
 
-	step3 := NewStepHandler("flow1", "step3", func(ctx context.Context, in step3Input) (string, error) {
+	flow1 := NewFlow("flow1")
+	flow1.AddStep("step1", StepHandler(func(ctx context.Context, in step1Input) (string, error) {
+		return in.FlowInput + " processed by step 1", nil
+	}))
+	flow1.AddStep("step2", DependsOn("step1"), StepHandler(func(ctx context.Context, in step2Input) (string, error) {
+		return in.Step1 + " and by step 2", nil
+	}))
+	flow1.AddStep("step3", DependsOn("step2"), StepHandler(func(ctx context.Context, in step3Input) (string, error) {
 		return in.Step2 + " and by step 3", nil
-	})
+	}))
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	go func() {
-		err := client.StartWorker(t.Context(), []*Handler{task1, step1, step2, step3},
+		err := client.StartWorker(t.Context(),
 			WithLogger(logger),
+			WithTask(task1),
+			WithFlow(flow1),
 		)
 		if err != nil {
 			t.Logf("worker error: %s", err)
