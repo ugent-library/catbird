@@ -33,20 +33,40 @@ type WorkerOpt interface {
 	applyToWorker(*Worker)
 }
 
-type HandlerOpt interface {
-	applyToHandler(*Handler)
+type taskOpt struct {
+	task *Task
+}
+
+func (o taskOpt) applyToWorker(w *Worker) {
+	w.tasks = append(w.tasks, o.task)
+}
+
+func WithTask(t *Task) *taskOpt {
+	return &taskOpt{task: t}
+}
+
+type flowOpt struct {
+	flow *Flow
+}
+
+func (o flowOpt) applyToWorker(w *Worker) {
+	w.flows = append(w.flows, o.flow)
+}
+
+func WithFlow(f *Flow) *flowOpt {
+	return &flowOpt{flow: f}
 }
 
 type loggerOpt struct {
 	logger *slog.Logger
 }
 
-func WithLogger(l *slog.Logger) *loggerOpt {
-	return &loggerOpt{logger: l}
-}
-
 func (o loggerOpt) applyToWorker(w *Worker) {
 	w.logger = o.logger
+}
+
+func WithLogger(l *slog.Logger) *loggerOpt {
+	return &loggerOpt{logger: l}
 }
 
 type timeoutOpt struct {
@@ -61,51 +81,36 @@ func (o timeoutOpt) applyToWorker(w *Worker) {
 	w.timeout = o.timeout
 }
 
-func (o timeoutOpt) applyToHandler(h *Handler) {
-	h.timeout = o.timeout
+type scheduledTaskOpt struct {
+	taskName string
+	schedule string
 }
 
-type concurrencyOpt struct {
-	concurrency int
+func (o scheduledTaskOpt) applyToWorker(w *Worker) {
+	w.taskSchedules = append(w.taskSchedules, taskSchedule{
+		taskName: o.taskName,
+		schedule: o.schedule,
+	})
 }
 
-func WithConcurrency(n int) *concurrencyOpt {
-	return &concurrencyOpt{concurrency: n}
+func WithScheduledTask(taskName, schedule string) *scheduledTaskOpt {
+	return &scheduledTaskOpt{taskName: taskName, schedule: schedule}
 }
 
-func (o concurrencyOpt) applyToHandler(h *Handler) {
-	h.concurrency = o.concurrency
+type scheduledFlowOpt struct {
+	flowName string
+	schedule string
 }
 
-type batchSizeOpt struct {
-	batchSize int
+func (o scheduledFlowOpt) applyToWorker(w *Worker) {
+	w.flowSchedules = append(w.flowSchedules, flowSchedule{
+		flowName: o.flowName,
+		schedule: o.schedule,
+	})
 }
 
-func WithBatchSize(n int) *batchSizeOpt {
-	return &batchSizeOpt{batchSize: n}
-}
-
-func (o batchSizeOpt) applyToHandler(h *Handler) {
-	h.batchSize = o.batchSize
-}
-
-type retriesOpt struct {
-	retries int
-	delay   time.Duration
-}
-
-func WithRetries(n int) *retriesOpt {
-	return &retriesOpt{retries: n}
-}
-
-func (o *retriesOpt) Delay(d time.Duration) *retriesOpt {
-	o.delay = d
-	return o
-}
-
-func (o retriesOpt) applyToHandler(h *Handler) {
-	h.retries = o.retries
-	h.delay = o.delay
+func WithScheduledFlow(flowName, schedule string) *scheduledFlowOpt {
+	return &scheduledFlowOpt{flowName: flowName, schedule: schedule}
 }
 
 type gcOpt struct {
@@ -122,9 +127,13 @@ func (o *gcOpt) Schedule(schedule string) *gcOpt {
 }
 
 func (o gcOpt) applyToWorker(w *Worker) {
-	w.handlers = append(w.handlers, NewPeriodicTaskHandler("gc", o.schedule, func(ctx context.Context, input struct{}) (struct{}, error) {
+	w.tasks = append(w.tasks, NewTask("gc", TaskHandler(func(ctx context.Context, input struct{}) (struct{}, error) {
 		return struct{}{}, GC(ctx, w.conn)
-	}))
+	})))
+	w.taskSchedules = append(w.taskSchedules, taskSchedule{
+		taskName: "gc",
+		schedule: o.schedule,
+	})
 }
 
 type Message struct {
@@ -137,6 +146,93 @@ type Message struct {
 	DeliverAt       time.Time       `json:"deliver_at"`
 }
 
+type handler struct {
+	fn           func(context.Context, []byte) ([]byte, error)
+	concurrency  int
+	batchSize    int
+	timeout      time.Duration
+	retries      int
+	retryDelay   time.Duration
+	jitterFactor float64
+}
+
+type handlerOpt func(h *handler)
+
+func WithConcurrency(n int) handlerOpt {
+	return func(h *handler) {
+		h.concurrency = n
+	}
+}
+
+func Timeout(d time.Duration) handlerOpt {
+	return func(h *handler) {
+		h.timeout = d
+	}
+}
+
+func WithBatchSize(n int) handlerOpt {
+	return func(h *handler) {
+		h.batchSize = n
+	}
+}
+
+func WithRetries(n int) handlerOpt {
+	return func(h *handler) {
+		h.retries = n
+	}
+}
+
+func WithRetryDelay(d time.Duration) handlerOpt {
+	return func(h *handler) {
+		h.retryDelay = d
+	}
+}
+
+type Task struct {
+	Name    string `json:"name"`
+	handler *handler
+}
+
+type TaskOpt func(*Task)
+
+func NewTask(name string, opts ...TaskOpt) *Task {
+	t := &Task{
+		Name: name,
+	}
+	for _, opt := range opts {
+		opt(t)
+	}
+	return t
+}
+
+func TaskHandler[Input, Output any](fn func(context.Context, Input) (Output, error), opts ...handlerOpt) TaskOpt {
+	h := &handler{
+		concurrency:  1,
+		batchSize:    10,
+		jitterFactor: 0.1,
+		fn: func(ctx context.Context, b []byte) ([]byte, error) {
+			var in Input
+			if err := json.Unmarshal(b, &in); err != nil {
+				return nil, err
+			}
+
+			out, err := fn(ctx, in)
+			if err != nil {
+				return nil, err
+			}
+
+			return json.Marshal(out)
+		},
+	}
+
+	return func(t *Task) {
+		t.handler = h
+		for _, opt := range opts {
+			opt(h)
+		}
+	}
+}
+
 type Flow struct {
 	Name  string  `json:"name"`
 	Steps []*Step `json:"steps"`
@@ -145,7 +241,10 @@ type Flow struct {
 type Step struct {
 	Name      string   `json:"name"`
 	DependsOn []string `json:"depends_on,omitempty"`
+	handler   *handler
 }
+
+type StepOpt func(*Step)
 
 func NewFlow(name string) *Flow {
 	return &Flow{
@@ -153,19 +252,46 @@ func NewFlow(name string) *Flow {
 	}
 }
 
-func (f *Flow) AddStep(name string) *StepBuilder {
+func (f *Flow) AddStep(name string, opts ...StepOpt) {
 	step := &Step{Name: name}
+	for _, opt := range opts {
+		opt(step)
+	}
 	f.Steps = append(f.Steps, step)
-	return &StepBuilder{step: step}
 }
 
-type StepBuilder struct {
-	step *Step
+func DependsOn(steps ...string) StepOpt {
+	return func(s *Step) {
+		s.DependsOn = append(s.DependsOn, steps...)
+	}
 }
 
-func (b *StepBuilder) DependsOn(stepNames ...string) *StepBuilder {
-	b.step.DependsOn = append(b.step.DependsOn, stepNames...)
-	return b
+func StepHandler[Input, Output any](fn func(context.Context, Input) (Output, error), opts ...handlerOpt) StepOpt {
+	h := &handler{
+		concurrency:  1,
+		batchSize:    10,
+		jitterFactor: 0.1,
+		fn: func(ctx context.Context, b []byte) ([]byte, error) {
+			var in Input
+			if err := json.Unmarshal(b, &in); err != nil {
+				return nil, err
+			}
+
+			out, err := fn(ctx, in)
+			if err != nil {
+				return nil, err
+			}
+
+			return json.Marshal(out)
+		},
+	}
+
+	return func(s *Step) {
+		s.handler = h
+		for _, opt := range opts {
+			opt(h)
+		}
+	}
 }
 
 type QueueInfo struct {
@@ -355,9 +481,9 @@ func DeleteMany(ctx context.Context, conn Conn, queue string, ids []int64) error
 	return err
 }
 
-func CreateTask(ctx context.Context, conn Conn, name string) error {
+func CreateTask(ctx context.Context, conn Conn, task *Task) error {
 	q := `SELECT * FROM cb_create_task(name => $1);`
-	_, err := conn.Exec(ctx, q, name)
+	_, err := conn.Exec(ctx, q, task.Name)
 	if err != nil {
 		return err
 	}
@@ -442,14 +568,14 @@ func GetTaskRun(ctx context.Context, conn Conn, id string) (*TaskRunInfo, error)
 	return scanTaskRun(conn.QueryRow(ctx, q, id))
 }
 
-func ListTaskRuns(ctx context.Context, conn Conn, taskName string) ([]*TaskRunInfo, error) {
+func ListTaskRuns(ctx context.Context, conn Conn, name string) ([]*TaskRunInfo, error) {
 	q := `
 		SELECT id, deduplication_id, status, output, error_message, started_at, completed_at, failed_at
 		FROM cb_task_runs
 		WHERE task_name = $1
 		ORDER BY started_at DESC
 		LIMIT 20;`
-	rows, err := conn.Query(ctx, q, taskName)
+	rows, err := conn.Query(ctx, q, name)
 	if err != nil {
 		return nil, err
 	}
@@ -580,14 +706,14 @@ func GetFlowRun(ctx context.Context, conn Conn, id string) (*FlowRunInfo, error)
 	return scanFlowRun(conn.QueryRow(ctx, q, id))
 }
 
-func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunInfo, error) {
+func ListFlowRuns(ctx context.Context, conn Conn, name string) ([]*FlowRunInfo, error) {
 	q := `
 		SELECT id, deduplication_id, status, output, error_message, started_at, completed_at, failed_at
 		FROM cb_flow_runs
 		WHERE flow_name = $1
 		ORDER BY started_at DESC
 		LIMIT 20;`
-	rows, err := conn.Query(ctx, q, flowName)
+	rows, err := conn.Query(ctx, q, name)
 	if err != nil {
 		return nil, err
 	}
