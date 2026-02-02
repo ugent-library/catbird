@@ -33,16 +33,6 @@ CREATE INDEX IF NOT EXISTS cb_queues_topics_idx ON cb_queues USING gin (topics);
 CREATE INDEX IF NOT EXISTS cb_queues_delete_at_idx ON cb_queues (delete_at);
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION _cb_acquire_queue_lock(name text) 
-RETURNS void
-LANGUAGE plpgsql AS $$
-BEGIN
-  PERFORM pg_advisory_xact_lock(hashtext(_cb_table_name(_cb_acquire_queue_lock.name, 'q')));
-END;
-$$;
--- +goose statementend
-
--- +goose statementbegin
 CREATE OR REPLACE FUNCTION _cb_table_name(name text, prefix text)
 RETURNS text
 LANGUAGE plpgsql AS $$
@@ -70,7 +60,7 @@ LANGUAGE plpgsql AS $$
 DECLARE
     _q_table text = _cb_table_name(cb_create_queue.name, 'q');
 BEGIN
-    PERFORM _cb_acquire_queue_lock(cb_create_queue.name);
+    PERFORM pg_advisory_xact_lock(hashtext('cb_q_' || lower(cb_create_queue.name)));
 
     IF cb_create_queue.unlogged THEN
         EXECUTE format(
@@ -128,7 +118,7 @@ DECLARE
     _q_table text = _cb_table_name(cb_delete_queue.name, 'q');
     _res boolean;
 BEGIN
-    PERFORM _cb_acquire_queue_lock(cb_delete_queue.name);
+    PERFORM pg_advisory_xact_lock(hashtext('cb_q_' || lower(cb_delete_queue.name)));
 
     EXECUTE FORMAT('DROP TABLE IF EXISTS %I;', _q_table);
 
@@ -439,7 +429,6 @@ DROP FUNCTION cb_hide_many;
 DROP FUNCTION cb_delete;
 DROP FUNCTION cb_delete_many;
 DROP FUNCTION _cb_table_name;
-DROP FUNCTION _cb_acquire_queue_lock;
 
 DROP TABLE cb_queues;
 

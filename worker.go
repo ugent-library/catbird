@@ -169,8 +169,9 @@ func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, erro
 
 func (w *Worker) Start(ctx context.Context) error {
 	var scheduler *cron.Cron
-	var handlerNames []string
 	var wg sync.WaitGroup
+	var taskHandlers []TaskHandlerInfo
+	var stepHandlers []StepHandlerInfo
 
 	wg.Go(func() {
 		ticker := time.NewTicker(10 * time.Second)
@@ -190,7 +191,7 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	for _, t := range w.tasks {
 		if h := t.handler; h != nil {
-			handlerNames = append(handlerNames, t.Name)
+			taskHandlers = append(taskHandlers, TaskHandlerInfo{TaskName: t.Name})
 
 			queueName := fmt.Sprintf("t_%s", t.Name)
 			msgChan := make(chan Message)
@@ -243,7 +244,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	for _, f := range w.flows {
 		for _, s := range f.Steps {
 			if h := s.handler; h != nil {
-				handlerNames = append(handlerNames, fmt.Sprintf("%s/%s", f.Name, s.Name))
+				stepHandlers = append(stepHandlers, StepHandlerInfo{FlowName: f.Name, StepName: s.Name})
 
 				queueName := fmt.Sprintf("f_%s_%s", f.Name, s.Name)
 				msgChan := make(chan Message)
@@ -355,7 +356,15 @@ func (w *Worker) Start(ctx context.Context) error {
 		})
 	}
 
-	if _, err := w.conn.Exec(ctx, `SELECT * FROM cb_worker_started(id => $1, handlers => $2);`, w.id, handlerNames); err != nil {
+	tb, err := json.Marshal(taskHandlers)
+	if err != nil {
+		return err
+	}
+	sb, err := json.Marshal(stepHandlers)
+	if err != nil {
+		return err
+	}
+	if _, err := w.conn.Exec(ctx, `SELECT * FROM cb_worker_started(id => $1, task_handlers => coalesce($2, '[]'::jsonb), step_handlers => coalesce($3, '[]'::jsonb));`, w.id, tb, sb); err != nil {
 		return err
 	}
 
