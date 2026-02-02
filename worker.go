@@ -14,6 +14,17 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
+type Worker struct {
+	id              string
+	conn            Conn
+	logger          *slog.Logger
+	tasks           []*Task
+	flows           []*Flow
+	flowSchedules   []flowSchedule
+	taskSchedules   []taskSchedule
+	shutdownTimeout time.Duration
+}
+
 type taskSchedule struct {
 	taskName string
 	schedule string
@@ -24,25 +35,133 @@ type flowSchedule struct {
 	schedule string
 }
 
-type Worker struct {
-	id            string
-	conn          Conn
-	logger        *slog.Logger
-	tasks         []*Task
-	flows         []*Flow
-	flowSchedules []flowSchedule
-	taskSchedules []taskSchedule
-	timeout       time.Duration
+type WorkerOpt interface {
+	apply(*Worker)
 }
 
-func NewWorker(conn Conn, opts ...WorkerOpt) (*Worker, error) {
+type taskOpt struct {
+	task *Task
+}
+
+func (o taskOpt) apply(w *Worker) {
+	w.tasks = append(w.tasks, o.task)
+}
+
+func WithTask(t *Task) WorkerOpt {
+	return &taskOpt{task: t}
+}
+
+type flowOpt struct {
+	flow *Flow
+}
+
+func (o flowOpt) apply(w *Worker) {
+	w.flows = append(w.flows, o.flow)
+}
+
+func WithFlow(f *Flow) WorkerOpt {
+	return &flowOpt{flow: f}
+}
+
+type loggerOpt struct {
+	logger *slog.Logger
+}
+
+func (o loggerOpt) apply(w *Worker) {
+	w.logger = o.logger
+}
+
+func WithLogger(l *slog.Logger) WorkerOpt {
+	return &loggerOpt{logger: l}
+}
+
+type shutdownTimeoutOpt struct {
+	shutdownTimeout time.Duration
+}
+
+func WithShutdownTimeout(d time.Duration) WorkerOpt {
+	return &shutdownTimeoutOpt{shutdownTimeout: d}
+}
+
+func (o shutdownTimeoutOpt) apply(w *Worker) {
+	w.shutdownTimeout = o.shutdownTimeout
+}
+
+type scheduledTaskOpt struct {
+	taskName string
+	schedule string
+}
+
+func (o scheduledTaskOpt) apply(w *Worker) {
+	w.taskSchedules = append(w.taskSchedules, taskSchedule{
+		taskName: o.taskName,
+		schedule: o.schedule,
+	})
+}
+
+func WithScheduledTask(taskName, schedule string) WorkerOpt {
+	return &scheduledTaskOpt{taskName: taskName, schedule: schedule}
+}
+
+type scheduledFlowOpt struct {
+	flowName string
+	schedule string
+}
+
+func (o scheduledFlowOpt) apply(w *Worker) {
+	w.flowSchedules = append(w.flowSchedules, flowSchedule{
+		flowName: o.flowName,
+		schedule: o.schedule,
+	})
+}
+
+func WithScheduledFlow(flowName, schedule string) WorkerOpt {
+	return &scheduledFlowOpt{flowName: flowName, schedule: schedule}
+}
+
+type gcOpt struct {
+	schedule string
+}
+
+func WithGC() WorkerOpt {
+	return &gcOpt{schedule: "@every 10m"}
+}
+
+func (o *gcOpt) Schedule(schedule string) *gcOpt {
+	o.schedule = schedule
+	return o
+}
+
+func (o gcOpt) apply(w *Worker) {
+	w.tasks = append(w.tasks, NewTask("gc", func(ctx context.Context, input struct{}) (struct{}, error) {
+		return struct{}{}, GC(ctx, w.conn)
+	}))
+	w.taskSchedules = append(w.taskSchedules, taskSchedule{
+		taskName: "gc",
+		schedule: o.schedule,
+	})
+}
+
+func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, error) {
 	w := &Worker{
 		id:     uuid.NewString(),
 		conn:   conn,
 		logger: slog.Default(),
 	}
 	for _, opt := range opts {
-		opt.applyToWorker(w)
+		opt.apply(w)
+	}
+
+	for _, t := range w.tasks {
+		if err := CreateTask(ctx, w.conn, t); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, f := range w.flows {
+		if err := CreateFlow(ctx, w.conn, f); err != nil {
+			return nil, err
+		}
 	}
 
 	return w, nil
@@ -70,10 +189,6 @@ func (w *Worker) Start(ctx context.Context) error {
 	})
 
 	for _, t := range w.tasks {
-		if err := CreateTask(ctx, w.conn, t); err != nil {
-			return err
-		}
-
 		if h := t.handler; h != nil {
 			handlerNames = append(handlerNames, t.Name)
 
@@ -126,10 +241,6 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 
 	for _, f := range w.flows {
-		if err := CreateFlow(ctx, w.conn, f); err != nil {
-			return err
-		}
-
 		for _, s := range f.Steps {
 			if h := s.handler; h != nil {
 				handlerNames = append(handlerNames, fmt.Sprintf("%s/%s", f.Name, s.Name))
@@ -239,7 +350,7 @@ func (w *Worker) Start(ctx context.Context) error {
 			stopCtx := scheduler.Stop()
 			select {
 			case <-stopCtx.Done():
-			case <-time.After(w.timeout):
+			case <-time.After(w.shutdownTimeout):
 			}
 		})
 	}
@@ -253,15 +364,10 @@ func (w *Worker) Start(ctx context.Context) error {
 	return nil
 }
 
-type handlerPayload struct {
-	ID    string          `json:"id,omitempty"`
-	Input json.RawMessage `json:"input"`
-}
-
 func (w *Worker) handleTask(ctx context.Context, t *Task, queueName string, msg Message, stopHiding func(id int64)) {
 	h := t.handler
 
-	var p handlerPayload
+	var p taskPayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		w.logger.ErrorContext(ctx, "worker: cannot decode payload", "handler", t.Name, "error", err)
 		return // TODO
@@ -272,7 +378,7 @@ func (w *Worker) handleTask(ctx context.Context, t *Task, queueName string, msg 
 		"id", p.ID,
 		"deduplication_id", msg.DeduplicationID,
 		"message_id", msg.ID,
-		"input", string(p.Input),
+		"payload", string(msg.Payload),
 	)
 
 	fnCtx := ctx
@@ -282,7 +388,7 @@ func (w *Worker) handleTask(ctx context.Context, t *Task, queueName string, msg 
 		defer cancel()
 	}
 
-	out, err := h.fn(fnCtx, p.Input)
+	out, err := h.fn(fnCtx, p)
 
 	stopHiding(msg.ID)
 
@@ -310,7 +416,7 @@ func (w *Worker) handleTask(ctx context.Context, t *Task, queueName string, msg 
 func (w *Worker) handleStep(ctx context.Context, s *Step, queueName string, msg Message, stopHiding func(id int64)) {
 	h := s.handler
 
-	var p handlerPayload
+	var p stepPayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		w.logger.ErrorContext(ctx, "worker: cannot decode payload", "handler", s.Name, "error", err)
 		return // TODO
@@ -321,7 +427,7 @@ func (w *Worker) handleStep(ctx context.Context, s *Step, queueName string, msg 
 		"id", p.ID,
 		"deduplication_id", msg.DeduplicationID,
 		"message_id", msg.ID,
-		"input", string(p.Input),
+		"payload", string(msg.Payload),
 	)
 
 	fnCtx := ctx
@@ -331,7 +437,7 @@ func (w *Worker) handleStep(ctx context.Context, s *Step, queueName string, msg 
 		defer cancel()
 	}
 
-	out, err := h.fn(fnCtx, p.Input)
+	out, err := h.fn(fnCtx, p)
 
 	stopHiding(msg.ID)
 

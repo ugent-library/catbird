@@ -133,16 +133,8 @@ func (c *Client) ListWorkers(ctx context.Context) ([]*WorkerInfo, error) {
 	return ListWorkers(ctx, c.Conn)
 }
 
-func (c *Client) NewWorker(opts ...WorkerOpt) (*Worker, error) {
-	return NewWorker(c.Conn, opts...)
-}
-
-func (c *Client) StartWorker(ctx context.Context, opts ...WorkerOpt) error {
-	worker, err := NewWorker(c.Conn, opts...)
-	if err != nil {
-		return err
-	}
-	return worker.Start(ctx)
+func (c *Client) NewWorker(ctx context.Context, opts ...WorkerOpt) (*Worker, error) {
+	return NewWorker(ctx, c.Conn, opts...)
 }
 
 func (c *Client) GC(ctx context.Context) error {

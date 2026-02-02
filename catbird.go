@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -29,113 +28,6 @@ type Conn interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-type WorkerOpt interface {
-	applyToWorker(*Worker)
-}
-
-type taskOpt struct {
-	task *Task
-}
-
-func (o taskOpt) applyToWorker(w *Worker) {
-	w.tasks = append(w.tasks, o.task)
-}
-
-func WithTask(t *Task) *taskOpt {
-	return &taskOpt{task: t}
-}
-
-type flowOpt struct {
-	flow *Flow
-}
-
-func (o flowOpt) applyToWorker(w *Worker) {
-	w.flows = append(w.flows, o.flow)
-}
-
-func WithFlow(f *Flow) *flowOpt {
-	return &flowOpt{flow: f}
-}
-
-type loggerOpt struct {
-	logger *slog.Logger
-}
-
-func (o loggerOpt) applyToWorker(w *Worker) {
-	w.logger = o.logger
-}
-
-func WithLogger(l *slog.Logger) *loggerOpt {
-	return &loggerOpt{logger: l}
-}
-
-type timeoutOpt struct {
-	timeout time.Duration
-}
-
-func WithTimeout(d time.Duration) *timeoutOpt {
-	return &timeoutOpt{timeout: d}
-}
-
-func (o timeoutOpt) applyToWorker(w *Worker) {
-	w.timeout = o.timeout
-}
-
-type scheduledTaskOpt struct {
-	taskName string
-	schedule string
-}
-
-func (o scheduledTaskOpt) applyToWorker(w *Worker) {
-	w.taskSchedules = append(w.taskSchedules, taskSchedule{
-		taskName: o.taskName,
-		schedule: o.schedule,
-	})
-}
-
-func WithScheduledTask(taskName, schedule string) *scheduledTaskOpt {
-	return &scheduledTaskOpt{taskName: taskName, schedule: schedule}
-}
-
-type scheduledFlowOpt struct {
-	flowName string
-	schedule string
-}
-
-func (o scheduledFlowOpt) applyToWorker(w *Worker) {
-	w.flowSchedules = append(w.flowSchedules, flowSchedule{
-		flowName: o.flowName,
-		schedule: o.schedule,
-	})
-}
-
-func WithScheduledFlow(flowName, schedule string) *scheduledFlowOpt {
-	return &scheduledFlowOpt{flowName: flowName, schedule: schedule}
-}
-
-type gcOpt struct {
-	schedule string
-}
-
-func WithGC() *gcOpt {
-	return &gcOpt{schedule: "@every 10m"}
-}
-
-func (o *gcOpt) Schedule(schedule string) *gcOpt {
-	o.schedule = schedule
-	return o
-}
-
-func (o gcOpt) applyToWorker(w *Worker) {
-	w.tasks = append(w.tasks, NewTask("gc", TaskHandler(func(ctx context.Context, input struct{}) (struct{}, error) {
-		return struct{}{}, GC(ctx, w.conn)
-	})))
-	w.taskSchedules = append(w.taskSchedules, taskSchedule{
-		taskName: "gc",
-		schedule: o.schedule,
-	})
-}
-
 type Message struct {
 	ID              int64           `json:"id"`
 	DeduplicationID string          `json:"deduplication_id,omitempty"`
@@ -146,8 +38,7 @@ type Message struct {
 	DeliverAt       time.Time       `json:"deliver_at"`
 }
 
-type handler struct {
-	fn           func(context.Context, []byte) ([]byte, error)
+type handlerOpts struct {
 	concurrency  int
 	batchSize    int
 	timeout      time.Duration
@@ -156,63 +47,95 @@ type handler struct {
 	jitterFactor float64
 }
 
-type handlerOpt func(h *handler)
-
-func WithConcurrency(n int) handlerOpt {
-	return func(h *handler) {
-		h.concurrency = n
-	}
+type HandlerOpt interface {
+	apply(*handlerOpts)
 }
 
-func Timeout(d time.Duration) handlerOpt {
-	return func(h *handler) {
-		h.timeout = d
-	}
+type concurrencyOpt struct {
+	concurrency int
 }
 
-func WithBatchSize(n int) handlerOpt {
-	return func(h *handler) {
-		h.batchSize = n
-	}
+func (o concurrencyOpt) apply(h *handlerOpts) {
+	h.concurrency = o.concurrency
 }
 
-func WithRetries(n int) handlerOpt {
-	return func(h *handler) {
-		h.retries = n
-	}
+func WithConcurrency(n int) HandlerOpt {
+	return concurrencyOpt{concurrency: n}
 }
 
-func WithRetryDelay(d time.Duration) handlerOpt {
-	return func(h *handler) {
-		h.retryDelay = d
-	}
+type timeoutOpt struct {
+	timeout time.Duration
+}
+
+func (o timeoutOpt) apply(h *handlerOpts) {
+	h.timeout = o.timeout
+}
+
+func WithTimeout(d time.Duration) HandlerOpt {
+	return timeoutOpt{timeout: d}
+}
+
+type batchSizeOpt struct {
+	batchSize int
+}
+
+func (o batchSizeOpt) apply(h *handlerOpts) {
+	h.batchSize = o.batchSize
+}
+
+func WithBatchSize(n int) HandlerOpt {
+	return batchSizeOpt{batchSize: n}
+}
+
+type retriesOpt struct {
+	retries int
+}
+
+func (o retriesOpt) apply(h *handlerOpts) {
+	h.retries = o.retries
+}
+
+func WithRetries(n int) HandlerOpt {
+	return retriesOpt{retries: n}
+}
+
+type retryDelayOpt struct {
+	delay time.Duration
+}
+
+func (o retryDelayOpt) apply(h *handlerOpts) {
+	h.retryDelay = o.delay
+}
+
+func WithRetryDelay(d time.Duration) HandlerOpt {
+	return retryDelayOpt{delay: d}
 }
 
 type Task struct {
 	Name    string `json:"name"`
-	handler *handler
+	handler *taskHandler
 }
 
-type TaskOpt func(*Task)
-
-func NewTask(name string, opts ...TaskOpt) *Task {
-	t := &Task{
-		Name: name,
-	}
-	for _, opt := range opts {
-		opt(t)
-	}
-	return t
+type taskHandler struct {
+	handlerOpts
+	fn func(context.Context, taskPayload) ([]byte, error)
 }
 
-func TaskHandler[Input, Output any](fn func(context.Context, Input) (Output, error), opts ...handlerOpt) TaskOpt {
-	h := &handler{
-		concurrency:  1,
-		batchSize:    10,
-		jitterFactor: 0.1,
-		fn: func(ctx context.Context, b []byte) ([]byte, error) {
-			var in Input
-			if err := json.Unmarshal(b, &in); err != nil {
+type taskPayload struct {
+	ID    string          `json:"id"`
+	Input json.RawMessage `json:"input"`
+}
+
+func NewTask[In, Out any](name string, fn func(context.Context, In) (Out, error), opts ...HandlerOpt) *Task {
+	h := &taskHandler{
+		handlerOpts: handlerOpts{
+			concurrency:  1,
+			batchSize:    10,
+			jitterFactor: 0.1,
+		},
+		fn: func(ctx context.Context, p taskPayload) ([]byte, error) {
+			var in In
+			if err := json.Unmarshal(p.Input, &in); err != nil {
 				return nil, err
 			}
 
@@ -225,11 +148,13 @@ func TaskHandler[Input, Output any](fn func(context.Context, Input) (Output, err
 		},
 	}
 
-	return func(t *Task) {
-		t.handler = h
-		for _, opt := range opts {
-			opt(h)
-		}
+	for _, opt := range opts {
+		opt.apply(&h.handlerOpts)
+	}
+
+	return &Task{
+		Name:    name,
+		handler: h,
 	}
 }
 
@@ -241,57 +166,283 @@ type Flow struct {
 type Step struct {
 	Name      string   `json:"name"`
 	DependsOn []string `json:"depends_on,omitempty"`
-	handler   *handler
+	handler   *stepHandler
+}
+
+type StepDependency struct {
+	name string
+}
+
+func Dependency(name string) StepDependency {
+	return StepDependency{name: name}
+}
+
+type stepPayload struct {
+	ID          string                     `json:"id"`
+	FlowInput   json.RawMessage            `json:"flow_input"`
+	StepOutputs map[string]json.RawMessage `json:"step_outputs"`
+}
+
+type stepHandler struct {
+	handlerOpts
+	fn func(context.Context, stepPayload) ([]byte, error)
 }
 
 type StepOpt func(*Step)
 
-func NewFlow(name string) *Flow {
-	return &Flow{
+func NewFlow(name string, opts ...FlowOpt) *Flow {
+	f := &Flow{
 		Name: name,
 	}
-}
-
-func (f *Flow) AddStep(name string, opts ...StepOpt) {
-	step := &Step{Name: name}
 	for _, opt := range opts {
-		opt(step)
+		opt.apply(f)
 	}
-	f.Steps = append(f.Steps, step)
+	return f
 }
 
-func DependsOn(steps ...string) StepOpt {
-	return func(s *Step) {
-		s.DependsOn = append(s.DependsOn, steps...)
-	}
+type FlowOpt interface {
+	apply(*Flow)
 }
 
-func StepHandler[Input, Output any](fn func(context.Context, Input) (Output, error), opts ...handlerOpt) StepOpt {
-	h := &handler{
-		concurrency:  1,
-		batchSize:    10,
-		jitterFactor: 0.1,
-		fn: func(ctx context.Context, b []byte) ([]byte, error) {
-			var in Input
-			if err := json.Unmarshal(b, &in); err != nil {
+type stepOpt struct {
+	step *Step
+}
+
+func (o stepOpt) apply(f *Flow) {
+	f.Steps = append(f.Steps, o.step)
+}
+
+func InitialStep[In, Out any](name string, fn func(context.Context, In) (Out, error), opts ...HandlerOpt) FlowOpt {
+	return stepOpt{step: &Step{
+		Name:      name,
+		DependsOn: nil,
+		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+			var in In
+			if err := json.Unmarshal(p.FlowInput, &in); err != nil {
 				return nil, err
 			}
-
 			out, err := fn(ctx, in)
 			if err != nil {
 				return nil, err
 			}
-
 			return json.Marshal(out)
+		}, opts...),
+	}}
+}
+
+func StepWithOneDependency[In, Dep1Out, Out any](name string, dep1 StepDependency, fn func(context.Context, In, Dep1Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+	return stepOpt{step: &Step{
+		Name:      name,
+		DependsOn: []string{dep1.name},
+		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+			var in In
+			var dep1Out Dep1Out
+			if err := unmarshalStepArgs(p, []string{dep1.name}, &in, []any{&dep1Out}); err != nil {
+				return nil, err
+			}
+			out, err := fn(ctx, in, dep1Out)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(out)
+		}, opts...),
+	}}
+}
+
+func StepWithTwoDependencies[In, Dep1Out, Dep2Out, Out any](name string, dep1 StepDependency, dep2 StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+	return stepOpt{step: &Step{
+		Name:      name,
+		DependsOn: []string{dep1.name, dep2.name},
+		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+			var in In
+			var dep1Out Dep1Out
+			var dep2Out Dep2Out
+			if err := unmarshalStepArgs(p, []string{dep1.name, dep2.name}, &in, []any{&dep1Out, &dep2Out}); err != nil {
+				return nil, err
+			}
+			out, err := fn(ctx, in, dep1Out, dep2Out)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(out)
+		}, opts...),
+	}}
+}
+
+func StepWithThreeDependencies[In, Dep1Out, Dep2Out, Dep3Out, Out any](name string, dep1 StepDependency, dep2 StepDependency, dep3 StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+	return stepOpt{step: &Step{
+		Name:      name,
+		DependsOn: []string{dep1.name, dep2.name, dep3.name},
+		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+			var in In
+			var dep1Out Dep1Out
+			var dep2Out Dep2Out
+			var dep3Out Dep3Out
+			if err := unmarshalStepArgs(p, []string{dep1.name, dep2.name, dep3.name}, &in, []any{&dep1Out, &dep2Out, &dep3Out}); err != nil {
+				return nil, err
+			}
+			out, err := fn(ctx, in, dep1Out, dep2Out, dep3Out)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(out)
+		}, opts...),
+	}}
+}
+
+func StepWithFourDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Out any](name string, dep1 StepDependency, dep2 StepDependency, dep3 StepDependency, dep4 StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+	return stepOpt{step: &Step{
+		Name:      name,
+		DependsOn: []string{dep1.name, dep2.name, dep3.name, dep4.name},
+		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+			var in In
+			var dep1Out Dep1Out
+			var dep2Out Dep2Out
+			var dep3Out Dep3Out
+			var dep4Out Dep4Out
+			if err := unmarshalStepArgs(p, []string{dep1.name, dep2.name, dep3.name, dep4.name}, &in, []any{&dep1Out, &dep2Out, &dep3Out, &dep4Out}); err != nil {
+				return nil, err
+			}
+			out, err := fn(ctx, in, dep1Out, dep2Out, dep3Out, dep4Out)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(out)
+		}, opts...),
+	}}
+}
+
+func StepWithFiveDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Out any](name string, dep1 StepDependency, dep2 StepDependency, dep3 StepDependency, dep4 StepDependency, dep5 StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+	return stepOpt{step: &Step{
+		Name:      name,
+		DependsOn: []string{dep1.name, dep2.name, dep3.name, dep4.name, dep5.name},
+		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+			var in In
+			var dep1Out Dep1Out
+			var dep2Out Dep2Out
+			var dep3Out Dep3Out
+			var dep4Out Dep4Out
+			var dep5Out Dep5Out
+			if err := unmarshalStepArgs(p, []string{dep1.name, dep2.name, dep3.name, dep4.name, dep5.name}, &in, []any{&dep1Out, &dep2Out, &dep3Out, &dep4Out, &dep5Out}); err != nil {
+				return nil, err
+			}
+			out, err := fn(ctx, in, dep1Out, dep2Out, dep3Out, dep4Out, dep5Out)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(out)
+		}, opts...),
+	}}
+}
+
+func StepWithSixDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Out any](name string, dep1 StepDependency, dep2 StepDependency, dep3 StepDependency, dep4 StepDependency, dep5 StepDependency, dep6 StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+	return stepOpt{step: &Step{
+		Name:      name,
+		DependsOn: []string{dep1.name, dep2.name, dep3.name, dep4.name, dep5.name, dep6.name},
+		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+			var in In
+			var dep1Out Dep1Out
+			var dep2Out Dep2Out
+			var dep3Out Dep3Out
+			var dep4Out Dep4Out
+			var dep5Out Dep5Out
+			var dep6Out Dep6Out
+			if err := unmarshalStepArgs(p, []string{dep1.name, dep2.name, dep3.name, dep4.name, dep5.name, dep6.name}, &in, []any{&dep1Out, &dep2Out, &dep3Out, &dep4Out, &dep5Out, &dep6Out}); err != nil {
+				return nil, err
+			}
+			out, err := fn(ctx, in, dep1Out, dep2Out, dep3Out, dep4Out, dep5Out, dep6Out)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(out)
+		}, opts...),
+	}}
+}
+
+func StepWithSevenDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out, Out any](name string, dep1 StepDependency, dep2 StepDependency, dep3 StepDependency, dep4 StepDependency, dep5 StepDependency, dep6 StepDependency, dep7 StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+	return stepOpt{step: &Step{
+		Name:      name,
+		DependsOn: []string{dep1.name, dep2.name, dep3.name, dep4.name, dep5.name, dep6.name, dep7.name},
+		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+			var in In
+			var dep1Out Dep1Out
+			var dep2Out Dep2Out
+			var dep3Out Dep3Out
+			var dep4Out Dep4Out
+			var dep5Out Dep5Out
+			var dep6Out Dep6Out
+			var dep7Out Dep7Out
+			if err := unmarshalStepArgs(p, []string{dep1.name, dep2.name, dep3.name, dep4.name, dep5.name, dep6.name, dep7.name}, &in, []any{&dep1Out, &dep2Out, &dep3Out, &dep4Out, &dep5Out, &dep6Out, &dep7Out}); err != nil {
+				return nil, err
+			}
+			out, err := fn(ctx, in, dep1Out, dep2Out, dep3Out, dep4Out, dep5Out, dep6Out, dep7Out)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(out)
+		}, opts...),
+	}}
+}
+
+func StepWithEightDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out, Dep8Out, Out any](name string, dep1 StepDependency, dep2 StepDependency, dep3 StepDependency, dep4 StepDependency, dep5 StepDependency, dep6 StepDependency, dep7 StepDependency, dep8 StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out, Dep8Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+	return stepOpt{step: &Step{
+		Name:      name,
+		DependsOn: []string{dep1.name, dep2.name, dep3.name, dep4.name, dep5.name, dep6.name, dep7.name, dep8.name},
+		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+			var in In
+			var dep1Out Dep1Out
+			var dep2Out Dep2Out
+			var dep3Out Dep3Out
+			var dep4Out Dep4Out
+			var dep5Out Dep5Out
+			var dep6Out Dep6Out
+			var dep7Out Dep7Out
+			var dep8Out Dep8Out
+			if err := unmarshalStepArgs(p, []string{dep1.name, dep2.name, dep3.name, dep4.name, dep5.name, dep6.name, dep7.name, dep8.name}, &in, []any{&dep1Out, &dep2Out, &dep3Out, &dep4Out, &dep5Out, &dep6Out, &dep7Out, &dep8Out}); err != nil {
+				return nil, err
+			}
+			out, err := fn(ctx, in, dep1Out, dep2Out, dep3Out, dep4Out, dep5Out, dep6Out, dep7Out, dep8Out)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(out)
+		}, opts...),
+	}}
+}
+
+func newStepHandler(fn func(context.Context, stepPayload) ([]byte, error), opts ...HandlerOpt) *stepHandler {
+	h := &stepHandler{
+		handlerOpts: handlerOpts{
+			concurrency:  1,
+			batchSize:    10,
+			jitterFactor: 0.1,
 		},
+		fn: fn,
 	}
 
-	return func(s *Step) {
-		s.handler = h
-		for _, opt := range opts {
-			opt(h)
+	for _, opt := range opts {
+		opt.apply(&h.handlerOpts)
+	}
+
+	return h
+}
+
+func unmarshalStepArgs(p stepPayload, stepNames []string, in any, stepOutputs []any) error {
+	if err := json.Unmarshal(p.FlowInput, in); err != nil {
+		return err
+	}
+
+	for i, stepName := range stepNames {
+		b, ok := p.StepOutputs[stepName]
+		if !ok {
+			return fmt.Errorf("missing step output for step: %s", stepName)
+		}
+		if err := json.Unmarshal(b, stepOutputs[i]); err != nil {
+			return err
 		}
 	}
+
+	return nil
 }
 
 type QueueInfo struct {
