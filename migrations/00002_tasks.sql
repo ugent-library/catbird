@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS cb_task_runs (
   started_at timestamptz NOT NULL DEFAULT now(),
   completed_at timestamptz,
   failed_at timestamptz,
-  CONSTRAINT status_is_valid CHECK (status IN ('started', 'completed', 'failed')),
+  CONSTRAINT status_valid CHECK (status IN ('started', 'completed', 'failed')),
   CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
   CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
   CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS cb_flow_runs (
   started_at timestamptz NOT NULL DEFAULT now(),
   completed_at timestamptz,
   failed_at timestamptz,
-  CONSTRAINT status_is_valid CHECK (status IN ('started', 'completed', 'failed')),
+  CONSTRAINT status_valid CHECK (status IN ('started', 'completed', 'failed')),
   CONSTRAINT remaining_steps_valid CHECK (remaining_steps >= 0),
   CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
   CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS cb_steps (
     dependency_count int NOT NULL DEFAULT 0,
     PRIMARY KEY (flow_name, name),
     UNIQUE (flow_name, idx),
-    CONSTRAINT name_valid CHECK (name <> '' AND name <> 'flow_input'),
+    CONSTRAINT name_valid CHECK (name <> ''),
     CONSTRAINT idx_valid CHECK (idx >= 0),
     CONSTRAINT dependency_count_valid CHECK (dependency_count >= 0)
 );
@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS cb_step_runs (
   completed_at timestamptz,
   failed_at timestamptz,
   FOREIGN KEY (flow_name, step_name) REFERENCES cb_steps (flow_name, name),
-  CONSTRAINT status_is_valid CHECK (status IN ('created', 'started', 'completed', 'failed')),
+  CONSTRAINT status_valid CHECK (status IN ('created', 'started', 'completed', 'failed')),
   CONSTRAINT remaining_dependencies_valid CHECK (remaining_dependencies >= 0),
   CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
   CONSTRAINT started_at_is_after_created_at CHECK (started_at IS NULL OR started_at >= created_at),
@@ -342,9 +342,8 @@ BEGIN
         queue   => 'f_' || s_r.flow_name || '_' || s_r.step_name,
         payload => jsonb_build_object(
           'id', s_r.id,
-          'input', jsonb_build_object(
-            'flow_input', flow_run.input
-          ) || coalesce((
+          'flow_input', flow_run.input,
+          'step_outputs', coalesce((
             SELECT jsonb_object_agg(o.step_name, o.output)
             FROM (
               SELECT dep_runs.step_name, dep_runs.output
@@ -477,11 +476,12 @@ BEGIN
   WHERE f_r.id = _flow_run_id
     AND f_r.status = 'started';
 
-  -- delete all queued task messages for remaining steps in the flow run
+  -- delete task messages for remaining steps in the flow run
   PERFORM cb_delete_many('f_' || s_r.flow_name || '_' || s_r.step_name, array_agg(s_r.message_id))
   FROM cb_step_runs s_r
   WHERE s_r.flow_run_id = _flow_run_id
-    AND s_r.status IN ('queued', 'started')
+    AND s_r.status IN ('created', 'started')
+  GROUP BY s_r.flow_name, s_r.step_name
   HAVING COUNT(s_r.message_id) > 0;
 END;
 $$;
