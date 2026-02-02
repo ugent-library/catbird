@@ -77,10 +77,13 @@ CREATE TABLE IF NOT EXISTS cb_step_dependencies (
     flow_name text NOT NULL REFERENCES cb_flows (name),
     step_name text NOT NULL,
     dependency_name text NOT NULL,
-    PRIMARY KEY (flow_name, step_name, dependency_name),
+    idx int NOT NULL DEFAULT 0,
+    PRIMARY KEY (flow_name, step_name, idx),
+    UNIQUE (flow_name, step_name, dependency_name),
     FOREIGN KEY (flow_name, step_name) REFERENCES cb_steps (flow_name, name),
     FOREIGN KEY (flow_name, dependency_name) REFERENCES cb_steps (flow_name, name),
-    CONSTRAINT dependency_name_is_different CHECK (dependency_name != step_name)
+    CONSTRAINT dependency_name_is_different CHECK (dependency_name != step_name),
+    CONSTRAINT idx_valid CHECK (idx >= 0)
 );
 
 CREATE INDEX IF NOT EXISTS cb_step_dependencies_step_fk ON cb_step_dependencies (flow_name, step_name);
@@ -142,11 +145,14 @@ CREATE OR REPLACE FUNCTION cb_create_task(name text)
 RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
-    INSERT INTO cb_tasks (name)
-    VALUES (
-        cb_create_task.name
-    )
-    ON CONFLICT ON CONSTRAINT cb_tasks_pkey DO NOTHING;
+    PERFORM pg_advisory_xact_lock(hashtext('cb_t_' || lower(cb_create_task.name)));
+
+    -- Return early if task already exists
+    IF EXISTS (SELECT 1 FROM cb_tasks WHERE cb_tasks.name = cb_create_task.name) THEN
+        RETURN;
+    END IF;
+
+    INSERT INTO cb_tasks (name) VALUES (cb_create_task.name);
 
     PERFORM cb_create_queue('t_' || cb_create_task.name);
 END;
@@ -242,10 +248,41 @@ LANGUAGE plpgsql AS $$
 DECLARE
   _idx int = 0;
   _step jsonb;
+  _existing_steps jsonb;
+  _dep_idx int;
+  _dep_name text;
 BEGIN
-  INSERT INTO cb_flows (name)
-  VALUES (cb_create_flow.name)
-  ON CONFLICT ON CONSTRAINT cb_flows_pkey DO NOTHING;
+  PERFORM pg_advisory_xact_lock(hashtext('cb_f_' || lower(cb_create_flow.name)));
+
+  -- Check if flow already exists
+  IF EXISTS (SELECT 1 FROM cb_flows WHERE cb_flows.name = cb_create_flow.name) THEN
+    -- Reconstruct existing steps to compare
+    _existing_steps := (
+      SELECT jsonb_agg(
+        jsonb_build_object(
+          'name', s.name,
+          'depends_on', COALESCE(
+            (SELECT jsonb_agg(sd.dependency_name ORDER BY sd.idx)
+             FROM cb_step_dependencies sd
+             WHERE sd.flow_name = s.flow_name AND sd.step_name = s.name),
+            '[]'::jsonb
+          )
+        )
+        ORDER BY s.idx
+      )
+      FROM cb_steps s
+      WHERE s.flow_name = cb_create_flow.name
+    );
+
+    -- Compare steps - raise exception if they differ
+    IF _existing_steps IS DISTINCT FROM steps THEN
+      RAISE EXCEPTION 'Flow "%" already exists with different steps', cb_create_flow.name;
+    END IF;
+
+    RETURN;
+  END IF;
+
+  INSERT INTO cb_flows (name) VALUES (cb_create_flow.name);
 
   FOR _step IN SELECT * FROM jsonb_array_elements(steps)
   LOOP
@@ -255,13 +292,15 @@ BEGIN
       _step->>'name',
       _idx,
       jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb))
-    )
-    ON CONFLICT ON CONSTRAINT cb_steps_pkey DO NOTHING;
+    );
 
-		INSERT INTO cb_step_dependencies (flow_name, step_name, dependency_name)
-		SELECT cb_create_flow.name, _step->>'name', depends_on
-		FROM jsonb_array_elements_text(coalesce(_step->'depends_on', '[]'::jsonb)) AS depends_on
-		ON CONFLICT ON CONSTRAINT cb_step_dependencies_pkey DO NOTHING;
+		_dep_idx := 0;
+		FOR _dep_name IN SELECT jsonb_array_elements_text(coalesce(_step->'depends_on', '[]'::jsonb))
+		LOOP
+			INSERT INTO cb_step_dependencies (flow_name, step_name, dependency_name, idx)
+			VALUES (cb_create_flow.name, _step->>'name', _dep_name, _dep_idx);
+			_dep_idx := _dep_idx + 1;
+		END LOOP;
 
     PERFORM cb_create_queue('f_' || cb_create_flow.name || '_' || (_step->>'name'));
 
@@ -490,28 +529,57 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_worker_started(id uuid, handlers text[])
+CREATE OR REPLACE FUNCTION cb_worker_started(id uuid, task_handlers jsonb, step_handlers jsonb)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-  _handler text;
+  _handler jsonb;
+  _flow_name text;
+  _step_name text;
+  _task_name text;
 BEGIN
-    INSERT INTO cb_workers (id)
-    VALUES (cb_worker_started.id);
+    INSERT INTO cb_workers (id) VALUES (cb_worker_started.id);
 
-    FOR _handler IN SELECT * FROM unnest(cb_worker_started.handlers)
+    -- Insert task handlers
+    FOR _handler IN SELECT jsonb_array_elements(cb_worker_started.task_handlers)
     LOOP
-        IF position('/' in _handler) > 0 THEN
-            INSERT INTO cb_step_handlers (worker_id, flow_name, step_name)
-            VALUES (
-                cb_worker_started.id,
-                split_part(_handler, '/', 1),
-                split_part(_handler, '/', 2)
-            );
-        ELSE
-            INSERT INTO cb_task_handlers (worker_id, task_name)
-            VALUES (cb_worker_started.id, _handler);
+        -- Validate task handler has required key
+        IF NOT (_handler ? 'task_name') THEN
+            RAISE EXCEPTION 'Task handler missing required key: task_name';
         END IF;
+
+        _task_name := _handler->>'task_name';
+
+        -- Validate value is non-empty string
+        IF _task_name IS NULL OR _task_name = '' THEN
+            RAISE EXCEPTION 'Task handler task_name must be a non-empty string';
+        END IF;
+
+        INSERT INTO cb_task_handlers (worker_id, task_name)
+        VALUES (cb_worker_started.id, _task_name);
+    END LOOP;
+
+    -- Insert flow handlers
+    FOR _handler IN SELECT jsonb_array_elements(cb_worker_started.step_handlers)
+    LOOP
+        -- Validate flow handler has required keys
+        IF NOT (_handler ? 'flow_name' AND _handler ? 'step_name') THEN
+            RAISE EXCEPTION 'Flow handler missing required keys: flow_name, step_name';
+        END IF;
+
+        _flow_name := _handler->>'flow_name';
+        _step_name := _handler->>'step_name';
+
+        -- Validate values are non-empty strings
+        IF _flow_name IS NULL OR _flow_name = '' THEN
+            RAISE EXCEPTION 'Flow handler flow_name must be a non-empty string';
+        END IF;
+        IF _step_name IS NULL OR _step_name = '' THEN
+            RAISE EXCEPTION 'Flow handler step_name must be a non-empty string';
+        END IF;
+
+        INSERT INTO cb_step_handlers (worker_id, flow_name, step_name)
+        VALUES (cb_worker_started.id, _flow_name, _step_name);
     END LOOP;
 END;
 $$;
