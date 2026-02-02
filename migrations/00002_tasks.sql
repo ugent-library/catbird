@@ -146,7 +146,7 @@ BEGIN
     VALUES (
         cb_create_task.name
     )
-    ON CONFLICT DO NOTHING;
+    ON CONFLICT ON CONSTRAINT cb_tasks_pkey DO NOTHING;
 
     PERFORM cb_create_queue('t_' || cb_create_task.name);
 END;
@@ -157,6 +157,7 @@ $$;
 CREATE OR REPLACE FUNCTION cb_run_task(name text, input jsonb, deduplication_id text = NULL)
 RETURNS uuid
 LANGUAGE plpgsql AS $$
+#variable_conflict use_column
 DECLARE
   _id uuid = gen_random_uuid();
 BEGIN
@@ -174,7 +175,7 @@ BEGIN
         )
       )
     )
-    ON CONFLICT DO NOTHING
+    ON CONFLICT (task_name, deduplication_id) WHERE deduplication_id IS NOT NULL AND status = 'started' DO NOTHING
     RETURNING id
   )
 
@@ -244,7 +245,7 @@ DECLARE
 BEGIN
   INSERT INTO cb_flows (name)
   VALUES (cb_create_flow.name)
-  ON CONFLICT DO NOTHING;
+  ON CONFLICT ON CONSTRAINT cb_flows_pkey DO NOTHING;
 
   FOR _step IN SELECT * FROM jsonb_array_elements(steps)
   LOOP
@@ -255,12 +256,12 @@ BEGIN
       _idx,
       jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb))
     )
-    ON CONFLICT DO NOTHING;
+    ON CONFLICT ON CONSTRAINT cb_steps_pkey DO NOTHING;
 
 		INSERT INTO cb_step_dependencies (flow_name, step_name, dependency_name)
 		SELECT cb_create_flow.name, _step->>'name', depends_on
 		FROM jsonb_array_elements_text(coalesce(_step->'depends_on', '[]'::jsonb)) AS depends_on
-		ON CONFLICT DO NOTHING;
+		ON CONFLICT ON CONSTRAINT cb_step_dependencies_pkey DO NOTHING;
 
     PERFORM cb_create_queue('f_' || cb_create_flow.name || '_' || (_step->>'name'));
 
@@ -274,6 +275,7 @@ $$;
 CREATE OR REPLACE FUNCTION cb_run_flow(name text, input jsonb, deduplication_id text = NULL)
 RETURNS uuid
 LANGUAGE plpgsql AS $$
+#variable_conflict use_column
 DECLARE
   _id uuid = gen_random_uuid();
 BEGIN
@@ -294,7 +296,7 @@ BEGIN
       cb_run_flow.input,
       (SELECT count(*) FROM flow_steps)
     )
-    ON CONFLICT DO NOTHING
+    ON CONFLICT (flow_name, deduplication_id) WHERE deduplication_id IS NOT NULL AND status = 'started' DO NOTHING
     RETURNING id
   ),
   -- create step runs
