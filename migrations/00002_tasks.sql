@@ -175,6 +175,7 @@ BEGIN
       cb_run_task.name,
       cb_send(
         queue => 't_' || cb_run_task.name,
+        deduplication_id => cb_run_task.deduplication_id,
         payload => jsonb_build_object(
           'id', _id,
           'input', cb_run_task.input
