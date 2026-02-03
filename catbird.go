@@ -118,12 +118,7 @@ type Task struct {
 
 type taskHandler struct {
 	handlerOpts
-	fn func(context.Context, taskPayload) ([]byte, error)
-}
-
-type taskPayload struct {
-	ID    string          `json:"id"`
-	Input json.RawMessage `json:"input"`
+	fn func(context.Context, []byte) ([]byte, error)
 }
 
 func NewTask[In, Out any](name string, fn func(context.Context, In) (Out, error), opts ...HandlerOpt) *Task {
@@ -133,9 +128,9 @@ func NewTask[In, Out any](name string, fn func(context.Context, In) (Out, error)
 			batchSize:    10,
 			jitterFactor: 0.1,
 		},
-		fn: func(ctx context.Context, p taskPayload) ([]byte, error) {
+		fn: func(ctx context.Context, b []byte) ([]byte, error) {
 			var in In
-			if err := json.Unmarshal(p.Input, &in); err != nil {
+			if err := json.Unmarshal(b, &in); err != nil {
 				return nil, err
 			}
 

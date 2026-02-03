@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/robfig/cron/v3"
 )
 
@@ -193,9 +194,8 @@ func (w *Worker) Start(ctx context.Context) error {
 		if h := t.handler; h != nil {
 			taskHandlers = append(taskHandlers, TaskHandlerInfo{TaskName: t.Name})
 
-			queueName := fmt.Sprintf("t_%s", t.Name)
-			msgChan := make(chan Message)
-			msgHider := newMessageHider(w.conn, w.logger, t.Name, queueName, h.jitterFactor)
+			msgChan := make(chan taskMessage)
+			msgHider := newTaskHider(w.conn, w.logger, t.Name, h.jitterFactor)
 
 			wg.Go(func() {
 				msgHider.start(ctx)
@@ -206,7 +206,7 @@ func (w *Worker) Start(ctx context.Context) error {
 				defer close(msgChan)
 
 				for {
-					msgs, err := ReadPoll(ctx, w.conn, queueName, h.batchSize, withJitter(10*time.Minute, h.jitterFactor), 10*time.Second, 100*time.Millisecond)
+					msgs, err := readTasks(ctx, w.conn, t.Name, h.batchSize, withJitter(10*time.Minute, h.jitterFactor), 10*time.Second, 100*time.Millisecond)
 					if err != nil {
 						if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 							w.logger.ErrorContext(ctx, "worker: cannot read messages", "handler", t.Name, "error", err)
@@ -234,7 +234,7 @@ func (w *Worker) Start(ctx context.Context) error {
 			for i := 0; i < h.concurrency; i++ {
 				wg.Go(func() {
 					for msg := range msgChan {
-						w.handleTask(ctx, t, queueName, msg, msgHider.stopHiding)
+						w.handleTask(ctx, t, msg, msgHider.stopHiding)
 					}
 				})
 			}
@@ -373,21 +373,14 @@ func (w *Worker) Start(ctx context.Context) error {
 	return nil
 }
 
-func (w *Worker) handleTask(ctx context.Context, t *Task, queueName string, msg Message, stopHiding func(id int64)) {
+func (w *Worker) handleTask(ctx context.Context, t *Task, msg taskMessage, stopHiding func(id int64)) {
 	h := t.handler
 
-	var p taskPayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		w.logger.ErrorContext(ctx, "worker: cannot decode payload", "handler", t.Name, "error", err)
-		return // TODO
-	}
-
 	w.logger.DebugContext(ctx, "worker: handleTask",
-		"handler", t.Name,
-		"id", p.ID,
+		"task", t.Name,
+		"id", msg.ID,
 		"deduplication_id", msg.DeduplicationID,
-		"message_id", msg.ID,
-		"payload", string(msg.Payload),
+		"input", string(msg.Input),
 	)
 
 	fnCtx := ctx
@@ -397,27 +390,27 @@ func (w *Worker) handleTask(ctx context.Context, t *Task, queueName string, msg 
 		defer cancel()
 	}
 
-	out, err := h.fn(fnCtx, p)
+	out, err := h.fn(fnCtx, msg.Input)
 
 	stopHiding(msg.ID)
 
 	if err != nil {
-		w.logger.ErrorContext(ctx, "worker: failed", "handler", t.Name, "error", err)
+		w.logger.ErrorContext(ctx, "worker: failed", "task", t.Name, "error", err)
 
 		if msg.Deliveries > h.retries {
-			q := `SELECT * FROM cb_fail_task(id => $1, error_message => $2);`
-			if _, err := w.conn.Exec(ctx, q, p.ID, err.Error()); err != nil {
-				w.logger.ErrorContext(ctx, "worker: cannot mark task as failed", "handler", t.Name, "error", err)
+			q := `SELECT * FROM cb_fail_task(name => $1, id => $2, error_message => $3);`
+			if _, err := w.conn.Exec(ctx, q, msg.ID, err.Error()); err != nil {
+				w.logger.ErrorContext(ctx, "worker: cannot mark task as failed", "task", t.Name, "error", err)
 			}
 		} else if h.retryDelay > 0 {
-			if _, err := Hide(ctx, w.conn, queueName, msg.ID, withJitter(h.retryDelay, h.jitterFactor)); err != nil {
-				w.logger.ErrorContext(ctx, "worker: cannot delay next run", "handler", t.Name, "error", err)
+			if err := hideTasks(ctx, w.conn, t.Name, []int64{msg.ID}, withJitter(h.retryDelay, h.jitterFactor)); err != nil {
+				w.logger.ErrorContext(ctx, "worker: cannot delay next run", "task", t.Name, "error", err)
 			}
 		}
 	} else {
-		q := `SELECT * FROM cb_complete_task(id => $1, output => $2);`
-		if _, err := w.conn.Exec(ctx, q, p.ID, out); err != nil {
-			w.logger.ErrorContext(ctx, "worker: cannot mark task as completed", "handler", t.Name, "error", err)
+		q := `SELECT * FROM cb_complete_task(name => $1, id => $2, output => $3);`
+		if _, err := w.conn.Exec(ctx, q, t.Name, msg.ID, out); err != nil {
+			w.logger.ErrorContext(ctx, "worker: cannot mark task as completed", "task", t.Name, "error", err)
 		}
 	}
 }
@@ -543,4 +536,117 @@ func withJitter(delay time.Duration, jitterFactor float64) time.Duration {
 	}
 	randomFactor := 1 + (1-rand.Float64()*2)*jitterFactor
 	return time.Duration(float64(delay) * randomFactor)
+}
+
+type taskMessage struct {
+	ID              int64           `json:"id"`
+	DeduplicationID string          `json:"deduplication_id,omitempty"`
+	Input           json.RawMessage `json:"input"`
+	Deliveries      int             `json:"deliveries"`
+}
+
+func readTasks(ctx context.Context, conn Conn, name string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]taskMessage, error) {
+	q := `SELECT * FROM cb_read_tasks(name => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
+
+	rows, err := conn.Query(ctx, q, name, quantity, hideFor.Seconds(), pollFor.Seconds(), pollInterval.Milliseconds())
+	if err != nil {
+		return nil, err
+	}
+
+	return pgx.CollectRows(rows, scanCollectibleTaskMessage)
+}
+
+func hideTasks(ctx context.Context, conn Conn, name string, ids []int64, hideFor time.Duration) error {
+	q := `SELECT * FROM cb_hide_tasks(name => $1, ids => $2, hide_for => $3);`
+	_, err := conn.Exec(ctx, q, name, ids, hideFor.Seconds())
+	return err
+}
+
+type taskHider struct {
+	conn         Conn
+	logger       *slog.Logger
+	ids          map[int64]struct{}
+	mu           sync.Mutex
+	name         string
+	jitterFactor float64
+}
+
+func newTaskHider(conn Conn, logger *slog.Logger, name string, jitterFactor float64) *taskHider {
+	return &taskHider{
+		conn:         conn,
+		logger:       logger,
+		ids:          make(map[int64]struct{}),
+		name:         name,
+		jitterFactor: jitterFactor,
+	}
+}
+
+func (mh *taskHider) start(ctx context.Context) {
+	hideFor := 10 * time.Minute
+	hideTicker := time.NewTicker(30 * time.Second)
+	defer hideTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-hideTicker.C:
+			mh.mu.Lock()
+			numIDs := len(mh.ids)
+			if numIDs == 0 {
+				mh.mu.Unlock()
+				continue
+			}
+			ids := make([]int64, 0, numIDs)
+			for id := range mh.ids {
+				ids = append(ids, id)
+			}
+			mh.mu.Unlock()
+
+			if err := hideTasks(ctx, mh.conn, mh.name, ids, withJitter(hideFor, mh.jitterFactor)); err != nil {
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					mh.logger.ErrorContext(ctx, "worker: cannot hide tasks", "name", mh.name, "error", err)
+				}
+			}
+		}
+	}
+}
+
+func (mh *taskHider) hideMessages(msgs []taskMessage) {
+	mh.mu.Lock()
+	for _, msg := range msgs {
+		mh.ids[msg.ID] = struct{}{}
+	}
+	mh.mu.Unlock()
+}
+
+func (mh *taskHider) stopHiding(id int64) {
+	mh.mu.Lock()
+	delete(mh.ids, id)
+	mh.mu.Unlock()
+}
+
+func scanCollectibleTaskMessage(row pgx.CollectableRow) (taskMessage, error) {
+	return scanTaskMessage(row)
+}
+
+func scanTaskMessage(row pgx.Row) (taskMessage, error) {
+	rec := taskMessage{}
+
+	var deduplicationID *string
+
+	if err := row.Scan(
+		&rec.ID,
+		&deduplicationID,
+		&rec.Input,
+		&rec.Deliveries,
+	); err != nil {
+		return rec, err
+	}
+
+	if deduplicationID != nil {
+		rec.DeduplicationID = *deduplicationID
+	}
+
+	return rec, nil
 }

@@ -62,6 +62,11 @@ DECLARE
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('cb_q_' || lower(cb_create_queue.name)));
 
+    -- Return early if queue already exists
+    IF EXISTS (SELECT 1 FROM cb_queues WHERE cb_queues.name = cb_create_queue.name) THEN
+        RETURN;
+    END IF;
+
     IF cb_create_queue.unlogged THEN
         EXECUTE format(
             $QUERY$
@@ -94,7 +99,7 @@ BEGIN
         );
     END IF;
 
-    EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (deduplication_id);', _q_table || '_deduplication_id_idx', _q_table);
+    EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (deduplication_id) WHERE deduplication_id IS NOT NULL;', _q_table || '_deduplication_id_idx', _q_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (deliver_at);', _q_table || '_deliver_at_idx', _q_table);
 
     -- TODO should check attributes are same
@@ -104,8 +109,7 @@ BEGIN
         cb_create_queue.topics,
         cb_create_queue.unlogged,
         cb_create_queue.delete_at
-    )
-    ON CONFLICT DO NOTHING;
+    );
 END;
 $$;
 -- +goose statementend
@@ -156,7 +160,7 @@ BEGIN
             $QUERY$
             INSERT INTO %I (topic, payload, deduplication_id, deliver_at)
             VALUES ($1, $2, $3, $4)
-            ON CONFLICT (deduplication_id) DO NOTHING;
+            ON CONFLICT (deduplication_id) WHERE deduplication_id IS NOT NULL DO NOTHING;
             $QUERY$,
             _q_table
         )
@@ -179,6 +183,7 @@ CREATE OR REPLACE FUNCTION cb_send(
 )
 RETURNS bigint
 LANGUAGE plpgsql AS $$
+#variable_conflict use_column
 DECLARE
     _deliver_at timestamptz = coalesce(cb_send.deliver_at, now());
     _q_table text = _cb_table_name(cb_send.queue, 'q');
@@ -188,7 +193,7 @@ BEGIN
         $QUERY$
         INSERT INTO %I (topic, payload, deduplication_id, deliver_at)
         VALUES ($1, $2, $3, $4)
-        ON CONFLICT (deduplication_id) DO NOTHING
+        ON CONFLICT (deduplication_id) WHERE deduplication_id IS NOT NULL DO NOTHING
         RETURNING id;
         $QUERY$,
         _q_table
