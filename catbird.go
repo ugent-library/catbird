@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -506,6 +507,7 @@ type TaskRunInfo struct {
 	ID              int64           `json:"id"`
 	DeduplicationID string          `json:"deduplication_id,omitempty"`
 	Status          string          `json:"status"`
+	Input           json.RawMessage `json:"input,omitempty"`
 	Output          json.RawMessage `json:"output,omitempty"`
 	ErrorMessage    string          `json:"error_message,omitempty"`
 	StartedAt       time.Time       `json:"started_at,omitzero"`
@@ -532,6 +534,7 @@ type FlowRunInfo struct {
 	ID              int64           `json:"id"`
 	DeduplicationID string          `json:"deduplication_id,omitempty"`
 	Status          string          `json:"status"`
+	Input           json.RawMessage `json:"input,omitempty"`
 	Output          json.RawMessage `json:"output,omitempty"`
 	ErrorMessage    string          `json:"error_message,omitempty"`
 	StartedAt       time.Time       `json:"started_at,omitzero"`
@@ -919,19 +922,9 @@ func (h *TaskHandle) WaitForOutput(ctx context.Context, out any) error {
 // - name: task name
 // - id: task run ID
 func GetTaskRun(ctx context.Context, conn Conn, name string, id int64) (*TaskRunInfo, error) {
-	q := `SELECT * FROM cb_task_run_info($1, $2);`
-	rows, err := conn.Query(ctx, q, name, fmt.Sprintf("WHERE id = %d", id))
-	if err != nil {
-		return nil, err
-	}
-	results, err := pgx.CollectRows(rows, scanCollectibleTaskRun)
-	if err != nil {
-		return nil, err
-	}
-	if len(results) == 0 {
-		return nil, nil
-	}
-	return results[0], nil
+	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(name))
+	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
+	return scanTaskRun(conn.QueryRow(ctx, query, id))
 }
 
 // ListTaskRuns returns recent task runs for a task.
@@ -941,8 +934,9 @@ func GetTaskRun(ctx context.Context, conn Conn, name string, id int64) (*TaskRun
 // - conn: database connection
 // - name: task name
 func ListTaskRuns(ctx context.Context, conn Conn, name string) ([]*TaskRunInfo, error) {
-	q := `SELECT * FROM cb_task_run_info($1, $2);`
-	rows, err := conn.Query(ctx, q, name, "")
+	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(name))
+	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
+	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -975,13 +969,13 @@ func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 // - conn: database connection
 // - name: flow name
 func GetFlow(ctx context.Context, conn Conn, name string) (*FlowInfo, error) {
-	q := `SELECT * FROM cb_flow_info() WHERE name = $1;`
+	q := `SELECT * FROM cb_flow_info WHERE name = $1;`
 	return scanFlow(conn.QueryRow(ctx, q, name))
 }
 
 // ListFlows returns all flows
 func ListFlows(ctx context.Context, conn Conn) ([]*FlowInfo, error) {
-	q := `SELECT * FROM cb_flow_info();`
+	q := `SELECT * FROM cb_flow_info;`
 	rows, err := conn.Query(ctx, q)
 	if err != nil {
 		return nil, err
@@ -1075,19 +1069,9 @@ func (h *FlowHandle) WaitForOutput(ctx context.Context, out any) error {
 // - name: flow name
 // - id: flow run ID
 func GetFlowRun(ctx context.Context, conn Conn, flowName string, id int64) (*FlowRunInfo, error) {
-	q := `SELECT * FROM cb_flow_run_info($1, $2);`
-	rows, err := conn.Query(ctx, q, flowName, fmt.Sprintf("WHERE id = %d", id))
-	if err != nil {
-		return nil, err
-	}
-	results, err := pgx.CollectRows(rows, scanCollectibleFlowRun)
-	if err != nil {
-		return nil, err
-	}
-	if len(results) == 0 {
-		return nil, nil
-	}
-	return results[0], nil
+	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
+	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
+	return scanFlowRun(conn.QueryRow(ctx, query, id))
 }
 
 // ListFlowRuns returns recent flow runs for a flow.
@@ -1097,8 +1081,9 @@ func GetFlowRun(ctx context.Context, conn Conn, flowName string, id int64) (*Flo
 // - conn: database connection
 // - name: flow name
 func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunInfo, error) {
-	q := `SELECT * FROM cb_flow_run_info($1, $2);`
-	rows, err := conn.Query(ctx, q, flowName, "")
+	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
+	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
+	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -1256,6 +1241,7 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 	rec := TaskRunInfo{}
 
 	var deduplicationID *string
+	var input *json.RawMessage
 	var output *json.RawMessage
 	var errorMessage *string
 	var completedAt *time.Time
@@ -1265,6 +1251,7 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 		&rec.ID,
 		&deduplicationID,
 		&rec.Status,
+		&input,
 		&output,
 		&errorMessage,
 		&rec.StartedAt,
@@ -1276,6 +1263,9 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 
 	if deduplicationID != nil {
 		rec.DeduplicationID = *deduplicationID
+	}
+	if input != nil {
+		rec.Input = *input
 	}
 	if output != nil {
 		rec.Output = *output
@@ -1325,6 +1315,7 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 	rec := FlowRunInfo{}
 
 	var deduplicationID *string
+	var input *json.RawMessage
 	var output *json.RawMessage
 	var errorMessage *string
 	var completedAt *time.Time
@@ -1334,6 +1325,7 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 		&rec.ID,
 		&deduplicationID,
 		&rec.Status,
+		&input,
 		&output,
 		&errorMessage,
 		&rec.StartedAt,
@@ -1345,6 +1337,9 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 
 	if deduplicationID != nil {
 		rec.DeduplicationID = *deduplicationID
+	}
+	if input != nil {
+		rec.Input = *input
 	}
 	if output != nil {
 		rec.Output = *output

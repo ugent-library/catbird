@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/ugent-library/catbird"
 )
 
@@ -44,7 +45,7 @@ func New(config Config) *App {
 			if t.IsZero() {
 				return "-"
 			}
-			return t.Format(time.RFC3339)
+			return humanize.Time(t)
 		},
 		"toJSON": func(v any) (template.JS, error) {
 			b, err := json.Marshal(v)
@@ -98,12 +99,13 @@ func (a *App) render(w http.ResponseWriter, r *http.Request, t *template.Templat
 	}
 
 	if err := t.ExecuteTemplate(w, tmpl, data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		// Headers may already be written, so just log the error
+		a.logger.Error("template execution error", "error", err)
 		return
 	}
 }
 
-func (a *App) handeError(w http.ResponseWriter, r *http.Request, err error) {
+func (a *App) handleError(w http.ResponseWriter, r *http.Request, err error) {
 	a.logger.Error("handler error", "error", err)
 	http.Error(w, err.Error(), http.StatusInternalServerError)
 }
@@ -115,7 +117,7 @@ func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleQueues(w http.ResponseWriter, r *http.Request) {
 	queues, err := a.client.ListQueues(r.Context())
 	if err != nil {
-		a.handeError(w, r, err)
+		a.handleError(w, r, err)
 		return
 	}
 
@@ -129,7 +131,7 @@ func (a *App) handleQueues(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleTasks(w http.ResponseWriter, r *http.Request) {
 	tasks, err := a.client.ListTasks(r.Context())
 	if err != nil {
-		a.handeError(w, r, err)
+		a.handleError(w, r, err)
 		return
 	}
 
@@ -145,13 +147,13 @@ func (a *App) handleTask(w http.ResponseWriter, r *http.Request) {
 
 	task, err := a.client.GetTask(r.Context(), taskName)
 	if err != nil {
-		a.handeError(w, r, err)
+		a.handleError(w, r, err)
 		return
 	}
 
 	taskRuns, err := a.client.ListTaskRuns(r.Context(), taskName)
 	if err != nil {
-		a.handeError(w, r, err)
+		a.handleError(w, r, err)
 		return
 	}
 
@@ -167,7 +169,7 @@ func (a *App) handleTask(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleFlows(w http.ResponseWriter, r *http.Request) {
 	flows, err := a.client.ListFlows(r.Context())
 	if err != nil {
-		a.handeError(w, r, err)
+		a.handleError(w, r, err)
 		return
 	}
 
@@ -183,13 +185,13 @@ func (a *App) handleFlow(w http.ResponseWriter, r *http.Request) {
 
 	flow, err := a.client.GetFlow(r.Context(), flowName)
 	if err != nil {
-		a.handeError(w, r, err)
+		a.handleError(w, r, err)
 		return
 	}
 
 	flowRuns, err := a.client.ListFlowRuns(r.Context(), flowName)
 	if err != nil {
-		a.handeError(w, r, err)
+		a.handleError(w, r, err)
 		return
 	}
 
@@ -205,7 +207,7 @@ func (a *App) handleFlow(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleWorkers(w http.ResponseWriter, r *http.Request) {
 	workers, err := a.client.ListWorkers(r.Context())
 	if err != nil {
-		a.handeError(w, r, err)
+		a.handleError(w, r, err)
 		return
 	}
 

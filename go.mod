@@ -3,6 +3,7 @@ module github.com/ugent-library/catbird
 go 1.25.3
 
 require (
+	github.com/dustin/go-humanize v1.0.1
 	github.com/jackc/pgx/v5 v5.7.6
 	github.com/pressly/goose/v3 v3.26.0
 )

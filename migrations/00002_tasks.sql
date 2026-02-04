@@ -1072,17 +1072,11 @@ $$;
 -- +goose statementbegin
 -- cb_flow_info: Query information about all flow definitions
 -- Returns all registered flows with their step definitions and metadata
--- Parameters: none
--- Returns table with columns:
+-- Columns:
 --   - name: Flow name
 --   - steps: JSON array of step definitions with dependencies
 --   - created_at: Flow creation timestamp
-CREATE OR REPLACE FUNCTION cb_flow_info()
-RETURNS TABLE (
-  name text,
-  steps jsonb,
-  created_at timestamptz
-) AS $$
+CREATE OR REPLACE VIEW cb_flow_info AS
   SELECT
     f.name,
     s.steps,
@@ -1104,95 +1098,18 @@ RETURNS TABLE (
     WHERE s.flow_name = f.name
     GROUP BY flow_name
   ) s ON s.flow_name = f.name;
-$$ LANGUAGE sql;
--- +goose statementend
-
--- +goose statementbegin
--- cb_task_run_info: Query task run information with optional filtering
--- Returns task runs with status, output, and execution metadata
--- Parameters:
---   p_task_name: Task name to query runs for
---   p_where_clause: Optional SQL WHERE clause for filtering (e.g., "WHERE status = 'completed'")
--- Returns table with columns:
---   - id: Task run ID
---   - deduplication_id: Deduplication ID (if provided during run creation)
---   - status: Current status (queued, started, completed, failed)
---   - output: JSON output from completed runs
---   - error_message: Error message from failed runs
---   - started_at, completed_at, failed_at: Timestamps
-CREATE OR REPLACE FUNCTION cb_task_run_info(p_task_name text, p_where_clause text DEFAULT '')
-RETURNS TABLE (
-  id bigint,
-  deduplication_id text,
-  status text,
-  output jsonb,
-  error_message text,
-  started_at timestamptz,
-  completed_at timestamptz,
-  failed_at timestamptz
-) AS $$
-BEGIN
-	RETURN QUERY EXECUTE format('
-		SELECT id, deduplication_id, status, output, error_message, started_at, completed_at, failed_at
-		FROM %I
-		%s
-		ORDER BY started_at DESC
-		LIMIT 20', cb_table_name(p_task_name, 't'), p_where_clause);
-END;
-$$ LANGUAGE plpgsql;
-
--- cb_flow_run_info: Query flow run information with optional filtering
--- Returns flow runs with status, output, and execution metadata
--- Parameters:
---   p_flow_name: Flow name to query runs for
---   p_where_clause: Optional SQL WHERE clause for filtering (e.g., "WHERE status = 'completed'")
--- Returns table with columns:
---   - id: Flow run ID
---   - deduplication_id: Deduplication ID (if provided during run creation)
---   - status: Current status (started, completed, failed)
---   - output: JSON output combining all step outputs from completed flows
---   - error_message: Error message from failed flows
---   - started_at, completed_at, failed_at: Timestamps
-CREATE OR REPLACE FUNCTION cb_flow_run_info(p_flow_name text, p_where_clause text DEFAULT '')
-RETURNS TABLE (
-  id bigint,
-  deduplication_id text,
-  status text,
-  output jsonb,
-  error_message text,
-  started_at timestamptz,
-  completed_at timestamptz,
-  failed_at timestamptz
-) AS $$
-BEGIN
-	RETURN QUERY EXECUTE format('
-		SELECT id, deduplication_id, status, output, error_message, started_at, completed_at, failed_at
-		FROM %I
-		%s
-		ORDER BY started_at DESC
-		LIMIT 20', cb_table_name(p_flow_name, 'f'), p_where_clause);
-END;
-$$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
 -- cb_worker_info: Query information about all registered workers
 -- Returns worker registration details and their assigned handlers
--- Parameters: none
--- Returns table with columns:
+-- Columns:
 --   - id: Worker UUID
 --   - started_at: When the worker registered
 --   - last_heartbeat_at: Timestamp of last heartbeat
 --   - task_handlers: JSON array of assigned tasks
 --   - step_handlers: JSON array of assigned flow steps
-CREATE OR REPLACE FUNCTION cb_worker_info()
-RETURNS TABLE (
-  id uuid,
-  started_at timestamptz,
-  last_heartbeat_at timestamptz,
-  task_handlers json,
-  step_handlers json
-) AS $$
+CREATE OR REPLACE VIEW cb_worker_info AS
   SELECT
     w.id,
     w.started_at,
@@ -1215,7 +1132,6 @@ RETURNS TABLE (
     GROUP BY worker_id
   ) s ON s.worker_id = w.id
   ORDER BY w.started_at DESC;
-$$ LANGUAGE sql;
 -- +goose statementend
 
 -- +goose down
@@ -1224,10 +1140,8 @@ $$ LANGUAGE sql;
 SELECT cb_delete_task(name) FROM cb_tasks;
 SELECT cb_delete_flow(name) FROM cb_flows;
 
-DROP FUNCTION IF EXISTS cb_worker_info();
-DROP FUNCTION IF EXISTS cb_flow_info();
-DROP FUNCTION IF EXISTS cb_task_run_info(text, text);
-DROP FUNCTION IF EXISTS cb_flow_run_info(text, text);
+DROP VIEW IF EXISTS cb_worker_info;
+DROP VIEW IF EXISTS cb_flow_info;
 DROP FUNCTION IF EXISTS cb_worker_heartbeat(uuid);
 DROP FUNCTION IF EXISTS cb_worker_started(uuid, jsonb, jsonb);
 DROP FUNCTION IF EXISTS cb_fail_step(text, text, bigint, text);
