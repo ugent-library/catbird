@@ -2,7 +2,6 @@
 
 -- +goose up
 
-
 -- +goose statementbegin
 DO $$
 BEGIN
@@ -90,6 +89,11 @@ CREATE TABLE IF NOT EXISTS cb_step_handlers (
 );
 
 -- +goose statementbegin
+-- cb_create_task: Create a task definition
+-- Creates the task metadata and associated queue table for task runs
+-- Parameters:
+--   name: Task name (must be unique)
+-- Returns: void
 CREATE OR REPLACE FUNCTION cb_create_task(name text)
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -140,6 +144,12 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_run_task: Create a task run (enqueue a task execution)
+-- Parameters:
+--   name: Task name
+--   input: JSON input data for the task
+--   deduplication_id: Optional unique ID for deduplication (prevents duplicate executions)
+-- Returns: bigint - the task run ID
 CREATE OR REPLACE FUNCTION cb_run_task(name text, input jsonb, deduplication_id text = NULL)
 RETURNS bigint
 LANGUAGE plpgsql AS $$
@@ -170,6 +180,14 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_read_tasks: Read task runs from the queue
+-- Parameters:
+--   name: Task name
+--   quantity: Number of task runs to read (must be > 0)
+--   hide_for: Duration in milliseconds to hide task runs from other workers (must be > 0)
+--   poll_for: Total duration in milliseconds to poll before timing out (must be > 0)
+--   poll_interval: Duration in milliseconds between poll attempts (must be > 0 and < poll_for)
+-- Returns: Set of cb_task_message records
 CREATE OR REPLACE FUNCTION cb_read_tasks(
     name text,
     quantity int,
@@ -254,6 +272,12 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_hide_tasks: Hide task runs from being read by workers
+-- Parameters:
+--   name: Task name
+--   ids: Array of task run IDs to hide
+--   hide_for: Duration in milliseconds to hide the task runs (must be > 0)
+-- Returns: void
 CREATE OR REPLACE FUNCTION cb_hide_tasks(name text, ids bigint[], hide_for integer)
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -279,6 +303,13 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_complete_task: Mark a task run as completed
+-- Sets the task run status to 'completed' and stores the output
+-- Parameters:
+--   name: Task name
+--   id: Task run ID
+--   output: JSON output data from the task execution
+-- Returns: void
 CREATE OR REPLACE FUNCTION cb_complete_task(name text, id bigint, output jsonb)
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -303,6 +334,13 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_fail_task: Mark a task run as failed
+-- Sets the task run status to 'failed' and stores the error message
+-- Parameters:
+--   name: Task name
+--   id: Task run ID
+--   error_message: Description of the error that occurred
+-- Returns: void
 CREATE OR REPLACE FUNCTION cb_fail_task(name text, id bigint, output jsonb)
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -327,6 +365,11 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_delete_task: Delete a task definition and all its runs
+-- Removes the task metadata, handlers, and drops the associated queue table
+-- Parameters:
+--   name: Task name
+-- Returns: boolean - true if task was deleted, false if not found
 CREATE OR REPLACE FUNCTION cb_delete_task(name text)
 RETURNS boolean
 LANGUAGE plpgsql AS $$
@@ -352,6 +395,12 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_create_flow: Create a flow definition
+-- Creates the flow metadata and associated tables for flow runs and steps
+-- Parameters:
+--   name: Flow name (must be unique)
+--   steps: JSON array describing flow steps and their dependencies
+-- Returns: void
 CREATE OR REPLACE FUNCTION cb_create_flow(name text, steps jsonb)
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -499,6 +548,13 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_run_flow: Create a flow run (enqueue a flow execution)
+-- Creates a flow run and initializes all step runs with dependency tracking
+-- Parameters:
+--   name: Flow name
+--   input: JSON input data for the flow
+--   deduplication_id: Optional unique ID for deduplication (prevents duplicate executions)
+-- Returns: bigint - the flow run ID
 CREATE OR REPLACE FUNCTION cb_run_flow(name text, input jsonb, deduplication_id text = NULL)
 RETURNS bigint
 LANGUAGE plpgsql AS $$
@@ -555,6 +611,12 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_start_steps: Start steps in a flow that have no pending dependencies
+-- Called automatically after step completion to start dependent steps
+-- Parameters:
+--   flow_name: Flow name
+--   flow_run_id: Flow run ID
+-- Returns: void
 CREATE OR REPLACE FUNCTION cb_start_steps(flow_name text, flow_run_id bigint)
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -597,6 +659,15 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_read_steps: Read step runs from a flow
+-- Parameters:
+--   flow_name: Flow name
+--   step_name: Step name within the flow
+--   quantity: Number of step runs to read (must be > 0)
+--   hide_for: Duration in milliseconds to hide step runs from other workers (must be > 0)
+--   poll_for: Total duration in milliseconds to poll before timing out (must be > 0)
+--   poll_interval: Duration in milliseconds between poll attempts (must be > 0 and < poll_for)
+-- Returns: Set of cb_step_message records
 CREATE OR REPLACE FUNCTION cb_read_steps(
     flow_name text,
     step_name text,
@@ -695,6 +766,13 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_hide_steps: Hide step runs from being read by workers
+-- Parameters:
+--   flow_name: Flow name
+--   step_name: Step name within the flow
+--   ids: Array of step run IDs to hide
+--   hide_for: Duration in milliseconds to hide the step runs (must be > 0)
+-- Returns: void
 CREATE OR REPLACE FUNCTION cb_hide_steps(flow_name text, step_name text, ids bigint[], hide_for integer)
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -722,6 +800,14 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_complete_step: Mark a step run as completed
+-- Sets the step run status to 'completed', decrements flow dependencies, and starts dependent steps
+-- Parameters:
+--   flow_name: Flow name
+--   step_name: Step name within the flow
+--   step_id: Step run ID
+--   output: JSON output data from the step execution
+-- Returns: void
 CREATE OR REPLACE FUNCTION cb_complete_step(flow_name text, step_name text, step_id bigint, output jsonb)
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -810,6 +896,14 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_fail_step: Mark a step run as failed
+-- Sets the step run and the parent flow run to 'failed' status, stores the error message
+-- Parameters:
+--   flow_name: Flow name
+--   step_name: Step name within the flow
+--   step_id: Step run ID
+--   error_message: Description of the error that occurred
+-- Returns: void
 CREATE OR REPLACE FUNCTION cb_fail_step(flow_name text, step_name text, step_id bigint, error_message text)
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -857,6 +951,11 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_delete_flow: Delete a flow definition and all its runs
+-- Removes the flow metadata, handlers, steps, and drops the associated tables
+-- Parameters:
+--   name: Flow name
+-- Returns: boolean - true if flow was deleted, false if not found
 CREATE OR REPLACE FUNCTION cb_delete_flow(name text)
 RETURNS boolean
 LANGUAGE plpgsql AS $$
@@ -890,6 +989,13 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_worker_started: Register a worker with the system
+-- Creates worker record and registers task and step handlers
+-- Parameters:
+--   id: Worker UUID (unique identifier)
+--   task_handlers: JSON array of {task_name: string} objects
+--   step_handlers: JSON array of {flow_name: string, step_name: string} objects
+-- Returns: void
 CREATE OR REPLACE FUNCTION cb_worker_started(id uuid, task_handlers jsonb, step_handlers jsonb)
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -947,6 +1053,11 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_worker_heartbeat: Update worker's last heartbeat timestamp
+-- Called periodically by workers to indicate they are still alive
+-- Parameters:
+--   id: Worker UUID
+-- Returns: void
 CREATE OR REPLACE FUNCTION cb_worker_heartbeat(id uuid)
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -959,6 +1070,13 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_flow_info: Query information about all flow definitions
+-- Returns all registered flows with their step definitions and metadata
+-- Parameters: none
+-- Returns table with columns:
+--   - name: Flow name
+--   - steps: JSON array of step definitions with dependencies
+--   - created_at: Flow creation timestamp
 CREATE OR REPLACE FUNCTION cb_flow_info()
 RETURNS TABLE (
   name text,
@@ -990,6 +1108,18 @@ $$ LANGUAGE sql;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_task_run_info: Query task run information with optional filtering
+-- Returns task runs with status, output, and execution metadata
+-- Parameters:
+--   p_task_name: Task name to query runs for
+--   p_where_clause: Optional SQL WHERE clause for filtering (e.g., "WHERE status = 'completed'")
+-- Returns table with columns:
+--   - id: Task run ID
+--   - deduplication_id: Deduplication ID (if provided during run creation)
+--   - status: Current status (queued, started, completed, failed)
+--   - output: JSON output from completed runs
+--   - error_message: Error message from failed runs
+--   - started_at, completed_at, failed_at: Timestamps
 CREATE OR REPLACE FUNCTION cb_task_run_info(p_task_name text, p_where_clause text DEFAULT '')
 RETURNS TABLE (
   id bigint,
@@ -1011,6 +1141,18 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- cb_flow_run_info: Query flow run information with optional filtering
+-- Returns flow runs with status, output, and execution metadata
+-- Parameters:
+--   p_flow_name: Flow name to query runs for
+--   p_where_clause: Optional SQL WHERE clause for filtering (e.g., "WHERE status = 'completed'")
+-- Returns table with columns:
+--   - id: Flow run ID
+--   - deduplication_id: Deduplication ID (if provided during run creation)
+--   - status: Current status (started, completed, failed)
+--   - output: JSON output combining all step outputs from completed flows
+--   - error_message: Error message from failed flows
+--   - started_at, completed_at, failed_at: Timestamps
 CREATE OR REPLACE FUNCTION cb_flow_run_info(p_flow_name text, p_where_clause text DEFAULT '')
 RETURNS TABLE (
   id bigint,
@@ -1034,6 +1176,15 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_worker_info: Query information about all registered workers
+-- Returns worker registration details and their assigned handlers
+-- Parameters: none
+-- Returns table with columns:
+--   - id: Worker UUID
+--   - started_at: When the worker registered
+--   - last_heartbeat_at: Timestamp of last heartbeat
+--   - task_handlers: JSON array of assigned tasks
+--   - step_handlers: JSON array of assigned flow steps
 CREATE OR REPLACE FUNCTION cb_worker_info()
 RETURNS TABLE (
   id uuid,

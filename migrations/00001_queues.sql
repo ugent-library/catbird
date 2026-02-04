@@ -33,6 +33,12 @@ CREATE INDEX IF NOT EXISTS cb_queues_topics_idx ON cb_queues USING gin (topics);
 CREATE INDEX IF NOT EXISTS cb_queues_delete_at_idx ON cb_queues (delete_at);
 
 -- +goose statementbegin
+-- cb_table_name: Generate a PostgreSQL table name for queue/task/flow storage
+-- Validates the name and constructs the internal table name with prefix
+-- Parameters:
+--   name: Queue/task/flow name (must contain only a-z, 0-9, _; max 58 chars)
+--   prefix: Type prefix ('q' for queue, 't' for task, etc.)
+-- Returns: text - the full PostgreSQL table name
 CREATE OR REPLACE FUNCTION cb_table_name(name text, prefix text)
 RETURNS text
 LANGUAGE plpgsql AS $$
@@ -49,6 +55,14 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_create_queue: Create a queue definition
+-- Creates the queue metadata and associated message table for enqueued messages
+-- Parameters:
+--   name: Queue name (must be unique)
+--   topics: Optional array of topic strings for message routing
+--   delete_at: Optional timestamp when the queue should be automatically deleted
+--   unlogged: Whether to use an unlogged table for better performance (loses durability)
+-- Returns: void
 CREATE OR REPLACE FUNCTION cb_create_queue(
     name text,
     topics text[] = null,
@@ -111,6 +125,11 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_delete_queue: Delete a queue definition and all its messages
+-- Removes the queue metadata and drops the associated message table
+-- Parameters:
+--   name: Queue name
+-- Returns: boolean - true if queue was deleted, false if not found
 CREATE OR REPLACE FUNCTION cb_delete_queue(name text)
 RETURNS boolean
 LANGUAGE plpgsql AS $$
@@ -133,6 +152,14 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_dispatch: Send a message to all queues subscribed to a topic
+-- Routes the message to queues based on topic subscription
+-- Parameters:
+--   topic: Topic string to route to subscribed queues
+--   payload: JSON message payload
+--   deduplication_id: Optional unique ID for deduplication (prevents duplicate messages)
+--   deliver_at: Optional timestamp when message should become deliverable (default: now)
+-- Returns: void
 CREATE OR REPLACE FUNCTION cb_dispatch(
     topic text,
     payload jsonb,
@@ -170,6 +197,15 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_send: Send a message to a specific queue
+-- Enqueues a message in the queue, with optional topic and deduplication
+-- Parameters:
+--   queue: Queue name
+--   payload: JSON message payload
+--   topic: Optional topic string for categorization
+--   deduplication_id: Optional unique ID for deduplication (prevents duplicate messages)
+--   deliver_at: Optional timestamp when message should become deliverable (default: now)
+-- Returns: bigint - the message ID
 CREATE OR REPLACE FUNCTION cb_send(
     queue text,
     payload jsonb,
@@ -205,8 +241,12 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- TODO return or error if deleted
-CREATE OR REPLACE FUNCTION cb_read(
+-- TODO return or error if deleted-- cb_read: Read messages from a queue
+-- Parameters:
+--   queue: Queue name
+--   quantity: Number of messages to read (must be > 0)
+--   hide_for: Duration in milliseconds to hide messages from other readers (must be > 0)
+-- Returns: Set of cb_message recordsCREATE OR REPLACE FUNCTION cb_read(
     queue text,
     quantity int,
     hide_for int
@@ -255,6 +295,15 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_read_poll: Read messages from a queue with polling
+-- Polls the queue repeatedly until messages are available or timeout is reached
+-- Parameters:
+--   queue: Queue name
+--   quantity: Number of messages to read (must be > 0)
+--   hide_for: Duration in milliseconds to hide messages from other readers (must be > 0)
+--   poll_for: Total duration in milliseconds to poll before timing out (must be > 0)
+--   poll_interval: Duration in milliseconds between poll attempts (must be > 0 and < poll_for)
+-- Returns: Set of cb_message records
 CREATE OR REPLACE FUNCTION cb_read_poll(
     queue text,
     quantity int,
@@ -339,6 +388,12 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_hide: Hide a message from being read
+-- Parameters:
+--   queue: Queue name
+--   id: Message ID to hide
+--   hide_for: Duration in milliseconds to hide the message (must be > 0)
+-- Returns: true if message was hidden, false if not found
 CREATE OR REPLACE FUNCTION cb_hide(
     queue text,
     id bigint,
@@ -371,6 +426,12 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_hide: Hide multiple messages from being read
+-- Parameters:
+--   queue: Queue name
+--   ids: Array of message IDs to hide
+--   hide_for: Duration in milliseconds to hide the messages (must be > 0)
+-- Returns: void
 CREATE OR REPLACE FUNCTION cb_hide(
     queue text,
     ids bigint[],
@@ -399,6 +460,11 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_delete: Delete a message from a queue
+-- Parameters:
+--   queue: Queue name
+--   id: Message ID to delete
+-- Returns: boolean - true if message was deleted, false if not found
 CREATE OR REPLACE FUNCTION cb_delete(queue text, id bigint)
 RETURNS boolean AS $$
 DECLARE
@@ -419,6 +485,11 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_delete: Delete multiple messages from a queue
+-- Parameters:
+--   queue: Queue name
+--   ids: Array of message IDs to delete
+-- Returns: void
 CREATE OR REPLACE FUNCTION cb_delete(queue text, ids bigint[])
 RETURNS void AS $$
 DECLARE
