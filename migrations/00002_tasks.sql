@@ -1,4 +1,4 @@
--- SQL code is mostly taken or adapted from pgflow (https://github.com/pgflow-dev/pgflow)
+-- SQL code is taken from or inspired by pgflow (https://github.com/pgflow-dev/pgflow)
 
 -- +goose up
 

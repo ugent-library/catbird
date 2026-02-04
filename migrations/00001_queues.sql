@@ -1,4 +1,4 @@
--- SQL code is mostly taken or adapted from pgmq (https://github.com/pgmq/pgmq) 
+-- SQL code is taken from or inspired by pgflow pgmq (https://github.com/pgmq/pgmq) 
 -- TODO better return values
 
 -- +goose up
