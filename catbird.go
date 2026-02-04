@@ -118,12 +118,7 @@ type Task struct {
 
 type taskHandler struct {
 	handlerOpts
-	fn func(context.Context, taskPayload) ([]byte, error)
-}
-
-type taskPayload struct {
-	ID    string          `json:"id"`
-	Input json.RawMessage `json:"input"`
+	fn func(context.Context, []byte) ([]byte, error)
 }
 
 func NewTask[In, Out any](name string, fn func(context.Context, In) (Out, error), opts ...HandlerOpt) *Task {
@@ -133,9 +128,9 @@ func NewTask[In, Out any](name string, fn func(context.Context, In) (Out, error)
 			batchSize:    10,
 			jitterFactor: 0.1,
 		},
-		fn: func(ctx context.Context, p taskPayload) ([]byte, error) {
+		fn: func(ctx context.Context, b []byte) ([]byte, error) {
 			var in In
-			if err := json.Unmarshal(p.Input, &in); err != nil {
+			if err := json.Unmarshal(b, &in); err != nil {
 				return nil, err
 			}
 
@@ -164,28 +159,37 @@ type Flow struct {
 }
 
 type Step struct {
-	Name      string   `json:"name"`
-	DependsOn []string `json:"depends_on,omitempty"`
+	Name      string            `json:"name"`
+	DependsOn []*StepDependency `json:"depends_on,omitempty"`
 	handler   *stepHandler
 }
 
 type StepDependency struct {
-	name string
+	Name string `json:"name"`
 }
 
-func Dependency(name string) StepDependency {
-	return StepDependency{name: name}
+func Dependency(name string) *StepDependency {
+	return &StepDependency{Name: name}
 }
 
-type stepPayload struct {
-	ID          string                     `json:"id"`
+type stepMessage struct {
+	ID          int64                      `json:"id"`
+	FlowRunID   int64                      `json:"flow_run_id"`
+	StepName    string                     `json:"step_name"`
+	Deliveries  int                        `json:"deliveries"`
 	FlowInput   json.RawMessage            `json:"flow_input"`
 	StepOutputs map[string]json.RawMessage `json:"step_outputs"`
 }
 
+func (m stepMessage) getID() int64 { return m.ID }
+
+type handlerMessage interface {
+	getID() int64
+}
+
 type stepHandler struct {
 	handlerOpts
-	fn func(context.Context, stepPayload) ([]byte, error)
+	fn func(context.Context, stepMessage) ([]byte, error)
 }
 
 type StepOpt func(*Step)
@@ -216,7 +220,7 @@ func InitialStep[In, Out any](name string, fn func(context.Context, In) (Out, er
 	return stepOpt{step: &Step{
 		Name:      name,
 		DependsOn: nil,
-		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			if err := json.Unmarshal(p.FlowInput, &in); err != nil {
 				return nil, err
@@ -230,14 +234,14 @@ func InitialStep[In, Out any](name string, fn func(context.Context, In) (Out, er
 	}}
 }
 
-func StepWithOneDependency[In, Dep1Out, Out any](name string, dep1 StepDependency, fn func(context.Context, In, Dep1Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+func StepWithOneDependency[In, Dep1Out, Out any](name string, dep1 *StepDependency, fn func(context.Context, In, Dep1Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
-		DependsOn: []string{dep1.name},
-		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+		DependsOn: []*StepDependency{dep1},
+		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			var dep1Out Dep1Out
-			if err := unmarshalStepArgs(p, []string{dep1.name}, &in, []any{&dep1Out}); err != nil {
+			if err := unmarshalStepArgs(p, []string{dep1.Name}, &in, []any{&dep1Out}); err != nil {
 				return nil, err
 			}
 			out, err := fn(ctx, in, dep1Out)
@@ -249,15 +253,15 @@ func StepWithOneDependency[In, Dep1Out, Out any](name string, dep1 StepDependenc
 	}}
 }
 
-func StepWithTwoDependencies[In, Dep1Out, Dep2Out, Out any](name string, dep1 StepDependency, dep2 StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+func StepWithTwoDependencies[In, Dep1Out, Dep2Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
-		DependsOn: []string{dep1.name, dep2.name},
-		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+		DependsOn: []*StepDependency{dep1, dep2},
+		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			var dep1Out Dep1Out
 			var dep2Out Dep2Out
-			if err := unmarshalStepArgs(p, []string{dep1.name, dep2.name}, &in, []any{&dep1Out, &dep2Out}); err != nil {
+			if err := unmarshalStepArgs(p, []string{dep1.Name, dep2.Name}, &in, []any{&dep1Out, &dep2Out}); err != nil {
 				return nil, err
 			}
 			out, err := fn(ctx, in, dep1Out, dep2Out)
@@ -269,16 +273,16 @@ func StepWithTwoDependencies[In, Dep1Out, Dep2Out, Out any](name string, dep1 St
 	}}
 }
 
-func StepWithThreeDependencies[In, Dep1Out, Dep2Out, Dep3Out, Out any](name string, dep1 StepDependency, dep2 StepDependency, dep3 StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+func StepWithThreeDependencies[In, Dep1Out, Dep2Out, Dep3Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
-		DependsOn: []string{dep1.name, dep2.name, dep3.name},
-		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+		DependsOn: []*StepDependency{dep1, dep2, dep3},
+		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			var dep1Out Dep1Out
 			var dep2Out Dep2Out
 			var dep3Out Dep3Out
-			if err := unmarshalStepArgs(p, []string{dep1.name, dep2.name, dep3.name}, &in, []any{&dep1Out, &dep2Out, &dep3Out}); err != nil {
+			if err := unmarshalStepArgs(p, []string{dep1.Name, dep2.Name, dep3.Name}, &in, []any{&dep1Out, &dep2Out, &dep3Out}); err != nil {
 				return nil, err
 			}
 			out, err := fn(ctx, in, dep1Out, dep2Out, dep3Out)
@@ -290,17 +294,17 @@ func StepWithThreeDependencies[In, Dep1Out, Dep2Out, Dep3Out, Out any](name stri
 	}}
 }
 
-func StepWithFourDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Out any](name string, dep1 StepDependency, dep2 StepDependency, dep3 StepDependency, dep4 StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+func StepWithFourDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, dep4 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
-		DependsOn: []string{dep1.name, dep2.name, dep3.name, dep4.name},
-		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+		DependsOn: []*StepDependency{dep1, dep2, dep3, dep4},
+		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			var dep1Out Dep1Out
 			var dep2Out Dep2Out
 			var dep3Out Dep3Out
 			var dep4Out Dep4Out
-			if err := unmarshalStepArgs(p, []string{dep1.name, dep2.name, dep3.name, dep4.name}, &in, []any{&dep1Out, &dep2Out, &dep3Out, &dep4Out}); err != nil {
+			if err := unmarshalStepArgs(p, []string{dep1.Name, dep2.Name, dep3.Name, dep4.Name}, &in, []any{&dep1Out, &dep2Out, &dep3Out, &dep4Out}); err != nil {
 				return nil, err
 			}
 			out, err := fn(ctx, in, dep1Out, dep2Out, dep3Out, dep4Out)
@@ -312,18 +316,18 @@ func StepWithFourDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Out any](n
 	}}
 }
 
-func StepWithFiveDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Out any](name string, dep1 StepDependency, dep2 StepDependency, dep3 StepDependency, dep4 StepDependency, dep5 StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+func StepWithFiveDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, dep4 *StepDependency, dep5 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
-		DependsOn: []string{dep1.name, dep2.name, dep3.name, dep4.name, dep5.name},
-		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+		DependsOn: []*StepDependency{dep1, dep2, dep3, dep4, dep5},
+		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			var dep1Out Dep1Out
 			var dep2Out Dep2Out
 			var dep3Out Dep3Out
 			var dep4Out Dep4Out
 			var dep5Out Dep5Out
-			if err := unmarshalStepArgs(p, []string{dep1.name, dep2.name, dep3.name, dep4.name, dep5.name}, &in, []any{&dep1Out, &dep2Out, &dep3Out, &dep4Out, &dep5Out}); err != nil {
+			if err := unmarshalStepArgs(p, []string{dep1.Name, dep2.Name, dep3.Name, dep4.Name, dep5.Name}, &in, []any{&dep1Out, &dep2Out, &dep3Out, &dep4Out, &dep5Out}); err != nil {
 				return nil, err
 			}
 			out, err := fn(ctx, in, dep1Out, dep2Out, dep3Out, dep4Out, dep5Out)
@@ -335,11 +339,11 @@ func StepWithFiveDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, O
 	}}
 }
 
-func StepWithSixDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Out any](name string, dep1 StepDependency, dep2 StepDependency, dep3 StepDependency, dep4 StepDependency, dep5 StepDependency, dep6 StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+func StepWithSixDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, dep4 *StepDependency, dep5 *StepDependency, dep6 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
-		DependsOn: []string{dep1.name, dep2.name, dep3.name, dep4.name, dep5.name, dep6.name},
-		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+		DependsOn: []*StepDependency{dep1, dep2, dep3, dep4, dep5, dep6},
+		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			var dep1Out Dep1Out
 			var dep2Out Dep2Out
@@ -347,7 +351,7 @@ func StepWithSixDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, De
 			var dep4Out Dep4Out
 			var dep5Out Dep5Out
 			var dep6Out Dep6Out
-			if err := unmarshalStepArgs(p, []string{dep1.name, dep2.name, dep3.name, dep4.name, dep5.name, dep6.name}, &in, []any{&dep1Out, &dep2Out, &dep3Out, &dep4Out, &dep5Out, &dep6Out}); err != nil {
+			if err := unmarshalStepArgs(p, []string{dep1.Name, dep2.Name, dep3.Name, dep4.Name, dep5.Name, dep6.Name}, &in, []any{&dep1Out, &dep2Out, &dep3Out, &dep4Out, &dep5Out, &dep6Out}); err != nil {
 				return nil, err
 			}
 			out, err := fn(ctx, in, dep1Out, dep2Out, dep3Out, dep4Out, dep5Out, dep6Out)
@@ -359,11 +363,11 @@ func StepWithSixDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, De
 	}}
 }
 
-func StepWithSevenDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out, Out any](name string, dep1 StepDependency, dep2 StepDependency, dep3 StepDependency, dep4 StepDependency, dep5 StepDependency, dep6 StepDependency, dep7 StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+func StepWithSevenDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, dep4 *StepDependency, dep5 *StepDependency, dep6 *StepDependency, dep7 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
-		DependsOn: []string{dep1.name, dep2.name, dep3.name, dep4.name, dep5.name, dep6.name, dep7.name},
-		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+		DependsOn: []*StepDependency{dep1, dep2, dep3, dep4, dep5, dep6, dep7},
+		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			var dep1Out Dep1Out
 			var dep2Out Dep2Out
@@ -372,7 +376,7 @@ func StepWithSevenDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, 
 			var dep5Out Dep5Out
 			var dep6Out Dep6Out
 			var dep7Out Dep7Out
-			if err := unmarshalStepArgs(p, []string{dep1.name, dep2.name, dep3.name, dep4.name, dep5.name, dep6.name, dep7.name}, &in, []any{&dep1Out, &dep2Out, &dep3Out, &dep4Out, &dep5Out, &dep6Out, &dep7Out}); err != nil {
+			if err := unmarshalStepArgs(p, []string{dep1.Name, dep2.Name, dep3.Name, dep4.Name, dep5.Name, dep6.Name, dep7.Name}, &in, []any{&dep1Out, &dep2Out, &dep3Out, &dep4Out, &dep5Out, &dep6Out, &dep7Out}); err != nil {
 				return nil, err
 			}
 			out, err := fn(ctx, in, dep1Out, dep2Out, dep3Out, dep4Out, dep5Out, dep6Out, dep7Out)
@@ -384,11 +388,11 @@ func StepWithSevenDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, 
 	}}
 }
 
-func StepWithEightDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out, Dep8Out, Out any](name string, dep1 StepDependency, dep2 StepDependency, dep3 StepDependency, dep4 StepDependency, dep5 StepDependency, dep6 StepDependency, dep7 StepDependency, dep8 StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out, Dep8Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+func StepWithEightDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out, Dep8Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, dep4 *StepDependency, dep5 *StepDependency, dep6 *StepDependency, dep7 *StepDependency, dep8 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out, Dep8Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
-		DependsOn: []string{dep1.name, dep2.name, dep3.name, dep4.name, dep5.name, dep6.name, dep7.name, dep8.name},
-		handler: newStepHandler(func(ctx context.Context, p stepPayload) ([]byte, error) {
+		DependsOn: []*StepDependency{dep1, dep2, dep3, dep4, dep5, dep6, dep7, dep8},
+		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			var dep1Out Dep1Out
 			var dep2Out Dep2Out
@@ -398,7 +402,7 @@ func StepWithEightDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, 
 			var dep6Out Dep6Out
 			var dep7Out Dep7Out
 			var dep8Out Dep8Out
-			if err := unmarshalStepArgs(p, []string{dep1.name, dep2.name, dep3.name, dep4.name, dep5.name, dep6.name, dep7.name, dep8.name}, &in, []any{&dep1Out, &dep2Out, &dep3Out, &dep4Out, &dep5Out, &dep6Out, &dep7Out, &dep8Out}); err != nil {
+			if err := unmarshalStepArgs(p, []string{dep1.Name, dep2.Name, dep3.Name, dep4.Name, dep5.Name, dep6.Name, dep7.Name, dep8.Name}, &in, []any{&dep1Out, &dep2Out, &dep3Out, &dep4Out, &dep5Out, &dep6Out, &dep7Out, &dep8Out}); err != nil {
 				return nil, err
 			}
 			out, err := fn(ctx, in, dep1Out, dep2Out, dep3Out, dep4Out, dep5Out, dep6Out, dep7Out, dep8Out)
@@ -410,7 +414,7 @@ func StepWithEightDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, 
 	}}
 }
 
-func newStepHandler(fn func(context.Context, stepPayload) ([]byte, error), opts ...HandlerOpt) *stepHandler {
+func newStepHandler(fn func(context.Context, stepMessage) ([]byte, error), opts ...HandlerOpt) *stepHandler {
 	h := &stepHandler{
 		handlerOpts: handlerOpts{
 			concurrency:  1,
@@ -427,7 +431,7 @@ func newStepHandler(fn func(context.Context, stepPayload) ([]byte, error), opts 
 	return h
 }
 
-func unmarshalStepArgs(p stepPayload, stepNames []string, in any, stepOutputs []any) error {
+func unmarshalStepArgs(p stepMessage, stepNames []string, in any, stepOutputs []any) error {
 	if err := json.Unmarshal(p.FlowInput, in); err != nil {
 		return err
 	}
@@ -459,7 +463,7 @@ type TaskInfo struct {
 }
 
 type TaskRunInfo struct {
-	ID              string          `json:"id"`
+	ID              int64           `json:"id"`
 	DeduplicationID string          `json:"deduplication_id,omitempty"`
 	Status          string          `json:"status"`
 	Output          json.RawMessage `json:"output,omitempty"`
@@ -476,12 +480,16 @@ type FlowInfo struct {
 }
 
 type StepInfo struct {
-	Name      string   `json:"name"`
-	DependsOn []string `json:"depends_on,omitempty"`
+	Name      string               `json:"name"`
+	DependsOn []StepDependencyInfo `json:"depends_on,omitempty"`
+}
+
+type StepDependencyInfo struct {
+	Name string `json:"name"`
 }
 
 type FlowRunInfo struct {
-	ID              string          `json:"id"`
+	ID              int64           `json:"id"`
 	DeduplicationID string          `json:"deduplication_id,omitempty"`
 	Status          string          `json:"status"`
 	Output          json.RawMessage `json:"output,omitempty"`
@@ -614,7 +622,7 @@ func Hide(ctx context.Context, conn Conn, queue string, id int64, hideFor time.D
 }
 
 func HideMany(ctx context.Context, conn Conn, queue string, ids []int64, hideFor time.Duration) error {
-	q := `SELECT * FROM cb_hide_many(queue => $1, ids => $2, hide_for => $3);`
+	q := `SELECT * FROM cb_hide(queue => $1, ids => $2, hide_for => $3);`
 	_, err := conn.Exec(ctx, q, queue, ids, hideFor.Seconds())
 	return err
 }
@@ -670,21 +678,26 @@ func RunTaskWithOpts(ctx context.Context, conn Conn, name string, input any, opt
 	}
 
 	q := `SELECT * FROM cb_run_task(name => $1, input => $2, deduplication_id => $3);`
-	var id string
+	var id int64
 	err = conn.QueryRow(ctx, q, name, b, ptrOrNil(opts.DeduplicationID)).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
 
-	return &TaskHandle{conn: conn, id: id}, nil
+	return &TaskHandle{conn: conn, name: name, id: id}, nil
 }
 
 type TaskHandle struct {
 	conn Conn
-	id   string
+	name string
+	id   int64
 }
 
-func (h *TaskHandle) ID() string {
+func (h *TaskHandle) Name() string {
+	return h.name
+}
+
+func (h *TaskHandle) ID() int64 {
 	return h.id
 }
 
@@ -697,7 +710,7 @@ func (h *TaskHandle) WaitForOutput(ctx context.Context, out any) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			info, err := GetTaskRun(ctx, h.conn, h.id)
+			info, err := GetTaskRun(ctx, h.conn, h.name, h.id)
 			if err != nil {
 				return err
 			}
@@ -711,22 +724,25 @@ func (h *TaskHandle) WaitForOutput(ctx context.Context, out any) error {
 	}
 }
 
-func GetTaskRun(ctx context.Context, conn Conn, id string) (*TaskRunInfo, error) {
-	q := `
-		SELECT id, deduplication_id, status, output, error_message, started_at, completed_at, failed_at
-		FROM cb_task_runs
-		WHERE id = $1;`
-	return scanTaskRun(conn.QueryRow(ctx, q, id))
+func GetTaskRun(ctx context.Context, conn Conn, name string, id int64) (*TaskRunInfo, error) {
+	q := `SELECT * FROM cb_task_run_info($1, $2);`
+	rows, err := conn.Query(ctx, q, name, fmt.Sprintf("WHERE id = %d", id))
+	if err != nil {
+		return nil, err
+	}
+	results, err := pgx.CollectRows(rows, scanCollectibleTaskRun)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+	return results[0], nil
 }
 
 func ListTaskRuns(ctx context.Context, conn Conn, name string) ([]*TaskRunInfo, error) {
-	q := `
-		SELECT id, deduplication_id, status, output, error_message, started_at, completed_at, failed_at
-		FROM cb_task_runs
-		WHERE task_name = $1
-		ORDER BY started_at DESC
-		LIMIT 20;`
-	rows, err := conn.Query(ctx, q, name)
+	q := `SELECT * FROM cb_task_run_info($1, $2);`
+	rows, err := conn.Query(ctx, q, name, "")
 	if err != nil {
 		return nil, err
 	}
@@ -747,47 +763,12 @@ func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 }
 
 func GetFlow(ctx context.Context, conn Conn, name string) (*FlowInfo, error) {
-	q := `
-		SELECT f.name, s.steps AS steps, f.created_at
-		FROM cb_flows f
-		LEFT JOIN LATERAL (
-			SELECT s.flow_name,
-				jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
-					'name', s.name,
-					'depends_on', (
-						SELECT jsonb_agg(s_d.dependency_name)
-						FROM cb_step_dependencies AS s_d
-						WHERE s_d.flow_name = s.flow_name
-						AND s_d.step_name = s.name
-					)
-				)) ORDER BY s.idx) FILTER (WHERE s.idx IS NOT NULL) AS steps
-			FROM cb_steps s
-			WHERE s.flow_name = f.name
-			GROUP BY flow_name
-		) s ON s.flow_name = f.name
-		WHERE f.name = $1;`
+	q := `SELECT name, steps, created_at FROM cb_flow_info WHERE name = $1;`
 	return scanFlow(conn.QueryRow(ctx, q, name))
 }
 
 func ListFlows(ctx context.Context, conn Conn) ([]*FlowInfo, error) {
-	q := `
-		SELECT f.name, s.steps AS steps, f.created_at
-		FROM cb_flows f
-		LEFT JOIN LATERAL (
-			SELECT s.flow_name,
-				jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
-					'name', s.name,
-					'depends_on', (
-						SELECT jsonb_agg(s_d.dependency_name)
-						FROM cb_step_dependencies AS s_d
-						WHERE s_d.flow_name = s.flow_name
-						AND s_d.step_name = s.name
-					)
-				)) ORDER BY s.idx) FILTER (WHERE s.idx IS NOT NULL) AS steps
-			FROM cb_steps s
-			WHERE s.flow_name = f.name
-			GROUP BY flow_name
-		) s ON s.flow_name = f.name;`
+	q := `SELECT name, steps, created_at FROM cb_flow_info;`
 	rows, err := conn.Query(ctx, q)
 	if err != nil {
 		return nil, err
@@ -809,20 +790,21 @@ func RunFlowWithOpts(ctx context.Context, conn Conn, name string, input any, opt
 		return nil, err
 	}
 	q := `SELECT * FROM cb_run_flow(name => $1, input => $2, deduplication_id => $3);`
-	var id string
+	var id int64
 	err = conn.QueryRow(ctx, q, name, b, ptrOrNil(opts.DeduplicationID)).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
-	return &FlowHandle{id: id, conn: conn}, nil
+	return &FlowHandle{id: id, name: name, conn: conn}, nil
 }
 
 type FlowHandle struct {
-	id   string
+	id   int64
+	name string
 	conn Conn
 }
 
-func (h *FlowHandle) ID() string {
+func (h *FlowHandle) ID() int64 {
 	return h.id
 }
 
@@ -835,7 +817,7 @@ func (h *FlowHandle) WaitForOutput(ctx context.Context, out any) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			info, err := GetFlowRun(ctx, h.conn, h.id)
+			info, err := GetFlowRun(ctx, h.conn, h.name, h.id)
 			if err != nil {
 				return err
 			}
@@ -849,22 +831,25 @@ func (h *FlowHandle) WaitForOutput(ctx context.Context, out any) error {
 	}
 }
 
-func GetFlowRun(ctx context.Context, conn Conn, id string) (*FlowRunInfo, error) {
-	q := `
-		SELECT id, deduplication_id, status, output, error_message, started_at, completed_at, failed_at
-		FROM cb_flow_runs
-		WHERE id = $1;`
-	return scanFlowRun(conn.QueryRow(ctx, q, id))
+func GetFlowRun(ctx context.Context, conn Conn, flowName string, id int64) (*FlowRunInfo, error) {
+	q := `SELECT * FROM cb_flow_run_info($1, $2);`
+	rows, err := conn.Query(ctx, q, flowName, fmt.Sprintf("WHERE id = %d", id))
+	if err != nil {
+		return nil, err
+	}
+	results, err := pgx.CollectRows(rows, scanCollectibleFlowRun)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+	return results[0], nil
 }
 
-func ListFlowRuns(ctx context.Context, conn Conn, name string) ([]*FlowRunInfo, error) {
-	q := `
-		SELECT id, deduplication_id, status, output, error_message, started_at, completed_at, failed_at
-		FROM cb_flow_runs
-		WHERE flow_name = $1
-		ORDER BY started_at DESC
-		LIMIT 20;`
-	rows, err := conn.Query(ctx, q, name)
+func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunInfo, error) {
+	q := `SELECT * FROM cb_flow_run_info($1, $2);`
+	rows, err := conn.Query(ctx, q, flowName, "")
 	if err != nil {
 		return nil, err
 	}
@@ -872,25 +857,7 @@ func ListFlowRuns(ctx context.Context, conn Conn, name string) ([]*FlowRunInfo, 
 }
 
 func ListWorkers(ctx context.Context, conn Conn) ([]*WorkerInfo, error) {
-	q := `
-		SELECT w.id, w.started_at, w.last_heartbeat_at, t.task_handlers AS task_handlers, s.step_handlers AS step_handlers
-		FROM cb_workers w
-		LEFT JOIN LATERAL (
-			SELECT t.worker_id,
-   			       json_agg(json_build_object('task_name', t.task_name) ORDER BY t.task_name) FILTER (WHERE t.worker_id IS NOT NULL) AS task_handlers
-			FROM cb_task_handlers t
-			WHERE t.worker_id = w.id
-			GROUP BY worker_id
-		) t ON t.worker_id = w.id
-		LEFT JOIN LATERAL (
-			SELECT s.worker_id,
-   			       json_agg(json_build_object('flow_name', s.flow_name, 'step_name', s.step_name) ORDER BY s.flow_name, s.step_name) FILTER (WHERE s.worker_id IS NOT NULL) AS step_handlers
-			FROM cb_step_handlers s
-			WHERE s.worker_id = w.id
-			GROUP BY worker_id
-		) s ON s.worker_id = w.id
-		ORDER BY w.started_at DESC;`
-
+	q := `SELECT id, started_at, last_heartbeat_at, task_handlers, step_handlers FROM cb_worker_info;`
 	rows, err := conn.Query(ctx, q)
 	if err != nil {
 		return nil, err

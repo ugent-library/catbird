@@ -98,8 +98,8 @@ func TestFlows(t *testing.T) {
 
 	worker, err := client.NewWorker(t.Context(),
 		WithLogger(logger),
-		WithTask(task1),
 		WithFlow(flow1),
+		WithTask(task1),
 	)
 	if err != nil {
 		t.Fatal(err)

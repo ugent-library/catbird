@@ -93,8 +93,8 @@ func (c *Client) RunTaskWithOpts(ctx context.Context, name string, input any, op
 	return RunTaskWithOpts(ctx, c.Conn, name, input, opts)
 }
 
-func (c *Client) GetTaskRun(ctx context.Context, id string) (*TaskRunInfo, error) {
-	return GetTaskRun(ctx, c.Conn, id)
+func (c *Client) GetTaskRun(ctx context.Context, name string, id int64) (*TaskRunInfo, error) {
+	return GetTaskRun(ctx, c.Conn, name, id)
 }
 
 func (c *Client) ListTaskRuns(ctx context.Context, name string) ([]*TaskRunInfo, error) {
@@ -121,8 +121,8 @@ func (c *Client) RunFlowWithOpts(ctx context.Context, name string, input any, op
 	return RunFlowWithOpts(ctx, c.Conn, name, input, opts)
 }
 
-func (c *Client) GetFlowRun(ctx context.Context, id string) (*FlowRunInfo, error) {
-	return GetFlowRun(ctx, c.Conn, id)
+func (c *Client) GetFlowRun(ctx context.Context, name string, id int64) (*FlowRunInfo, error) {
+	return GetFlowRun(ctx, c.Conn, name, id)
 }
 
 func (c *Client) ListFlowRuns(ctx context.Context, name string) ([]*FlowRunInfo, error) {

@@ -18,4 +18,4 @@ $$;
 
 -- +goose down
 
-DROP FUNCTION cb_gc;
+DROP FUNCTION cb_gc();

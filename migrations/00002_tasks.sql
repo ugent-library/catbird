@@ -2,64 +2,42 @@
 
 -- +goose up
 
+
+-- +goose statementbegin
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'cb_task_message') THEN
+        CREATE TYPE cb_task_message AS (
+            id bigint,
+            deduplication_id text,
+            input jsonb,
+            deliveries int
+        );
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'cb_step_message') THEN
+        CREATE TYPE cb_step_message AS (
+            id bigint,
+            flow_run_id bigint,
+            step_name text,
+            deliveries int,
+            flow_input jsonb,
+            step_outputs jsonb
+        );
+    END IF;
+END$$;
+-- +goose statementend
+
 CREATE TABLE IF NOT EXISTS cb_tasks (
     name text PRIMARY KEY,
     created_at timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT name_not_empty CHECK (name <> '' )
 );
 
-CREATE TABLE IF NOT EXISTS cb_task_runs (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  deduplication_id text,
-  task_name text NOT NULL REFERENCES cb_tasks (name),
-  message_id bigint NOT NULL,
-  status text NOT NULL DEFAULT 'started',
-  output jsonb,
-  error_message text,
-  started_at timestamptz NOT NULL DEFAULT now(),
-  completed_at timestamptz,
-  failed_at timestamptz,
-  CONSTRAINT status_valid CHECK (status IN ('started', 'completed', 'failed')),
-  CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
-  CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
-  CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
-  CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
-  CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = '')))
-);
-
--- TODO what other indexes are needed? 
-CREATE UNIQUE INDEX IF NOT EXISTS cb_task_runs_task_name_deduplication_id_idx ON cb_task_runs (task_name, deduplication_id) WHERE deduplication_id IS NOT NULL AND status = 'started';
-
 CREATE TABLE IF NOT EXISTS cb_flows (
     name text PRIMARY KEY,
     created_at timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT name_not_empty CHECK (name <> '' )
 );
-
-CREATE TABLE IF NOT EXISTS cb_flow_runs (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  deduplication_id text,
-  flow_name text NOT NULL REFERENCES cb_flows (name),
-  status text NOT NULL DEFAULT 'started',
-  input jsonb NOT NULL,
-  error_message text,
-  output jsonb,
-  remaining_steps int NOT NULL DEFAULT 0,
-  started_at timestamptz NOT NULL DEFAULT now(),
-  completed_at timestamptz,
-  failed_at timestamptz,
-  CONSTRAINT status_valid CHECK (status IN ('started', 'completed', 'failed')),
-  CONSTRAINT remaining_steps_valid CHECK (remaining_steps >= 0),
-  CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
-  CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
-  CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
-  CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
-  CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = '')))
-);
-
-CREATE INDEX IF NOT EXISTS cb_flow_runs_flow_name_idx ON cb_flow_runs (flow_name);
-CREATE INDEX IF NOT EXISTS cb_flow_runs_status_idx ON cb_flow_runs (status);
-CREATE UNIQUE INDEX IF NOT EXISTS cb_flow_runs_flow_name_deduplication_id_idx ON cb_flow_runs (flow_name, deduplication_id) WHERE deduplication_id IS NOT NULL AND status = 'started';
 
 CREATE TABLE IF NOT EXISTS cb_steps (
     flow_name text NOT NULL REFERENCES cb_flows (name),
@@ -89,42 +67,13 @@ CREATE TABLE IF NOT EXISTS cb_step_dependencies (
 CREATE INDEX IF NOT EXISTS cb_step_dependencies_step_fk ON cb_step_dependencies (flow_name, step_name);
 CREATE INDEX IF NOT EXISTS cb_step_dependencies_dependency_name_fk ON cb_step_dependencies (flow_name, dependency_name);
 
--- -- TODO indexes
-CREATE TABLE IF NOT EXISTS cb_step_runs (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  flow_run_id uuid NOT NULL REFERENCES cb_flow_runs (id),
-  flow_name text NOT NULL REFERENCES cb_flows (name),
-  step_name text NOT NULL,
-  status text NOT NULL DEFAULT 'created',
-  message_id bigint,
-  output jsonb,
-  error_message text,
-  remaining_dependencies int NOT NULL DEFAULT 0,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  started_at timestamptz,
-  completed_at timestamptz,
-  failed_at timestamptz,
-  FOREIGN KEY (flow_name, step_name) REFERENCES cb_steps (flow_name, name),
-  CONSTRAINT status_valid CHECK (status IN ('created', 'started', 'completed', 'failed')),
-  CONSTRAINT remaining_dependencies_valid CHECK (remaining_dependencies >= 0),
-  CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
-  CONSTRAINT started_at_is_after_created_at CHECK (started_at IS NULL OR started_at >= created_at),
-  CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
-  CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
-  CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
-  CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = '')))
-);
-
-CREATE INDEX IF NOT EXISTS cb_step_flow_run_fk on cb_step_runs (flow_run_id);
-CREATE INDEX IF NOT EXISTS cb_step_runs_ready_idx on cb_step_runs (id, status, remaining_dependencies) WHERE status = 'created' AND remaining_dependencies = 0;
-
 CREATE TABLE IF NOT EXISTS cb_workers (
   id uuid PRIMARY KEY,
   started_at timestamptz NOT NULL DEFAULT now(),
   last_heartbeat_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS cb_workers_last_heartbeat_at_idx on cb_workers (last_heartbeat_at);
+CREATE INDEX IF NOT EXISTS cb_workers_last_heartbeat_at_idx ON cb_workers (last_heartbeat_at);
 
 CREATE TABLE IF NOT EXISTS cb_task_handlers (
   worker_id uuid NOT NULL REFERENCES cb_workers (id) ON DELETE CASCADE,
@@ -144,53 +93,75 @@ CREATE TABLE IF NOT EXISTS cb_step_handlers (
 CREATE OR REPLACE FUNCTION cb_create_task(name text)
 RETURNS void
 LANGUAGE plpgsql AS $$
+DECLARE
+    _t_table text := cb_table_name(cb_create_task.name, 't');
 BEGIN
-    PERFORM pg_advisory_xact_lock(hashtext('cb_t_' || lower(cb_create_task.name)));
+    PERFORM pg_advisory_xact_lock(hashtext(_t_table));
 
     -- Return early if task already exists
     IF EXISTS (SELECT 1 FROM cb_tasks WHERE cb_tasks.name = cb_create_task.name) THEN
         RETURN;
     END IF;
 
-    INSERT INTO cb_tasks (name) VALUES (cb_create_task.name);
+    INSERT INTO cb_tasks (name)
+    VALUES (
+        cb_create_task.name
+    );
 
-    PERFORM cb_create_queue('t_' || cb_create_task.name);
+    EXECUTE format(
+      $QUERY$
+      CREATE TABLE IF NOT EXISTS %I (
+        id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+        deduplication_id text,
+        status text NOT NULL DEFAULT 'queued',
+        deliveries int NOT NULL DEFAULT 0,
+        input jsonb NOT NULL,
+        output jsonb,
+        error_message text,
+        deliver_at timestamptz NOT NULL DEFAULT now(),
+        started_at timestamptz NOT NULL DEFAULT now(),
+        completed_at timestamptz,
+        failed_at timestamptz,
+        CONSTRAINT status_valid CHECK (status IN ('queued', 'started', 'completed', 'failed')),
+        CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
+        CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
+        CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
+        CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
+        CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = '')))
+      )
+      $QUERY$,
+      _t_table
+    );
+
+    EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (deduplication_id) WHERE deduplication_id IS NOT NULL AND status IN (''queued'', ''started'')', _t_table || '_deduplication_id_idx', _t_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (deliver_at);', _t_table || '_deliver_at_idx', _t_table);
 END;
 $$;
 -- +goose statementend
 
 -- +goose statementbegin
 CREATE OR REPLACE FUNCTION cb_run_task(name text, input jsonb, deduplication_id text = NULL)
-RETURNS uuid
+RETURNS bigint
 LANGUAGE plpgsql AS $$
 #variable_conflict use_column
 DECLARE
-  _id uuid = gen_random_uuid();
+    _t_table text := cb_table_name(cb_run_task.name, 't');
+    _id bigint;
 BEGIN
-  WITH task_run AS (
-    INSERT INTO cb_task_runs (id, deduplication_id, task_name, message_id)
-    VALUES (
-      _id,
-      cb_run_task.deduplication_id,
-      cb_run_task.name,
-      cb_send(
-        queue => 't_' || cb_run_task.name,
-        deduplication_id => cb_run_task.deduplication_id,
-        payload => jsonb_build_object(
-          'id', _id,
-          'input', cb_run_task.input
-        )
-      )
-    )
-    ON CONFLICT (task_name, deduplication_id) WHERE deduplication_id IS NOT NULL AND status = 'started' DO NOTHING
+  -- See https://dba.stackexchange.com/questions/212580/concurrent-transactions-result-in-race-condition-with-unique-constraint-on-inser/213625#213625
+  EXECUTE format(
+    $QUERY$
+    INSERT INTO %I (input, deduplication_id)
+    VALUES ($1, $2)
+    ON CONFLICT (deduplication_id) WHERE deduplication_id IS NOT NULL AND status IN ('queued', 'started') DO UPDATE
+    SET deduplication_id = EXCLUDED.deduplication_id WHERE FALSE -- no-op to force a returning value
     RETURNING id
+    $QUERY$,
+    _t_table,
+    _t_table
   )
-
-  SELECT id FROM task_run
-  UNION ALL
-  SELECT id FROM cb_task_runs t_r
-  WHERE t_r.deduplication_id = cb_run_task.deduplication_id
-    AND t_r.status = 'started'
+  USING cb_run_task.input,
+        cb_run_task.deduplication_id
   INTO _id;
 
   RETURN _id;
@@ -199,45 +170,173 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_complete_task(id uuid, output jsonb)
-RETURNS void
+CREATE OR REPLACE FUNCTION cb_read_tasks(
+    name text,
+    quantity int,
+    hide_for int,
+    poll_for int,
+    poll_interval int
+)
+RETURNS SETOF cb_task_message
 LANGUAGE plpgsql AS $$
+DECLARE
+    _m cb_task_message;
+    _sleep_for double precision;
+    _stop_at timestamp;
+    _q text;
+    _t_table text := cb_table_name(cb_read_tasks.name, 't');
 BEGIN
-  -- delete queued task message
-  PERFORM cb_delete('t_' || task_name, message_id)
-  FROM cb_task_runs t_r
-  WHERE t_r.id = cb_complete_task.id
-    AND t_r.status = 'started';
+    IF cb_read_tasks.poll_for <= 0 THEN
+        RAISE EXCEPTION 'cb: poll_for must be greater than 0';
+    END IF;
+    IF cb_read_tasks.poll_interval <= 0 THEN
+        RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
+    END IF;
 
-	-- complete task run
-	UPDATE cb_task_runs t_r
-  SET status = 'completed',
-      completed_at = now(),
-      output = cb_complete_task.output
-  WHERE t_r.id = cb_complete_task.id
-    AND t_r.status = 'started';
+    _sleep_for := cb_read_tasks.poll_interval::numeric / 1000;
+
+    IF _sleep_for >= cb_read_tasks.poll_for THEN
+        RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
+    END IF;
+
+    _stop_at := clock_timestamp() + make_interval(secs => cb_read_tasks.poll_for);
+
+    _q := FORMAT(
+        $QUERY$
+        WITH runs AS (
+          SELECT id
+          FROM %I
+          WHERE deliver_at <= clock_timestamp()
+            AND status IN ('queued', 'started')
+          ORDER BY id ASC
+          LIMIT $1
+          FOR UPDATE SKIP LOCKED
+        )
+        UPDATE %I m
+        SET status = 'started',
+            started_at = clock_timestamp(),
+            deliveries = deliveries + 1,
+            deliver_at = clock_timestamp() + $2
+        FROM runs
+        WHERE m.id = runs.id
+        RETURNING m.id,
+                  m.deduplication_id,
+                  m.input,
+                  m.deliveries;
+        $QUERY$,
+        _t_table, _t_table
+      );
+
+    LOOP
+      IF (SELECT clock_timestamp() >= _stop_at) THEN
+        RETURN;
+      END IF;
+
+      FOR _m IN
+        EXECUTE _q USING cb_read_tasks.quantity, make_interval(secs => cb_read_tasks.hide_for)
+      LOOP
+        RETURN NEXT _m;
+      END LOOP;
+      IF FOUND THEN
+        RETURN;
+      ELSE
+        PERFORM pg_sleep(_sleep_for);
+      END IF;
+    END LOOP;
 END;
 $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_fail_task(id uuid, error_message text)
+CREATE OR REPLACE FUNCTION cb_hide_tasks(name text, ids bigint[], hide_for integer)
 RETURNS void
 LANGUAGE plpgsql AS $$
+DECLARE
+    _t_table text := cb_table_name(cb_hide_tasks.name, 't');
 BEGIN
-  -- delete queued task message
-  PERFORM cb_delete('t_' || task_name, message_id)
-  FROM cb_task_runs t_r
-  WHERE t_r.id = cb_fail_task.id
-    AND t_r.status = 'started';
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET deliver_at = (clock_timestamp() + $2)
+      WHERE id = any($1);
+      $QUERY$,
+      _t_table
+    )
+    USING cb_hide_tasks.ids,
+          make_interval(secs => cb_hide_task.hide_for);
+END;
+$$;
+-- +goose statementend
 
-	-- fail task run
-	UPDATE cb_task_runs t_r
-  SET status = 'failed',
-      failed_at = now(),
-      error_message = cb_fail_task.error_message
-  WHERE t_r.id = cb_fail_task.id
-    AND t_r.status = 'started';
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_complete_task(name text, id bigint, output jsonb)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    _t_table text := cb_table_name(cb_complete_task.name, 't');
+BEGIN
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I t_r
+      SET status = 'completed',
+          completed_at = now(),
+          output = $2
+      WHERE t_r.id = $1
+        AND t_r.status = 'started';
+      $QUERY$,
+      _t_table
+    )
+    USING cb_complete_task.id,
+          cb_complete_task.output;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_fail_task(name text, id bigint, output jsonb)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    _t_table text := cb_table_name(cb_fail_task.name, 't');
+BEGIN
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I t_r
+      SET status = 'failed',
+          failed_at = now(),
+          error_message = $2
+      WHERE t_r.id = $1
+        AND t_r.status = 'started';
+      $QUERY$,
+      _t_table
+    )
+    USING cb_fail_task.id,
+          cb_fail_task.error_message;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_delete_task(name text)
+RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+  _t_table text := cb_table_name(cb_delete_task.name, 't');
+  _res boolean;
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext(_t_table));
+
+  EXECUTE format('DROP TABLE IF EXISTS %I;', _t_table);
+
+  DELETE FROM cb_task_handlers t
+  WHERE t.task_name = cb_delete_task.name;
+
+  DELETE FROM cb_tasks t
+  WHERE t.name = cb_delete_task.name
+  RETURNING true
+  INTO _res;
+
+  RETURN coalesce(_res, false);
 END;
 $$;
 -- +goose statementend
@@ -247,13 +346,16 @@ CREATE OR REPLACE FUNCTION cb_create_flow(name text, steps jsonb)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-  _idx int = 0;
+  _idx int := 0;
   _step jsonb;
+  _step_name text;
   _existing_steps jsonb;
   _dep_idx int;
-  _dep_name text;
+  _dep jsonb;
+  _f_table text := cb_table_name(cb_create_flow.name, 'f');
+  _s_table text := cb_table_name(cb_create_flow.name, 's');
 BEGIN
-  PERFORM pg_advisory_xact_lock(hashtext('cb_f_' || lower(cb_create_flow.name)));
+  PERFORM pg_advisory_xact_lock(hashtext(_f_table));
 
   -- Check if flow already exists
   IF EXISTS (SELECT 1 FROM cb_flows WHERE cb_flows.name = cb_create_flow.name) THEN
@@ -263,7 +365,7 @@ BEGIN
         jsonb_build_object(
           'name', s.name,
           'depends_on', COALESCE(
-            (SELECT jsonb_agg(sd.dependency_name ORDER BY sd.idx)
+            (SELECT jsonb_agg(jsonb_build_object('name', sd.dependency_name) ORDER BY sd.idx)
              FROM cb_step_dependencies sd
              WHERE sd.flow_name = s.flow_name AND sd.step_name = s.name),
             '[]'::jsonb
@@ -276,7 +378,15 @@ BEGIN
     );
 
     -- Compare steps - raise exception if they differ
-    IF _existing_steps IS DISTINCT FROM steps THEN
+    IF _existing_steps IS DISTINCT FROM (
+    SELECT jsonb_agg(
+      CASE 
+        WHEN step_elem ? 'depends_on' THEN step_elem
+        ELSE step_elem || jsonb_build_object('depends_on', '[]'::jsonb)
+      END
+    )
+    FROM jsonb_array_elements(steps) AS step_elem
+  ) THEN
       RAISE EXCEPTION 'Flow "%" already exists with different steps', cb_create_flow.name;
     END IF;
 
@@ -285,7 +395,7 @@ BEGIN
 
   INSERT INTO cb_flows (name) VALUES (cb_create_flow.name);
 
-  FOR _step IN SELECT * FROM jsonb_array_elements(steps)
+  FOR _step IN SELECT jsonb_array_elements(steps)
   LOOP
     INSERT INTO cb_steps (flow_name, name, idx, dependency_count)
     VALUES (
@@ -295,70 +405,139 @@ BEGIN
       jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb))
     );
 
-		_dep_idx := 0;
-		FOR _dep_name IN SELECT jsonb_array_elements_text(coalesce(_step->'depends_on', '[]'::jsonb))
-		LOOP
-			INSERT INTO cb_step_dependencies (flow_name, step_name, dependency_name, idx)
-			VALUES (cb_create_flow.name, _step->>'name', _dep_name, _dep_idx);
-			_dep_idx := _dep_idx + 1;
-		END LOOP;
+    -- TODO validate steps (e.g., dependencies refer to existing steps, no circular dependencies, etc.)
 
-    PERFORM cb_create_queue('f_' || cb_create_flow.name || '_' || (_step->>'name'));
+    _dep_idx := 0;
+    FOR _dep IN SELECT jsonb_array_elements(coalesce(_step->'depends_on', '[]'::jsonb))
+    LOOP
+      INSERT INTO cb_step_dependencies (flow_name, step_name, dependency_name, idx)
+      VALUES (cb_create_flow.name, _step->>'name', _dep->>'name', _dep_idx);
+      _dep_idx := _dep_idx + 1;
+    END LOOP;
 
-    _idx = _idx + 1;
+    _idx := _idx + 1;
   END LOOP;
+
+  EXECUTE format(
+    $QUERY$
+    CREATE TABLE IF NOT EXISTS %I (
+      id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+      deduplication_id text,
+      status text NOT NULL DEFAULT 'started',
+      remaining_steps int NOT NULL DEFAULT 0,
+      input jsonb NOT NULL,
+      output jsonb,
+      error_message text,
+      started_at timestamptz NOT NULL DEFAULT now(),
+      completed_at timestamptz,
+      failed_at timestamptz,
+      CONSTRAINT status_valid CHECK (status IN ('started', 'completed', 'failed')),
+      CONSTRAINT remaining_steps_valid CHECK (remaining_steps >= 0),
+      CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
+      CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
+      CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
+      CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
+      CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = '')))
+    )
+    $QUERY$,
+    _f_table
+  );
+
+  EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (status);', _f_table || '_status_idx', _f_table);
+  EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (deduplication_id) WHERE deduplication_id IS NOT NULL AND status = ''started''', _f_table || '_deduplication_id_idx', _f_table);
+
+  -- Create single step runs table for this flow
+  EXECUTE format(
+    $QUERY$
+    CREATE TABLE IF NOT EXISTS %I (
+      id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+      flow_run_id bigint NOT NULL,
+      step_name text NOT NULL,
+      status text NOT NULL DEFAULT 'created',
+      deliveries int NOT NULL DEFAULT 0,
+      output jsonb,
+      error_message text,  
+      remaining_dependencies int NOT NULL DEFAULT 0,
+      deliver_at timestamptz NOT NULL DEFAULT now(),
+      created_at timestamptz NOT NULL DEFAULT now(),
+      started_at timestamptz,
+      completed_at timestamptz,
+      failed_at timestamptz,
+      UNIQUE (flow_run_id, step_name),
+      FOREIGN KEY (flow_run_id) REFERENCES %I (id),
+      CONSTRAINT status_valid CHECK (status IN ('created', 'started', 'completed', 'failed')),
+      CONSTRAINT remaining_dependencies_valid CHECK (remaining_dependencies >= 0),
+      CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
+      CONSTRAINT started_at_is_after_created_at CHECK (started_at IS NULL OR started_at >= created_at),
+      CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
+      CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
+      CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
+      CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = '')))
+    )
+    $QUERY$,
+    _s_table,
+    _f_table
+  );
+
+  EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id);', _s_table || '_flow_run_fk', _s_table);
+  EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (step_name);', _s_table || '_step_name_idx', _s_table);
+  EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (deliver_at);', _s_table || '_deliver_at_idx', _s_table);
+  EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (status, remaining_dependencies) WHERE status = ''created'' AND remaining_dependencies = 0;', _s_table || '_ready_idx', _s_table);
+  EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (status);', _s_table || '_status_idx', _s_table);
 END;
 $$;
 -- +goose statementend
 
 -- +goose statementbegin
 CREATE OR REPLACE FUNCTION cb_run_flow(name text, input jsonb, deduplication_id text = NULL)
-RETURNS uuid
+RETURNS bigint
 LANGUAGE plpgsql AS $$
 #variable_conflict use_column
 DECLARE
-  _id uuid = gen_random_uuid();
+  _f_table text := cb_table_name(cb_run_flow.name, 'f');
+  _s_table text := cb_table_name(cb_run_flow.name, 's');
+  _id bigint;
+  _remaining_steps int;
 BEGIN
-  WITH
-  -- gather flow steps
-  flow_steps AS (
-    SELECT *
-    FROM cb_steps s
-    WHERE s.flow_name = cb_run_flow.name
-  ),
-  -- create flow run
-  flow_run AS (
-    INSERT INTO cb_flow_runs (id, deduplication_id, flow_name, input, remaining_steps)
-    VALUES (
-      _id,
-      cb_run_flow.deduplication_id,
-      cb_run_flow.name,
-      cb_run_flow.input,
-      (SELECT count(*) FROM flow_steps)
-    )
-    ON CONFLICT (flow_name, deduplication_id) WHERE deduplication_id IS NOT NULL AND status = 'started' DO NOTHING
+  -- Count total steps
+  SELECT count(*) INTO _remaining_steps
+  FROM cb_steps s
+  WHERE s.flow_name = cb_run_flow.name;
+
+  -- Create flow run or get existing 'started' run with same deduplication_id
+  -- Partial unique index ensures only one 'started' run per deduplication_id
+  -- Completed/failed runs don't block new runs with same deduplication_id
+  EXECUTE format(
+    $QUERY$
+    INSERT INTO %I (deduplication_id, input, remaining_steps, status)
+    VALUES ($1, $2, $3, 'started')
+    ON CONFLICT (deduplication_id) WHERE deduplication_id IS NOT NULL AND status = 'started' DO UPDATE
+    SET deduplication_id = EXCLUDED.deduplication_id WHERE FALSE
     RETURNING id
-  ),
-  -- create step runs
-  step_runs AS (
-    INSERT INTO cb_step_runs (flow_name, flow_run_id, step_name, remaining_dependencies)
-    SELECT
-      s.flow_name,
-      (SELECT flow_run.id FROM flow_run),
-      s.name,
-      s.dependency_count
-    FROM flow_steps s
+    $QUERY$,
+    _f_table
   )
-  -- get flow run id
-  SELECT id FROM flow_run
-  UNION ALL
-  SELECT id FROM cb_flow_runs f_r
-  WHERE f_r.deduplication_id = cb_run_flow.deduplication_id
-    AND f_r.status = 'started'
+  USING cb_run_flow.deduplication_id,
+        cb_run_flow.input,
+        _remaining_steps
   INTO _id;
 
-  -- start steps with no dependencies
-  PERFORM _cb_start_steps(_id);
+  -- Create step runs for all steps in a single INSERT
+  EXECUTE format(
+    $QUERY$
+    INSERT INTO %I (flow_run_id, step_name, status, remaining_dependencies)
+    SELECT %L, s.name, 'created', s.dependency_count
+    FROM cb_steps s
+    WHERE s.flow_name = %L
+    ON CONFLICT (flow_run_id, step_name) DO NOTHING
+    $QUERY$,
+    _s_table,
+    _id,
+    cb_run_flow.name
+  );
+
+  -- Start steps with no dependencies
+  PERFORM cb_start_steps(cb_run_flow.name, _id);
 
   RETURN _id;
 END;
@@ -366,165 +545,326 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION _cb_start_steps(flow_run_id uuid)
-RETURNS void
-LANGUAGE plpgsql AS $$
-BEGIN
-  WITH flow_run AS (
-    SELECT f_r.id, f_r.input
-    FROM cb_flow_runs f_r
-    WHERE f_r.id = _cb_start_steps.flow_run_id
-    AND f_r.status = 'started'
-  )
-
-  UPDATE cb_step_runs s_r
-  SET status = 'started',
-      started_at = now(),
-      message_id = cb_send(
-        queue   => 'f_' || s_r.flow_name || '_' || s_r.step_name,
-        payload => jsonb_build_object(
-          'id', s_r.id,
-          'flow_input', flow_run.input,
-          'step_outputs', coalesce((
-            SELECT jsonb_object_agg(o.step_name, o.output)
-            FROM (
-              SELECT dep_runs.step_name, dep_runs.output
-              FROM cb_step_dependencies deps
-              JOIN cb_step_runs dep_runs ON dep_runs.flow_run_id = flow_run.id AND dep_runs.step_name = deps.dependency_name
-              WHERE deps.flow_name = dep_runs.flow_name
-                AND deps.step_name = s_r.step_name
-            ) o
-          ), '{}'::jsonb)
-        )
-      )
-  FROM flow_run
-  WHERE s_r.flow_run_id = flow_run.id
-    AND s_r.status = 'created'
-    AND s_r.remaining_dependencies = 0;
-END;
-$$;
--- +goose statementend
-
--- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_complete_step(id uuid, output jsonb)
+CREATE OR REPLACE FUNCTION cb_start_steps(flow_name text, flow_run_id bigint)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-  _flow_run_id uuid;
-  _flow_run_record cb_flow_runs%ROWTYPE;
+  _f_table text := cb_table_name(cb_start_steps.flow_name, 'f');
+  _s_table text := cb_table_name(cb_start_steps.flow_name, 's');
+  _flow_input jsonb;
 BEGIN
-  -- delete queued task message
-  PERFORM cb_delete('f_' || s_r.flow_name || '_' || s_r.step_name, s_r.message_id)
-  FROM cb_step_runs s_r
-  WHERE s_r.id = cb_complete_step.id
-    AND s_r.status = 'started';
+  -- Get flow input
+  EXECUTE format(
+    $QUERY$
+    SELECT input FROM %I WHERE id = $1 AND status = 'started'
+    $QUERY$,
+    _f_table
+  )
+  USING cb_start_steps.flow_run_id
+  INTO _flow_input;
 
-	-- complete step run
-	UPDATE cb_step_runs s_r
-  SET status = 'completed',
-      completed_at = now(),
-      output = cb_complete_step.output
-  WHERE s_r.id = cb_complete_step.id
-    AND s_r.status = 'started'
-  RETURNING flow_run_id
-  INTO _flow_run_id;
-
-  -- lock flow run
-  SELECT * INTO _flow_run_record
-  FROM cb_flow_runs f_r
-  WHERE f_r.id = _flow_run_id
-  FOR UPDATE;
-
-  IF _flow_run_record.status <> 'started' THEN
+  -- If flow not found or not started, return
+  IF _flow_input IS NULL THEN
     RETURN;
   END IF;
 
-  -- decrement flow_run remaining_steps
-  UPDATE cb_flow_runs f_r
-  SET remaining_steps = remaining_steps - 1
-  WHERE f_r.id = _flow_run_id
-    AND f_r.status = 'started';
-
-  -- decrement dependent step run remaining_dependencies
-  WITH dependent_steps AS (
-    SELECT s_d.step_name
-    FROM cb_step_dependencies s_d
-    JOIN cb_step_runs s_r ON s_r.flow_run_id = _flow_run_id AND s_r.step_name = s_d.dependency_name
-    WHERE s_r.id = cb_complete_step.id
-      AND s_r.status = 'completed'
-  ),
-  dependent_step_runs_lock AS (
-    SELECT * FROM cb_step_runs s_r
-    WHERE s_r.flow_run_id = _flow_run_id
-      AND s_r.step_name IN (SELECT step_name FROM dependent_steps)
-    FOR UPDATE
+  -- Start all steps with no dependencies
+  EXECUTE format(
+    $QUERY$
+    UPDATE %I
+    SET status = 'started',
+        started_at = now(),
+        deliver_at = now()
+    WHERE flow_run_id = $1
+      AND status = 'created'
+      AND remaining_dependencies = 0
+    $QUERY$,
+    _s_table
   )
-  UPDATE cb_step_runs s_r
-  SET remaining_dependencies = s_r.remaining_dependencies - 1
-  FROM dependent_steps
-  WHERE s_r.flow_run_id = _flow_run_id
-  AND s_r.step_name = dependent_steps.step_name;
-
-  -- maybe complete flow run
-  UPDATE cb_flow_runs f_r
-  SET status = 'completed',
-      completed_at = now(),
-      output = (
-        SELECT jsonb_object_agg(o.step_name, o.output)
-        FROM (
-          SELECT s_r.step_name, s_r.output
-          FROM cb_step_runs s_r
-          WHERE s_r.flow_run_id = _flow_run_id
-        ) o
-      )
-  WHERE f_r.id = _flow_run_id
-    AND f_r.remaining_steps = 0
-    AND f_r.status = 'started';
-
-  -- start steps with no dependencies
-  PERFORM _cb_start_steps(_flow_run_id);
+  USING cb_start_steps.flow_run_id;
 END;
 $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_fail_step(id uuid, error_message text)
+CREATE OR REPLACE FUNCTION cb_read_steps(
+    flow_name text,
+    step_name text,
+    quantity int,
+    hide_for int,
+    poll_for int,
+    poll_interval int
+)
+RETURNS SETOF cb_step_message
+LANGUAGE plpgsql AS $$
+DECLARE
+    _m cb_step_message;
+    _sleep_for double precision;
+    _stop_at timestamp;
+    _q text;
+    _f_table text := cb_table_name(cb_read_steps.flow_name, 'f');
+    _s_table text := cb_table_name(cb_read_steps.flow_name, 's');
+BEGIN
+    IF cb_read_steps.poll_for <= 0 THEN
+        RAISE EXCEPTION 'cb: poll_for must be greater than 0';
+    END IF;
+    IF cb_read_steps.poll_interval <= 0 THEN
+        RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
+    END IF;
+
+    _sleep_for := cb_read_steps.poll_interval::numeric / 1000;
+
+    IF _sleep_for >= cb_read_steps.poll_for THEN
+        RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
+    END IF;
+
+    _stop_at := clock_timestamp() + make_interval(secs => cb_read_steps.poll_for);
+
+    _q := FORMAT(
+        $QUERY$
+        WITH runs AS (
+          SELECT m.id, m.flow_run_id
+          FROM %I m
+          INNER JOIN %I f ON m.flow_run_id = f.id
+          WHERE m.step_name = $1
+            AND m.deliver_at <= clock_timestamp()
+            AND m.status = 'started'
+            AND f.status = 'started'
+          ORDER BY m.id ASC
+          LIMIT $2
+          FOR UPDATE SKIP LOCKED
+        )
+        UPDATE %I m
+        SET deliveries = deliveries + 1,
+            deliver_at = clock_timestamp() + $3
+        FROM runs
+        WHERE m.id = runs.id
+          AND EXISTS (SELECT 1 FROM %I f WHERE f.id = runs.flow_run_id AND f.status = 'started')
+        RETURNING m.id,
+                  m.flow_run_id,
+                  m.step_name,
+                  m.deliveries,
+                  (SELECT input FROM %I f WHERE f.id = m.flow_run_id) AS flow_input,
+                  (SELECT jsonb_object_agg(deps.step_name, deps.output)
+                   FROM %I deps
+                   WHERE deps.flow_run_id = m.flow_run_id
+                     AND deps.step_name IN (
+                       SELECT dependency_name 
+                       FROM cb_step_dependencies 
+                       WHERE flow_name = $4 AND step_name = m.step_name
+                     )
+                  ) AS step_outputs;
+        $QUERY$,
+        _s_table, _f_table, _s_table, _f_table, _f_table, _s_table
+      );
+
+    LOOP
+      IF (SELECT clock_timestamp() >= _stop_at) THEN
+        RETURN;
+      END IF;
+
+      FOR _m IN
+        EXECUTE _q USING cb_read_steps.step_name, cb_read_steps.quantity, make_interval(secs => cb_read_steps.hide_for), cb_read_steps.flow_name
+      LOOP
+        RETURN NEXT _m;
+      END LOOP;
+      IF FOUND THEN
+        RETURN;
+      ELSE
+        PERFORM pg_sleep(_sleep_for);
+      END IF;
+    END LOOP;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_hide_steps(flow_name text, step_name text, ids bigint[], hide_for integer)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-  _flow_run_id uuid;
+    _s_table text := cb_table_name(cb_hide_steps.flow_name, 's');
 BEGIN
-  -- delete queued task message
-  PERFORM cb_delete('f_' || s_r.flow_name || '_' || s_r.step_name, s_r.message_id)
-  FROM cb_step_runs s_r
-  WHERE s_r.id = cb_fail_step.id
-    AND s_r.status = 'started';
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET deliver_at = (clock_timestamp() + $2)
+      WHERE id = any($1)
+        AND step_name = $3;
+      $QUERY$,
+      _s_table
+    )
+    USING cb_hide_steps.ids,
+          make_interval(secs => cb_hide_steps.hide_for),
+          cb_hide_steps.step_name;
+END;
+$$;
+-- +goose statementend
 
-	-- fail step run
-	UPDATE cb_step_runs s_r
-  SET status = 'failed',
-      failed_at = now(),
-      error_message = cb_fail_step.error_message
-  WHERE s_r.id = cb_fail_step.id
-    AND s_r.status = 'started'
-  RETURNING s_r.flow_run_id
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_complete_step(flow_name text, step_name text, step_id bigint, output jsonb)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+  _f_table text := cb_table_name(cb_complete_step.flow_name, 'f');
+  _s_table text := cb_table_name(cb_complete_step.flow_name, 's');
+  _flow_run_id bigint;
+  _remaining int;
+BEGIN
+  -- Complete step run atomically - only succeeds if status='started'
+  EXECUTE format(
+    $QUERY$
+    UPDATE %I
+    SET status = 'completed',
+        completed_at = now(),
+        output = $2
+    WHERE id = $1
+      AND status = 'started'
+    RETURNING flow_run_id
+    $QUERY$,
+    _s_table
+  )
+  USING cb_complete_step.step_id, cb_complete_step.output
   INTO _flow_run_id;
 
-  -- fail flow run
-  UPDATE cb_flow_runs f_r
-  SET status = 'failed',
-      failed_at = now(),
-      error_message = cb_fail_step.error_message
-  WHERE f_r.id = _flow_run_id
-    AND f_r.status = 'started';
+  -- If step wasn't in 'created' status, return early (already completed or failed)
+  IF _flow_run_id IS NULL THEN
+    RETURN;
+  END IF;
 
-  -- delete task messages for remaining steps in the flow run
-  PERFORM cb_delete_many('f_' || s_r.flow_name || '_' || s_r.step_name, array_agg(s_r.message_id))
-  FROM cb_step_runs s_r
-  WHERE s_r.flow_run_id = _flow_run_id
-    AND s_r.status IN ('created', 'started')
-  GROUP BY s_r.flow_name, s_r.step_name
-  HAVING COUNT(s_r.message_id) > 0;
+  -- Atomically decrement remaining_steps and get new value
+  EXECUTE format(
+    $QUERY$
+    UPDATE %I
+    SET remaining_steps = remaining_steps - 1
+    WHERE id = $1 AND status = 'started'
+    RETURNING remaining_steps
+    $QUERY$,
+    _f_table
+  )
+  USING _flow_run_id
+  INTO _remaining;
+
+  -- If flow already completed/failed, return early
+  IF _remaining IS NULL THEN
+    RETURN;
+  END IF;
+
+  -- Decrement dependent step run remaining_dependencies atomically
+  EXECUTE format(
+    $QUERY$
+    UPDATE %I
+    SET remaining_dependencies = remaining_dependencies - 1
+    WHERE flow_run_id = $1
+      AND step_name IN (SELECT step_name FROM cb_step_dependencies WHERE flow_name = $2 AND dependency_name = $3)
+      AND status = 'created'
+    $QUERY$,
+    _s_table
+  )
+  USING _flow_run_id, cb_complete_step.flow_name, cb_complete_step.step_name;
+
+  -- Maybe complete flow run - only if remaining_steps reached 0
+  IF _remaining = 0 THEN
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET status = 'completed',
+          completed_at = now(),
+          output = (
+            SELECT jsonb_object_agg(step_name, output)
+            FROM %I
+            WHERE flow_run_id = $1 AND status = 'completed'
+          )
+      WHERE id = $1
+        AND status = 'started'
+      $QUERY$,
+      _f_table, _s_table
+    )
+    USING _flow_run_id;
+  END IF;
+
+  -- Start steps with no dependencies
+  PERFORM cb_start_steps(cb_complete_step.flow_name, _flow_run_id);
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_fail_step(flow_name text, step_name text, step_id bigint, error_message text)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+  _f_table text := cb_table_name(cb_fail_step.flow_name, 'f');
+  _s_table text := cb_table_name(cb_fail_step.flow_name, 's');
+  _flow_run_id bigint;
+BEGIN
+  -- Fail step run atomically - only succeeds if status is 'created' or 'started'
+  EXECUTE format(
+    $QUERY$
+    UPDATE %I
+    SET status = 'failed',
+        failed_at = now(),
+        error_message = $2
+    WHERE id = $1
+      AND status IN ('created', 'started')
+    RETURNING flow_run_id
+    $QUERY$,
+    _s_table
+  )
+  USING cb_fail_step.step_id, cb_fail_step.error_message
+  INTO _flow_run_id;
+
+  -- If step wasn't in 'created' or 'started' status, return early (already completed/failed)
+  IF _flow_run_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  -- Fail flow run atomically - only if status is 'started'
+  EXECUTE format(
+    $QUERY$
+    UPDATE %I
+    SET status = 'failed',
+        failed_at = now(),
+        error_message = $2
+    WHERE id = $1
+      AND status = 'started'
+    $QUERY$,
+    _f_table
+  )
+  USING _flow_run_id, cb_fail_step.error_message;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_delete_flow(name text)
+RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+  _f_table text := cb_table_name(cb_delete_flow.name, 'f');
+  _s_table text := cb_table_name(cb_delete_flow.name, 's');
+  _res boolean;
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext(_f_table));
+
+  EXECUTE format('DROP TABLE IF EXISTS %I CASCADE;', _s_table);
+  EXECUTE format('DROP TABLE IF EXISTS %I CASCADE;', _f_table);
+
+  DELETE FROM cb_step_handlers h
+  WHERE h.flow_name = cb_delete_flow.name;
+
+  DELETE FROM cb_step_dependencies d
+  WHERE d.flow_name = cb_delete_flow.name;
+
+  DELETE FROM cb_steps s
+  WHERE s.flow_name = cb_delete_flow.name;
+
+  DELETE FROM cb_flows f
+  WHERE f.name = cb_delete_flow.name
+  RETURNING true
+  INTO _res;
+
+  RETURN coalesce(_res, false);
 END;
 $$;
 -- +goose statementend
@@ -535,9 +875,9 @@ RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
   _handler jsonb;
+  _task_name text;
   _flow_name text;
   _step_name text;
-  _task_name text;
 BEGIN
     INSERT INTO cb_workers (id) VALUES (cb_worker_started.id);
 
@@ -590,7 +930,6 @@ $$;
 CREATE OR REPLACE FUNCTION cb_worker_heartbeat(id uuid)
 RETURNS void
 LANGUAGE plpgsql AS $$
-DECLARE
 BEGIN
     UPDATE cb_workers
     SET last_heartbeat_at = now()
@@ -599,27 +938,150 @@ END;
 $$;
 -- +goose statementend
 
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_flow_info()
+RETURNS TABLE (
+  name text,
+  steps jsonb,
+  created_at timestamptz
+) AS $$
+  SELECT
+    f.name,
+    s.steps,
+    f.created_at
+  FROM cb_flows f
+  LEFT JOIN LATERAL (
+    SELECT
+      s.flow_name,
+      jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
+        'name', s.name,
+        'depends_on', (
+          SELECT jsonb_agg(jsonb_build_object('name', s_d.dependency_name))
+          FROM cb_step_dependencies AS s_d
+          WHERE s_d.flow_name = s.flow_name
+          AND s_d.step_name = s.name
+        )
+      )) ORDER BY s.idx) FILTER (WHERE s.idx IS NOT NULL) AS steps
+    FROM cb_steps s
+    WHERE s.flow_name = f.name
+    GROUP BY flow_name
+  ) s ON s.flow_name = f.name;
+$$ LANGUAGE sql;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_task_run_info(p_task_name text, p_where_clause text DEFAULT '')
+RETURNS TABLE (
+  id bigint,
+  deduplication_id text,
+  status text,
+  output jsonb,
+  error_message text,
+  started_at timestamptz,
+  completed_at timestamptz,
+  failed_at timestamptz
+) AS $$
+BEGIN
+	RETURN QUERY EXECUTE format('
+		SELECT id, deduplication_id, status, output, error_message, started_at, completed_at, failed_at
+		FROM %I
+		%s
+		ORDER BY started_at DESC
+		LIMIT 20', cb_table_name(p_task_name, 't'), p_where_clause);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cb_flow_run_info(p_flow_name text, p_where_clause text DEFAULT '')
+RETURNS TABLE (
+  id bigint,
+  deduplication_id text,
+  status text,
+  output jsonb,
+  error_message text,
+  started_at timestamptz,
+  completed_at timestamptz,
+  failed_at timestamptz
+) AS $$
+BEGIN
+	RETURN QUERY EXECUTE format('
+		SELECT id, deduplication_id, status, output, error_message, started_at, completed_at, failed_at
+		FROM %I
+		%s
+		ORDER BY started_at DESC
+		LIMIT 20', cb_table_name(p_flow_name, 'f'), p_where_clause);
+END;
+$$ LANGUAGE plpgsql;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_worker_info()
+RETURNS TABLE (
+  id uuid,
+  started_at timestamptz,
+  last_heartbeat_at timestamptz,
+  task_handlers json,
+  step_handlers json
+) AS $$
+  SELECT
+    w.id,
+    w.started_at,
+    w.last_heartbeat_at,
+    t.task_handlers AS task_handlers,
+    s.step_handlers AS step_handlers
+  FROM cb_workers w
+  LEFT JOIN LATERAL (
+    SELECT t.worker_id,
+         json_agg(json_build_object('task_name', t.task_name) ORDER BY t.task_name) FILTER (WHERE t.worker_id IS NOT NULL) AS task_handlers
+    FROM cb_task_handlers t
+    WHERE t.worker_id = w.id
+    GROUP BY worker_id
+  ) t ON t.worker_id = w.id
+  LEFT JOIN LATERAL (
+    SELECT s.worker_id,
+         json_agg(json_build_object('flow_name', s.flow_name, 'step_name', s.step_name) ORDER BY s.flow_name, s.step_name) FILTER (WHERE s.worker_id IS NOT NULL) AS step_handlers
+    FROM cb_step_handlers s
+    WHERE s.worker_id = w.id
+    GROUP BY worker_id
+  ) s ON s.worker_id = w.id
+  ORDER BY w.started_at DESC;
+$$ LANGUAGE sql;
+-- +goose statementend
+
 -- +goose down
 
-DROP FUNCTION cb_worker_started;
-DROP FUNCTION cb_worker_heartbeat;
-DROP FUNCTION cb_create_flow;
-DROP FUNCTION cb_run_flow;
-DROP FUNCTION cb_complete_step;
-DROP FUNCTION cb_fail_step;
-DROP FUNCTION cb_create_task;
-DROP FUNCTION cb_run_task;
-DROP FUNCTION cb_complete_task;
-DROP FUNCTION cb_fail_task;
-DROP FUNCTION _cb_start_steps;
+-- Drop dynamically created tables
+SELECT cb_delete_task(name) FROM cb_tasks;
+SELECT cb_delete_flow(name) FROM cb_flows;
 
-DROP TABLE cb_task_handlers;
-DROP TABLE cb_step_handlers;
-DROP TABLE cb_workers;
-DROP TABLE cb_task_runs;
-DROP TABLE cb_step_runs;
-DROP TABLE cb_flow_runs;
-DROP TABLE cb_step_dependencies;
-DROP TABLE cb_steps;
-DROP TABLE cb_flows;
-DROP TABLE cb_tasks;
+DROP FUNCTION IF EXISTS cb_worker_info();
+DROP FUNCTION IF EXISTS cb_flow_info();
+DROP FUNCTION IF EXISTS cb_task_run_info(text, text);
+DROP FUNCTION IF EXISTS cb_flow_run_info(text, text);
+DROP FUNCTION IF EXISTS cb_worker_heartbeat(uuid);
+DROP FUNCTION IF EXISTS cb_worker_started(uuid, jsonb, jsonb);
+DROP FUNCTION IF EXISTS cb_fail_step(text, text, bigint, text);
+DROP FUNCTION IF EXISTS cb_complete_step(text, text, bigint, jsonb);
+DROP FUNCTION IF EXISTS cb_hide_steps(text, text, bigint[], integer);
+DROP FUNCTION IF EXISTS cb_read_steps(text, text, int, int, int, int);
+DROP FUNCTION IF EXISTS cb_start_steps(text, bigint);
+DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text);
+DROP FUNCTION IF EXISTS cb_delete_flow(text);
+DROP FUNCTION IF EXISTS cb_create_flow(text, jsonb);
+DROP FUNCTION IF EXISTS cb_fail_task(text, bigint, jsonb);
+DROP FUNCTION IF EXISTS cb_complete_task(text, bigint, jsonb);
+DROP FUNCTION IF EXISTS cb_hide_tasks(text, bigint[], integer);
+DROP FUNCTION IF EXISTS cb_read_tasks(text, int, int, int, int);
+DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text);
+DROP FUNCTION IF EXISTS cb_delete_task(text);
+DROP FUNCTION IF EXISTS cb_create_task(text);
+
+DROP TABLE IF EXISTS cb_step_handlers;
+DROP TABLE IF EXISTS cb_task_handlers;
+DROP TABLE IF EXISTS cb_workers;
+DROP TABLE IF EXISTS cb_step_dependencies;
+DROP TABLE IF EXISTS cb_steps;
+DROP TABLE IF EXISTS cb_flows;
+DROP TABLE IF EXISTS cb_tasks;
+
+DROP TYPE IF EXISTS cb_step_message;
+DROP TYPE IF EXISTS cb_task_message;

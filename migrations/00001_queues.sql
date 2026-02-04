@@ -33,17 +33,17 @@ CREATE INDEX IF NOT EXISTS cb_queues_topics_idx ON cb_queues USING gin (topics);
 CREATE INDEX IF NOT EXISTS cb_queues_delete_at_idx ON cb_queues (delete_at);
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION _cb_table_name(name text, prefix text)
+CREATE OR REPLACE FUNCTION cb_table_name(name text, prefix text)
 RETURNS text
 LANGUAGE plpgsql AS $$
 BEGIN
-    IF _cb_table_name.name !~ '^[a-z0-9_]+$' THEN
+    IF cb_table_name.name !~ '^[a-z0-9_]+$' THEN
         RAISE EXCEPTION 'cb: queue name can only contain characters: a-z, 0-9 or _';
     END IF;
-    IF length(_cb_table_name.name) >= 58 THEN
+    IF length(cb_table_name.name) >= 58 THEN
         RAISE EXCEPTION 'cb: queue name is too long, maximum length is 58';
     END IF;
-    RETURN 'cb_' || _cb_table_name.prefix || '_' || lower(_cb_table_name.name);
+    RETURN 'cb_' || cb_table_name.prefix || '_' || lower(cb_table_name.name);
 END;
 $$;
 -- +goose statementend
@@ -58,9 +58,9 @@ CREATE OR REPLACE FUNCTION cb_create_queue(
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-    _q_table text = _cb_table_name(cb_create_queue.name, 'q');
+    _q_table text := cb_table_name(cb_create_queue.name, 'q');
 BEGIN
-    PERFORM pg_advisory_xact_lock(hashtext('cb_q_' || lower(cb_create_queue.name)));
+    PERFORM pg_advisory_xact_lock(hashtext(_q_table));
 
     IF cb_create_queue.unlogged THEN
         EXECUTE format(
@@ -115,10 +115,10 @@ CREATE OR REPLACE FUNCTION cb_delete_queue(name text)
 RETURNS boolean
 LANGUAGE plpgsql AS $$
 DECLARE
-    _q_table text = _cb_table_name(cb_delete_queue.name, 'q');
+    _q_table text := cb_table_name(cb_delete_queue.name, 'q');
     _res boolean;
 BEGIN
-    PERFORM pg_advisory_xact_lock(hashtext('cb_q_' || lower(cb_delete_queue.name)));
+    PERFORM pg_advisory_xact_lock(hashtext(_q_table));
 
     EXECUTE FORMAT('DROP TABLE IF EXISTS %I;', _q_table);
 
@@ -151,7 +151,7 @@ BEGIN
         FROM cb_queues q
         WHERE cb_dispatch.topic = any(q.topics) AND (q.delete_at IS NULL OR q.delete_at > now())
     LOOP
-        _q_table = _cb_table_name(_rec.name, 'q');
+        _q_table := cb_table_name(_rec.name, 'q');
         EXECUTE format(
             $QUERY$
             INSERT INTO %I (topic, payload, deduplication_id, deliver_at)
@@ -180,8 +180,8 @@ CREATE OR REPLACE FUNCTION cb_send(
 RETURNS bigint
 LANGUAGE plpgsql AS $$
 DECLARE
-    _deliver_at timestamptz = coalesce(cb_send.deliver_at, now());
-    _q_table text = _cb_table_name(cb_send.queue, 'q');
+    _deliver_at timestamptz := coalesce(cb_send.deliver_at, now());
+    _q_table text := cb_table_name(cb_send.queue, 'q');
     _id bigint;
 BEGIN
     EXECUTE format(
@@ -214,25 +214,25 @@ CREATE OR REPLACE FUNCTION cb_read(
 RETURNS SETOF cb_message
 LANGUAGE plpgsql AS $$
 DECLARE
-    _q_table text = _cb_table_name(cb_read.queue, 'q');
+    _q_table text := cb_table_name(cb_read.queue, 'q');
     _q text;
 BEGIN
-    _q = format(
+    _q := format(
         $QUERY$
         WITH msgs AS (
-			SELECT id
-			FROM %I
-			WHERE deliver_at <= clock_timestamp()
-			ORDER BY id ASC
-			LIMIT $1
-			FOR UPDATE SKIP LOCKED
-		)
-		UPDATE %I m
-		SET deliveries = deliveries + 1,
+          SELECT id
+          FROM %I
+          WHERE deliver_at <= clock_timestamp()
+          ORDER BY id ASC
+          LIMIT $1
+          FOR UPDATE SKIP LOCKED
+        )
+        UPDATE %I m
+        SET deliveries = deliveries + 1,
             deliver_at = clock_timestamp() + $2
-		FROM msgs
-		WHERE m.id = msgs.id
-		RETURNING m.id,
+        FROM msgs
+        WHERE m.id = msgs.id
+        RETURNING m.id,
                   m.deduplication_id,
                   m.topic,
                   m.payload,
@@ -262,7 +262,7 @@ DECLARE
     _sleep_for double precision;
     _stop_at timestamp;
     _q text;
-    _q_table text = _cb_table_name(cb_read_poll.queue, 'q');
+    _q_table text := cb_table_name(cb_read_poll.queue, 'q');
 BEGIN
     IF cb_read_poll.poll_for <= 0 THEN
         RAISE EXCEPTION 'cb: poll_for must be greater than 0';
@@ -271,26 +271,26 @@ BEGIN
         RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
     END IF;
 
-    _sleep_for = cb_read_poll.poll_interval::numeric / 1000;
+    _sleep_for := cb_read_poll.poll_interval::numeric / 1000;
 
     IF _sleep_for >= cb_read_poll.poll_for THEN
         RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
     END IF;
 
-    _stop_at = clock_timestamp() + make_interval(secs => cb_read_poll.poll_for);
+    _stop_at := clock_timestamp() + make_interval(secs => cb_read_poll.poll_for);
 
     LOOP
         IF (SELECT clock_timestamp() >= _stop_at) THEN
             RETURN;
         END IF;
 
-        _q = FORMAT(
+        _q := FORMAT(
             $QUERY$
             WITH msgs AS (
                 SELECT id
                 FROM %I
                 WHERE deliver_at <= clock_timestamp()
-    			ORDER BY id ASC
+                ORDER BY id ASC
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
             )
@@ -334,7 +334,7 @@ CREATE OR REPLACE FUNCTION cb_hide(
 RETURNS boolean
 LANGUAGE plpgsql AS $$
 DECLARE
-    _q_table text = _cb_table_name(cb_hide.queue, 'q');
+    _q_table text := cb_table_name(cb_hide.queue, 'q');
     _res boolean;
 BEGIN
     EXECUTE format(
@@ -354,7 +354,7 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_hide_many(
+CREATE OR REPLACE FUNCTION cb_hide(
     queue text,
     ids bigint[],
     hide_for integer
@@ -362,7 +362,7 @@ CREATE OR REPLACE FUNCTION cb_hide_many(
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-    _q_table text = _cb_table_name(cb_hide_many.queue, 'q');
+    _q_table text := cb_table_name(cb_hide.queue, 'q');
 BEGIN
     EXECUTE format(
         $QUERY$
@@ -372,7 +372,7 @@ BEGIN
         $QUERY$,
         _q_table
     )
-    USING cb_hide_many.ids, make_interval(secs => cb_hide_many.hide_for);
+    USING cb_hide.ids, make_interval(secs => cb_hide.hide_for);
 END;
 $$;
 -- +goose statementend
@@ -381,7 +381,7 @@ $$;
 CREATE OR REPLACE FUNCTION cb_delete(queue text, id bigint)
 RETURNS boolean AS $$
 DECLARE
-    _q_table text = _cb_table_name(cb_delete.queue, 'q');
+    _q_table text := cb_table_name(cb_delete.queue, 'q');
     _res boolean;
 BEGIN
     EXECUTE format(
@@ -398,10 +398,10 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_delete_many(queue text, ids bigint[])
+CREATE OR REPLACE FUNCTION cb_delete(queue text, ids bigint[])
 RETURNS void AS $$
 DECLARE
-    _q_table text = _cb_table_name(cb_delete_many.queue, 'q');
+    _q_table text := cb_table_name(cb_delete.queue, 'q');
 BEGIN
     EXECUTE format(
         $QUERY$
@@ -409,7 +409,7 @@ BEGIN
         $QUERY$,
         _q_table
     )
-    USING cb_delete_many.ids;
+    USING cb_delete.ids;
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -418,17 +418,17 @@ $$ LANGUAGE plpgsql;
 
 SELECT cb_delete_queue(name) FROM cb_queues;
 
-DROP FUNCTION cb_create_queue;
-DROP FUNCTION cb_delete_queue;
-DROP FUNCTION cb_dispatch;
-DROP FUNCTION cb_send;
-DROP FUNCTION cb_read;
-DROP FUNCTION cb_read_poll;
-DROP FUNCTION cb_hide;
-DROP FUNCTION cb_hide_many;
-DROP FUNCTION cb_delete;
-DROP FUNCTION cb_delete_many;
-DROP FUNCTION _cb_table_name;
+DROP FUNCTION cb_create_queue(text, text[], timestamptz, boolean);
+DROP FUNCTION cb_delete_queue(text);
+DROP FUNCTION cb_dispatch(text, jsonb, text, timestamptz);
+DROP FUNCTION cb_send(text, jsonb, text, text, timestamptz);
+DROP FUNCTION cb_read(text, int, int);
+DROP FUNCTION cb_read_poll(text, int, int, int, int);
+DROP FUNCTION cb_hide(text, bigint, integer);
+DROP FUNCTION cb_hide(text, bigint[], integer);
+DROP FUNCTION cb_delete(text, bigint);
+DROP FUNCTION cb_delete(text, bigint[]);
+DROP FUNCTION cb_table_name(text, text);
 
 DROP TABLE cb_queues;
 
