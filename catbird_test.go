@@ -490,6 +490,7 @@ func TestFlowSingleStep(t *testing.T) {
 func TestFlowWithDependencies(t *testing.T) {
 	client := getTestClient(t)
 
+	// Flow structure: step1 -> step2 -> step3 (linear chain)
 	type FlowOutput struct {
 		Step1 string `json:"step1"`
 		Step2 string `json:"step2"`
@@ -670,5 +671,94 @@ func TestTaskListTasks(t *testing.T) {
 
 	if !found1 || !found2 {
 		t.Fatalf("not all tasks found in list")
+	}
+}
+func TestFlowComplexDependencies(t *testing.T) {
+	client := getTestClient(t)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	// Flow structure:
+	//        step1
+	//       /     \
+	//    step2    step3
+	//       \     /
+	//        step4
+	// Create a complex flow with multiple dependencies:
+	flow := NewFlow("complex_flow",
+		InitialStep("step1", func(ctx context.Context, in string) (int, error) {
+			return 10, nil
+		}),
+		StepWithOneDependency("step2",
+			Dependency("step1"),
+			func(ctx context.Context, in string, step1Out int) (int, error) {
+				return step1Out * 2, nil // 20
+			}),
+		StepWithOneDependency("step3",
+			Dependency("step1"),
+			func(ctx context.Context, in string, step1Out int) (int, error) {
+				return step1Out * 3, nil // 30
+			}),
+		StepWithTwoDependencies("step4",
+			Dependency("step2"),
+			Dependency("step3"),
+			func(ctx context.Context, in string, step2Out, step3Out int) (int, error) {
+				return step2Out + step3Out, nil // 20 + 30 = 50
+			}),
+	)
+
+	err := client.CreateFlow(t.Context(), flow)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start worker to execute flow
+	worker, err := client.NewWorker(t.Context(),
+		WithLogger(logger),
+		WithFlow(flow),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		if err := worker.Start(t.Context()); err != nil {
+			t.Logf("worker error: %s", err)
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Run the flow
+	h, err := client.RunFlow(t.Context(), "complex_flow", "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Get results
+	type ComplexOutput struct {
+		Step1 int `json:"step1"`
+		Step2 int `json:"step2"`
+		Step3 int `json:"step3"`
+		Step4 int `json:"step4"`
+	}
+
+	var out ComplexOutput
+	if err := h.WaitForOutput(t.Context(), &out); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the computation graph was executed correctly
+	if out.Step1 != 10 {
+		t.Fatalf("expected step1=10, got %d", out.Step1)
+	}
+	if out.Step2 != 20 {
+		t.Fatalf("expected step2=20, got %d", out.Step2)
+	}
+	if out.Step3 != 30 {
+		t.Fatalf("expected step3=30, got %d", out.Step3)
+	}
+	if out.Step4 != 50 {
+		t.Fatalf("expected step4=50, got %d", out.Step4)
 	}
 }

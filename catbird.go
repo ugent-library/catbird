@@ -1,3 +1,10 @@
+// Package catbird provides a PostgreSQL-based distributed message queue
+// with task and workflow execution engine. It supports:
+// - Generic message queues (Send, Dispatch, Read operations)
+// - Task execution with automatic polling and worker distribution
+// - Workflow execution with step dependencies and data flow
+//
+// All duration parameters use milliseconds for precision.
 package catbird
 
 import (
@@ -10,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+// Status constants for task and flow runs
 const (
 	StatusCreated   = "created"
 	StatusStarted   = "started"
@@ -18,16 +26,20 @@ const (
 )
 
 var (
+	// ErrTaskFailed is returned when a task run fails
 	ErrTaskFailed = fmt.Errorf("task failed")
+	// ErrFlowFailed is returned when a flow run fails
 	ErrFlowFailed = fmt.Errorf("flow failed")
 )
 
+// Conn is an interface for database connections compatible with pgx.Conn and pgx.Pool
 type Conn interface {
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 	Query(context.Context, string, ...any) (pgx.Rows, error)
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
+// Message represents a message in a queue
 type Message struct {
 	ID              int64           `json:"id"`
 	DeduplicationID string          `json:"deduplication_id,omitempty"`
@@ -47,6 +59,7 @@ type handlerOpts struct {
 	jitterFactor float64
 }
 
+// HandlerOpt is an option for configuring task and flow step handlers
 type HandlerOpt interface {
 	apply(*handlerOpts)
 }
@@ -59,6 +72,7 @@ func (o concurrencyOpt) apply(h *handlerOpts) {
 	h.concurrency = o.concurrency
 }
 
+// WithConcurrency sets the number of concurrent handler executions
 func WithConcurrency(n int) HandlerOpt {
 	return concurrencyOpt{concurrency: n}
 }
@@ -71,6 +85,7 @@ func (o timeoutOpt) apply(h *handlerOpts) {
 	h.timeout = o.timeout
 }
 
+// WithTimeout sets the timeout for handler execution
 func WithTimeout(d time.Duration) HandlerOpt {
 	return timeoutOpt{timeout: d}
 }
@@ -83,6 +98,7 @@ func (o batchSizeOpt) apply(h *handlerOpts) {
 	h.batchSize = o.batchSize
 }
 
+// WithBatchSize sets the number of messages to read per batch
 func WithBatchSize(n int) HandlerOpt {
 	return batchSizeOpt{batchSize: n}
 }
@@ -95,6 +111,7 @@ func (o retriesOpt) apply(h *handlerOpts) {
 	h.retries = o.retries
 }
 
+// WithRetries sets the number of retry attempts for failed handlers
 func WithRetries(n int) HandlerOpt {
 	return retriesOpt{retries: n}
 }
@@ -107,10 +124,12 @@ func (o retryDelayOpt) apply(h *handlerOpts) {
 	h.retryDelay = o.delay
 }
 
+// WithRetryDelay sets the initial delay between retry attempts
 func WithRetryDelay(d time.Duration) HandlerOpt {
 	return retryDelayOpt{delay: d}
 }
 
+// Task represents a task definition with a generic typed handler
 type Task struct {
 	Name    string `json:"name"`
 	handler *taskHandler
@@ -121,6 +140,9 @@ type taskHandler struct {
 	fn func(context.Context, []byte) ([]byte, error)
 }
 
+// NewTask creates a new task with a generic handler function
+// The handler receives typed input and returns typed output
+// Input and output types are automatically marshaled to/from JSON
 func NewTask[In, Out any](name string, fn func(context.Context, In) (Out, error), opts ...HandlerOpt) *Task {
 	h := &taskHandler{
 		handlerOpts: handlerOpts{
@@ -687,20 +709,24 @@ func RunTaskWithOpts(ctx context.Context, conn Conn, name string, input any, opt
 	return &TaskHandle{conn: conn, name: name, id: id}, nil
 }
 
+// TaskHandle is a handle to a running or completed task execution
 type TaskHandle struct {
 	conn Conn
 	name string
 	id   int64
 }
 
+// Name returns the task name
 func (h *TaskHandle) Name() string {
 	return h.name
 }
 
+// ID returns the task run ID
 func (h *TaskHandle) ID() int64 {
 	return h.id
 }
 
+// WaitForOutput blocks until the task completes and unmarshals the output
 func (h *TaskHandle) WaitForOutput(ctx context.Context, out any) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -798,16 +824,20 @@ func RunFlowWithOpts(ctx context.Context, conn Conn, name string, input any, opt
 	return &FlowHandle{id: id, name: name, conn: conn}, nil
 }
 
+// FlowHandle is a handle to a running or completed flow execution
 type FlowHandle struct {
 	id   int64
 	name string
 	conn Conn
 }
 
+// ID returns the flow run ID
 func (h *FlowHandle) ID() int64 {
 	return h.id
 }
 
+// WaitForOutput blocks until the flow completes and unmarshals the output
+// Flow output contains combined JSON object of all step outputs
 func (h *FlowHandle) WaitForOutput(ctx context.Context, out any) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()

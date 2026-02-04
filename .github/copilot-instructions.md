@@ -89,11 +89,11 @@ go mod download
 
 ## Critical Files
 
-- [catbird.go](catbird.go): Message, Task, Flow, Step, Options definitions
-- [worker.go](worker.go): Worker struct, scheduling, polling logic
-- [client.go](client.go): Public API (delegation layer)
-- [dashboard/handler.go](dashboard/handler.go): HTTP routes & templating
-- [migrations/](migrations/): Database schema (versioned)
+- [catbird.go](/catbird.go): Message, Task, Flow, Step, Options definitions
+- [worker.go](/worker.go): Worker struct, scheduling, polling logic
+- [client.go](/client.go): Public API (delegation layer)
+- [dashboard/handler.go](/dashboard/handler.go): HTTP routes & templating
+- [migrations/](/migrations/): Database schema (versioned)
 
 ## Common Patterns to Replicate
 

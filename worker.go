@@ -15,6 +15,7 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
+// Worker processes tasks and flows from the queue
 type Worker struct {
 	id              string
 	conn            Conn
@@ -36,6 +37,7 @@ type flowSchedule struct {
 	schedule string
 }
 
+// WorkerOpt is an option for configuring a worker
 type WorkerOpt interface {
 	apply(*Worker)
 }
@@ -48,6 +50,7 @@ func (o taskOpt) apply(w *Worker) {
 	w.tasks = append(w.tasks, o.task)
 }
 
+// WithTask registers a task with the worker
 func WithTask(t *Task) WorkerOpt {
 	return &taskOpt{task: t}
 }
@@ -60,6 +63,7 @@ func (o flowOpt) apply(w *Worker) {
 	w.flows = append(w.flows, o.flow)
 }
 
+// WithFlow registers a flow with the worker
 func WithFlow(f *Flow) WorkerOpt {
 	return &flowOpt{flow: f}
 }
@@ -72,6 +76,7 @@ func (o loggerOpt) apply(w *Worker) {
 	w.logger = o.logger
 }
 
+// WithLogger sets a custom logger for the worker
 func WithLogger(l *slog.Logger) WorkerOpt {
 	return &loggerOpt{logger: l}
 }
@@ -80,12 +85,12 @@ type shutdownTimeoutOpt struct {
 	shutdownTimeout time.Duration
 }
 
-func WithShutdownTimeout(d time.Duration) WorkerOpt {
-	return &shutdownTimeoutOpt{shutdownTimeout: d}
-}
-
 func (o shutdownTimeoutOpt) apply(w *Worker) {
 	w.shutdownTimeout = o.shutdownTimeout
+}
+
+func WithShutdownTimeout(d time.Duration) WorkerOpt {
+	return &shutdownTimeoutOpt{shutdownTimeout: d}
 }
 
 type scheduledTaskOpt struct {
@@ -100,7 +105,8 @@ func (o scheduledTaskOpt) apply(w *Worker) {
 	})
 }
 
-func WithScheduledTask(taskName, schedule string) WorkerOpt {
+// WithScheduledTask registers a scheduled task execution using cron syntax
+func WithScheduledTask(taskName string, schedule string) WorkerOpt {
 	return &scheduledTaskOpt{taskName: taskName, schedule: schedule}
 }
 
@@ -116,7 +122,8 @@ func (o scheduledFlowOpt) apply(w *Worker) {
 	})
 }
 
-func WithScheduledFlow(flowName, schedule string) WorkerOpt {
+// WithScheduledFlow registers a scheduled flow execution using cron syntax
+func WithScheduledFlow(flowName string, schedule string) WorkerOpt {
 	return &scheduledFlowOpt{flowName: flowName, schedule: schedule}
 }
 
@@ -143,6 +150,8 @@ func (o gcOpt) apply(w *Worker) {
 	})
 }
 
+// NewWorker creates a new worker with the given options
+// The worker will register all tasks and flows it has been configured with
 func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, error) {
 	w := &Worker{
 		id:     uuid.NewString(),
@@ -168,6 +177,8 @@ func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, erro
 	return w, nil
 }
 
+// Start begins processing tasks and flows
+// The worker will poll for new work and execute handlers until the context is cancelled
 func (w *Worker) Start(ctx context.Context) error {
 	var scheduler *cron.Cron
 	var wg sync.WaitGroup

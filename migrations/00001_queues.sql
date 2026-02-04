@@ -241,12 +241,13 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- TODO return or error if deleted-- cb_read: Read messages from a queue
+-- cb_read: Read messages from a queue
 -- Parameters:
 --   queue: Queue name
 --   quantity: Number of messages to read (must be > 0)
 --   hide_for: Duration in milliseconds to hide messages from other readers (must be > 0)
--- Returns: Set of cb_message recordsCREATE OR REPLACE FUNCTION cb_read(
+-- Returns: Set of cb_message records
+CREATE OR REPLACE FUNCTION cb_read(
     queue text,
     quantity int,
     hide_for int
