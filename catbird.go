@@ -1,10 +1,5 @@
 // Package catbird provides a PostgreSQL-based distributed message queue
-// with task and workflow execution engine. It supports:
-// - Generic message queues (Send, Dispatch, Read operations)
-// - Task execution with automatic polling and worker distribution
-// - Workflow execution with step dependencies and data flow
-//
-// All duration parameters use milliseconds for precision.
+// with task and workflow execution engine.
 package catbird
 
 import (
