@@ -217,6 +217,13 @@ DECLARE
     _q_table text := cb_table_name(cb_read.queue, 'q');
     _q text;
 BEGIN
+    IF cb_read.quantity <= 0 THEN
+        RAISE EXCEPTION 'cb: quantity must be greater than 0';
+    END IF;
+    IF cb_read.hide_for <= 0 THEN
+        RAISE EXCEPTION 'cb: hide_for must be greater than 0';
+    END IF;
+
     _q := format(
         $QUERY$
         WITH msgs AS (
@@ -242,7 +249,7 @@ BEGIN
         $QUERY$,
         _q_table, _q_table
     );
-    RETURN QUERY EXECUTE _q USING cb_read.quantity, make_interval(secs => cb_read.hide_for);
+    RETURN QUERY EXECUTE _q USING cb_read.quantity, make_interval(secs => cb_read.hide_for / 1000.0);
 end
 $$;
 -- +goose statementend
@@ -264,6 +271,12 @@ DECLARE
     _q text;
     _q_table text := cb_table_name(cb_read_poll.queue, 'q');
 BEGIN
+    IF cb_read_poll.quantity <= 0 THEN
+        RAISE EXCEPTION 'cb: quantity must be greater than 0';
+    END IF;
+    IF cb_read_poll.hide_for <= 0 THEN
+        RAISE EXCEPTION 'cb: hide_for must be greater than 0';
+    END IF;
     IF cb_read_poll.poll_for <= 0 THEN
         RAISE EXCEPTION 'cb: poll_for must be greater than 0';
     END IF;
@@ -271,13 +284,13 @@ BEGIN
         RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
     END IF;
 
-    _sleep_for := cb_read_poll.poll_interval::numeric / 1000;
+    _sleep_for := cb_read_poll.poll_interval / 1000.0;
 
-    IF _sleep_for >= cb_read_poll.poll_for THEN
+    IF _sleep_for >= cb_read_poll.poll_for / 1000.0 THEN
         RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
     END IF;
 
-    _stop_at := clock_timestamp() + make_interval(secs => cb_read_poll.poll_for);
+    _stop_at := clock_timestamp() + make_interval(secs => cb_read_poll.poll_for / 1000.0);
 
     LOOP
         IF (SELECT clock_timestamp() >= _stop_at) THEN
@@ -311,7 +324,7 @@ BEGIN
       );
 
       FOR _m IN
-        EXECUTE _q USING cb_read_poll.quantity, make_interval(secs => cb_read_poll.hide_for)
+        EXECUTE _q USING cb_read_poll.quantity, make_interval(secs => cb_read_poll.hide_for / 1000.0)
       LOOP
         RETURN NEXT _m;
       END LOOP;
@@ -329,7 +342,7 @@ $$;
 CREATE OR REPLACE FUNCTION cb_hide(
     queue text,
     id bigint,
-    hide_for integer
+    hide_for int
 )
 RETURNS boolean
 LANGUAGE plpgsql AS $$
@@ -337,6 +350,10 @@ DECLARE
     _q_table text := cb_table_name(cb_hide.queue, 'q');
     _res boolean;
 BEGIN
+    IF cb_hide.hide_for <= 0 THEN
+        RAISE EXCEPTION 'cb: hide_for must be greater than 0';
+    END IF;
+
     EXECUTE format(
         $QUERY$
         UPDATE %I
@@ -346,7 +363,7 @@ BEGIN
         $QUERY$,
         _q_table
     )
-    USING cb_hide.id, make_interval(secs => cb_hide.hide_for)
+    USING cb_hide.id, make_interval(secs => cb_hide.hide_for / 1000.0)
     INTO _res;
     RETURN coalesce(_res, false);
 END;
@@ -357,13 +374,17 @@ $$;
 CREATE OR REPLACE FUNCTION cb_hide(
     queue text,
     ids bigint[],
-    hide_for integer
+    hide_for int
 )
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
     _q_table text := cb_table_name(cb_hide.queue, 'q');
 BEGIN
+    IF cb_hide.hide_for <= 0 THEN
+        RAISE EXCEPTION 'cb: hide_for must be greater than 0';
+    END IF;
+
     EXECUTE format(
         $QUERY$
         UPDATE %I
@@ -372,7 +393,7 @@ BEGIN
         $QUERY$,
         _q_table
     )
-    USING cb_hide.ids, make_interval(secs => cb_hide.hide_for);
+    USING cb_hide.ids, make_interval(secs => cb_hide.hide_for / 1000.0);
 END;
 $$;
 -- +goose statementend

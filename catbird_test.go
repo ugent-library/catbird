@@ -100,7 +100,7 @@ func TestQueueSendAndRead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	messages, err := client.Read(t.Context(), queueName, 1, 0)
+	messages, err := client.Read(t.Context(), queueName, 1, 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestQueueDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	messages, err := client.Read(t.Context(), queueName, 1, 0)
+	messages, err := client.Read(t.Context(), queueName, 1, 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestQueueDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	messages, err := client.Read(t.Context(), queueName, 1, 0)
+	messages, err := client.Read(t.Context(), queueName, 1, 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,7 @@ func TestQueueDelete(t *testing.T) {
 		t.Fatal("expected message to be deleted")
 	}
 
-	messages, err = client.Read(t.Context(), queueName, 1, 0)
+	messages, err = client.Read(t.Context(), queueName, 1, 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestQueueHide(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	messages, err := client.Read(t.Context(), queueName, 1, 0)
+	messages, err := client.Read(t.Context(), queueName, 1, 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func TestQueueHide(t *testing.T) {
 	}
 
 	// Message should be hidden now
-	messages, err = client.Read(t.Context(), queueName, 1, 0)
+	messages, err = client.Read(t.Context(), queueName, 1, 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,7 @@ func TestQueueHideExpiry(t *testing.T) {
 	}
 
 	// Read message
-	messages, err := client.Read(t.Context(), queueName, 1, 0)
+	messages, err := client.Read(t.Context(), queueName, 1, 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -596,7 +596,7 @@ func DispatchWithOpts(ctx context.Context, conn Conn, topic string, payload any,
 
 func Read(ctx context.Context, conn Conn, queue string, quantity int, hideFor time.Duration) ([]Message, error) {
 	q := `SELECT * FROM cb_read(queue => $1, quantity => $2, hide_for => $3);`
-	rows, err := conn.Query(ctx, q, queue, quantity, hideFor.Seconds())
+	rows, err := conn.Query(ctx, q, queue, quantity, hideFor.Milliseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -606,7 +606,7 @@ func Read(ctx context.Context, conn Conn, queue string, quantity int, hideFor ti
 func ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]Message, error) {
 	q := `SELECT * FROM cb_read_poll(queue => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
 
-	rows, err := conn.Query(ctx, q, queue, quantity, hideFor.Seconds(), pollFor.Seconds(), pollInterval.Milliseconds())
+	rows, err := conn.Query(ctx, q, queue, quantity, hideFor.Milliseconds(), pollFor.Milliseconds(), pollInterval.Milliseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -617,13 +617,13 @@ func ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFo
 func Hide(ctx context.Context, conn Conn, queue string, id int64, hideFor time.Duration) (bool, error) {
 	q := `SELECT * FROM cb_hide(queue => $1, id => $2, hide_for => $3);`
 	exists := false
-	err := conn.QueryRow(ctx, q, queue, id, hideFor.Seconds()).Scan(&exists)
+	err := conn.QueryRow(ctx, q, queue, id, hideFor.Milliseconds()).Scan(&exists)
 	return exists, err
 }
 
 func HideMany(ctx context.Context, conn Conn, queue string, ids []int64, hideFor time.Duration) error {
 	q := `SELECT * FROM cb_hide(queue => $1, ids => $2, hide_for => $3);`
-	_, err := conn.Exec(ctx, q, queue, ids, hideFor.Seconds())
+	_, err := conn.Exec(ctx, q, queue, ids, hideFor.Milliseconds())
 	return err
 }
 
