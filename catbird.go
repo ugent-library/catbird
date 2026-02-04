@@ -190,6 +190,8 @@ type StepDependency struct {
 	Name string `json:"name"`
 }
 
+// Dependency creates a step dependency reference by name
+// Used when defining flow steps that depend on other steps
 func Dependency(name string) *StepDependency {
 	return &StepDependency{Name: name}
 }
@@ -216,6 +218,8 @@ type stepHandler struct {
 
 type StepOpt func(*Step)
 
+// NewFlow creates a new flow with the given name and step options
+// Each FlowOpt (e.g., InitialStep, StepWithOneDependency) adds a step to the flow
 func NewFlow(name string, opts ...FlowOpt) *Flow {
 	f := &Flow{
 		Name: name,
@@ -238,6 +242,9 @@ func (o stepOpt) apply(f *Flow) {
 	f.Steps = append(f.Steps, o.step)
 }
 
+// InitialStep creates a flow step with no dependencies
+// The handler receives the flow input directly and produces output
+// Input and output types are automatically marshaled to/from JSON
 func InitialStep[In, Out any](name string, fn func(context.Context, In) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
@@ -256,6 +263,8 @@ func InitialStep[In, Out any](name string, fn func(context.Context, In) (Out, er
 	}}
 }
 
+// StepWithOneDependency creates a flow step that depends on one previous step
+// The handler receives the flow input and the output of the dependency step
 func StepWithOneDependency[In, Dep1Out, Out any](name string, dep1 *StepDependency, fn func(context.Context, In, Dep1Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
@@ -275,6 +284,8 @@ func StepWithOneDependency[In, Dep1Out, Out any](name string, dep1 *StepDependen
 	}}
 }
 
+// StepWithTwoDependencies creates a flow step that depends on two previous steps
+// The handler receives the flow input and the outputs of both dependency steps
 func StepWithTwoDependencies[In, Dep1Out, Dep2Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
@@ -295,6 +306,8 @@ func StepWithTwoDependencies[In, Dep1Out, Dep2Out, Out any](name string, dep1 *S
 	}}
 }
 
+// StepWithThreeDependencies creates a flow step that depends on three previous steps
+// The handler receives the flow input and the outputs of all three dependency steps
 func StepWithThreeDependencies[In, Dep1Out, Dep2Out, Dep3Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
@@ -316,6 +329,8 @@ func StepWithThreeDependencies[In, Dep1Out, Dep2Out, Dep3Out, Out any](name stri
 	}}
 }
 
+// StepWithFourDependencies creates a flow step that depends on four previous steps
+// The handler receives the flow input and the outputs of all four dependency steps
 func StepWithFourDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, dep4 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
@@ -338,6 +353,8 @@ func StepWithFourDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Out any](n
 	}}
 }
 
+// StepWithFiveDependencies creates a flow step that depends on five previous steps
+// The handler receives the flow input and the outputs of all five dependency steps
 func StepWithFiveDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, dep4 *StepDependency, dep5 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
@@ -361,6 +378,8 @@ func StepWithFiveDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, O
 	}}
 }
 
+// StepWithSixDependencies creates a flow step that depends on six previous steps
+// The handler receives the flow input and the outputs of all six dependency steps
 func StepWithSixDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, dep4 *StepDependency, dep5 *StepDependency, dep6 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
@@ -385,6 +404,8 @@ func StepWithSixDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, De
 	}}
 }
 
+// StepWithSevenDependencies creates a flow step that depends on seven previous steps
+// The handler receives the flow input and the outputs of all seven dependency steps
 func StepWithSevenDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, dep4 *StepDependency, dep5 *StepDependency, dep6 *StepDependency, dep7 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
@@ -410,6 +431,8 @@ func StepWithSevenDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, 
 	}}
 }
 
+// StepWithEightDependencies creates a flow step that depends on eight previous steps
+// The handler receives the flow input and the outputs of all eight dependency steps
 func StepWithEightDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out, Dep8Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, dep4 *StepDependency, dep5 *StepDependency, dep6 *StepDependency, dep7 *StepDependency, dep8 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out, Dep8Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	return stepOpt{step: &Step{
 		Name:      name,
@@ -544,21 +567,48 @@ type QueueOpts struct {
 	Unlogged bool
 }
 
+// CreateQueue creates a new queue with the given name.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - name: unique queue identifier
 func CreateQueue(ctx context.Context, conn Conn, name string) error {
 	return CreateQueueWithOpts(ctx, conn, name, QueueOpts{})
 }
 
+// CreateQueueWithOpts creates a queue with options.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - name: unique queue identifier
+// - opts: QueueOpts with Topics, DeleteAt, and Unlogged settings
 func CreateQueueWithOpts(ctx context.Context, conn Conn, name string, opts QueueOpts) error {
 	q := `SELECT cb_create_queue(name => $1, topics => $2, delete_at => $3, unlogged => $4);`
 	_, err := conn.Exec(ctx, q, name, opts.Topics, ptrOrNil(opts.DeleteAt), opts.Unlogged)
 	return err
 }
 
+// GetQueue retrieves queue metadata by name.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - name: unique queue identifier
 func GetQueue(ctx context.Context, conn Conn, name string) (*QueueInfo, error) {
 	q := `SELECT name, topics, unlogged, created_at, delete_at FROM cb_queues WHERE name = $1;`
 	return scanQueue(conn.QueryRow(ctx, q, name))
 }
 
+// DeleteQueue deletes a queue and all its messages.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - name: unique queue identifier
+//
+// Returns: true if queue existed, false if not found
 func DeleteQueue(ctx context.Context, conn Conn, name string) (bool, error) {
 	q := `SELECT * FROM cb_delete_queue(name => $1);`
 	existed := false
@@ -566,6 +616,7 @@ func DeleteQueue(ctx context.Context, conn Conn, name string) (bool, error) {
 	return existed, err
 }
 
+// ListQueues returns all queues
 func ListQueues(ctx context.Context, conn Conn) ([]*QueueInfo, error) {
 	q := `SELECT name, topics, unlogged, created_at, delete_at FROM cb_queues;`
 	rows, err := conn.Query(ctx, q)
@@ -581,10 +632,25 @@ type SendOpts struct {
 	DeliverAt       time.Time
 }
 
+// Send enqueues a message to a queue.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - queue: target queue name
+// - payload: message payload (marshaled to JSON)
 func Send(ctx context.Context, conn Conn, queue string, payload any) error {
 	return SendWithOpts(ctx, conn, queue, payload, SendOpts{})
 }
 
+// SendWithOpts enqueues a message with options.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - queue: target queue name
+// - payload: message payload (marshaled to JSON)
+// - opts: SendOpts with Topic, DeduplicationID, and DeliverAt
 func SendWithOpts(ctx context.Context, conn Conn, queue string, payload any, opts SendOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -601,10 +667,25 @@ type DispatchOpts struct {
 	DeliverAt       *time.Time
 }
 
+// Dispatch sends a message to all queues subscribed to a topic.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - topic: topic name
+// - payload: message payload (marshaled to JSON)
 func Dispatch(ctx context.Context, conn Conn, topic string, payload any) error {
 	return DispatchWithOpts(ctx, conn, topic, payload, DispatchOpts{})
 }
 
+// DispatchWithOpts sends a message to topic-subscribed queues with options.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - topic: topic name
+// - payload: message payload (marshaled to JSON)
+// - opts: DispatchOpts with DeduplicationID and DeliverAt
 func DispatchWithOpts(ctx context.Context, conn Conn, topic string, payload any, opts DispatchOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -616,6 +697,14 @@ func DispatchWithOpts(ctx context.Context, conn Conn, topic string, payload any,
 	return err
 }
 
+// Read reads messages from a queue with a specified hide duration.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - queue: source queue name
+// - quantity: maximum number of messages to read
+// - hideFor: duration to hide messages from other readers
 func Read(ctx context.Context, conn Conn, queue string, quantity int, hideFor time.Duration) ([]Message, error) {
 	q := `SELECT * FROM cb_read(queue => $1, quantity => $2, hide_for => $3);`
 	rows, err := conn.Query(ctx, q, queue, quantity, hideFor.Milliseconds())
@@ -625,6 +714,17 @@ func Read(ctx context.Context, conn Conn, queue string, quantity int, hideFor ti
 	return pgx.CollectRows(rows, scanCollectibleMessage)
 }
 
+// ReadPoll reads messages from a queue with polling support.
+// Polls repeatedly until messages are available or pollFor timeout is reached.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - queue: source queue name
+// - quantity: maximum number of messages to read
+// - hideFor: duration to hide messages from other readers
+// - pollFor: total duration to poll before timing out
+// - pollInterval: interval between poll attempts
 func ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]Message, error) {
 	q := `SELECT * FROM cb_read_poll(queue => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
 
@@ -636,6 +736,16 @@ func ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFo
 	return pgx.CollectRows(rows, scanCollectibleMessage)
 }
 
+// Hide hides a single message from being read.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - queue: queue name containing the message
+// - id: message ID
+// - hideFor: duration to hide message from readers
+//
+// Returns: true if message existed, false if not found
 func Hide(ctx context.Context, conn Conn, queue string, id int64, hideFor time.Duration) (bool, error) {
 	q := `SELECT * FROM cb_hide(queue => $1, id => $2, hide_for => $3);`
 	exists := false
@@ -643,12 +753,29 @@ func Hide(ctx context.Context, conn Conn, queue string, id int64, hideFor time.D
 	return exists, err
 }
 
+// HideMany hides multiple messages from being read.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - queue: queue name containing the messages
+// - ids: slice of message IDs
+// - hideFor: duration to hide messages from readers
 func HideMany(ctx context.Context, conn Conn, queue string, ids []int64, hideFor time.Duration) error {
 	q := `SELECT * FROM cb_hide(queue => $1, ids => $2, hide_for => $3);`
 	_, err := conn.Exec(ctx, q, queue, ids, hideFor.Milliseconds())
 	return err
 }
 
+// Delete deletes a single message from a queue.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - queue: queue name containing the message
+// - id: message ID
+//
+// Returns: true if message existed, false if not found
 func Delete(ctx context.Context, conn Conn, queue string, id int64) (bool, error) {
 	q := `SELECT * FROM cb_delete(queue => $1, id => $2);`
 	existed := false
@@ -656,12 +783,25 @@ func Delete(ctx context.Context, conn Conn, queue string, id int64) (bool, error
 	return existed, err
 }
 
+// DeleteMany deletes multiple messages from a queue.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - queue: queue name containing the messages
+// - ids: slice of message IDs
 func DeleteMany(ctx context.Context, conn Conn, queue string, ids []int64) error {
 	q := `SELECT * FROM cb_delete(queue => $1, ids => $2);`
 	_, err := conn.Exec(ctx, q, queue, ids)
 	return err
 }
 
+// CreateTask creates a new task definition.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - task: Task definition with name and handler
 func CreateTask(ctx context.Context, conn Conn, task *Task) error {
 	q := `SELECT * FROM cb_create_task(name => $1);`
 	_, err := conn.Exec(ctx, q, task.Name)
@@ -671,11 +811,18 @@ func CreateTask(ctx context.Context, conn Conn, task *Task) error {
 	return nil
 }
 
+// GetTask retrieves task metadata by name.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - name: task name
 func GetTask(ctx context.Context, conn Conn, name string) (*TaskInfo, error) {
 	q := `SELECT name, created_at FROM cb_tasks WHERE name = $1;`
 	return scanTask(conn.QueryRow(ctx, q, name))
 }
 
+// ListTasks returns all tasks
 func ListTasks(ctx context.Context, conn Conn) ([]*TaskInfo, error) {
 	q := `SELECT name, created_at FROM cb_tasks;`
 	rows, err := conn.Query(ctx, q)
@@ -689,10 +836,29 @@ type RunTaskOpts struct {
 	DeduplicationID string
 }
 
+// RunTask enqueues a task execution and returns a handle for monitoring.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - name: task name
+// - input: task input (marshaled to JSON)
+//
+// Returns: handle to poll task status and retrieve output
 func RunTask(ctx context.Context, conn Conn, name string, input any) (*TaskHandle, error) {
 	return RunTaskWithOpts(ctx, conn, name, input, RunTaskOpts{})
 }
 
+// RunTaskWithOpts enqueues a task with options.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - name: task name
+// - input: task input (marshaled to JSON)
+// - opts: RunTaskOpts with DeduplicationID for deduplication
+//
+// Returns: handle to poll task status and retrieve output
 func RunTaskWithOpts(ctx context.Context, conn Conn, name string, input any, opts RunTaskOpts) (*TaskHandle, error) {
 	b, err := json.Marshal(input)
 	if err != nil {
@@ -750,6 +916,13 @@ func (h *TaskHandle) WaitForOutput(ctx context.Context, out any) error {
 	}
 }
 
+// GetTaskRun retrieves a specific task run result.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - name: task name
+// - id: task run ID
 func GetTaskRun(ctx context.Context, conn Conn, name string, id int64) (*TaskRunInfo, error) {
 	q := `SELECT * FROM cb_task_run_info($1, $2);`
 	rows, err := conn.Query(ctx, q, name, fmt.Sprintf("WHERE id = %d", id))
@@ -766,6 +939,12 @@ func GetTaskRun(ctx context.Context, conn Conn, name string, id int64) (*TaskRun
 	return results[0], nil
 }
 
+// ListTaskRuns returns recent task runs for a task.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - name: task name
 func ListTaskRuns(ctx context.Context, conn Conn, name string) ([]*TaskRunInfo, error) {
 	q := `SELECT * FROM cb_task_run_info($1, $2);`
 	rows, err := conn.Query(ctx, q, name, "")
@@ -775,6 +954,12 @@ func ListTaskRuns(ctx context.Context, conn Conn, name string) ([]*TaskRunInfo, 
 	return pgx.CollectRows(rows, scanCollectibleTaskRun)
 }
 
+// CreateFlow creates a new flow definition.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - flow: Flow definition with name and steps
 func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 	b, err := json.Marshal(flow.Steps)
 	if err != nil {
@@ -788,11 +973,18 @@ func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 	return nil
 }
 
+// GetFlow retrieves flow metadata by name.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - name: flow name
 func GetFlow(ctx context.Context, conn Conn, name string) (*FlowInfo, error) {
 	q := `SELECT * FROM cb_flow_info() WHERE name = $1;`
 	return scanFlow(conn.QueryRow(ctx, q, name))
 }
 
+// ListFlows returns all flows
 func ListFlows(ctx context.Context, conn Conn) ([]*FlowInfo, error) {
 	q := `SELECT * FROM cb_flow_info();`
 	rows, err := conn.Query(ctx, q)
@@ -806,10 +998,29 @@ type RunFlowOpts struct {
 	DeduplicationID string
 }
 
+// RunFlow enqueues a flow execution and returns a handle for monitoring.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - name: flow name
+// - input: flow input (marshaled to JSON)
+//
+// Returns: handle to poll flow status and retrieve combined step outputs
 func RunFlow(ctx context.Context, conn Conn, name string, input any) (*FlowHandle, error) {
 	return RunFlowWithOpts(ctx, conn, name, input, RunFlowOpts{})
 }
 
+// RunFlowWithOpts enqueues a flow with options.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - name: flow name
+// - input: flow input (marshaled to JSON)
+// - opts: RunFlowOpts with DeduplicationID for deduplication
+//
+// Returns: handle to poll flow status and retrieve combined step outputs
 func RunFlowWithOpts(ctx context.Context, conn Conn, name string, input any, opts RunFlowOpts) (*FlowHandle, error) {
 	b, err := json.Marshal(input)
 	if err != nil {
@@ -861,6 +1072,13 @@ func (h *FlowHandle) WaitForOutput(ctx context.Context, out any) error {
 	}
 }
 
+// GetFlowRun retrieves a specific flow run result.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - name: flow name
+// - id: flow run ID
 func GetFlowRun(ctx context.Context, conn Conn, flowName string, id int64) (*FlowRunInfo, error) {
 	q := `SELECT * FROM cb_flow_run_info($1, $2);`
 	rows, err := conn.Query(ctx, q, flowName, fmt.Sprintf("WHERE id = %d", id))
@@ -877,6 +1095,12 @@ func GetFlowRun(ctx context.Context, conn Conn, flowName string, id int64) (*Flo
 	return results[0], nil
 }
 
+// ListFlowRuns returns recent flow runs for a flow.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
+// - name: flow name
 func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunInfo, error) {
 	q := `SELECT * FROM cb_flow_run_info($1, $2);`
 	rows, err := conn.Query(ctx, q, flowName, "")
@@ -886,6 +1110,11 @@ func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunIn
 	return pgx.CollectRows(rows, scanCollectibleFlowRun)
 }
 
+// ListWorkers returns all registered workers.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
 func ListWorkers(ctx context.Context, conn Conn) ([]*WorkerInfo, error) {
 	q := `SELECT id, started_at, last_heartbeat_at, task_handlers, step_handlers FROM cb_worker_info;`
 	rows, err := conn.Query(ctx, q)
@@ -896,12 +1125,24 @@ func ListWorkers(ctx context.Context, conn Conn) ([]*WorkerInfo, error) {
 
 }
 
+// GC runs garbage collection to clean up expired and deleted entries.
+//
+// Parameters:
+// - ctx: context for operation cancellation
+// - conn: database connection
 func GC(ctx context.Context, conn Conn) error {
 	q := `SELECT cb_gc();`
 	_, err := conn.Exec(ctx, q)
 	return err
 }
 
+// EnqueueSend adds a Send operation to a batch for efficient bulk message sending.
+//
+// Parameters:
+// - batch: pgx.Batch to add the operation to
+// - queue: target queue name
+// - payload: message payload (marshaled to JSON)
+// - opts: SendOpts with Topic, DeduplicationID, and DeliverAt
 func EnqueueSend(batch *pgx.Batch, queue string, payload any, opts SendOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -916,6 +1157,13 @@ func EnqueueSend(batch *pgx.Batch, queue string, payload any, opts SendOpts) err
 	return nil
 }
 
+// EnqueueDispatch adds a Dispatch operation to a batch for efficient bulk message dispatching.
+//
+// Parameters:
+// - batch: pgx.Batch to add the operation to
+// - topic: topic name
+// - payload: message payload (marshaled to JSON)
+// - opts: DispatchOpts with DeduplicationID and DeliverAt
 func EnqueueDispatch(batch *pgx.Batch, topic string, payload any, opts DispatchOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
