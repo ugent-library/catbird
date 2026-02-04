@@ -1,4 +1,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/ugent-library/catbird.svg)](https://pkg.go.dev/github.com/ugent-library/catbird)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Go Version](https://img.shields.io/badge/go-1.25+-blue.svg)](https://golang.org)
+[![Go Report Card](https://goreportcard.com/badge/github.com/ugent-library/catbird)](https://goreportcard.com/report/github.com/ugent-library/catbird)
 
 ![CatBird](catbird-banner.svg "CatBird banner")
 
@@ -107,16 +110,6 @@ flow := catbird.NewFlow("order-processing",
 worker, err := client.NewWorker(ctx,
     catbird.WithFlow(flow),
 )
-go worker.Start(ctx)
-
-// Run the flow
-handle, err := client.RunFlow(ctx, "order-processing", myOrder)
-
-// Get combined results from all steps
-var results map[string]json.RawMessage
-err = handle.WaitForOutput(ctx, &results)
-// results contains output from all steps: validate, charge, check, ship
-```
 go worker.Start(ctx)
 
 // Run the flow
