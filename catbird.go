@@ -566,22 +566,12 @@ type QueueOpts struct {
 }
 
 // CreateQueue creates a new queue with the given name.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - name: unique queue identifier
 func CreateQueue(ctx context.Context, conn Conn, name string) error {
 	return CreateQueueWithOpts(ctx, conn, name, QueueOpts{})
 }
 
-// CreateQueueWithOpts creates a queue with options.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - name: unique queue identifier
-// - opts: QueueOpts with Topics, DeleteAt, and Unlogged settings
+// CreateQueueWithOpts creates a queue with the specified options including
+// topics, deletion time, and unlogged mode.
 func CreateQueueWithOpts(ctx context.Context, conn Conn, name string, opts QueueOpts) error {
 	q := `SELECT cb_create_queue(name => $1, topics => $2, delete_at => $3, unlogged => $4);`
 	_, err := conn.Exec(ctx, q, name, opts.Topics, ptrOrNil(opts.DeleteAt), opts.Unlogged)
@@ -589,24 +579,13 @@ func CreateQueueWithOpts(ctx context.Context, conn Conn, name string, opts Queue
 }
 
 // GetQueue retrieves queue metadata by name.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - name: unique queue identifier
 func GetQueue(ctx context.Context, conn Conn, name string) (*QueueInfo, error) {
 	q := `SELECT name, topics, unlogged, created_at, delete_at FROM cb_queues WHERE name = $1;`
 	return scanQueue(conn.QueryRow(ctx, q, name))
 }
 
 // DeleteQueue deletes a queue and all its messages.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - name: unique queue identifier
-//
-// Returns: true if queue existed, false if not found
+// Returns true if the queue existed.
 func DeleteQueue(ctx context.Context, conn Conn, name string) (bool, error) {
 	q := `SELECT * FROM cb_delete_queue(name => $1);`
 	existed := false
@@ -630,25 +609,14 @@ type SendOpts struct {
 	DeliverAt       time.Time
 }
 
-// Send enqueues a message to a queue.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - queue: target queue name
-// - payload: message payload (marshaled to JSON)
+// Send enqueues a message to the specified queue.
+// The payload is marshaled to JSON.
 func Send(ctx context.Context, conn Conn, queue string, payload any) error {
 	return SendWithOpts(ctx, conn, queue, payload, SendOpts{})
 }
 
-// SendWithOpts enqueues a message with options.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - queue: target queue name
-// - payload: message payload (marshaled to JSON)
-// - opts: SendOpts with Topic, DeduplicationID, and DeliverAt
+// SendWithOpts enqueues a message with options for topic, deduplication ID,
+// and delivery time.
 func SendWithOpts(ctx context.Context, conn Conn, queue string, payload any, opts SendOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -665,25 +633,13 @@ type DispatchOpts struct {
 	DeliverAt       *time.Time
 }
 
-// Dispatch sends a message to all queues subscribed to a topic.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - topic: topic name
-// - payload: message payload (marshaled to JSON)
+// Dispatch sends a message to all queues subscribed to the specified topic.
 func Dispatch(ctx context.Context, conn Conn, topic string, payload any) error {
 	return DispatchWithOpts(ctx, conn, topic, payload, DispatchOpts{})
 }
 
-// DispatchWithOpts sends a message to topic-subscribed queues with options.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - topic: topic name
-// - payload: message payload (marshaled to JSON)
-// - opts: DispatchOpts with DeduplicationID and DeliverAt
+// DispatchWithOpts sends a message to topic-subscribed queues with options
+// for deduplication ID and delivery time.
 func DispatchWithOpts(ctx context.Context, conn Conn, topic string, payload any, opts DispatchOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -695,14 +651,8 @@ func DispatchWithOpts(ctx context.Context, conn Conn, topic string, payload any,
 	return err
 }
 
-// Read reads messages from a queue with a specified hide duration.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - queue: source queue name
-// - quantity: maximum number of messages to read
-// - hideFor: duration to hide messages from other readers
+// Read reads up to quantity messages from the queue, hiding them from other
+// readers for the specified duration.
 func Read(ctx context.Context, conn Conn, queue string, quantity int, hideFor time.Duration) ([]Message, error) {
 	q := `SELECT * FROM cb_read(queue => $1, quantity => $2, hide_for => $3);`
 	rows, err := conn.Query(ctx, q, queue, quantity, hideFor.Milliseconds())
@@ -713,16 +663,8 @@ func Read(ctx context.Context, conn Conn, queue string, quantity int, hideFor ti
 }
 
 // ReadPoll reads messages from a queue with polling support.
-// Polls repeatedly until messages are available or pollFor timeout is reached.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - queue: source queue name
-// - quantity: maximum number of messages to read
-// - hideFor: duration to hide messages from other readers
-// - pollFor: total duration to poll before timing out
-// - pollInterval: interval between poll attempts
+// It polls repeatedly at the specified interval until messages are available
+// or the pollFor timeout is reached.
 func ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]Message, error) {
 	q := `SELECT * FROM cb_read_poll(queue => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
 
@@ -734,16 +676,8 @@ func ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFo
 	return pgx.CollectRows(rows, scanCollectibleMessage)
 }
 
-// Hide hides a single message from being read.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - queue: queue name containing the message
-// - id: message ID
-// - hideFor: duration to hide message from readers
-//
-// Returns: true if message existed, false if not found
+// Hide hides a single message from being read for the specified duration.
+// Returns true if the message existed.
 func Hide(ctx context.Context, conn Conn, queue string, id int64, hideFor time.Duration) (bool, error) {
 	q := `SELECT * FROM cb_hide(queue => $1, id => $2, hide_for => $3);`
 	exists := false
@@ -751,29 +685,15 @@ func Hide(ctx context.Context, conn Conn, queue string, id int64, hideFor time.D
 	return exists, err
 }
 
-// HideMany hides multiple messages from being read.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - queue: queue name containing the messages
-// - ids: slice of message IDs
-// - hideFor: duration to hide messages from readers
+// HideMany hides multiple messages from being read for the specified duration.
 func HideMany(ctx context.Context, conn Conn, queue string, ids []int64, hideFor time.Duration) error {
 	q := `SELECT * FROM cb_hide(queue => $1, ids => $2, hide_for => $3);`
 	_, err := conn.Exec(ctx, q, queue, ids, hideFor.Milliseconds())
 	return err
 }
 
-// Delete deletes a single message from a queue.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - queue: queue name containing the message
-// - id: message ID
-//
-// Returns: true if message existed, false if not found
+// Delete deletes a single message from the queue.
+// Returns true if the message existed.
 func Delete(ctx context.Context, conn Conn, queue string, id int64) (bool, error) {
 	q := `SELECT * FROM cb_delete(queue => $1, id => $2);`
 	existed := false
@@ -781,13 +701,7 @@ func Delete(ctx context.Context, conn Conn, queue string, id int64) (bool, error
 	return existed, err
 }
 
-// DeleteMany deletes multiple messages from a queue.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - queue: queue name containing the messages
-// - ids: slice of message IDs
+// DeleteMany deletes multiple messages from the queue.
 func DeleteMany(ctx context.Context, conn Conn, queue string, ids []int64) error {
 	q := `SELECT * FROM cb_delete(queue => $1, ids => $2);`
 	_, err := conn.Exec(ctx, q, queue, ids)
@@ -795,11 +709,6 @@ func DeleteMany(ctx context.Context, conn Conn, queue string, ids []int64) error
 }
 
 // CreateTask creates a new task definition.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - task: Task definition with name and handler
 func CreateTask(ctx context.Context, conn Conn, task *Task) error {
 	q := `SELECT * FROM cb_create_task(name => $1);`
 	_, err := conn.Exec(ctx, q, task.Name)
@@ -810,11 +719,6 @@ func CreateTask(ctx context.Context, conn Conn, task *Task) error {
 }
 
 // GetTask retrieves task metadata by name.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - name: task name
 func GetTask(ctx context.Context, conn Conn, name string) (*TaskInfo, error) {
 	q := `SELECT name, created_at FROM cb_tasks WHERE name = $1;`
 	return scanTask(conn.QueryRow(ctx, q, name))
@@ -834,29 +738,14 @@ type RunTaskOpts struct {
 	DeduplicationID string
 }
 
-// RunTask enqueues a task execution and returns a handle for monitoring.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - name: task name
-// - input: task input (marshaled to JSON)
-//
-// Returns: handle to poll task status and retrieve output
+// RunTask enqueues a task execution and returns a handle for monitoring
+// progress and retrieving output.
 func RunTask(ctx context.Context, conn Conn, name string, input any) (*TaskHandle, error) {
 	return RunTaskWithOpts(ctx, conn, name, input, RunTaskOpts{})
 }
 
-// RunTaskWithOpts enqueues a task with options.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - name: task name
-// - input: task input (marshaled to JSON)
-// - opts: RunTaskOpts with DeduplicationID for deduplication
-//
-// Returns: handle to poll task status and retrieve output
+// RunTaskWithOpts enqueues a task with options for deduplication and returns
+// a handle for monitoring.
 func RunTaskWithOpts(ctx context.Context, conn Conn, name string, input any, opts RunTaskOpts) (*TaskHandle, error) {
 	b, err := json.Marshal(input)
 	if err != nil {
@@ -914,25 +803,14 @@ func (h *TaskHandle) WaitForOutput(ctx context.Context, out any) error {
 	}
 }
 
-// GetTaskRun retrieves a specific task run result.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - name: task name
-// - id: task run ID
+// GetTaskRun retrieves a specific task run result by ID.
 func GetTaskRun(ctx context.Context, conn Conn, name string, id int64) (*TaskRunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(name))
 	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
 	return scanTaskRun(conn.QueryRow(ctx, query, id))
 }
 
-// ListTaskRuns returns recent task runs for a task.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - name: task name
+// ListTaskRuns returns recent task runs for the specified task.
 func ListTaskRuns(ctx context.Context, conn Conn, name string) ([]*TaskRunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(name))
 	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
@@ -944,11 +822,6 @@ func ListTaskRuns(ctx context.Context, conn Conn, name string) ([]*TaskRunInfo, 
 }
 
 // CreateFlow creates a new flow definition.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - flow: Flow definition with name and steps
 func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 	b, err := json.Marshal(flow.Steps)
 	if err != nil {
@@ -963,11 +836,6 @@ func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 }
 
 // GetFlow retrieves flow metadata by name.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - name: flow name
 func GetFlow(ctx context.Context, conn Conn, name string) (*FlowInfo, error) {
 	q := `SELECT * FROM cb_flow_info WHERE name = $1;`
 	return scanFlow(conn.QueryRow(ctx, q, name))
@@ -988,28 +856,12 @@ type RunFlowOpts struct {
 }
 
 // RunFlow enqueues a flow execution and returns a handle for monitoring.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - name: flow name
-// - input: flow input (marshaled to JSON)
-//
-// Returns: handle to poll flow status and retrieve combined step outputs
 func RunFlow(ctx context.Context, conn Conn, name string, input any) (*FlowHandle, error) {
 	return RunFlowWithOpts(ctx, conn, name, input, RunFlowOpts{})
 }
 
-// RunFlowWithOpts enqueues a flow with options.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - name: flow name
-// - input: flow input (marshaled to JSON)
-// - opts: RunFlowOpts with DeduplicationID for deduplication
-//
-// Returns: handle to poll flow status and retrieve combined step outputs
+// RunFlowWithOpts enqueues a flow with options for deduplication and returns
+// a handle for monitoring.
 func RunFlowWithOpts(ctx context.Context, conn Conn, name string, input any, opts RunFlowOpts) (*FlowHandle, error) {
 	b, err := json.Marshal(input)
 	if err != nil {
@@ -1061,27 +913,16 @@ func (h *FlowHandle) WaitForOutput(ctx context.Context, out any) error {
 	}
 }
 
-// GetFlowRun retrieves a specific flow run result.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - name: flow name
-// - id: flow run ID
-func GetFlowRun(ctx context.Context, conn Conn, flowName string, id int64) (*FlowRunInfo, error) {
-	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
+// GetFlowRun retrieves a specific flow run result by ID.
+func GetFlowRun(ctx context.Context, conn Conn, name string, id int64) (*FlowRunInfo, error) {
+	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(name))
 	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
 	return scanFlowRun(conn.QueryRow(ctx, query, id))
 }
 
-// ListFlowRuns returns recent flow runs for a flow.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
-// - name: flow name
-func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunInfo, error) {
-	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
+// ListFlowRuns returns recent flow runs for the specified flow.
+func ListFlowRuns(ctx context.Context, conn Conn, name string) ([]*FlowRunInfo, error) {
+	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(name))
 	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
@@ -1091,10 +932,6 @@ func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunIn
 }
 
 // ListWorkers returns all registered workers.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
 func ListWorkers(ctx context.Context, conn Conn) ([]*WorkerInfo, error) {
 	q := `SELECT id, started_at, last_heartbeat_at, task_handlers, step_handlers FROM cb_worker_info;`
 	rows, err := conn.Query(ctx, q)
@@ -1106,10 +943,6 @@ func ListWorkers(ctx context.Context, conn Conn) ([]*WorkerInfo, error) {
 }
 
 // GC runs garbage collection to clean up expired and deleted entries.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - conn: database connection
 func GC(ctx context.Context, conn Conn) error {
 	q := `SELECT cb_gc();`
 	_, err := conn.Exec(ctx, q)
@@ -1117,12 +950,6 @@ func GC(ctx context.Context, conn Conn) error {
 }
 
 // EnqueueSend adds a Send operation to a batch for efficient bulk message sending.
-//
-// Parameters:
-// - batch: pgx.Batch to add the operation to
-// - queue: target queue name
-// - payload: message payload (marshaled to JSON)
-// - opts: SendOpts with Topic, DeduplicationID, and DeliverAt
 func EnqueueSend(batch *pgx.Batch, queue string, payload any, opts SendOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -1138,12 +965,6 @@ func EnqueueSend(batch *pgx.Batch, queue string, payload any, opts SendOpts) err
 }
 
 // EnqueueDispatch adds a Dispatch operation to a batch for efficient bulk message dispatching.
-//
-// Parameters:
-// - batch: pgx.Batch to add the operation to
-// - topic: topic name
-// - payload: message payload (marshaled to JSON)
-// - opts: DispatchOpts with DeduplicationID and DeliverAt
 func EnqueueDispatch(batch *pgx.Batch, topic string, payload any, opts DispatchOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {

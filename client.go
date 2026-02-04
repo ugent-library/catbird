@@ -18,40 +18,23 @@ func New(conn Conn) *Client {
 }
 
 // CreateQueue creates a new queue with the given name.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - name: unique queue identifier
 func (c *Client) CreateQueue(ctx context.Context, name string) error {
 	return CreateQueue(ctx, c.Conn, name)
 }
 
-// CreateQueueWithOpts creates a queue with options.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - name: unique queue identifier
-// - opts: QueueOpts with Topics, DeleteAt, and Unlogged settings
+// CreateQueueWithOpts creates a queue with the specified options including
+// topics, deletion time, and unlogged mode.
 func (c *Client) CreateQueueWithOpts(ctx context.Context, name string, opts QueueOpts) error {
 	return CreateQueueWithOpts(ctx, c.Conn, name, opts)
 }
 
 // GetQueue retrieves queue metadata by name.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - name: unique queue identifier
 func (c *Client) GetQueue(ctx context.Context, name string) (*QueueInfo, error) {
 	return GetQueue(ctx, c.Conn, name)
 }
 
 // DeleteQueue deletes a queue and all its messages.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - name: unique queue identifier
-//
-// Returns: true if queue existed, false if not found
+// Returns true if the queue existed.
 func (c *Client) DeleteQueue(ctx context.Context, name string) (bool, error) {
 	return DeleteQueue(ctx, c.Conn, name)
 }
@@ -61,133 +44,70 @@ func (c *Client) ListQueues(ctx context.Context) ([]*QueueInfo, error) {
 	return ListQueues(ctx, c.Conn)
 }
 
-// Send enqueues a message to a queue.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - queue: target queue name
-// - payload: message payload (marshaled to JSON)
+// Send enqueues a message to the specified queue.
+// The payload is marshaled to JSON.
 func (c *Client) Send(ctx context.Context, queue string, payload any) error {
 	return Send(ctx, c.Conn, queue, payload)
 }
 
-// SendWithOpts enqueues a message with options.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - queue: target queue name
-// - payload: message payload (marshaled to JSON)
-// - opts: SendOpts with Topic, DeduplicationID, and DeliverAt
+// SendWithOpts enqueues a message with options for topic, deduplication ID,
+// and delivery time.
 func (c *Client) SendWithOpts(ctx context.Context, queue string, payload any, opts SendOpts) error {
 	return SendWithOpts(ctx, c.Conn, queue, payload, opts)
 }
 
-// Dispatch sends a message to all queues subscribed to a topic.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - topic: topic name
-// - payload: message payload (marshaled to JSON)
+// Dispatch sends a message to all queues subscribed to the specified topic.
 func (c *Client) Dispatch(ctx context.Context, topic string, payload any) error {
 	return Dispatch(ctx, c.Conn, topic, payload)
 }
 
-// DispatchWithOpts sends a message to topic-subscribed queues with options.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - topic: topic name
-// - payload: message payload (marshaled to JSON)
-// - opts: DispatchOpts with DeduplicationID and DeliverAt
+// DispatchWithOpts sends a message to topic-subscribed queues with options
+// for deduplication ID and delivery time.
 func (c *Client) DispatchWithOpts(ctx context.Context, topic string, payload any, opts DispatchOpts) error {
 	return DispatchWithOpts(ctx, c.Conn, topic, payload, opts)
 }
 
-// Read reads messages from a queue with a specified hide duration.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - queue: source queue name
-// - quantity: maximum number of messages to read
-// - hideFor: duration to hide messages from other readers
+// Read reads up to quantity messages from the queue, hiding them from other
+// readers for the specified duration.
 func (c *Client) Read(ctx context.Context, queue string, quantity int, hideFor time.Duration) ([]Message, error) {
 	return Read(ctx, c.Conn, queue, quantity, hideFor)
 }
 
 // ReadPoll reads messages from a queue with polling support.
-// Polls repeatedly until messages are available or pollFor timeout is reached.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - queue: source queue name
-// - quantity: maximum number of messages to read
-// - hideFor: duration to hide messages from other readers
-// - pollFor: total duration to poll before timing out
-// - pollInterval: interval between poll attempts
+// It polls repeatedly at the specified interval until messages are available
+// or the pollFor timeout is reached.
 func (c *Client) ReadPoll(ctx context.Context, queue string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]Message, error) {
 	return ReadPoll(ctx, c.Conn, queue, quantity, hideFor, pollFor, pollInterval)
 }
 
-// Hide hides a single message from being read.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - queue: queue name containing the message
-// - id: message ID
-// - hideFor: duration to hide message from readers
-//
-// Returns: true if message existed, false if not found
+// Hide hides a single message from being read for the specified duration.
+// Returns true if the message existed.
 func (c *Client) Hide(ctx context.Context, queue string, id int64, hideFor time.Duration) (bool, error) {
 	return Hide(ctx, c.Conn, queue, id, hideFor)
 }
 
-// HideMany hides multiple messages from being read.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - queue: queue name containing the messages
-// - ids: slice of message IDs
-// - hideFor: duration to hide messages from readers
+// HideMany hides multiple messages from being read for the specified duration.
 func (c *Client) HideMany(ctx context.Context, queue string, ids []int64, hideFor time.Duration) error {
 	return HideMany(ctx, c.Conn, queue, ids, hideFor)
 }
 
-// Delete deletes a single message from a queue.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - queue: queue name containing the message
-// - id: message ID
-//
-// Returns: true if message existed, false if not found
+// Delete deletes a single message from the queue.
+// Returns true if the message existed.
 func (c *Client) Delete(ctx context.Context, queue string, id int64) (bool, error) {
 	return Delete(ctx, c.Conn, queue, id)
 }
 
-// DeleteMany deletes multiple messages from a queue.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - queue: queue name containing the messages
-// - ids: slice of message IDs
+// DeleteMany deletes multiple messages from the queue.
 func (c *Client) DeleteMany(ctx context.Context, queue string, ids []int64) error {
 	return DeleteMany(ctx, c.Conn, queue, ids)
 }
 
 // CreateTask creates a new task definition.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - task: Task definition with name and handler
 func (c *Client) CreateTask(ctx context.Context, task *Task) error {
 	return CreateTask(ctx, c.Conn, task)
 }
 
 // GetTask retrieves task metadata by name.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - name: task name
 func (c *Client) GetTask(ctx context.Context, name string) (*TaskInfo, error) {
 	return GetTask(ctx, c.Conn, name)
 }
@@ -197,64 +117,34 @@ func (c *Client) ListTasks(ctx context.Context) ([]*TaskInfo, error) {
 	return ListTasks(ctx, c.Conn)
 }
 
-// RunTask enqueues a task execution and returns a handle for monitoring.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - name: task name
-// - input: task input (marshaled to JSON)
-//
-// Returns: handle to poll task status and retrieve output
+// RunTask enqueues a task execution and returns a handle for monitoring
+// progress and retrieving output.
 func (c *Client) RunTask(ctx context.Context, name string, input any) (*TaskHandle, error) {
 	return RunTask(ctx, c.Conn, name, input)
 }
 
-// RunTaskWithOpts enqueues a task with options.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - name: task name
-// - input: task input (marshaled to JSON)
-// - opts: RunTaskOpts with DeduplicationID for deduplication
-//
-// Returns: handle to poll task status and retrieve output
+// RunTaskWithOpts enqueues a task with options for deduplication and returns
+// a handle for monitoring.
 func (c *Client) RunTaskWithOpts(ctx context.Context, name string, input any, opts RunTaskOpts) (*TaskHandle, error) {
 	return RunTaskWithOpts(ctx, c.Conn, name, input, opts)
 }
 
-// GetTaskRun retrieves a specific task run result.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - name: task name
-// - id: task run ID
+// GetTaskRun retrieves a specific task run result by ID.
 func (c *Client) GetTaskRun(ctx context.Context, name string, id int64) (*TaskRunInfo, error) {
 	return GetTaskRun(ctx, c.Conn, name, id)
 }
 
-// ListTaskRuns returns recent task runs for a task.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - name: task name
+// ListTaskRuns returns recent task runs for the specified task.
 func (c *Client) ListTaskRuns(ctx context.Context, name string) ([]*TaskRunInfo, error) {
 	return ListTaskRuns(ctx, c.Conn, name)
 }
 
 // CreateFlow creates a new flow definition.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - flow: Flow definition with name and steps
 func (c *Client) CreateFlow(ctx context.Context, flow *Flow) error {
 	return CreateFlow(ctx, c.Conn, flow)
 }
 
 // GetFlow retrieves flow metadata by name.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - name: flow name
 func (c *Client) GetFlow(ctx context.Context, name string) (*FlowInfo, error) {
 	return GetFlow(ctx, c.Conn, name)
 }
@@ -265,72 +155,38 @@ func (c *Client) ListFlows(ctx context.Context) ([]*FlowInfo, error) {
 }
 
 // RunFlow enqueues a flow execution and returns a handle for monitoring.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - name: flow name
-// - input: flow input (marshaled to JSON)
-//
-// Returns: handle to poll flow status and retrieve combined step outputs
 func (c *Client) RunFlow(ctx context.Context, name string, input any) (*FlowHandle, error) {
 	return RunFlow(ctx, c.Conn, name, input)
 }
 
-// RunFlowWithOpts enqueues a flow with options.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - name: flow name
-// - input: flow input (marshaled to JSON)
-// - opts: RunFlowOpts with DeduplicationID for deduplication
-//
-// Returns: handle to poll flow status and retrieve combined step outputs
+// RunFlowWithOpts enqueues a flow with options for deduplication and returns
+// a handle for monitoring.
 func (c *Client) RunFlowWithOpts(ctx context.Context, name string, input any, opts RunFlowOpts) (*FlowHandle, error) {
 	return RunFlowWithOpts(ctx, c.Conn, name, input, opts)
 }
 
-// GetFlowRun retrieves a specific flow run result.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - name: flow name
-// - id: flow run ID
+// GetFlowRun retrieves a specific flow run result by ID.
 func (c *Client) GetFlowRun(ctx context.Context, name string, id int64) (*FlowRunInfo, error) {
 	return GetFlowRun(ctx, c.Conn, name, id)
 }
 
-// ListFlowRuns returns recent flow runs for a flow.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - name: flow name
+// ListFlowRuns returns recent flow runs for the specified flow.
 func (c *Client) ListFlowRuns(ctx context.Context, name string) ([]*FlowRunInfo, error) {
 	return ListFlowRuns(ctx, c.Conn, name)
 }
 
 // ListWorkers returns all registered workers.
-//
-// Parameters:
-// - ctx: context for operation cancellation
 func (c *Client) ListWorkers(ctx context.Context) ([]*WorkerInfo, error) {
 	return ListWorkers(ctx, c.Conn)
 }
 
 // NewWorker creates a new worker that processes task and flow executions.
-//
-// Parameters:
-// - ctx: context for operation cancellation
-// - opts: worker options (WithTask, WithFlow, WithScheduledTask, etc.)
-//
-// Returns: initialized worker ready to Start()
+// Configure the worker with options like WithTask, WithFlow, and WithScheduledTask.
 func (c *Client) NewWorker(ctx context.Context, opts ...WorkerOpt) (*Worker, error) {
 	return NewWorker(ctx, c.Conn, opts...)
 }
 
 // GC runs garbage collection to clean up expired and deleted entries.
-//
-// Parameters:
-// - ctx: context for operation cancellation
 func (c *Client) GC(ctx context.Context) error {
 	return GC(ctx, c.Conn)
 }
