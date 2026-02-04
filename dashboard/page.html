@@ -195,7 +195,7 @@
           elements.push({ data: { id: step.name, label: step.name } });
           if (step.depends_on) {
             step.depends_on.forEach((dep) => {
-              elements.push({ id: `${step.name}-${dep}`, data: { source: dep, target: step.name } });
+              elements.push({ id: `${step.name}-${dep.name}`, data: { source: dep.name, target: step.name } });
             });
           }
         });
@@ -226,11 +226,7 @@
                 'curve-style': 'bezier'
               }
             }
-          ],
-          layout: {
-            name: 'grid',
-            rows: 1
-          }
+          ]
         });
       });
     });
