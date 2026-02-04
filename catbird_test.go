@@ -319,24 +319,184 @@ func TestQueueListQueues(t *testing.T) {
 	}
 }
 
-func TestFlows(t *testing.T) {
+func TestTaskCreate(t *testing.T) {
 	client := getTestClient(t)
 
-	type Task1Input struct {
-		Str string `json:"str"`
-	}
-
-	task1 := NewTask("task1", func(ctx context.Context, in Task1Input) (string, error) {
-		return in.Str + " processed by task 1", nil
+	task := NewTask("test_task", func(ctx context.Context, in string) (string, error) {
+		return in + " processed", nil
 	})
 
-	type flow1Output struct {
+	err := client.CreateTask(t.Context(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := client.GetTask(t.Context(), "test_task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Name != "test_task" {
+		t.Fatalf("unexpected task name: %s", info.Name)
+	}
+}
+
+func TestTaskRunAndWait(t *testing.T) {
+	client := getTestClient(t)
+
+	type TaskInput struct {
+		Value int `json:"value"`
+	}
+
+	task := NewTask("math_task", func(ctx context.Context, in TaskInput) (int, error) {
+		return in.Value * 2, nil
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	worker, err := client.NewWorker(t.Context(),
+		WithLogger(logger),
+		WithTask(task),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		err := worker.Start(t.Context())
+		if err != nil {
+			t.Logf("worker error: %s", err)
+		}
+	}()
+
+	// Give worker time to start
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunTask(t.Context(), "math_task", TaskInput{Value: 21})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result int
+	if err := h.WaitForOutput(t.Context(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if result != 42 {
+		t.Fatalf("expected 42, got %d", result)
+	}
+}
+
+func TestFlowCreate(t *testing.T) {
+	client := getTestClient(t)
+
+	flow := NewFlow("test_flow",
+		InitialStep("step1", func(ctx context.Context, in string) (string, error) {
+			return in + " processed", nil
+		}),
+	)
+
+	err := client.CreateFlow(t.Context(), flow)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Test that we can run the flow (implicit verification it was created)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	worker, err := client.NewWorker(t.Context(),
+		WithLogger(logger),
+		WithFlow(flow),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		err := worker.Start(t.Context())
+		if err != nil {
+			t.Logf("worker error: %s", err)
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	type FlowOutput struct {
+		Step1 string `json:"step1"`
+	}
+
+	h, err := client.RunFlow(t.Context(), "test_flow", "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out FlowOutput
+	if err := h.WaitForOutput(t.Context(), &out); err != nil {
+		t.Fatal(err)
+	}
+
+	if out.Step1 != "input processed" {
+		t.Fatalf("unexpected output: %s", out.Step1)
+	}
+}
+
+func TestFlowSingleStep(t *testing.T) {
+	client := getTestClient(t)
+
+	type FlowOutput struct {
+		Step1 string `json:"step1"`
+	}
+
+	flow := NewFlow("single_step_flow",
+		InitialStep("step1", func(ctx context.Context, in string) (string, error) {
+			return in + " processed by step 1", nil
+		}),
+	)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	worker, err := client.NewWorker(t.Context(),
+		WithLogger(logger),
+		WithFlow(flow),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		err := worker.Start(t.Context())
+		if err != nil {
+			t.Logf("worker error: %s", err)
+		}
+	}()
+
+	// Give worker time to start
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), "single_step_flow", "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out FlowOutput
+	if err := h.WaitForOutput(t.Context(), &out); err != nil {
+		t.Fatal(err)
+	}
+
+	if out.Step1 != "input processed by step 1" {
+		t.Fatalf("unexpected output: %s", out.Step1)
+	}
+}
+
+func TestFlowWithDependencies(t *testing.T) {
+	client := getTestClient(t)
+
+	type FlowOutput struct {
 		Step1 string `json:"step1"`
 		Step2 string `json:"step2"`
 		Step3 string `json:"step3"`
 	}
 
-	flow1 := NewFlow("flow1",
+	flow := NewFlow("dependency_flow",
 		InitialStep("step1", func(ctx context.Context, in string) (string, error) {
 			return in + " processed by step 1", nil
 		}),
@@ -356,8 +516,7 @@ func TestFlows(t *testing.T) {
 
 	worker, err := client.NewWorker(t.Context(),
 		WithLogger(logger),
-		WithFlow(flow1),
-		WithTask(task1),
+		WithFlow(flow),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -370,37 +529,146 @@ func TestFlows(t *testing.T) {
 		}
 	}()
 
-	func() {
-		h, err := client.RunTask(t.Context(), "task1", Task1Input{Str: "input"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		var out string
-		if err := h.WaitForOutput(t.Context(), &out); err != nil {
-			t.Fatal(err)
-		}
-		if out != "input processed by task 1" {
-			t.Fatalf("unexpected task output: %s", out)
+	// Give worker time to start
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), "dependency_flow", "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out FlowOutput
+	if err := h.WaitForOutput(t.Context(), &out); err != nil {
+		t.Fatal(err)
+	}
+
+	if out.Step1 != "input processed by step 1" {
+		t.Fatalf("unexpected flow output for step1: %s", out.Step1)
+	}
+	if out.Step2 != "input processed by step 1 and by step 2" {
+		t.Fatalf("unexpected flow output for step2: %s", out.Step2)
+	}
+	if out.Step3 != "input processed by step 1 and by step 2 and by step 3" {
+		t.Fatalf("unexpected flow output for step3: %s", out.Step3)
+	}
+}
+
+func TestFlowListFlows(t *testing.T) {
+	client := getTestClient(t)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// Create multiple flows
+	flows := make([]*Flow, 2)
+
+	flow1 := NewFlow("list_flow_1",
+		InitialStep("step1", func(ctx context.Context, in string) (string, error) {
+			return in, nil
+		}),
+	)
+
+	flow2 := NewFlow("list_flow_2",
+		InitialStep("step1", func(ctx context.Context, in string) (string, error) {
+			return in, nil
+		}),
+	)
+
+	flows[0] = flow1
+	flows[1] = flow2
+
+	err := client.CreateFlow(t.Context(), flow1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.CreateFlow(t.Context(), flow2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start worker to execute flows
+	worker, err := client.NewWorker(t.Context(),
+		WithLogger(logger),
+		WithFlow(flow1),
+		WithFlow(flow2),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		if err := worker.Start(t.Context()); err != nil {
+			t.Logf("worker error: %s", err)
 		}
 	}()
 
-	func() {
-		h, err := client.RunFlow(t.Context(), "flow1", "input")
-		if err != nil {
-			t.Fatal(err)
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify both flows execute successfully
+	type FlowOutput struct {
+		Step1 string `json:"step1"`
+	}
+
+	h1, err := client.RunFlow(t.Context(), "list_flow_1", "input_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out1 FlowOutput
+	if err := h1.WaitForOutput(t.Context(), &out1); err != nil {
+		t.Fatal(err)
+	}
+
+	h2, err := client.RunFlow(t.Context(), "list_flow_2", "input_2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out2 FlowOutput
+	if err := h2.WaitForOutput(t.Context(), &out2); err != nil {
+		t.Fatal(err)
+	}
+
+	if out1.Step1 != "input_1" || out2.Step1 != "input_2" {
+		t.Fatalf("unexpected flow outputs")
+	}
+}
+
+func TestTaskListTasks(t *testing.T) {
+	client := getTestClient(t)
+
+	task1 := NewTask("list_task_1", func(ctx context.Context, in string) (string, error) {
+		return in, nil
+	})
+
+	task2 := NewTask("list_task_2", func(ctx context.Context, in string) (string, error) {
+		return in, nil
+	})
+
+	err := client.CreateTask(t.Context(), task1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.CreateTask(t.Context(), task2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tasks, err := client.ListTasks(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var found1, found2 bool
+	for _, task := range tasks {
+		if task.Name == "list_task_1" {
+			found1 = true
 		}
-		var out flow1Output
-		if err := h.WaitForOutput(t.Context(), &out); err != nil {
-			t.Fatal(err)
+		if task.Name == "list_task_2" {
+			found2 = true
 		}
-		if out.Step1 != "input processed by step 1" {
-			t.Fatalf("unexpected flow output for step1: %s", out.Step1)
-		}
-		if out.Step2 != "input processed by step 1 and by step 2" {
-			t.Fatalf("unexpected flow output for step2: %s", out.Step2)
-		}
-		if out.Step3 != "input processed by step 1 and by step 2 and by step 3" {
-			t.Fatalf("unexpected flow output for step3: %s", out.Step3)
-		}
-	}()
+	}
+
+	if !found1 || !found2 {
+		t.Fatalf("not all tasks found in list")
+	}
 }

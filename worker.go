@@ -484,7 +484,7 @@ func (m taskMessage) getID() int64 { return m.ID }
 func readTasks(ctx context.Context, conn Conn, name string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]taskMessage, error) {
 	q := `SELECT * FROM cb_read_tasks(name => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
 
-	rows, err := conn.Query(ctx, q, name, quantity, hideFor.Seconds(), pollFor.Seconds(), pollInterval.Milliseconds())
+	rows, err := conn.Query(ctx, q, name, quantity, hideFor.Milliseconds(), pollFor.Milliseconds(), pollInterval.Milliseconds())
 	if err != nil {
 		return nil, fmt.Errorf("worker: read tasks: %w", err)
 	}
@@ -495,7 +495,7 @@ func readTasks(ctx context.Context, conn Conn, name string, quantity int, hideFo
 func readSteps(ctx context.Context, conn Conn, flowName, stepName string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]stepMessage, error) {
 	q := `SELECT * FROM cb_read_steps(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
 
-	rows, err := conn.Query(ctx, q, flowName, stepName, quantity, hideFor.Seconds(), pollFor.Seconds(), pollInterval.Milliseconds())
+	rows, err := conn.Query(ctx, q, flowName, stepName, quantity, hideFor.Milliseconds(), pollFor.Milliseconds(), pollInterval.Milliseconds())
 	if err != nil {
 		return nil, fmt.Errorf("worker: read steps: %w", err)
 	}
@@ -505,13 +505,13 @@ func readSteps(ctx context.Context, conn Conn, flowName, stepName string, quanti
 
 func hideTasks(ctx context.Context, conn Conn, name string, ids []int64, hideFor time.Duration) error {
 	q := `SELECT * FROM cb_hide_tasks(name => $1, ids => $2, hide_for => $3);`
-	_, err := conn.Exec(ctx, q, name, ids, hideFor.Seconds())
+	_, err := conn.Exec(ctx, q, name, ids, hideFor.Milliseconds())
 	return fmt.Errorf("worker: hide tasks: %w", err)
 }
 
 func hideSteps(ctx context.Context, conn Conn, flowName, stepName string, ids []int64, hideFor time.Duration) error {
 	q := `SELECT * FROM cb_hide_steps(flow_name => $1, step_name => $2, ids => $3, hide_for => $4);`
-	_, err := conn.Exec(ctx, q, flowName, stepName, ids, hideFor.Seconds())
+	_, err := conn.Exec(ctx, q, flowName, stepName, ids, hideFor.Milliseconds())
 	return fmt.Errorf("worker: hide steps: %w", err)
 }
 

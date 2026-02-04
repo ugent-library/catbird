@@ -763,12 +763,12 @@ func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 }
 
 func GetFlow(ctx context.Context, conn Conn, name string) (*FlowInfo, error) {
-	q := `SELECT name, steps, created_at FROM cb_flow_info WHERE name = $1;`
+	q := `SELECT * FROM cb_flow_info() WHERE name = $1;`
 	return scanFlow(conn.QueryRow(ctx, q, name))
 }
 
 func ListFlows(ctx context.Context, conn Conn) ([]*FlowInfo, error) {
-	q := `SELECT name, steps, created_at FROM cb_flow_info;`
+	q := `SELECT * FROM cb_flow_info();`
 	rows, err := conn.Query(ctx, q)
 	if err != nil {
 		return nil, err

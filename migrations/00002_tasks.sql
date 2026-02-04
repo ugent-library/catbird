@@ -186,6 +186,12 @@ DECLARE
     _q text;
     _t_table text := cb_table_name(cb_read_tasks.name, 't');
 BEGIN
+    IF cb_read_tasks.quantity <= 0 THEN
+        RAISE EXCEPTION 'cb: quantity must be greater than 0';
+    END IF;
+    IF cb_read_tasks.hide_for <= 0 THEN
+        RAISE EXCEPTION 'cb: hide_for must be greater than 0';
+    END IF;
     IF cb_read_tasks.poll_for <= 0 THEN
         RAISE EXCEPTION 'cb: poll_for must be greater than 0';
     END IF;
@@ -193,13 +199,13 @@ BEGIN
         RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
     END IF;
 
-    _sleep_for := cb_read_tasks.poll_interval::numeric / 1000;
+    _sleep_for := cb_read_tasks.poll_interval / 1000.0;
 
-    IF _sleep_for >= cb_read_tasks.poll_for THEN
+    IF _sleep_for >= cb_read_tasks.poll_for / 1000.0 THEN
         RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
     END IF;
 
-    _stop_at := clock_timestamp() + make_interval(secs => cb_read_tasks.poll_for);
+    _stop_at := clock_timestamp() + make_interval(secs => cb_read_tasks.poll_for / 1000.0);
 
     _q := FORMAT(
         $QUERY$
@@ -233,7 +239,7 @@ BEGIN
       END IF;
 
       FOR _m IN
-        EXECUTE _q USING cb_read_tasks.quantity, make_interval(secs => cb_read_tasks.hide_for)
+        EXECUTE _q USING cb_read_tasks.quantity, make_interval(secs => cb_read_tasks.hide_for / 1000.0)
       LOOP
         RETURN NEXT _m;
       END LOOP;
@@ -254,6 +260,10 @@ LANGUAGE plpgsql AS $$
 DECLARE
     _t_table text := cb_table_name(cb_hide_tasks.name, 't');
 BEGIN
+    IF cb_hide_tasks.hide_for <= 0 THEN
+        RAISE EXCEPTION 'cb: hide_for must be greater than 0';
+    END IF;
+
     EXECUTE format(
       $QUERY$
       UPDATE %I
@@ -263,7 +273,7 @@ BEGIN
       _t_table
     )
     USING cb_hide_tasks.ids,
-          make_interval(secs => cb_hide_task.hide_for);
+          make_interval(secs => cb_hide_tasks.hide_for / 1000.0);
 END;
 $$;
 -- +goose statementend
@@ -605,6 +615,12 @@ DECLARE
     _f_table text := cb_table_name(cb_read_steps.flow_name, 'f');
     _s_table text := cb_table_name(cb_read_steps.flow_name, 's');
 BEGIN
+    IF cb_read_steps.quantity <= 0 THEN
+        RAISE EXCEPTION 'cb: quantity must be greater than 0';
+    END IF;
+    IF cb_read_steps.hide_for <= 0 THEN
+        RAISE EXCEPTION 'cb: hide_for must be greater than 0';
+    END IF;
     IF cb_read_steps.poll_for <= 0 THEN
         RAISE EXCEPTION 'cb: poll_for must be greater than 0';
     END IF;
@@ -612,13 +628,13 @@ BEGIN
         RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
     END IF;
 
-    _sleep_for := cb_read_steps.poll_interval::numeric / 1000;
+    _sleep_for := cb_read_steps.poll_interval / 1000.0;
 
-    IF _sleep_for >= cb_read_steps.poll_for THEN
+    IF _sleep_for >= cb_read_steps.poll_for / 1000.0 THEN
         RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
     END IF;
 
-    _stop_at := clock_timestamp() + make_interval(secs => cb_read_steps.poll_for);
+    _stop_at := clock_timestamp() + make_interval(secs => cb_read_steps.poll_for / 1000.0);
 
     _q := FORMAT(
         $QUERY$
@@ -664,7 +680,7 @@ BEGIN
       END IF;
 
       FOR _m IN
-        EXECUTE _q USING cb_read_steps.step_name, cb_read_steps.quantity, make_interval(secs => cb_read_steps.hide_for), cb_read_steps.flow_name
+        EXECUTE _q USING cb_read_steps.step_name, cb_read_steps.quantity, make_interval(secs => cb_read_steps.hide_for / 1000.0), cb_read_steps.flow_name
       LOOP
         RETURN NEXT _m;
       END LOOP;
@@ -685,6 +701,10 @@ LANGUAGE plpgsql AS $$
 DECLARE
     _s_table text := cb_table_name(cb_hide_steps.flow_name, 's');
 BEGIN
+    IF cb_hide_steps.hide_for <= 0 THEN
+        RAISE EXCEPTION 'cb: hide_for must be greater than 0';
+    END IF;
+
     EXECUTE format(
       $QUERY$
       UPDATE %I
@@ -695,7 +715,7 @@ BEGIN
       _s_table
     )
     USING cb_hide_steps.ids,
-          make_interval(secs => cb_hide_steps.hide_for),
+          make_interval(secs => cb_hide_steps.hide_for / 1000.0),
           cb_hide_steps.step_name;
 END;
 $$;
