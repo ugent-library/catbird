@@ -264,9 +264,9 @@ SELECT * FROM cb_run_task(name => 'send_email', input => '{"to": "user@example.c
 ### Workflows
 
 ```sql
--- Create a flow with multiple steps and dependencies
+-- Create a flow definition
 SELECT cb_create_flow(name => 'order_processing', steps => '[
-  {"name": "validate", "depends_on": null},
+  {"name": "validate"},
   {"name": "charge", "depends_on": [{"name": "validate"}]},
   {"name": "ship", "depends_on": [{"name": "charge"}]}
 ]'::jsonb);
