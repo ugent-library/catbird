@@ -556,7 +556,6 @@ type StepHandlerInfo struct {
 }
 
 type QueueOpts struct {
-	Topics    []string
 	ExpiresAt time.Time
 	Unlogged  bool
 }
