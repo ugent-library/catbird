@@ -3,7 +3,7 @@
   <h1>Queues</h1>
   <div class="btn-toolbar mb-2 mb-md-0">
     <div class="btn-group me-2">
-      <button type="button" class="btn btn-sm btn-outline-secondary">
+      <button type="button" class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#create-queue-modal">
         <span data-feather="plus"></span>
         Create queue
       </button>
@@ -41,6 +41,11 @@
     {{ end }}
   </tbody>
 </table>
+
+<!-- Create Queue Modal -->
+<div id="create-queue-modal" class="modal" tabindex="-1" hx-get="/queue/create-form" hx-trigger="show.bs.modal" hx-target="#create-queue-modal" hx-swap="innerHTML">
+  <div id="create-queue-modal-content"></div>
+</div>
 
 <!-- Send Message Modal -->
 <div id="send-message-modal" class="modal" tabindex="-1" hx-get="/queue/send-form" hx-trigger="show.bs.modal" hx-target="#send-message-modal" hx-swap="innerHTML">
@@ -92,7 +97,7 @@
       Message sent successfully!
     </div>
     <div class="modal-footer">
-      <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">OK</button>
+      <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" hx-get="/queues" hx-target="main" hx-swap="innerHTML" hx-push-url="true">OK</button>
     </div>
   </div>
 </div>
@@ -148,4 +153,61 @@
     </div>
   </div>
 </form>
+{{ end }}
+
+{{ define "create_queue_form" }}
+<form id="create-queue-form" hx-post="/queue/create" hx-target="#create-queue-modal" hx-swap="innerHTML">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Create Queue</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3">
+          <label for="queue-name" class="form-label">Queue Name</label>
+          <input type="text" class="form-control" id="queue-name" name="name" placeholder="my-queue" required>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create</button>
+      </div>
+    </div>
+  </div>
+</form>
+{{ end }}
+
+{{ define "create_queue_success" }}
+<div class="modal-dialog">
+  <div class="modal-content">
+    <div class="modal-header text-bg-success">
+      <h5 class="modal-title">Success</h5>
+      <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+    </div>
+    <div class="modal-body">
+      Queue created successfully!
+    </div>
+    <div class="modal-footer">
+      <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" hx-get="/queues" hx-target="main" hx-swap="innerHTML" hx-push-url="true">OK</button>
+    </div>
+  </div>
+</div>
+{{ end }}
+
+{{ define "create_queue_error" }}
+<div class="modal-dialog">
+  <div class="modal-content">
+    <div class="modal-header text-bg-danger">
+      <h5 class="modal-title">Error</h5>
+      <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+    </div>
+    <div class="modal-body">
+      {{ .Error }}
+    </div>
+    <div class="modal-footer">
+      <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">OK</button>
+    </div>
+  </div>
+</div>
 {{ end }}

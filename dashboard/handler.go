@@ -14,7 +14,7 @@ import (
 	"github.com/ugent-library/catbird"
 )
 
-//go:embed *.html
+//go:embed *.html *.css
 var templatesFS embed.FS
 
 type App struct {
@@ -81,6 +81,8 @@ func (a *App) Handler() http.Handler {
 
 	mux.HandleFunc("GET /", a.handleIndex)
 	mux.HandleFunc("GET /queues", a.handleQueues)
+	mux.HandleFunc("GET /queue/create-form", a.handleCreateQueueForm)
+	mux.HandleFunc("POST /queue/create", a.handleCreateQueue)
 	mux.HandleFunc("GET /queue/send-form", a.handleSendMessageForm)
 	mux.HandleFunc("POST /queue/send", a.handleSendMessage)
 	mux.HandleFunc("GET /tasks", a.handleTasks)
@@ -94,6 +96,11 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /flow/{flow_name}/form", a.handleFlowStartRunForm)
 	mux.HandleFunc("POST /flow/{flow_name}/run", a.handleStartFlowRun)
 	mux.HandleFunc("GET /workers", a.handleWorkers)
+	mux.HandleFunc("GET /dark.css", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/css")
+		css, _ := templatesFS.ReadFile("dark.css")
+		w.Write(css)
+	})
 
 	return mux
 }
@@ -186,6 +193,45 @@ func (a *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.queues.ExecuteTemplate(w, "send_message_success", nil)
+}
+
+func (a *App) handleCreateQueueForm(w http.ResponseWriter, r *http.Request) {
+	if err := a.queues.ExecuteTemplate(w, "create_queue_form", nil); err != nil {
+		a.handleError(w, r, err)
+	}
+}
+
+func (a *App) handleCreateQueue(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		a.queues.ExecuteTemplate(w, "create_queue_error", struct {
+			Error string
+		}{
+			Error: err.Error(),
+		})
+		return
+	}
+
+	name := r.FormValue("name")
+	if name == "" {
+		a.queues.ExecuteTemplate(w, "create_queue_error", struct {
+			Error string
+		}{
+			Error: "queue name is required",
+		})
+		return
+	}
+
+	err := a.client.CreateQueue(r.Context(), name)
+	if err != nil {
+		a.queues.ExecuteTemplate(w, "create_queue_error", struct {
+			Error string
+		}{
+			Error: err.Error(),
+		})
+		return
+	}
+
+	a.queues.ExecuteTemplate(w, "create_queue_success", nil)
 }
 
 func (a *App) handleTasks(w http.ResponseWriter, r *http.Request) {
