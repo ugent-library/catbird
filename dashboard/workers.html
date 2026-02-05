@@ -3,10 +3,10 @@
   <h1>Workers</h1>
 </div>
 
-{{ template "workers-table" . }}
+{{ template "workers_table" . }}
 {{ end }}
 
-{{ define "workers-table" }}
+{{ define "workers_table" }}
 <div id="workers-table" hx-get="/workers" hx-trigger="every 2s" hx-swap="outerHTML">
 <table class="table">
   <tbody>
@@ -21,10 +21,10 @@
       <th>{{ .ID }}</th>
       <td>
         {{ range .TaskHandlers}}
-        <span class="badge rounded-pill text-bg-info">{{ .TaskName }}</span>
+        <span class="badge text-bg-info">{{ .TaskName }}</span>
         {{ end }}
         {{ range .StepHandlers}}
-        <span class="badge rounded-pill text-bg-info">{{ .FlowName }}/{{ .StepName }}</span>
+        <span class="badge text-bg-info">{{ .FlowName }}/{{ .StepName }}</span>
         {{ end }}
       </td>
       <td>{{ formatTime .StartedAt }}</td>

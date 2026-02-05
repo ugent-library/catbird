@@ -135,7 +135,11 @@ func (a *App) handleQueues(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		a.handleError(w, r, err)
+		a.queues.ExecuteTemplate(w, "send_message_error", struct {
+			Error string
+		}{
+			Error: err.Error(),
+		})
 		return
 	}
 
@@ -154,12 +158,15 @@ func (a *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 
 	err := a.client.SendWithOpts(r.Context(), queue, json.RawMessage(payload), opts)
 	if err != nil {
-		a.handleError(w, r, err)
+		a.queues.ExecuteTemplate(w, "send_message_error", struct {
+			Error string
+		}{
+			Error: err.Error(),
+		})
 		return
 	}
 
-	// Return empty response or success message
-	w.WriteHeader(http.StatusOK)
+	a.queues.ExecuteTemplate(w, "send_message_success", nil)
 }
 
 func (a *App) handleTasks(w http.ResponseWriter, r *http.Request) {
@@ -247,7 +254,7 @@ func (a *App) handleWorkers(w http.ResponseWriter, r *http.Request) {
 
 	// Check if this is an HTMX request for the table partial
 	if r.Header.Get("HX-Request") == "true" {
-		if err := a.workers.ExecuteTemplate(w, "workers-table", struct {
+		if err := a.workers.ExecuteTemplate(w, "workers_table", struct {
 			Workers []*catbird.WorkerInfo
 		}{
 			Workers: workers,
@@ -280,7 +287,7 @@ func (a *App) handleTaskRuns(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Render just the task runs table partial
-	if err := a.task.ExecuteTemplate(w, "task-runs-table", struct {
+	if err := a.task.ExecuteTemplate(w, "task_runs_table", struct {
 		Task     *catbird.TaskInfo
 		TaskRuns []*catbird.TaskRunInfo
 	}{
@@ -323,7 +330,7 @@ func (a *App) handleStartTaskRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := a.task.ExecuteTemplate(w, "task-runs-table", struct {
+	if err := a.task.ExecuteTemplate(w, "task_runs_table", struct {
 		Task     *catbird.TaskInfo
 		TaskRuns []*catbird.TaskRunInfo
 	}{
@@ -350,7 +357,7 @@ func (a *App) handleFlowRuns(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Render just the flow runs table partial
-	if err := a.flow.ExecuteTemplate(w, "flow-runs-table", struct {
+	if err := a.flow.ExecuteTemplate(w, "flow_runs_table", struct {
 		Flow     *catbird.FlowInfo
 		FlowRuns []*catbird.FlowRunInfo
 	}{
@@ -393,7 +400,7 @@ func (a *App) handleStartFlowRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := a.flow.ExecuteTemplate(w, "flow-runs-table", struct {
+	if err := a.flow.ExecuteTemplate(w, "flow_runs_table", struct {
 		Flow     *catbird.FlowInfo
 		FlowRuns []*catbird.FlowRunInfo
 	}{

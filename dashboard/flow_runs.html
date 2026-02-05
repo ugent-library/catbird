@@ -1,4 +1,4 @@
-{{ define "flow-runs-table" }}
+{{ define "flow_runs_table" }}
 <div id="flow-runs-table" hx-get="/flow/{{ .Flow.Name }}/runs" hx-trigger="every 2s [!document.querySelector('.modal.show')]" hx-swap="outerHTML">
 <table class="table">
   <tbody>
@@ -18,11 +18,11 @@
       </td>
       <td>
         {{ if eq .Status "started" }}
-        <span class="badge rounded-pill text-bg-info">started</span>
+        <span class="badge text-bg-info">started</span>
         {{ else if eq .Status "completed" }}
-        <span class="badge rounded-pill text-bg-success">completed</span>
+        <span class="badge text-bg-success">completed</span>
         {{ else if eq .Status "failed" }}
-        <span class="badge rounded-pill text-bg-danger">failed</span>
+        <span class="badge text-bg-danger">failed</span>
         {{ end }}
       </td>
       <td>{{ formatTime .StartedAt }}</td>
