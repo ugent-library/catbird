@@ -197,22 +197,16 @@
   <tbody>
     <tr>
       <th scope="col">Name</th>
-      <th scope="col">Topics</th>
       <th scope="col">Unlogged</th>
       <th scope="col">Created</th>
-      <th scope="col">Delete at</th>
+      <th scope="col">Expires at</th>
     </tr>
     {{ range .Queues }}
     <tr>
       <th>{{ .Name }}</th>
-      <td>
-        {{ range .Topics }}
-        <span class="badge badge-pill badge-info">{{ . }}</span>
-        {{ end }}
-      </td>
       <td>{{ if .Unlogged }}Unlogged{{ end }}</td>
       <td>{{ formatTime .CreatedAt }}</td>
-      <td>{{ formatTime .DeleteAt }}</td>
+      <td>{{ formatTime .ExpiresAt }}</td>
     </tr>
     {{ end }}
   </tbody>
