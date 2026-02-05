@@ -283,10 +283,14 @@ RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
     _t_table text := cb_table_name(cb_hide_tasks.name, 't');
+    _jitter_factor numeric := 0.1;
+    _jittered_delay numeric;
 BEGIN
     IF cb_hide_tasks.hide_for <= 0 THEN
         RAISE EXCEPTION 'cb: hide_for must be greater than 0';
     END IF;
+
+    _jittered_delay := cb_hide_tasks.hide_for * (1 + (random() * 2 - 1) * _jitter_factor);
 
     EXECUTE format(
       $QUERY$
@@ -297,7 +301,7 @@ BEGIN
       _t_table
     )
     USING cb_hide_tasks.ids,
-          make_interval(secs => cb_hide_tasks.hide_for / 1000.0);
+          make_interval(secs => _jittered_delay / 1000.0);
 END;
 $$;
 -- +goose statementend
@@ -778,10 +782,14 @@ RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
     _s_table text := cb_table_name(cb_hide_steps.flow_name, 's');
+    _jitter_factor numeric := 0.1;
+    _jittered_delay numeric;
 BEGIN
     IF cb_hide_steps.hide_for <= 0 THEN
         RAISE EXCEPTION 'cb: hide_for must be greater than 0';
     END IF;
+
+    _jittered_delay := cb_hide_steps.hide_for * (1 + (random() * 2 - 1) * _jitter_factor);
 
     EXECUTE format(
       $QUERY$
@@ -793,7 +801,7 @@ BEGIN
       _s_table
     )
     USING cb_hide_steps.ids,
-          make_interval(secs => cb_hide_steps.hide_for / 1000.0),
+          make_interval(secs => _jittered_delay / 1000.0),
           cb_hide_steps.step_name;
 END;
 $$;

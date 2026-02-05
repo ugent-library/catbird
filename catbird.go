@@ -52,7 +52,6 @@ type handlerOpts struct {
 	timeout      time.Duration
 	retries      int
 	retryDelay   time.Duration
-	jitterFactor float64
 }
 
 // HandlerOpt is an option for configuring task and flow step handlers
@@ -144,7 +143,6 @@ func NewTask[In, Out any](name string, fn func(context.Context, In) (Out, error)
 		handlerOpts: handlerOpts{
 			concurrency:  1,
 			batchSize:    10,
-			jitterFactor: 0.1,
 		},
 		fn: func(ctx context.Context, b []byte) ([]byte, error) {
 			var in In
@@ -460,7 +458,6 @@ func newStepHandler(fn func(context.Context, stepMessage) ([]byte, error), opts 
 		handlerOpts: handlerOpts{
 			concurrency:  1,
 			batchSize:    10,
-			jitterFactor: 0.1,
 		},
 		fn: fn,
 	}

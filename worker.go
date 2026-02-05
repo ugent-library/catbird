@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -205,13 +204,13 @@ func (w *Worker) Start(ctx context.Context) error {
 		if h := t.handler; h != nil {
 			taskHandlers = append(taskHandlers, &TaskHandlerInfo{TaskName: t.Name})
 
-			msgHider := newTaskHider(w.conn, w.logger, t.Name, h.jitterFactor)
+			msgHider := newTaskHider(w.conn, w.logger, t.Name)
 
 			startHandlerWorkers(
 				ctx,
 				&wg,
 				func() ([]taskMessage, error) {
-					msgs, err := readTasks(ctx, w.conn, t.Name, h.batchSize, withJitter(10*time.Minute, h.jitterFactor), 10*time.Second, 100*time.Millisecond)
+					msgs, err := readTasks(ctx, w.conn, t.Name, h.batchSize, 10*time.Minute, 10*time.Second, 100*time.Millisecond)
 					if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 						w.logger.ErrorContext(ctx, "worker: cannot read messages", "handler", t.Name, "error", err)
 					}
@@ -231,13 +230,13 @@ func (w *Worker) Start(ctx context.Context) error {
 			if h := s.handler; h != nil {
 				stepHandlers = append(stepHandlers, &StepHandlerInfo{FlowName: f.Name, StepName: s.Name})
 
-				msgHider := newStepHider(w.conn, w.logger, f.Name, s.Name, h.jitterFactor)
+				msgHider := newStepHider(w.conn, w.logger, f.Name, s.Name)
 
 				startHandlerWorkers(
 					ctx,
 					&wg,
 					func() ([]stepMessage, error) {
-						msgs, err := readSteps(ctx, w.conn, f.Name, s.Name, h.batchSize, withJitter(10*time.Minute, h.jitterFactor), 10*time.Second, 100*time.Millisecond)
+						msgs, err := readSteps(ctx, w.conn, f.Name, s.Name, h.batchSize, 10*time.Minute, 10*time.Second, 100*time.Millisecond)
 						if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 							w.logger.ErrorContext(ctx, "worker: cannot read steps", "flow", f.Name, "step", s.Name, "error", err)
 						}
@@ -371,7 +370,7 @@ func (w *Worker) handleTask(ctx context.Context, t *Task, msg taskMessage, stopH
 				w.logger.ErrorContext(ctx, "worker: cannot mark task as failed", "task", t.Name, "error", err)
 			}
 		} else if h.retryDelay > 0 {
-			if err := hideTasks(ctx, w.conn, t.Name, []int64{msg.ID}, withJitter(h.retryDelay, h.jitterFactor)); err != nil {
+			if err := hideTasks(ctx, w.conn, t.Name, []int64{msg.ID}, h.retryDelay); err != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot delay next run", "task", t.Name, "error", err)
 			}
 		}
@@ -428,7 +427,7 @@ func (w *Worker) handleStep(ctx context.Context, flowName string, s *Step, msg s
 				w.logger.ErrorContext(ctx, "worker: cannot mark step as failed", "flow", flowName, "step", s.Name, "error", err)
 			}
 		} else if h.retryDelay > 0 {
-			if err := hideSteps(ctx, w.conn, flowName, s.Name, []int64{msg.ID}, withJitter(h.retryDelay, h.jitterFactor)); err != nil {
+			if err := hideSteps(ctx, w.conn, flowName, s.Name, []int64{msg.ID}, h.retryDelay); err != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot delay next run", "flow", flowName, "step", s.Name, "error", err)
 			}
 		}
@@ -495,13 +494,6 @@ func startHandlerWorkers[T handlerMessage](
 	}
 }
 
-func withJitter(delay time.Duration, jitterFactor float64) time.Duration {
-	if jitterFactor == 0 {
-		return delay
-	}
-	randomFactor := 1 + (1-rand.Float64()*2)*jitterFactor
-	return time.Duration(float64(delay) * randomFactor)
-}
 
 type taskMessage struct {
 	ID              int64           `json:"id"`
@@ -547,16 +539,15 @@ func hideSteps(ctx context.Context, conn Conn, flowName, stepName string, ids []
 }
 
 type messageHider[T handlerMessage] struct {
-	conn         Conn
-	logger       *slog.Logger
-	ids          map[int64]struct{}
-	mu           sync.Mutex
-	hideFn       func(context.Context, Conn, []int64, time.Duration) error
-	logAttrs     []any
-	jitterFactor float64
+	conn     Conn
+	logger   *slog.Logger
+	ids      map[int64]struct{}
+	mu       sync.Mutex
+	hideFn   func(context.Context, Conn, []int64, time.Duration) error
+	logAttrs []any
 }
 
-func newTaskHider(conn Conn, logger *slog.Logger, name string, jitterFactor float64) *messageHider[taskMessage] {
+func newTaskHider(conn Conn, logger *slog.Logger, name string) *messageHider[taskMessage] {
 	return &messageHider[taskMessage]{
 		conn:   conn,
 		logger: logger,
@@ -564,12 +555,11 @@ func newTaskHider(conn Conn, logger *slog.Logger, name string, jitterFactor floa
 		hideFn: func(ctx context.Context, conn Conn, ids []int64, hideFor time.Duration) error {
 			return hideTasks(ctx, conn, name, ids, hideFor)
 		},
-		logAttrs:     []any{"name", name},
-		jitterFactor: jitterFactor,
+		logAttrs: []any{"name", name},
 	}
 }
 
-func newStepHider(conn Conn, logger *slog.Logger, flowName, stepName string, jitterFactor float64) *messageHider[stepMessage] {
+func newStepHider(conn Conn, logger *slog.Logger, flowName, stepName string) *messageHider[stepMessage] {
 	return &messageHider[stepMessage]{
 		conn:   conn,
 		logger: logger,
@@ -577,8 +567,7 @@ func newStepHider(conn Conn, logger *slog.Logger, flowName, stepName string, jit
 		hideFn: func(ctx context.Context, conn Conn, ids []int64, hideFor time.Duration) error {
 			return hideSteps(ctx, conn, flowName, stepName, ids, hideFor)
 		},
-		logAttrs:     []any{"flow", flowName, "step", stepName},
-		jitterFactor: jitterFactor,
+		logAttrs: []any{"flow", flowName, "step", stepName},
 	}
 }
 
@@ -604,7 +593,7 @@ func (mh *messageHider[T]) start(ctx context.Context) {
 			}
 			mh.mu.Unlock()
 
-			if err := mh.hideFn(ctx, mh.conn, ids, withJitter(hideFor, mh.jitterFactor)); err != nil {
+			if err := mh.hideFn(ctx, mh.conn, ids, hideFor); err != nil {
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 					attrs := append(mh.logAttrs, "error", err)
 					mh.logger.ErrorContext(ctx, "worker: cannot hide messages", attrs...)

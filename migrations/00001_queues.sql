@@ -405,10 +405,14 @@ LANGUAGE plpgsql AS $$
 DECLARE
     _q_table text := cb_table_name(cb_hide.queue, 'q');
     _res boolean;
+    _jitter_factor numeric := 0.1;
+    _jittered_delay numeric;
 BEGIN
     IF cb_hide.hide_for <= 0 THEN
         RAISE EXCEPTION 'cb: hide_for must be greater than 0';
     END IF;
+
+    _jittered_delay := cb_hide.hide_for * (1 + (random() * 2 - 1) * _jitter_factor);
 
     EXECUTE format(
         $QUERY$
@@ -419,7 +423,7 @@ BEGIN
         $QUERY$,
         _q_table
     )
-    USING cb_hide.id, make_interval(secs => cb_hide.hide_for / 1000.0)
+    USING cb_hide.id, make_interval(secs => _jittered_delay / 1000.0)
     INTO _res;
     RETURN coalesce(_res, false);
 END;
@@ -442,10 +446,14 @@ RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
     _q_table text := cb_table_name(cb_hide.queue, 'q');
+    _jitter_factor numeric := 0.1;
+    _jittered_delay numeric;
 BEGIN
     IF cb_hide.hide_for <= 0 THEN
         RAISE EXCEPTION 'cb: hide_for must be greater than 0';
     END IF;
+
+    _jittered_delay := cb_hide.hide_for * (1 + (random() * 2 - 1) * _jitter_factor);
 
     EXECUTE format(
         $QUERY$
@@ -455,7 +463,7 @@ BEGIN
         $QUERY$,
         _q_table
     )
-    USING cb_hide.ids, make_interval(secs => cb_hide.hide_for / 1000.0);
+    USING cb_hide.ids, make_interval(secs => _jittered_delay / 1000.0);
 END;
 $$;
 -- +goose statementend
