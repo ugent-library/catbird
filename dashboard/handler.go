@@ -96,6 +96,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /flow/{flow_name}/form", a.handleFlowStartRunForm)
 	mux.HandleFunc("POST /flow/{flow_name}/run", a.handleStartFlowRun)
 	mux.HandleFunc("GET /workers", a.handleWorkers)
+	mux.HandleFunc("GET /workers/table", a.handleWorkersTable)
 	mux.HandleFunc("GET /dark.css", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/css")
 		css, _ := templatesFS.ReadFile("dark.css")
@@ -317,23 +318,27 @@ func (a *App) handleWorkers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if this is an HTMX request for the table partial
-	if r.Header.Get("HX-Request") == "true" {
-		if err := a.workers.ExecuteTemplate(w, "workers_table", struct {
-			Workers []*catbird.WorkerInfo
-		}{
-			Workers: workers,
-		}); err != nil {
-			a.handleError(w, r, err)
-		}
-		return
-	}
-
 	a.render(w, r, a.workers, struct {
 		Workers []*catbird.WorkerInfo
 	}{
 		Workers: workers,
 	})
+}
+
+func (a *App) handleWorkersTable(w http.ResponseWriter, r *http.Request) {
+	workers, err := a.client.ListWorkers(r.Context())
+	if err != nil {
+		a.logger.Error("failed to list workers", "error", err)
+		return
+	}
+
+	if err := a.workers.ExecuteTemplate(w, "workers_table", struct {
+		Workers []*catbird.WorkerInfo
+	}{
+		Workers: workers,
+	}); err != nil {
+		a.logger.Error("template execution error", "error", err)
+	}
 }
 
 func (a *App) handleTaskRuns(w http.ResponseWriter, r *http.Request) {

@@ -3,11 +3,12 @@
   <h1>Workers</h1>
 </div>
 
-{{ template "workers_table" . }}
+<div id="workers-table" hx-get="/workers/table" hx-trigger="every 2s" hx-swap="innerHTML">
+  {{ template "workers_table" . }}
+</div>
 {{ end }}
 
 {{ define "workers_table" }}
-<div id="workers-table" hx-get="/workers" hx-trigger="every 2s" hx-swap="outerHTML">
 <table class="table">
   <tbody>
     <tr>
@@ -33,5 +34,4 @@
     {{ end }}
   </tbody>
 </table>
-</div>
 {{ end }}
