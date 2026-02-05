@@ -7,7 +7,7 @@
 
 # Catbird
 
-A PostgreSQL-powered distributed message queue and task execution engine. Catbird brings reliability and simplicity to background job processing by using your database as the single source of truth—no extra services to manage, just your database coordinating everything.
+A PostgreSQL-powered message queue and task execution engine. Catbird brings reliability and simplicity to background job processing by using your database as the single source of truth—no extra services to manage, just your database coordinating everything.
 
 ## Why Catbird?
 

@@ -1,6 +1,6 @@
 # Catbird Copilot Instructions
 
-Catbird is a PostgreSQL-based distributed message queue with task and workflow execution engine. Below is critical context for productive development.
+Catbird is a PostgreSQL-based message queue with task and workflow execution engine. Below is critical context for productive development.
 
 ## Architecture Overview
 

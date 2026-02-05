@@ -1,4 +1,4 @@
-// Package catbird provides a PostgreSQL-based distributed message queue
+// Package catbird provides a PostgreSQL-based message queue
 // with task and workflow execution engine.
 package catbird
 
