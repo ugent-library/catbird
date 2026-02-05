@@ -81,14 +81,17 @@ func (a *App) Handler() http.Handler {
 
 	mux.HandleFunc("GET /", a.handleIndex)
 	mux.HandleFunc("GET /queues", a.handleQueues)
+	mux.HandleFunc("GET /queue/send-form", a.handleSendMessageForm)
 	mux.HandleFunc("POST /queue/send", a.handleSendMessage)
 	mux.HandleFunc("GET /tasks", a.handleTasks)
 	mux.HandleFunc("GET /task/{task_name}", a.handleTask)
 	mux.HandleFunc("GET /task/{task_name}/runs", a.handleTaskRuns)
+	mux.HandleFunc("GET /task/{task_name}/form", a.handleTaskStartRunForm)
 	mux.HandleFunc("POST /task/{task_name}/run", a.handleStartTaskRun)
 	mux.HandleFunc("GET /flows", a.handleFlows)
 	mux.HandleFunc("GET /flow/{flow_name}", a.handleFlow)
 	mux.HandleFunc("GET /flow/{flow_name}/runs", a.handleFlowRuns)
+	mux.HandleFunc("GET /flow/{flow_name}/form", a.handleFlowStartRunForm)
 	mux.HandleFunc("POST /flow/{flow_name}/run", a.handleStartFlowRun)
 	mux.HandleFunc("GET /workers", a.handleWorkers)
 
@@ -131,6 +134,22 @@ func (a *App) handleQueues(w http.ResponseWriter, r *http.Request) {
 	}{
 		Queues: queues,
 	})
+}
+
+func (a *App) handleSendMessageForm(w http.ResponseWriter, r *http.Request) {
+	queues, err := a.client.ListQueues(r.Context())
+	if err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
+	if err := a.queues.ExecuteTemplate(w, "send_message_form", struct {
+		Queues []*catbird.QueueInfo
+	}{
+		Queues: queues,
+	}); err != nil {
+		a.handleError(w, r, err)
+	}
 }
 
 func (a *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
@@ -298,11 +317,33 @@ func (a *App) handleTaskRuns(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (a *App) handleTaskStartRunForm(w http.ResponseWriter, r *http.Request) {
+	taskName := r.PathValue("task_name")
+
+	task, err := a.client.GetTask(r.Context(), taskName)
+	if err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
+	if err := a.task.ExecuteTemplate(w, "start_task_run_form", struct {
+		Task *catbird.TaskInfo
+	}{
+		Task: task,
+	}); err != nil {
+		a.handleError(w, r, err)
+	}
+}
+
 func (a *App) handleStartTaskRun(w http.ResponseWriter, r *http.Request) {
 	taskName := r.PathValue("task_name")
 
 	if err := r.ParseForm(); err != nil {
-		a.handleError(w, r, err)
+		a.task.ExecuteTemplate(w, "start_task_run_error", struct {
+			Error string
+		}{
+			Error: err.Error(),
+		})
 		return
 	}
 
@@ -313,32 +354,16 @@ func (a *App) handleStartTaskRun(w http.ResponseWriter, r *http.Request) {
 
 	_, err := a.client.RunTask(r.Context(), taskName, json.RawMessage(input))
 	if err != nil {
-		a.handleError(w, r, err)
+		a.task.ExecuteTemplate(w, "start_task_run_error", struct {
+			Error string
+		}{
+			Error: err.Error(),
+		})
 		return
 	}
 
-	// Return updated task runs list
-	task, err := a.client.GetTask(r.Context(), taskName)
-	if err != nil {
-		a.handleError(w, r, err)
-		return
-	}
-
-	taskRuns, err := a.client.ListTaskRuns(r.Context(), taskName)
-	if err != nil {
-		a.handleError(w, r, err)
-		return
-	}
-
-	if err := a.task.ExecuteTemplate(w, "task_runs_table", struct {
-		Task     *catbird.TaskInfo
-		TaskRuns []*catbird.TaskRunInfo
-	}{
-		Task:     task,
-		TaskRuns: taskRuns,
-	}); err != nil {
-		a.handleError(w, r, err)
-	}
+	// Return success message - table will auto-refresh
+	a.task.ExecuteTemplate(w, "start_task_run_success", nil)
 }
 
 func (a *App) handleFlowRuns(w http.ResponseWriter, r *http.Request) {
@@ -368,11 +393,33 @@ func (a *App) handleFlowRuns(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (a *App) handleFlowStartRunForm(w http.ResponseWriter, r *http.Request) {
+	flowName := r.PathValue("flow_name")
+
+	flow, err := a.client.GetFlow(r.Context(), flowName)
+	if err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
+	if err := a.flow.ExecuteTemplate(w, "start_flow_run_form", struct {
+		Flow *catbird.FlowInfo
+	}{
+		Flow: flow,
+	}); err != nil {
+		a.handleError(w, r, err)
+	}
+}
+
 func (a *App) handleStartFlowRun(w http.ResponseWriter, r *http.Request) {
 	flowName := r.PathValue("flow_name")
 
 	if err := r.ParseForm(); err != nil {
-		a.handleError(w, r, err)
+		a.flow.ExecuteTemplate(w, "start_flow_run_error", struct {
+			Error string
+		}{
+			Error: err.Error(),
+		})
 		return
 	}
 
@@ -383,30 +430,14 @@ func (a *App) handleStartFlowRun(w http.ResponseWriter, r *http.Request) {
 
 	_, err := a.client.RunFlow(r.Context(), flowName, json.RawMessage(input))
 	if err != nil {
-		a.handleError(w, r, err)
+		a.flow.ExecuteTemplate(w, "start_flow_run_error", struct {
+			Error string
+		}{
+			Error: err.Error(),
+		})
 		return
 	}
 
-	// Return updated flow runs list
-	flow, err := a.client.GetFlow(r.Context(), flowName)
-	if err != nil {
-		a.handleError(w, r, err)
-		return
-	}
-
-	flowRuns, err := a.client.ListFlowRuns(r.Context(), flowName)
-	if err != nil {
-		a.handleError(w, r, err)
-		return
-	}
-
-	if err := a.flow.ExecuteTemplate(w, "flow_runs_table", struct {
-		Flow     *catbird.FlowInfo
-		FlowRuns []*catbird.FlowRunInfo
-	}{
-		Flow:     flow,
-		FlowRuns: flowRuns,
-	}); err != nil {
-		a.handleError(w, r, err)
-	}
+	// Return success message - table will auto-refresh
+	a.flow.ExecuteTemplate(w, "start_flow_run_success", nil)
 }

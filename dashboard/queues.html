@@ -43,39 +43,41 @@
 </table>
 
 <!-- Send Message Modal -->
-<div id="send-message-modal" class="modal" tabindex="-1">
-  <form id="send-message-form" hx-post="/queue/send" hx-target="#send-message-modal" hx-swap="innerHTML">
-    <div class="modal-dialog">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h5 class="modal-title">Send Message</h5>
-          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-        </div>
-        <div class="modal-body">
-          <div class="mb-3">
-            <label for="queue-select" class="form-label">Queue</label>
-            <select class="form-select" id="queue-select" name="queue" required>
-              {{ range .Queues }}
-              <option value="{{ .Name }}">{{ .Name }}</option>
-              {{ end }}
-            </select>
+<div id="send-message-modal" class="modal" tabindex="-1" hx-get="/queue/send-form" hx-trigger="show.bs.modal" hx-target="#send-message-modal" hx-swap="innerHTML">
+  <div id="send-message-modal-content">
+    <form id="send-message-form" hx-post="/queue/send" hx-target="#send-message-modal" hx-swap="innerHTML">
+      <div class="modal-dialog">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title">Send Message</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
           </div>
-          <div class="mb-3">
-            <label for="message-topic" class="form-label">Topic (optional)</label>
-            <input type="text" class="form-control" id="message-topic" name="topic" placeholder="topic-name">
+          <div class="modal-body">
+            <div class="mb-3">
+              <label for="queue-select" class="form-label">Queue</label>
+              <select class="form-select" id="queue-select" name="queue" required>
+                {{ range .Queues }}
+                <option value="{{ .Name }}">{{ .Name }}</option>
+                {{ end }}
+              </select>
+            </div>
+            <div class="mb-3">
+              <label for="message-topic" class="form-label">Topic (optional)</label>
+              <input type="text" class="form-control" id="message-topic" name="topic" placeholder="topic-name">
+            </div>
+            <div class="mb-3">
+              <label for="message-payload" class="form-label">Payload (JSON)</label>
+              <textarea class="form-control font-monospace" id="message-payload" name="payload" rows="8" placeholder='{"key": "value"}' required>{}</textarea>
+            </div>
           </div>
-          <div class="mb-3">
-            <label for="message-payload" class="form-label">Payload (JSON)</label>
-            <textarea class="form-control font-monospace" id="message-payload" name="payload" rows="8" placeholder='{"key": "value"}' required>{}</textarea>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+            <button type="submit" class="btn btn-primary">Send</button>
           </div>
-        </div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-          <button type="submit" class="btn btn-primary">Send</button>
         </div>
       </div>
-    </div>
-  </form>
+    </form>
+  </div>
 </div>
 {{ end }}
 
@@ -111,4 +113,39 @@
     </div>
   </div>
 </div>
+{{ end }}
+
+{{ define "send_message_form" }}
+<form id="send-message-form" hx-post="/queue/send" hx-target="#send-message-modal" hx-swap="innerHTML">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Send Message</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3">
+          <label for="queue-select" class="form-label">Queue</label>
+          <select class="form-select" id="queue-select" name="queue" required>
+            {{ range .Queues }}
+            <option value="{{ .Name }}">{{ .Name }}</option>
+            {{ end }}
+          </select>
+        </div>
+        <div class="mb-3">
+          <label for="message-topic" class="form-label">Topic (optional)</label>
+          <input type="text" class="form-control" id="message-topic" name="topic" placeholder="topic-name">
+        </div>
+        <div class="mb-3">
+          <label for="message-payload" class="form-label">Payload (JSON)</label>
+          <textarea class="form-control font-monospace" id="message-payload" name="payload" rows="8" placeholder='{"key": "value"}' required>{}</textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="submit" class="btn btn-primary">Send</button>
+      </div>
+    </div>
+  </div>
+</form>
 {{ end }}
