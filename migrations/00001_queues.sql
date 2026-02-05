@@ -199,18 +199,23 @@ BEGIN
         )
     LOOP
         _q_table := cb_table_name(_rec.name, 'q');
-        EXECUTE format(
-            $QUERY$
-            INSERT INTO %I (topic, payload, deduplication_id, deliver_at)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (deduplication_id) DO NOTHING;
-            $QUERY$,
-            _q_table
-        )
-        USING cb_dispatch.topic,
-              cb_dispatch.payload,
-              cb_dispatch.deduplication_id,
-              _deliver_at;
+        BEGIN
+            EXECUTE format(
+                $QUERY$
+                INSERT INTO %I (topic, payload, deduplication_id, deliver_at)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (deduplication_id) DO NOTHING;
+                $QUERY$,
+                _q_table
+            )
+            USING cb_dispatch.topic,
+                  cb_dispatch.payload,
+                  cb_dispatch.deduplication_id,
+                  _deliver_at;
+        EXCEPTION WHEN undefined_table THEN
+            -- Queue was deleted between SELECT and INSERT, skip it
+            CONTINUE;
+        END;
     END LOOP;
 END
 $$;
