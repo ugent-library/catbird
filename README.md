@@ -30,10 +30,32 @@ client := catbird.New(conn)
 // Create a queue
 err := client.CreateQueue(ctx, "my-queue")
 
+// Create a queue that expires after 1 hour and is unlogged for better performance
+err = client.CreateQueueWithOpts(ctx, "temp-queue", catbird.QueueOpts{
+    ExpiresAt: time.Now().Add(1 * time.Hour),
+    Unlogged:  true, // Faster but not crash-safe; useful for transient work
+})
+
 // Send a message
 err = client.Send(ctx, "my-queue", map[string]any{
     "user_id": 123,
     "action":  "process",
+})
+
+// Send a message with delayed delivery (available in 5 minutes)
+err = client.SendWithOpts(ctx, "my-queue", map[string]any{
+    "type":    "reminder",
+    "user_id": 456,
+}, catbird.SendOpts{
+    DeliverAt: time.Now().Add(5 * time.Minute),
+})
+
+// Send a message with deduplication to prevent duplicates
+err = client.SendWithOpts(ctx, "my-queue", map[string]any{
+    "order_id": 789,
+    "action":   "process",
+}, catbird.SendOpts{
+    DeduplicationID: "order-789-process",
 })
 
 // Read messages (hidden from other readers for 30 seconds)
@@ -87,16 +109,32 @@ Wildcard rules:
 task := catbird.NewTask("send-email", func(ctx context.Context, input EmailRequest) (EmailResponse, error) {
     // Send email logic here
     return EmailResponse{SentAt: time.Now()}, nil
-}, catbird.WithRetries(3))
+}, catbird.WithRetries(3), catbird.WithConcurrency(5)) // Allow up to 5 concurrent executions
 
 // Start a worker that handles the send-email task
 worker, err := client.NewWorker(ctx, catbird.WithTask(task))
+go worker.Start(ctx)
+
+// Schedule a task to run periodically (using cron syntax)
+worker, err = client.NewWorker(ctx,
+    catbird.WithTask(task),
+    catbird.WithScheduledTask("send-email", "@hourly"), // Run every hour
+    catbird.WithGC(), // Enable garbage collection to clean up expired queues and stale workers
+)
 go worker.Start(ctx)
 
 // Run the task
 handle, err := client.RunTask(ctx, "send-email", EmailRequest{
     To:      "user@example.com",
     Subject: "Hello",
+})
+
+// Run a task with deduplication to prevent duplicate executions
+handle, err = client.RunTaskWithOpts(ctx, "send-email", EmailRequest{
+    To:      "user@example.com",
+    Subject: "Welcome",
+}, catbird.RunTaskOpts{
+    DeduplicationID: "email-user123-welcome",
 })
 
 // Get result
@@ -149,8 +187,20 @@ worker, err := client.NewWorker(ctx,
 )
 go worker.Start(ctx)
 
+// Schedule a flow to run periodically (using cron syntax)
+worker, err = client.NewWorker(ctx,
+    catbird.WithFlow(flow),
+    catbird.WithScheduledFlow("order-processing", "0 2 * * *"), // Run daily at 2 AM
+)
+go worker.Start(ctx)
+
 // Run the flow
 handle, err := client.RunFlow(ctx, "order-processing", myOrder)
+
+// Run a flow with deduplication to prevent duplicate executions
+handle, err = client.RunFlowWithOpts(ctx, "order-processing", myOrder, catbird.RunFlowOpts{
+    DeduplicationID: "order-12345-processing",
+})
 
 // Get combined results from all steps
 var results map[string]any
