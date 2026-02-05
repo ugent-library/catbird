@@ -1,5 +1,5 @@
 {{ define "flow-runs-table" }}
-<div id="flow-runs-table" hx-get="/flow/{{ .Flow.Name }}/runs" hx-trigger="every 2s" hx-swap="outerHTML">
+<div id="flow-runs-table" hx-get="/flow/{{ .Flow.Name }}/runs" hx-trigger="every 2s [!document.querySelector('.modal.show')]" hx-swap="outerHTML">
 <table class="table">
   <tbody>
     <tr>
@@ -18,11 +18,11 @@
       </td>
       <td>
         {{ if eq .Status "started" }}
-        <span class="badge text-bg-info">started</span>
+        <span class="badge rounded-pill text-bg-info">started</span>
         {{ else if eq .Status "completed" }}
-        <span class="badge text-bg-success">completed</span>
+        <span class="badge rounded-pill text-bg-success">completed</span>
         {{ else if eq .Status "failed" }}
-        <span class="badge text-bg-danger">failed</span>
+        <span class="badge rounded-pill text-bg-danger">failed</span>
         {{ end }}
       </td>
       <td>{{ formatTime .StartedAt }}</td>
@@ -32,5 +32,31 @@
     {{ end }}
   </tbody>
 </table>
+
+{{ range .FlowRuns }}
+<div id="flow-run-{{ .ID }}" class="modal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">{{ $.Flow.Name }} - {{ .ID }}</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <h5>Input</h5>
+        <pre><code class="language-json">{{ prettyJSON .Input }}</code></pre>
+        <h5>Output</h5>
+        {{ with .Output }}
+        <pre><code class="language-json">{{ prettyJSON . }}</code></pre>
+        {{ else }}
+        -
+        {{ end }}
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-link" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+{{ end }}
 </div>
 {{ end }}

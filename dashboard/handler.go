@@ -81,6 +81,7 @@ func (a *App) Handler() http.Handler {
 
 	mux.HandleFunc("GET /", a.handleIndex)
 	mux.HandleFunc("GET /queues", a.handleQueues)
+	mux.HandleFunc("POST /queue/send", a.handleSendMessage)
 	mux.HandleFunc("GET /tasks", a.handleTasks)
 	mux.HandleFunc("GET /task/{task_name}", a.handleTask)
 	mux.HandleFunc("GET /task/{task_name}/runs", a.handleTaskRuns)
@@ -132,6 +133,35 @@ func (a *App) handleQueues(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (a *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
+	queue := r.FormValue("queue")
+	topic := r.FormValue("topic")
+	payload := r.FormValue("payload")
+
+	if payload == "" {
+		payload = "{}"
+	}
+
+	opts := catbird.SendOpts{}
+	if topic != "" {
+		opts.Topic = topic
+	}
+
+	err := a.client.SendWithOpts(r.Context(), queue, json.RawMessage(payload), opts)
+	if err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
+	// Return empty response or success message
+	w.WriteHeader(http.StatusOK)
+}
+
 func (a *App) handleTasks(w http.ResponseWriter, r *http.Request) {
 	tasks, err := a.client.ListTasks(r.Context())
 	if err != nil {
@@ -163,11 +193,9 @@ func (a *App) handleTask(w http.ResponseWriter, r *http.Request) {
 
 	a.render(w, r, a.task, struct {
 		Task     *catbird.TaskInfo
-		TaskName string
 		TaskRuns []*catbird.TaskRunInfo
 	}{
 		Task:     task,
-		TaskName: taskName,
 		TaskRuns: taskRuns,
 	})
 }
@@ -239,6 +267,12 @@ func (a *App) handleWorkers(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleTaskRuns(w http.ResponseWriter, r *http.Request) {
 	taskName := r.PathValue("task_name")
 
+	task, err := a.client.GetTask(r.Context(), taskName)
+	if err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
 	taskRuns, err := a.client.ListTaskRuns(r.Context(), taskName)
 	if err != nil {
 		a.handleError(w, r, err)
@@ -247,10 +281,10 @@ func (a *App) handleTaskRuns(w http.ResponseWriter, r *http.Request) {
 
 	// Render just the task runs table partial
 	if err := a.task.ExecuteTemplate(w, "task-runs-table", struct {
-		TaskName string
+		Task     *catbird.TaskInfo
 		TaskRuns []*catbird.TaskRunInfo
 	}{
-		TaskName: taskName,
+		Task:     task,
 		TaskRuns: taskRuns,
 	}); err != nil {
 		a.handleError(w, r, err)
@@ -266,23 +300,23 @@ func (a *App) handleStartTaskRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	input := r.FormValue("input")
-	var inputJSON json.RawMessage
-	if input != "" {
-		if err := json.Unmarshal([]byte(input), &inputJSON); err != nil {
-			http.Error(w, "Invalid JSON input", http.StatusBadRequest)
-			return
-		}
-	} else {
-		inputJSON = json.RawMessage("{}")
+	if input == "" {
+		input = "{}"
 	}
 
-	_, err := a.client.RunTask(r.Context(), taskName, inputJSON)
+	_, err := a.client.RunTask(r.Context(), taskName, json.RawMessage(input))
 	if err != nil {
 		a.handleError(w, r, err)
 		return
 	}
 
 	// Return updated task runs list
+	task, err := a.client.GetTask(r.Context(), taskName)
+	if err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
 	taskRuns, err := a.client.ListTaskRuns(r.Context(), taskName)
 	if err != nil {
 		a.handleError(w, r, err)
@@ -290,10 +324,10 @@ func (a *App) handleStartTaskRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := a.task.ExecuteTemplate(w, "task-runs-table", struct {
-		TaskName string
+		Task     *catbird.TaskInfo
 		TaskRuns []*catbird.TaskRunInfo
 	}{
-		TaskName: taskName,
+		Task:     task,
 		TaskRuns: taskRuns,
 	}); err != nil {
 		a.handleError(w, r, err)
@@ -336,23 +370,23 @@ func (a *App) handleStartFlowRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	input := r.FormValue("input")
-	var inputJSON json.RawMessage
-	if input != "" {
-		if err := json.Unmarshal([]byte(input), &inputJSON); err != nil {
-			http.Error(w, "Invalid JSON input", http.StatusBadRequest)
-			return
-		}
-	} else {
-		inputJSON = json.RawMessage("{}")
+	if input == "" {
+		input = "{}"
 	}
 
-	_, err := a.client.RunFlow(r.Context(), flowName, inputJSON)
+	_, err := a.client.RunFlow(r.Context(), flowName, json.RawMessage(input))
 	if err != nil {
 		a.handleError(w, r, err)
 		return
 	}
 
 	// Return updated flow runs list
+	flow, err := a.client.GetFlow(r.Context(), flowName)
+	if err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
 	flowRuns, err := a.client.ListFlowRuns(r.Context(), flowName)
 	if err != nil {
 		a.handleError(w, r, err)
@@ -360,10 +394,10 @@ func (a *App) handleStartFlowRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := a.flow.ExecuteTemplate(w, "flow-runs-table", struct {
-		FlowName string
+		Flow     *catbird.FlowInfo
 		FlowRuns []*catbird.FlowRunInfo
 	}{
-		FlowName: flowName,
+		Flow:     flow,
 		FlowRuns: flowRuns,
 	}); err != nil {
 		a.handleError(w, r, err)
