@@ -78,7 +78,7 @@ Wildcard rules:
 - `?` matches a single token (e.g., `events.?.created` matches `events.user.created`)
 - `*` matches one or more tokens at the end (e.g., `events.user.*` matches `events.user.created.v1`)
 - `*` must appear as `.*` at the end of the pattern
-- Tokens are separated by `.` and can contain `a-z`, `A-Z`, `0-9`, `_`
+- Tokens are separated by `.` and can contain `a-z`, `A-Z`, `0-9`, `_`, `-`
 
 ### Task Execution
 
@@ -157,6 +157,11 @@ var results map[string]any
 err = handle.WaitForOutput(ctx, &results)
 // results contains output from all steps: validate, charge, check, ship
 ```
+
+## Naming Rules
+
+- **Queue, task, flow, and step names**: Lowercase letters, digits, and underscores only (`a-z`, `0-9`, `_`). Max 58 characters. Step names must be unique within a flow.
+- **Topics/Patterns**: Letters (upper/lower), digits, dots, underscores, and hyphens (`a-z`, `A-Z`, `0-9`, `.`, `_`, `-`, plus wildcards `?`, `*`).
 
 ## Documentation
 

@@ -460,10 +460,20 @@ BEGIN
 
   FOR _step IN SELECT jsonb_array_elements(steps)
   LOOP
+    _step_name := _step->>'name';
+
+    -- Validate step name follows same rules as flow name
+    IF _step_name !~ '^[a-z0-9_]+$' THEN
+      RAISE EXCEPTION 'cb: step name "%" can only contain characters: a-z, 0-9 or _', _step_name;
+    END IF;
+    IF length(_step_name) >= 58 THEN
+      RAISE EXCEPTION 'cb: step name "%" is too long, maximum length is 58', _step_name;
+    END IF;
+
     INSERT INTO cb_steps (flow_name, name, idx, dependency_count)
     VALUES (
       cb_create_flow.name,
-      _step->>'name',
+      _step_name,
       _idx,
       jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb))
     );
@@ -474,7 +484,7 @@ BEGIN
     FOR _dep IN SELECT jsonb_array_elements(coalesce(_step->'depends_on', '[]'::jsonb))
     LOOP
       INSERT INTO cb_step_dependencies (flow_name, step_name, dependency_name, idx)
-      VALUES (cb_create_flow.name, _step->>'name', _dep->>'name', _dep_idx);
+      VALUES (cb_create_flow.name, _step_name, _dep->>'name', _dep_idx);
       _dep_idx := _dep_idx + 1;
     END LOOP;
 

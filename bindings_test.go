@@ -426,6 +426,64 @@ func TestBindPrefixOptimization(t *testing.T) {
 	}
 }
 
+func TestBindCaseSensitivity(t *testing.T) {
+	client := getTestClient(t)
+	ctx := context.Background()
+
+	q := "case_sensitive_q"
+	if err := client.CreateQueue(ctx, q); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bind to patterns with uppercase and mixed case
+	patterns := []string{
+		"Events.User.Created",
+		"API.?.Response",
+		"LogEvents.*",
+	}
+
+	for _, pattern := range patterns {
+		if err := client.Bind(ctx, q, pattern); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	testCases := []struct {
+		topic       string
+		shouldMatch bool
+	}{
+		{"Events.User.Created", true},       // Exact match with uppercase
+		{"events.user.created", false},      // Case mismatch
+		{"API.v1.Response", true},           // Wildcard with mixed case
+		{"API.V1.Response", true},           // Different case in wildcard part
+		{"api.v1.Response", false},          // Case mismatch in prefix
+		{"LogEvents.Error.Critical", true},  // Multi-token wildcard
+		{"logevents.error.critical", false}, // Case mismatch
+	}
+
+	for _, tc := range testCases {
+		if err := client.Dispatch(ctx, tc.topic, tc.topic); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	msgs, err := client.Read(ctx, q, 20, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedMatches := 0
+	for _, tc := range testCases {
+		if tc.shouldMatch {
+			expectedMatches++
+		}
+	}
+
+	if len(msgs) != expectedMatches {
+		t.Fatalf("expected %d messages (case-sensitive), got %d", expectedMatches, len(msgs))
+	}
+}
+
 func TestBindOrderIndependence(t *testing.T) {
 	client := getTestClient(t)
 	ctx := context.Background()

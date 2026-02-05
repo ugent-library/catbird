@@ -272,12 +272,12 @@ BEGIN
         END IF;
 
         -- Precompile regex pattern
-        -- ? -> [a-z0-9_]+ (single token matching allowed characters)
-        -- .* -> (\.[a-z0-9_]+)+ (one or more dot-separated tokens)
+        -- ? -> [a-zA-Z0-9_-]+ (single token matching allowed characters)
+        -- .* -> (\.[a-zA-Z0-9_-]+)+ (one or more dot-separated tokens)
         p_regex := '^' ||
             regexp_replace(
-                regexp_replace(cb_bind.pattern, E'\\.\\*$', '(\\.[a-z0-9_]+)+'),
-                E'\\?', '[a-z0-9_]+', 'g'
+                regexp_replace(cb_bind.pattern, E'\\.\\*$', '(\\.[a-zA-Z0-9_-]+)+'),
+                E'\\?', '[a-zA-Z0-9_-]+', 'g'
             ) || '$';
 
         -- Validate regex compiles correctly by testing it
