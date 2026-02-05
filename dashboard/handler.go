@@ -81,6 +81,7 @@ func (a *App) Handler() http.Handler {
 
 	mux.HandleFunc("GET /", a.handleIndex)
 	mux.HandleFunc("GET /queues", a.handleQueues)
+	mux.HandleFunc("GET /queues/table", a.handleQueuesTable)
 	mux.HandleFunc("GET /queue/create-form", a.handleCreateQueueForm)
 	mux.HandleFunc("POST /queue/create", a.handleCreateQueue)
 	mux.HandleFunc("GET /queue/send-form", a.handleSendMessageForm)
@@ -142,6 +143,22 @@ func (a *App) handleQueues(w http.ResponseWriter, r *http.Request) {
 	}{
 		Queues: queues,
 	})
+}
+
+func (a *App) handleQueuesTable(w http.ResponseWriter, r *http.Request) {
+	queues, err := a.client.ListQueues(r.Context())
+	if err != nil {
+		a.logger.Error("failed to list queues", "error", err)
+		return
+	}
+
+	if err := a.queues.ExecuteTemplate(w, "queues_table", struct {
+		Queues []*catbird.QueueInfo
+	}{
+		Queues: queues,
+	}); err != nil {
+		a.logger.Error("template execution error", "error", err)
+	}
 }
 
 func (a *App) handleSendMessageForm(w http.ResponseWriter, r *http.Request) {

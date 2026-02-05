@@ -17,30 +17,9 @@
   </div>
 </div>
 
-<table class="table">
-  <tbody>
-    <tr>
-      <th scope="col">Name</th>
-      <th scope="col">Topics</th>
-      <th scope="col">Unlogged</th>
-      <th scope="col">Created</th>
-      <th scope="col">Delete at</th>
-    </tr>
-    {{ range .Queues }}
-    <tr>
-      <th>{{ .Name }}</th>
-      <td>
-        {{ range .Topics }}
-        <span class="badge badge-pill badge-info">{{ . }}</span>
-        {{ end }}
-      </td>
-      <td>{{ if .Unlogged }}Unlogged{{ end }}</td>
-      <td>{{ formatTime .CreatedAt }}</td>
-      <td>{{ formatTime .DeleteAt }}</td>
-    </tr>
-    {{ end }}
-  </tbody>
-</table>
+<div id="queues-table" hx-get="/queues/table" hx-trigger="every 2s [!document.querySelector('.modal.show')]" hx-swap="outerHTML">
+  {{ template "queues_table" . }}
+</div>
 
 <!-- Create Queue Modal -->
 <div id="create-queue-modal" class="modal" tabindex="-1" hx-get="/queue/create-form" hx-trigger="show.bs.modal" hx-target="#create-queue-modal" hx-swap="innerHTML">
@@ -209,5 +188,34 @@
       <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">OK</button>
     </div>
   </div>
+</div>
+{{ end }}
+
+{{ define "queues_table" }}
+<div id="queues-table" hx-get="/queues/table" hx-trigger="every 2s [!document.querySelector('.modal.show')]" hx-swap="outerHTML">
+<table class="table">
+  <tbody>
+    <tr>
+      <th scope="col">Name</th>
+      <th scope="col">Topics</th>
+      <th scope="col">Unlogged</th>
+      <th scope="col">Created</th>
+      <th scope="col">Delete at</th>
+    </tr>
+    {{ range .Queues }}
+    <tr>
+      <th>{{ .Name }}</th>
+      <td>
+        {{ range .Topics }}
+        <span class="badge badge-pill badge-info">{{ . }}</span>
+        {{ end }}
+      </td>
+      <td>{{ if .Unlogged }}Unlogged{{ end }}</td>
+      <td>{{ formatTime .CreatedAt }}</td>
+      <td>{{ formatTime .DeleteAt }}</td>
+    </tr>
+    {{ end }}
+  </tbody>
+</table>
 </div>
 {{ end }}
