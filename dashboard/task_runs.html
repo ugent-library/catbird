@@ -1,0 +1,36 @@
+{{ define "task-runs-table" }}
+<div id="task-runs-table" hx-get="/task/{{ .TaskName }}/runs" hx-trigger="every 2s" hx-swap="outerHTML">
+<table class="table">
+  <tbody>
+    <tr>
+      <th scope="col">ID</th>
+      <th scope="col">Status</th>
+      <th scope="col">Started</th>
+      <th scope="col">Completed</th>
+      <th scope="col">Failed</th>
+    </tr>
+    {{ range .TaskRuns }}
+    <tr>
+      <td>
+        <button type="button" class="btn btn-link" data-bs-toggle="modal" data-bs-target="#task-run-{{ .ID }}">
+          {{ .ID }}
+        </button>
+      </td>
+      <td>
+        {{ if eq .Status "started" }}
+        <span class="badge text-bg-info">started</span>
+        {{ else if eq .Status "completed" }}
+        <span class="badge text-bg-success">completed</span>
+        {{ else if eq .Status "failed" }}
+        <span class="badge text-bg-danger">failed</span>
+        {{ end }}
+      </td>
+      <td>{{ formatTime .StartedAt }}</td>
+      <td>{{ formatTime .CompletedAt }}</td>
+      <td>{{ formatTime .FailedAt }}</td>
+    </tr>
+    {{ end }}
+  </tbody>
+</table>
+</div>
+{{ end }}

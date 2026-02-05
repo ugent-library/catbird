@@ -1,44 +1,40 @@
 {{ define "content" }}
 <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
   <h1>{{ .Flow.Name }}</h1>
+  <button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#start-flow-modal">
+    Start Run
+  </button>
 </div>
 
 <div data-cy="{{ toJSON .Flow.Steps }}" style="min-height:300px;"></div>
 
 <h2>Runs</h2>
 
-<table class="table">
-  <tbody>
-    <tr>
-      <th scope="col">ID</th>
-      <th scope="col">Status</th>
-      <th scope="col">Started</th>
-      <th scope="col">Completed</th>
-      <th scope="col">Failed</th>
-    </tr>
-    {{ range .FlowRuns }}
-    <tr>
-      <td>
-        <button type="button" class="btn btn-link" data-bs-toggle="modal" data-bs-target="#flow-run-{{ .ID }}">
-          {{ .ID }}
-        </button>
-      </td>
-      <td>
-        {{ if eq .Status "started" }}
-        <span class="badge text-bg-info">started</span>
-        {{ else if eq .Status "completed" }}
-        <span class="badge text-bg-success">completed</span>
-        {{ else if eq .Status "failed" }}
-        <span class="badge text-bg-danger">failed</span>
-        {{ end }}
-      </td>
-      <td>{{ formatTime .StartedAt }}</td>
-      <td>{{ formatTime .CompletedAt }}</td>
-      <td>{{ formatTime .FailedAt }}</td>
-    </tr>
-    {{ end }}
-  </tbody>
-</table>
+{{ template "flow-runs-table" . }}
+
+<!-- Start Flow Run Modal -->
+<div id="start-flow-modal" class="modal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Start {{ .Flow.Name }}</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <form hx-post="/flow/{{ .Flow.Name }}/run" hx-target="#flow-runs-table" hx-swap="outerHTML">
+        <div class="modal-body">
+          <div class="mb-3">
+            <label for="flow-input" class="form-label">Input (JSON)</label>
+            <textarea class="form-control font-monospace" id="flow-input" name="input" rows="8" placeholder='{"key": "value"}'>{}</textarea>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-primary" data-bs-dismiss="modal">Start</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
 
 {{ range .FlowRuns }}
 <div id="flow-run-{{ .ID }}" class="modal" tabindex="-1">

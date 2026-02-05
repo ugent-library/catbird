@@ -69,9 +69,9 @@ func New(config Config) *App {
 		index:   template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "index.html")),
 		queues:  template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "queues.html")),
 		tasks:   template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "tasks.html")),
-		task:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "task.html")),
+		task:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "task.html", "task_runs.html")),
 		flows:   template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flows.html")),
-		flow:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flow.html")),
+		flow:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flow.html", "flow_runs.html")),
 		workers: template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "workers.html")),
 	}
 }
@@ -83,8 +83,12 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /queues", a.handleQueues)
 	mux.HandleFunc("GET /tasks", a.handleTasks)
 	mux.HandleFunc("GET /task/{task_name}", a.handleTask)
+	mux.HandleFunc("GET /task/{task_name}/runs", a.handleTaskRuns)
+	mux.HandleFunc("POST /task/{task_name}/run", a.handleStartTaskRun)
 	mux.HandleFunc("GET /flows", a.handleFlows)
 	mux.HandleFunc("GET /flow/{flow_name}", a.handleFlow)
+	mux.HandleFunc("GET /flow/{flow_name}/runs", a.handleFlowRuns)
+	mux.HandleFunc("POST /flow/{flow_name}/run", a.handleStartFlowRun)
 	mux.HandleFunc("GET /workers", a.handleWorkers)
 
 	return mux
@@ -159,9 +163,11 @@ func (a *App) handleTask(w http.ResponseWriter, r *http.Request) {
 
 	a.render(w, r, a.task, struct {
 		Task     *catbird.TaskInfo
+		TaskName string
 		TaskRuns []*catbird.TaskRunInfo
 	}{
 		Task:     task,
+		TaskName: taskName,
 		TaskRuns: taskRuns,
 	})
 }
@@ -216,4 +222,138 @@ func (a *App) handleWorkers(w http.ResponseWriter, r *http.Request) {
 	}{
 		Workers: workers,
 	})
+}
+
+func (a *App) handleTaskRuns(w http.ResponseWriter, r *http.Request) {
+	taskName := r.PathValue("task_name")
+
+	taskRuns, err := a.client.ListTaskRuns(r.Context(), taskName)
+	if err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
+	// Render just the task runs table partial
+	if err := a.task.ExecuteTemplate(w, "task-runs-table", struct {
+		TaskName string
+		TaskRuns []*catbird.TaskRunInfo
+	}{
+		TaskName: taskName,
+		TaskRuns: taskRuns,
+	}); err != nil {
+		a.handleError(w, r, err)
+	}
+}
+
+func (a *App) handleStartTaskRun(w http.ResponseWriter, r *http.Request) {
+	taskName := r.PathValue("task_name")
+
+	if err := r.ParseForm(); err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
+	input := r.FormValue("input")
+	var inputJSON json.RawMessage
+	if input != "" {
+		if err := json.Unmarshal([]byte(input), &inputJSON); err != nil {
+			http.Error(w, "Invalid JSON input", http.StatusBadRequest)
+			return
+		}
+	} else {
+		inputJSON = json.RawMessage("{}")
+	}
+
+	_, err := a.client.RunTask(r.Context(), taskName, inputJSON)
+	if err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
+	// Return updated task runs list
+	taskRuns, err := a.client.ListTaskRuns(r.Context(), taskName)
+	if err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
+	if err := a.task.ExecuteTemplate(w, "task-runs-table", struct {
+		TaskName string
+		TaskRuns []*catbird.TaskRunInfo
+	}{
+		TaskName: taskName,
+		TaskRuns: taskRuns,
+	}); err != nil {
+		a.handleError(w, r, err)
+	}
+}
+
+func (a *App) handleFlowRuns(w http.ResponseWriter, r *http.Request) {
+	flowName := r.PathValue("flow_name")
+
+	flow, err := a.client.GetFlow(r.Context(), flowName)
+	if err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
+	flowRuns, err := a.client.ListFlowRuns(r.Context(), flowName)
+	if err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
+	// Render just the flow runs table partial
+	if err := a.flow.ExecuteTemplate(w, "flow-runs-table", struct {
+		Flow     *catbird.FlowInfo
+		FlowRuns []*catbird.FlowRunInfo
+	}{
+		Flow:     flow,
+		FlowRuns: flowRuns,
+	}); err != nil {
+		a.handleError(w, r, err)
+	}
+}
+
+func (a *App) handleStartFlowRun(w http.ResponseWriter, r *http.Request) {
+	flowName := r.PathValue("flow_name")
+
+	if err := r.ParseForm(); err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
+	input := r.FormValue("input")
+	var inputJSON json.RawMessage
+	if input != "" {
+		if err := json.Unmarshal([]byte(input), &inputJSON); err != nil {
+			http.Error(w, "Invalid JSON input", http.StatusBadRequest)
+			return
+		}
+	} else {
+		inputJSON = json.RawMessage("{}")
+	}
+
+	_, err := a.client.RunFlow(r.Context(), flowName, inputJSON)
+	if err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
+	// Return updated flow runs list
+	flowRuns, err := a.client.ListFlowRuns(r.Context(), flowName)
+	if err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
+	if err := a.flow.ExecuteTemplate(w, "flow-runs-table", struct {
+		FlowName string
+		FlowRuns []*catbird.FlowRunInfo
+	}{
+		FlowName: flowName,
+		FlowRuns: flowRuns,
+	}); err != nil {
+		a.handleError(w, r, err)
+	}
 }
