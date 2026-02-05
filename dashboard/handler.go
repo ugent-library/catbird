@@ -217,6 +217,18 @@ func (a *App) handleWorkers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if this is an HTMX request for the table partial
+	if r.Header.Get("HX-Request") == "true" {
+		if err := a.workers.ExecuteTemplate(w, "workers-table", struct {
+			Workers []*catbird.WorkerInfo
+		}{
+			Workers: workers,
+		}); err != nil {
+			a.handleError(w, r, err)
+		}
+		return
+	}
+
 	a.render(w, r, a.workers, struct {
 		Workers []*catbird.WorkerInfo
 	}{
