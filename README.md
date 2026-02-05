@@ -117,7 +117,7 @@ go worker.Start(ctx)
 handle, err := client.RunFlow(ctx, "order-processing", myOrder)
 
 // Get combined results from all steps
-var results map[string]json.RawMessage
+var results map[string]any
 err = handle.WaitForOutput(ctx, &results)
 // results contains output from all steps: validate, charge, check, ship
 ```
