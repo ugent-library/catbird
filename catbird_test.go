@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -761,4 +762,121 @@ func TestFlowComplexDependencies(t *testing.T) {
 	if out.Step4 != 50 {
 		t.Fatalf("expected step4=50, got %d", out.Step4)
 	}
+}
+
+func TestTaskPanicRecovery(t *testing.T) {
+	client := getTestClient(t)
+
+	task := NewTask("panic_task", func(ctx context.Context, in string) (string, error) {
+		panic("intentional panic in task")
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	worker, err := client.NewWorker(t.Context(),
+		WithLogger(logger),
+		WithTask(task),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		err := worker.Start(t.Context())
+		if err != nil {
+			t.Logf("worker error: %s", err)
+		}
+	}()
+
+	// Give worker time to start
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunTask(t.Context(), "panic_task", "test input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for task to fail with panic
+	time.Sleep(1 * time.Second)
+
+	// Get task run to verify it was marked as failed
+	taskRuns, err := client.ListTaskRuns(t.Context(), "panic_task")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(taskRuns) == 0 {
+		t.Fatal("expected at least one task run")
+	}
+
+	// Check that the task run shows failure due to panic
+	if taskRuns[0].Status != "failed" {
+		t.Fatalf("expected status failed, got %s", taskRuns[0].Status)
+	}
+
+	if taskRuns[0].ErrorMessage == "" || !strings.Contains(taskRuns[0].ErrorMessage, "panic") {
+		t.Fatalf("expected panic error message, got %q", taskRuns[0].ErrorMessage)
+	}
+
+	_ = h // silence unused variable
+}
+
+func TestFlowStepPanicRecovery(t *testing.T) {
+	client := getTestClient(t)
+
+	flow := NewFlow("panic_flow",
+		InitialStep("step1", func(ctx context.Context, in string) (string, error) {
+			return "success", nil
+		}),
+		StepWithOneDependency("step2",
+			Dependency("step1"),
+			func(ctx context.Context, in string, step1Out string) (string, error) {
+				panic("intentional panic in flow step")
+			}),
+	)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	worker, err := client.NewWorker(t.Context(),
+		WithLogger(logger),
+		WithFlow(flow),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		err := worker.Start(t.Context())
+		if err != nil {
+			t.Logf("worker error: %s", err)
+		}
+	}()
+
+	// Give worker time to start
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), "panic_flow", "test input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for flow to execute
+	time.Sleep(1 * time.Second)
+
+	// Get flow runs to verify step failure
+	flowRuns, err := client.ListFlowRuns(t.Context(), "panic_flow")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(flowRuns) == 0 {
+		t.Fatal("expected at least one flow run")
+	}
+
+	// Flow should have failed due to step panic
+	if flowRuns[0].Status != "failed" {
+		t.Fatalf("expected flow status failed, got %s", flowRuns[0].Status)
+	}
+
+	_ = h // silence unused variable
 }

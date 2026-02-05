@@ -341,7 +341,7 @@ $$;
 --   id: Task run ID
 --   error_message: Description of the error that occurred
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_fail_task(name text, id bigint, output jsonb)
+CREATE OR REPLACE FUNCTION cb_fail_task(name text, id bigint, error_message text)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -1152,7 +1152,7 @@ DROP FUNCTION IF EXISTS cb_start_steps(text, bigint);
 DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text);
 DROP FUNCTION IF EXISTS cb_delete_flow(text);
 DROP FUNCTION IF EXISTS cb_create_flow(text, jsonb);
-DROP FUNCTION IF EXISTS cb_fail_task(text, bigint, jsonb);
+DROP FUNCTION IF EXISTS cb_fail_task(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_task(text, bigint, jsonb);
 DROP FUNCTION IF EXISTS cb_hide_tasks(text, bigint[], integer);
 DROP FUNCTION IF EXISTS cb_read_tasks(text, int, int, int, int);

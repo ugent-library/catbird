@@ -348,7 +348,17 @@ func (w *Worker) handleTask(ctx context.Context, t *Task, msg taskMessage, stopH
 		defer cancel()
 	}
 
-	out, err := h.fn(fnCtx, msg.Input)
+	var out json.RawMessage
+	var err error
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("task handler panic: %v", r)
+			}
+		}()
+		out, err = h.fn(fnCtx, msg.Input)
+	}()
 
 	stopHiding(msg.ID)
 
@@ -395,7 +405,17 @@ func (w *Worker) handleStep(ctx context.Context, flowName string, s *Step, msg s
 		defer cancel()
 	}
 
-	out, err := h.fn(fnCtx, msg)
+	var out json.RawMessage
+	var err error
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("step handler panic: %v", r)
+			}
+		}()
+		out, err = h.fn(fnCtx, msg)
+	}()
 
 	stopHiding(msg.ID)
 
