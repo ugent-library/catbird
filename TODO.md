@@ -6,7 +6,6 @@
 - [ ] Fair queueing? https://docs.hatchet.run/blog/multi-tenant-queues
 
 ## Worker & Execution
-- [ ] Handle panics in worker
 - [ ] Pause tasks - wait for signal
 - [ ] RunTaskWait / RunFlowWait long polling
 - [ ] Add queue, task, flow and step description fields
