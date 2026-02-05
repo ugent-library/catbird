@@ -44,6 +44,42 @@ for _, msg := range messages {
 }
 ```
 
+### Topic-Based Routing
+
+```go
+// Create queues
+err := client.CreateQueue(ctx, "user-events")
+err = client.CreateQueue(ctx, "audit-log")
+
+// Bind queues to topic patterns
+// Exact match
+err = client.Bind(ctx, "user-events", "events.user.created")
+
+// Single-token wildcard (? matches exactly one token)
+err = client.Bind(ctx, "user-events", "events.?.updated")
+// Matches: events.user.updated, events.order.updated
+
+// Multi-token wildcard (* matches one or more tokens at end)
+err = client.Bind(ctx, "audit-log", "events.*")
+// Matches: events.user.created, events.order.shipped, etc.
+
+// Dispatch a message to all matching queues
+err = client.Dispatch(ctx, "events.user.created", map[string]any{
+    "user_id": 123,
+    "email":   "user@example.com",
+})
+// Message is delivered to both "user-events" (exact) and "audit-log" (wildcard)
+
+// Unbind a pattern
+err = client.Unbind(ctx, "user-events", "events.?.updated")
+```
+
+Wildcard rules:
+- `?` matches a single token (e.g., `events.?.created` matches `events.user.created`)
+- `*` matches one or more tokens at the end (e.g., `events.user.*` matches `events.user.created.v1`)
+- `*` must appear as `.*` at the end of the pattern
+- Tokens are separated by `.` and can contain `a-z`, `A-Z`, `0-9`, `_`
+
 ### Task Execution
 
 ```go

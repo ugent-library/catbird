@@ -137,7 +137,7 @@ func TestJitterAppliesRandomness(t *testing.T) {
 	}
 
 	baseDelay := 200 * time.Millisecond
-	
+
 	// Send 5 messages and hide them all at the same time
 	msgIDs := []int64{}
 	for i := 0; i < 5; i++ {

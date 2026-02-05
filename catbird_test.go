@@ -59,28 +59,6 @@ func TestQueueCreate(t *testing.T) {
 	}
 }
 
-func TestQueueCreateWithTopics(t *testing.T) {
-	client := getTestClient(t)
-
-	err := client.CreateQueueWithOpts(t.Context(), "test_queue", QueueOpts{
-		Topics: []string{"topic1", "topic2"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	info, err := client.GetQueue(t.Context(), "test_queue")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Name != "test_queue" {
-		t.Fatalf("unexpected queue name: %s", info.Name)
-	}
-	if len(info.Topics) != 2 || info.Topics[0] != "topic1" || info.Topics[1] != "topic2" {
-		t.Fatalf("unexpected queue topics: %v", info.Topics)
-	}
-}
-
 func TestQueueSendAndRead(t *testing.T) {
 	client := getTestClient(t)
 
@@ -123,10 +101,12 @@ func TestQueueDispatch(t *testing.T) {
 	client := getTestClient(t)
 
 	queueName := "dispatch_queue"
-	err := client.CreateQueueWithOpts(t.Context(), queueName, QueueOpts{
-		Topics: []string{"event_topic"},
-	})
+	err := client.CreateQueue(t.Context(), queueName)
 	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.Bind(t.Context(), queueName, "event_topic"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -791,8 +771,7 @@ func TestTaskPanicRecovery(t *testing.T) {
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunTask(t.Context(), "panic_task", "test input")
-	if err != nil {
+	if _, err := client.RunTask(t.Context(), "panic_task", "test input"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -817,8 +796,6 @@ func TestTaskPanicRecovery(t *testing.T) {
 	if taskRuns[0].ErrorMessage == "" || !strings.Contains(taskRuns[0].ErrorMessage, "panic") {
 		t.Fatalf("expected panic error message, got %q", taskRuns[0].ErrorMessage)
 	}
-
-	_ = h // silence unused variable
 }
 
 func TestFlowStepPanicRecovery(t *testing.T) {
@@ -855,8 +832,7 @@ func TestFlowStepPanicRecovery(t *testing.T) {
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunFlow(t.Context(), "panic_flow", "test input")
-	if err != nil {
+	if _, err := client.RunFlow(t.Context(), "panic_flow", "test input"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -877,6 +853,4 @@ func TestFlowStepPanicRecovery(t *testing.T) {
 	if flowRuns[0].Status != "failed" {
 		t.Fatalf("expected flow status failed, got %s", flowRuns[0].Status)
 	}
-
-	_ = h // silence unused variable
 }

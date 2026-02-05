@@ -8,7 +8,7 @@ DECLARE
 BEGIN
     PERFORM cb_delete_queue(name)
     FROM cb_queues
-    WHERE delete_at IS NOT NULL AND delete_at <= now();
+    WHERE expires_at IS NOT NULL AND expires_at <= now();
 
     DELETE FROM cb_workers
     WHERE last_heartbeat_at < now() - INTERVAL '5 minutes';

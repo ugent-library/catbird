@@ -443,7 +443,7 @@ BEGIN
     -- Compare steps - raise exception if they differ
     IF _existing_steps IS DISTINCT FROM (
     SELECT jsonb_agg(
-      CASE 
+      CASE
         WHEN step_elem ? 'depends_on' THEN step_elem
         ELSE step_elem || jsonb_build_object('depends_on', '[]'::jsonb)
       END
@@ -519,7 +519,7 @@ BEGIN
       status text NOT NULL DEFAULT 'created',
       deliveries int NOT NULL DEFAULT 0,
       output jsonb,
-      error_message text,  
+      error_message text,
       remaining_dependencies int NOT NULL DEFAULT 0,
       deliver_at timestamptz NOT NULL DEFAULT now(),
       created_at timestamptz NOT NULL DEFAULT now(),
@@ -740,8 +740,8 @@ BEGIN
                    FROM %I deps
                    WHERE deps.flow_run_id = m.flow_run_id
                      AND deps.step_name IN (
-                       SELECT dependency_name 
-                       FROM cb_step_dependencies 
+                       SELECT dependency_name
+                       FROM cb_step_dependencies
                        WHERE flow_name = $4 AND step_name = m.step_name
                      )
                   ) AS step_outputs;

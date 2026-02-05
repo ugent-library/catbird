@@ -47,11 +47,11 @@ type Message struct {
 }
 
 type handlerOpts struct {
-	concurrency  int
-	batchSize    int
-	timeout      time.Duration
-	retries      int
-	retryDelay   time.Duration
+	concurrency int
+	batchSize   int
+	timeout     time.Duration
+	retries     int
+	retryDelay  time.Duration
 }
 
 // HandlerOpt is an option for configuring task and flow step handlers
@@ -141,8 +141,8 @@ type taskHandler struct {
 func NewTask[In, Out any](name string, fn func(context.Context, In) (Out, error), opts ...HandlerOpt) *Task {
 	h := &taskHandler{
 		handlerOpts: handlerOpts{
-			concurrency:  1,
-			batchSize:    10,
+			concurrency: 1,
+			batchSize:   10,
 		},
 		fn: func(ctx context.Context, b []byte) ([]byte, error) {
 			var in In
@@ -456,8 +456,8 @@ func StepWithEightDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, 
 func newStepHandler(fn func(context.Context, stepMessage) ([]byte, error), opts ...HandlerOpt) *stepHandler {
 	h := &stepHandler{
 		handlerOpts: handlerOpts{
-			concurrency:  1,
-			batchSize:    10,
+			concurrency: 1,
+			batchSize:   10,
 		},
 		fn: fn,
 	}
@@ -489,10 +489,9 @@ func unmarshalStepArgs(p stepMessage, stepNames []string, in any, stepOutputs []
 
 type QueueInfo struct {
 	Name      string    `json:"name"`
-	Topics    []string  `json:"topics,omitempty"`
 	Unlogged  bool      `json:"unlogged"`
 	CreatedAt time.Time `json:"created_at"`
-	DeleteAt  time.Time `json:"delete_at,omitzero"`
+	ExpiresAt time.Time `json:"expires_at,omitzero"`
 }
 
 type TaskInfo struct {
@@ -557,9 +556,9 @@ type StepHandlerInfo struct {
 }
 
 type QueueOpts struct {
-	Topics   []string
-	DeleteAt time.Time
-	Unlogged bool
+	Topics    []string
+	ExpiresAt time.Time
+	Unlogged  bool
 }
 
 // CreateQueue creates a new queue with the given name.
@@ -567,18 +566,27 @@ func CreateQueue(ctx context.Context, conn Conn, name string) error {
 	return CreateQueueWithOpts(ctx, conn, name, QueueOpts{})
 }
 
-// CreateQueueWithOpts creates a queue with the specified options including
-// topics, deletion time, and unlogged mode.
+// CreateQueueWithOpts creates a queue with the specified options.
+// Use Bind() separately to create topic bindings.
 func CreateQueueWithOpts(ctx context.Context, conn Conn, name string, opts QueueOpts) error {
-	q := `SELECT cb_create_queue(name => $1, topics => $2, delete_at => $3, unlogged => $4);`
-	_, err := conn.Exec(ctx, q, name, opts.Topics, ptrOrNil(opts.DeleteAt), opts.Unlogged)
+	q := `SELECT cb_create_queue(name => $1, expires_at => $2, unlogged => $3);`
+	_, err := conn.Exec(ctx, q, name, ptrOrNil(opts.ExpiresAt), opts.Unlogged)
 	return err
 }
 
 // GetQueue retrieves queue metadata by name.
 func GetQueue(ctx context.Context, conn Conn, name string) (*QueueInfo, error) {
-	q := `SELECT name, topics, unlogged, created_at, delete_at FROM cb_queues WHERE name = $1;`
-	return scanQueue(conn.QueryRow(ctx, q, name))
+	q := `SELECT name, unlogged, created_at, expires_at FROM cb_queues WHERE name = $1;`
+	var info QueueInfo
+	var expiresAt *time.Time
+	err := conn.QueryRow(ctx, q, name).Scan(&info.Name, &info.Unlogged, &info.CreatedAt, &expiresAt)
+	if err != nil {
+		return nil, err
+	}
+	if expiresAt != nil {
+		info.ExpiresAt = *expiresAt
+	}
+	return &info, nil
 }
 
 // DeleteQueue deletes a queue and all its messages.
@@ -592,12 +600,27 @@ func DeleteQueue(ctx context.Context, conn Conn, name string) (bool, error) {
 
 // ListQueues returns all queues
 func ListQueues(ctx context.Context, conn Conn) ([]*QueueInfo, error) {
-	q := `SELECT name, topics, unlogged, created_at, delete_at FROM cb_queues;`
+	q := `SELECT name, unlogged, created_at, expires_at FROM cb_queues ORDER BY name;`
 	rows, err := conn.Query(ctx, q)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, scanCollectibleQueue)
+	defer rows.Close()
+
+	var queues []*QueueInfo
+	for rows.Next() {
+		var info QueueInfo
+		var expiresAt *time.Time
+		if err := rows.Scan(&info.Name, &info.Unlogged, &info.CreatedAt, &expiresAt); err != nil {
+			return nil, err
+		}
+		if expiresAt != nil {
+			info.ExpiresAt = *expiresAt
+		}
+		queues = append(queues, &info)
+	}
+
+	return queues, rows.Err()
 }
 
 type SendOpts struct {
@@ -622,6 +645,22 @@ func SendWithOpts(ctx context.Context, conn Conn, queue string, payload any, opt
 
 	q := `SELECT cb_send(queue => $1, payload => $2, topic => $3, deduplication_id => $4, deliver_at => $5);`
 	_, err = conn.Exec(ctx, q, queue, b, ptrOrNil(opts.Topic), ptrOrNil(opts.DeduplicationID), ptrOrNil(opts.DeliverAt))
+	return err
+}
+
+// Bind subscribes a queue to a topic pattern.
+// Pattern supports exact topics and wildcards: ? (single token), * (multi-token tail).
+// Examples: "foo.bar", "foo.?.bar", "foo.bar.*"
+func Bind(ctx context.Context, conn Conn, queue string, pattern string) error {
+	q := `SELECT cb_bind(queue_name => $1, pattern => $2);`
+	_, err := conn.Exec(ctx, q, queue, pattern)
+	return err
+}
+
+// Unbind unsubscribes a queue from a topic pattern.
+func Unbind(ctx context.Context, conn Conn, queue string, pattern string) error {
+	q := `SELECT cb_unbind(queue_name => $1, pattern => $2);`
+	_, err := conn.Exec(ctx, q, queue, pattern)
 	return err
 }
 
@@ -1015,20 +1054,19 @@ func scanCollectibleQueue(row pgx.CollectableRow) (*QueueInfo, error) {
 func scanQueue(row pgx.Row) (*QueueInfo, error) {
 	rec := QueueInfo{}
 
-	var deleteAt *time.Time
+	var expiresAt *time.Time
 
 	if err := row.Scan(
 		&rec.Name,
-		&rec.Topics,
 		&rec.Unlogged,
 		&rec.CreatedAt,
-		&deleteAt,
+		&expiresAt,
 	); err != nil {
 		return nil, err
 	}
 
-	if deleteAt != nil {
-		rec.DeleteAt = *deleteAt
+	if expiresAt != nil {
+		rec.ExpiresAt = *expiresAt
 	}
 
 	return &rec, nil

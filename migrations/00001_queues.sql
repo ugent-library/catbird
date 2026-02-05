@@ -1,4 +1,4 @@
--- SQL code is taken from or inspired by pgflow pgmq (https://github.com/pgmq/pgmq) 
+-- SQL code is taken from or inspired by pgmq (https://github.com/pgmq/pgmq)
 -- TODO better return values
 
 -- +goose up
@@ -22,15 +22,29 @@ END$$;
 
 CREATE TABLE IF NOT EXISTS cb_queues (
     name text PRIMARY KEY,
-    topics text[],
     unlogged boolean NOT null,
     created_at timestamptz NOT NULL DEFAULT now(),
-    delete_at timestamptz,
-    CONSTRAINT delete_at_is_valid CHECK (delete_at IS NULL OR delete_at > created_at)
+    expires_at timestamptz,
+    CONSTRAINT expires_at_is_valid CHECK (expires_at IS NULL OR expires_at > created_at)
 );
 
-CREATE INDEX IF NOT EXISTS cb_queues_topics_idx ON cb_queues USING gin (topics);
-CREATE INDEX IF NOT EXISTS cb_queues_delete_at_idx ON cb_queues (delete_at);
+CREATE INDEX IF NOT EXISTS cb_queues_expires_at_idx ON cb_queues (expires_at);
+
+-- Bindings table for topic routing with wildcard support
+CREATE TABLE IF NOT EXISTS cb_bindings (
+    queue_name text NOT NULL REFERENCES cb_queues(name) ON DELETE CASCADE,
+    pattern text NOT NULL,
+    pattern_type text NOT NULL CHECK (pattern_type IN ('exact', 'wildcard')),
+    prefix text,
+    regex text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (queue_name, pattern)
+);
+
+CREATE INDEX IF NOT EXISTS cb_bindings_exact_idx ON cb_bindings(pattern)
+    WHERE pattern_type = 'exact';
+CREATE INDEX IF NOT EXISTS cb_bindings_prefix_idx ON cb_bindings(prefix text_pattern_ops)
+    WHERE prefix IS NOT NULL;
 
 -- +goose statementbegin
 -- cb_table_name: Generate a PostgreSQL table name for queue/task/flow storage
@@ -59,14 +73,12 @@ $$;
 -- Creates the queue metadata and associated message table for enqueued messages
 -- Parameters:
 --   name: Queue name (must be unique)
---   topics: Optional array of topic strings for message routing
---   delete_at: Optional timestamp when the queue should be automatically deleted
+--   expires_at: Optional timestamp when the queue can be garbage collected
 --   unlogged: Whether to use an unlogged table for better performance (loses durability)
 -- Returns: void
 CREATE OR REPLACE FUNCTION cb_create_queue(
     name text,
-    topics text[] = null,
-    delete_at timestamptz = null,
+    expires_at timestamptz = null,
     unlogged boolean = false
 )
 RETURNS void
@@ -111,13 +123,12 @@ BEGIN
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (deduplication_id);', _q_table || '_deduplication_id_idx', _q_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (deliver_at);', _q_table || '_deliver_at_idx', _q_table);
 
-    -- TODO should check attributes are same
-    INSERT INTO cb_queues (name, topics, unlogged, delete_at)
+    -- Insert queue metadata
+    INSERT INTO cb_queues (name, unlogged, expires_at)
     VALUES (
         cb_create_queue.name,
-        cb_create_queue.topics,
         cb_create_queue.unlogged,
-        cb_create_queue.delete_at
+        cb_create_queue.expires_at
     )
     ON CONFLICT DO NOTHING;
 END;
@@ -145,7 +156,7 @@ BEGIN
     WHERE q.name = cb_delete_queue.name
     RETURNING true
     INTO _res;
- 
+
     RETURN coalesce(_res, false);
 end
 $$;
@@ -153,7 +164,7 @@ $$;
 
 -- +goose statementbegin
 -- cb_dispatch: Send a message to all queues subscribed to a topic
--- Routes the message to queues based on topic subscription
+-- Routes messages based on bindings with support for exact and wildcard patterns
 -- Parameters:
 --   topic: Topic string to route to subscribed queues
 --   payload: JSON message payload
@@ -173,10 +184,19 @@ DECLARE
     _rec record;
     _q_table text;
 BEGIN
-    FOR _rec IN 
-        SELECT q.name
-        FROM cb_queues q
-        WHERE cb_dispatch.topic = any(q.topics) AND (q.delete_at IS NULL OR q.delete_at > now())
+    -- Find all matching queues via bindings (exact + wildcard patterns)
+    FOR _rec IN
+        SELECT DISTINCT queue_name AS name
+        FROM cb_bindings
+        WHERE (
+            -- Exact match (fastest path)
+            (pattern_type = 'exact' AND pattern = cb_dispatch.topic)
+            OR
+            -- Wildcard match with prefix filter + regex
+            (pattern_type = 'wildcard'
+             AND (prefix = '' OR cb_dispatch.topic LIKE prefix || '%')
+             AND cb_dispatch.topic ~ regex)
+        )
     LOOP
         _q_table := cb_table_name(_rec.name, 'q');
         EXECUTE format(
@@ -193,6 +213,102 @@ BEGIN
               _deliver_at;
     END LOOP;
 END
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_bind: Subscribe a queue to a topic pattern
+-- Supports exact topics and wildcards (? for single token, * for multi-token tail)
+-- Parameters:
+--   queue_name: Name of the queue to bind
+--   pattern: Topic pattern (e.g., 'foo.bar', 'foo.?.bar', 'foo.bar.*')
+-- Returns: void
+CREATE OR REPLACE FUNCTION cb_bind(queue_name text, pattern text)
+RETURNS void
+LANGUAGE plpgsql AS $$
+#variable_conflict use_column
+DECLARE
+    p_type text;
+    p_prefix text;
+    p_regex text;
+    test_result boolean;
+BEGIN
+    -- Validate pattern contains only allowed characters
+    IF cb_bind.pattern !~ '^[a-zA-Z0-9._?*-]+$' THEN
+        RAISE EXCEPTION 'cb: pattern can only contain: a-z, A-Z, 0-9, ., _, -, ?, *';
+    END IF;
+
+    -- Validate no double dots, leading or trailing dots
+    IF cb_bind.pattern ~ '\.\.' OR cb_bind.pattern ~ '(^\.|\.$)' THEN
+        RAISE EXCEPTION 'cb: pattern cannot contain double dots (..), or start/end with a dot';
+    END IF;
+
+    -- Check if pattern has wildcards
+    IF cb_bind.pattern !~ '[?*]' THEN
+        -- Exact match
+        p_type := 'exact';
+        p_prefix := NULL;
+        p_regex := NULL;
+    ELSE
+        -- Wildcard match
+        p_type := 'wildcard';
+
+        -- Validate * only appears at end after a dot
+        IF cb_bind.pattern ~ '\*' AND cb_bind.pattern !~ '\.\*$' THEN
+            RAISE EXCEPTION 'cb: * wildcard must be at the end after a dot (e.g., "foo.bar.*")';
+        END IF;
+
+        -- Extract literal prefix before first wildcard
+        p_prefix := substring(cb_bind.pattern FROM '^([^?*]+)');
+
+        -- If no prefix (pattern starts with wildcard), set to empty for matching
+        IF p_prefix IS NULL OR p_prefix = '' THEN
+            p_prefix := '';
+        END IF;
+
+        -- Precompile regex pattern
+        -- ? -> [a-z0-9_]+ (single token matching allowed characters)
+        -- .* -> (\.[a-z0-9_]+)+ (one or more dot-separated tokens)
+        p_regex := '^' ||
+            regexp_replace(
+                regexp_replace(cb_bind.pattern, E'\\.\\*$', '(\\.[a-z0-9_]+)+'),
+                E'\\?', '[a-z0-9_]+', 'g'
+            ) || '$';
+
+        -- Validate regex compiles correctly by testing it
+        BEGIN
+            test_result := 'test.topic' ~ p_regex;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE EXCEPTION 'cb: invalid pattern "%" generated invalid regex: %', cb_bind.pattern, SQLERRM;
+        END;
+    END IF;
+
+    -- Insert or update binding
+    INSERT INTO cb_bindings(queue_name, pattern, pattern_type, prefix, regex)
+    VALUES (cb_bind.queue_name, cb_bind.pattern, p_type, p_prefix, p_regex)
+    ON CONFLICT (queue_name, pattern) DO NOTHING;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_unbind: Unsubscribe a queue from a topic pattern
+-- Parameters:
+--   queue_name: Name of the queue
+--   pattern: Topic pattern to remove
+-- Returns: void
+CREATE OR REPLACE FUNCTION cb_unbind(queue_name text, pattern text)
+RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM cb_bindings
+    WHERE cb_bindings.queue_name = cb_unbind.queue_name
+      AND cb_bindings.pattern = cb_unbind.pattern;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'cb: binding not found for queue "%" and pattern "%"', cb_unbind.queue_name, cb_unbind.pattern;
+    END IF;
+END;
 $$;
 -- +goose statementend
 
@@ -519,18 +635,22 @@ $$ LANGUAGE plpgsql;
 
 SELECT cb_delete_queue(name) FROM cb_queues;
 
-DROP FUNCTION cb_create_queue(text, text[], timestamptz, boolean);
-DROP FUNCTION cb_delete_queue(text);
-DROP FUNCTION cb_dispatch(text, jsonb, text, timestamptz);
-DROP FUNCTION cb_send(text, jsonb, text, text, timestamptz);
-DROP FUNCTION cb_read(text, int, int);
-DROP FUNCTION cb_read_poll(text, int, int, int, int);
-DROP FUNCTION cb_hide(text, bigint, integer);
-DROP FUNCTION cb_hide(text, bigint[], integer);
-DROP FUNCTION cb_delete(text, bigint);
-DROP FUNCTION cb_delete(text, bigint[]);
-DROP FUNCTION cb_table_name(text, text);
+DROP FUNCTION IF EXISTS cb_unbind(text, text);
+DROP FUNCTION IF EXISTS cb_bind(text, text);
+DROP FUNCTION IF EXISTS cb_create_queue(text, timestamptz, boolean);
+DROP FUNCTION IF EXISTS cb_create_queue(text, text[], timestamptz, boolean);
+DROP FUNCTION IF EXISTS cb_delete_queue(text);
+DROP FUNCTION IF EXISTS cb_dispatch(text, jsonb, text, timestamptz);
+DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, timestamptz);
+DROP FUNCTION IF EXISTS cb_read(text, int, int);
+DROP FUNCTION IF EXISTS cb_read_poll(text, int, int, int, int);
+DROP FUNCTION IF EXISTS cb_hide(text, bigint, integer);
+DROP FUNCTION IF EXISTS cb_hide(text, bigint[], integer);
+DROP FUNCTION IF EXISTS cb_delete(text, bigint);
+DROP FUNCTION IF EXISTS cb_delete(text, bigint[]);
+DROP FUNCTION IF EXISTS cb_table_name(text, text);
 
-DROP TABLE cb_queues;
+DROP TABLE IF EXISTS cb_bindings;
+DROP TABLE IF EXISTS cb_queues;
 
-DROP TYPE cb_message;
+DROP TYPE IF EXISTS cb_message;

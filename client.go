@@ -56,6 +56,18 @@ func (c *Client) SendWithOpts(ctx context.Context, queue string, payload any, op
 	return SendWithOpts(ctx, c.Conn, queue, payload, opts)
 }
 
+// Bind subscribes a queue to a topic pattern.
+// Pattern supports exact topics and wildcards: ? (single token), * (multi-token tail).
+// Examples: "foo.bar", "foo.?.bar", "foo.bar.*"
+func (c *Client) Bind(ctx context.Context, queue string, pattern string) error {
+	return Bind(ctx, c.Conn, queue, pattern)
+}
+
+// Unbind unsubscribes a queue from a topic pattern.
+func (c *Client) Unbind(ctx context.Context, queue string, pattern string) error {
+	return Unbind(ctx, c.Conn, queue, pattern)
+}
+
 // Dispatch sends a message to all queues subscribed to the specified topic.
 func (c *Client) Dispatch(ctx context.Context, topic string, payload any) error {
 	return Dispatch(ctx, c.Conn, topic, payload)

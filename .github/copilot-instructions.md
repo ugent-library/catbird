@@ -12,15 +12,15 @@ Catbird is a PostgreSQL-based message queue with task and workflow execution eng
 3. **Dashboard** (`dashboard/`): Web UI for starting task/flow runs, monitoring progress in real-time, and viewing results; served via CLI `cb dashboard`
 
 **Two Independent Systems**:
-1. **Generic Message Queues**: `Send()`, `Dispatch()`, `Read()` operations similar to pgmq/SQS. Messages stored in queue tables; independent from tasks/flows.
+1. **Generic Message Queues**: `Send()`, `Dispatch()`, `Read()` operations similar to pgmq/SQS. Messages stored in queue tables; independent from tasks/flows. **Topic routing** via explicit bindings with wildcard support (`?` for single token, `*` for multi-token tail). Bindings stored in `cb_bindings` table with pattern type (exact/wildcard), prefix extraction for indexed filtering, and precompiled regexes.
 2. **Task & Flow Execution**: Task/flow definitions describe shape; `RunTask()` or `RunFlow()` create entries in task_run/step_run tables (which act as queues themselves). Worker reads from these tables and executes handlers. State tracked via constants (created, started, completed, failed).
 
 ## Database Schema
 
 All schema is version-controlled in `migrations/` (goose-managed):
-- **Queues** (v1): `cb_queues` table + message functions; custom types `cb_message` (7 fields including id, topic, payload)
+- **Queues** (v1): `cb_queues` table (name PK, expires_at) + `cb_bindings` table (queue_name FK, pattern, pattern_type, prefix, regex) + message functions; custom types `cb_message` (7 fields including id, topic, payload). Bindings use exact match fast path (indexed) or wildcard (prefix filter + regex).
 - **Tasks/Flows** (v2): Task definitions, runs, flows; custom types `cb_task_message`, `cb_step_message`
-- **GC** (v3): Garbage collection routines
+- **GC** (v3): Garbage collection routines (`cb_gc()` deletes queues with `expires_at <= now()` and removes workers with stale heartbeats > 5 minutes old)
 
 Key: Migrations use goose with `DisableVersioning` + embedded FS. Schema version = 3.
 
@@ -39,7 +39,7 @@ task := catbird.NewTask("my_task", func(ctx context.Context, input MyInput) (MyO
 
 **Flows**: Multi-step DAGs with dependencies. Steps execute when their dependencies complete (simple DAG semantics). Flow output is the combined JSON object of all step outputs; step names are unique within a flow and form the output keys.
 ```go
-NewFlow("workflow", 
+NewFlow("workflow",
     InitialStep("step1", func(ctx context.Context, in string) (string, error) {
         return in + " processed by step 1", nil
     }),
@@ -65,23 +65,24 @@ NewFlow("workflow",
 - **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `WithLogger()`
 - **Scheduled tasks/flows**: Use robfig/cron syntax; `WithScheduledTask("name", "@hourly")` or `WithGC()`
 - **Deduplication**: Messages support `DeduplicationID` field to prevent duplicates
+- **Topic bindings**: Explicit via `Bind(queue, pattern)`; wildcards `?` (single token) and `*` (multi-token tail as `.*`). Foreign key CASCADE deletes bindings when queue is deleted. Pattern validation at bind time; regex precompiled in PostgreSQL.
 - **Task/Flow execution**: `client.RunTask()` or `client.RunFlow()` return handles with `WaitForOutput()` to block until completion
 
 ## Developer Workflows
 
-**Setup**: 
+**Setup**:
 ```bash
 go mod download
 # Requires PostgreSQL with `CB_CONN` env var (connstring)
 ```
 
-**Testing**: 
+**Testing**:
 - Unit tests in `*_test.go` files (see `catbird_test.go`)
 - Uses testcontainers for Postgres integration
 
-**Dashboard**: 
+**Dashboard**:
 - Start task and flow runs from web UI
-- Monitor real-time progress and state updates  
+- Monitor real-time progress and state updates
 - View task/flow results once completed
 - Access via: `CB_CONN="postgres://..." go run ./cmd/cb/main.go dashboard --port 8080`
 
@@ -100,5 +101,5 @@ go mod download
 1. **Errors**: Use `ErrTaskFailed`, `ErrFlowFailed` package-level errors
 2. **Context propagation**: All DB ops accept `context.Context` first param
 3. **JSON payloads**: Custom types → JSON via generics; validation happens in handler
-4. **Retries**: Built-in with exponential backoff + jitter; configured per handler
+4. **Retries**: Built-in with configurable delays per handler; jitter (±10%) applied in PostgreSQL
 5. **Concurrency**: Default 1 per handler; tweak with `WithConcurrency(n)`
