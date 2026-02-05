@@ -213,6 +213,90 @@ err = handle.WaitForOutput(ctx, &results)
 - **Queue, task, flow, and step names**: Lowercase letters, digits, and underscores only (`a-z`, `0-9`, `_`). Max 58 characters. Step names must be unique within a flow.
 - **Topics/Patterns**: Letters (upper/lower), digits, dots, underscores, and hyphens (`a-z`, `A-Z`, `0-9`, `.`, `_`, `-`, plus wildcards `?`, `*`).
 
+## Using the PostgreSQL API Directly
+
+Catbird is built on PostgreSQL functions, so you can use the API directly from any language or tool with PostgreSQL support (psql, Python, Node.js, Ruby, etc.).
+
+### Queues
+
+```sql
+-- Create a queue
+SELECT cb_create_queue(name => 'my_queue', expires_at => null, unlogged => false);
+
+-- Send a message
+SELECT cb_send(queue => 'my_queue', payload => '{"user_id": 123, "action": "process"}'::jsonb, 
+               topic => null, deduplication_id => null, deliver_at => null);
+
+-- Send with deduplication and delayed delivery
+SELECT cb_send(queue => 'my_queue', payload => '{"order_id": 789}'::jsonb,
+               topic => null, deduplication_id => 'order-789', deliver_at => now() + '5 minutes'::interval);
+
+-- Dispatch to topic-bound queues
+SELECT cb_dispatch(topic => 'events.user.created', payload => '{"user_id": 456}'::jsonb,
+                   deduplication_id => 'user-456-created', deliver_at => null);
+
+-- Read messages (with 30 second visibility timeout)
+SELECT * FROM cb_read(queue => 'my_queue', limit => 10, hide_for => 30);
+
+-- Delete a message
+SELECT cb_delete(queue => 'my_queue', id => 1);
+
+-- Bind queue to topic pattern
+SELECT cb_bind(queue_name => 'user_events', pattern => 'events.user.*');
+SELECT cb_unbind(queue_name => 'user_events', pattern => 'events.user.*');
+```
+
+### Tasks
+
+```sql
+-- Create a task definition
+SELECT cb_create_task(name => 'send_email');
+
+-- Run a task
+SELECT * FROM cb_run_task(name => 'send_email', input => '{"to": "user@example.com"}'::jsonb, 
+                          deduplication_id => null);
+
+-- Run a task with deduplication
+SELECT * FROM cb_run_task(name => 'send_email', input => '{"to": "user@example.com"}'::jsonb, 
+                          deduplication_id => 'email-user123-welcome');
+```
+
+### Workflows
+
+```sql
+-- Create a flow with multiple steps and dependencies
+SELECT cb_create_flow(name => 'order_processing', steps => '[
+  {"name": "validate", "depends_on": null},
+  {"name": "charge", "depends_on": [{"name": "validate"}]},
+  {"name": "ship", "depends_on": [{"name": "charge"}]}
+]'::jsonb);
+
+-- Run a flow
+SELECT * FROM cb_run_flow(name => 'order_processing', input => '{"order_id": 123}'::jsonb,
+                          deduplication_id => null);
+
+-- Run a flow with deduplication
+SELECT * FROM cb_run_flow(name => 'order_processing', input => '{"order_id": 123}'::jsonb,
+                          deduplication_id => 'order-123-processing');
+```
+
+### Monitoring Task and Flow Runs
+
+You can query task and flow run information directly:
+
+```sql
+-- List recent task runs (replace send_email with your task name)
+SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at
+FROM cb_t_send_email
+ORDER BY started_at DESC
+LIMIT 20;
+
+-- Get flow run (replace order_processing with your flow name)
+SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at
+FROM cb_f_order_processing
+WHERE id = $1;
+```
+
 ## Dashboard Preview
 
 <p align="center">
