@@ -3,6 +3,9 @@
   --bs-body-color: #e0e0e0;
   --bs-border-color: #2d2d44;
   --bs-secondary-bg: #252540;
+  --accent-purple: #9747ff;
+  --accent-green: #00B05B;
+  --accent-green-dark: #0C8F50;
 }
 
 body {
@@ -164,6 +167,12 @@ body {
   color: #e0e0e0 !important;
 }
 
+/* Success modal with green header */
+.modal-header.text-bg-success {
+  background-color: #00B05B !important;
+  color: #ffffff !important;
+}
+
 .form-control,
 .form-select {
   background-color: #252540 !important;
@@ -189,6 +198,11 @@ h1, h2, h3, h4, h5, h6 {
 .badge {
   background-color: #2d2d44 !important;
   color: #e0e0e0 !important;
+}
+
+.badge-accent {
+  background-color: #00B05B !important;
+  color: #ffffff !important;
 }
 
 .btn-secondary {
@@ -242,4 +256,31 @@ a:visited {
 
 .btn-link:hover {
   color: #d4a5ff !important;
+}
+
+/* Green accent styles */
+.text-success {
+  color: #00B05B !important;
+}
+
+.text-success-emphasis {
+  color: #0C8F50 !important;
+}
+
+.btn-success {
+  background-color: #00B05B !important;
+  border-color: #00B05B !important;
+}
+
+.btn-success:hover {
+  background-color: #0C8F50 !important;
+  border-color: #0C8F50 !important;
+}
+
+.badge-success {
+  background-color: #00B05B !important;
+}
+
+.badge-success:hover {
+  background-color: #0C8F50 !important;
 }
