@@ -163,6 +163,18 @@ err = handle.WaitForOutput(ctx, &results)
 - **Queue, task, flow, and step names**: Lowercase letters, digits, and underscores only (`a-z`, `0-9`, `_`). Max 58 characters. Step names must be unique within a flow.
 - **Topics/Patterns**: Letters (upper/lower), digits, dots, underscores, and hyphens (`a-z`, `A-Z`, `0-9`, `.`, `_`, `-`, plus wildcards `?`, `*`).
 
+## Dashboard Preview
+
+<p align="center">
+  <img src="screenshots/dashboard-queues.png" alt="Queues Management" width="800" />
+</p>
+<p align="center">
+  <img src="screenshots/dashboard-flows.png" alt="Flow Visualization" width="800" />
+</p>
+<p align="center">
+  <img src="screenshots/dashboard-workers.png" alt="Workers Overview" width="800" />
+</p>
+
 ## Documentation
 
 - **[Go API Documentation](https://pkg.go.dev/github.com/ugent-library/catbird)**: Complete reference for all public types and functions
