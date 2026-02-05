@@ -47,13 +47,14 @@ for _, msg := range messages {
 ### Task Execution
 
 ```go
+// Define the task
+task := catbird.NewTask("send-email", func(ctx context.Context, input EmailRequest) (EmailResponse, error) {
+    // Send email logic here
+    return EmailResponse{SentAt: time.Now()}, nil
+}, catbird.WithRetries(3))
+
 // Start a worker that handles the send-email task
-worker, err := client.NewWorker(ctx,
-    catbird.WithTask("send-email", func(ctx context.Context, input EmailRequest) (EmailResponse, error) {
-        // Send email logic here
-        return EmailResponse{SentAt: time.Now()}, nil
-    }, catbird.WithRetries(3)),
-)
+worker, err := client.NewWorker(ctx, catbird.WithTask(task))
 go worker.Start(ctx)
 
 // Run the task
