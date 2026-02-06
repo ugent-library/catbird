@@ -14,6 +14,25 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
+type WorkerInfo struct {
+	ID              string             `json:"id"`
+	TaskHandlers    []*TaskHandlerInfo `json:"task_handlers"`
+	StepHandlers    []*StepHandlerInfo `json:"step_handlers"`
+	StartedAt       time.Time          `json:"started_at"`
+	LastHeartbeatAt time.Time          `json:"last_heartbeat_at"`
+}
+
+// ListWorkers returns all registered workers.
+func ListWorkers(ctx context.Context, conn Conn) ([]*WorkerInfo, error) {
+	q := `SELECT id, started_at, last_heartbeat_at, task_handlers, step_handlers FROM cb_worker_info;`
+	rows, err := conn.Query(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, scanCollectibleWorker)
+
+}
+
 // Worker processes tasks and flows from the queue
 type Worker struct {
 	id              string
@@ -494,7 +513,6 @@ func startHandlerWorkers[T handlerMessage](
 	}
 }
 
-
 type taskMessage struct {
 	ID              int64           `json:"id"`
 	DeduplicationID string          `json:"deduplication_id,omitempty"`
@@ -667,4 +685,38 @@ func scanStepMessage(row pgx.Row) (stepMessage, error) {
 	}
 
 	return rec, nil
+}
+
+func scanCollectibleWorker(row pgx.CollectableRow) (*WorkerInfo, error) {
+	return scanWorker(row)
+}
+
+func scanWorker(row pgx.Row) (*WorkerInfo, error) {
+	rec := WorkerInfo{}
+
+	var taskHandlers json.RawMessage
+	var stepHandlers json.RawMessage
+
+	if err := row.Scan(
+		&rec.ID,
+		&rec.StartedAt,
+		&rec.LastHeartbeatAt,
+		&taskHandlers,
+		&stepHandlers,
+	); err != nil {
+		return nil, err
+	}
+
+	if taskHandlers != nil {
+		if err := json.Unmarshal(taskHandlers, &rec.TaskHandlers); err != nil {
+			return nil, err
+		}
+	}
+	if stepHandlers != nil {
+		if err := json.Unmarshal(stepHandlers, &rec.StepHandlers); err != nil {
+			return nil, err
+		}
+	}
+
+	return &rec, nil
 }
