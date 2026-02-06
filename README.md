@@ -109,7 +109,11 @@ Wildcard rules:
 task := catbird.NewTask("send-email", func(ctx context.Context, input EmailRequest) (EmailResponse, error) {
     // Send email logic here
     return EmailResponse{SentAt: time.Now()}, nil
-}, catbird.WithMaxRetries(3), catbird.WithConcurrency(5)) // Retry 3 times, allow up to 5 concurrent executions
+},
+    catbird.WithConcurrency(5), // Allow up to 5 concurrent executions
+    catbird.WithMaxRetries(3), // Retry 3 times
+    catbird.WithBackoff(500*time.Millisecond, 10*time.Second), // Exponential backoff between 500ms and 10s
+)
 
 // Start a worker that handles the send-email task
 worker, err := client.NewWorker(ctx, catbird.WithTask(task))
