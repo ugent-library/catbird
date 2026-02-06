@@ -24,7 +24,7 @@ type WorkerInfo struct {
 
 // ListWorkers returns all registered workers.
 func ListWorkers(ctx context.Context, conn Conn) ([]*WorkerInfo, error) {
-	q := `SELECT id, started_at, last_heartbeat_at, task_handlers, step_handlers FROM cb_worker_info;`
+	q := `SELECT id, started_at, last_heartbeat_at, task_handlers, step_handlers FROM cb_worker_info ORDER BY last_heartbeat_at DESC;`
 	rows, err := conn.Query(ctx, q)
 	if err != nil {
 		return nil, err
@@ -48,11 +48,13 @@ type Worker struct {
 type taskSchedule struct {
 	taskName string
 	schedule string
+	inputFn  func() (any, error)
 }
 
 type flowSchedule struct {
 	flowName string
 	schedule string
+	inputFn  func() (any, error)
 }
 
 // WorkerOpt is an option for configuring a worker
@@ -114,58 +116,60 @@ func WithShutdownTimeout(d time.Duration) WorkerOpt {
 type scheduledTaskOpt struct {
 	taskName string
 	schedule string
+	inputFn  func() (any, error)
 }
 
 func (o scheduledTaskOpt) apply(w *Worker) {
+	if o.inputFn == nil {
+		o.inputFn = func() (any, error) { return struct{}{}, nil }
+	}
 	w.taskSchedules = append(w.taskSchedules, taskSchedule{
 		taskName: o.taskName,
 		schedule: o.schedule,
+		inputFn:  o.inputFn,
 	})
 }
 
-// WithScheduledTask registers a scheduled task execution using cron syntax
-func WithScheduledTask(taskName string, schedule string) WorkerOpt {
-	return &scheduledTaskOpt{taskName: taskName, schedule: schedule}
+// WithScheduledTask registers a scheduled task execution using cron syntax.
+// The input function can be used to provide dynamic input at execution time.
+// If the input function is nil, an empty JSON object will be used as input to the task.
+func WithScheduledTask(taskName string, schedule string, inputFn func() (any, error)) WorkerOpt {
+	return &scheduledTaskOpt{taskName: taskName, schedule: schedule, inputFn: inputFn}
 }
 
 type scheduledFlowOpt struct {
 	flowName string
 	schedule string
+	inputFn  func() (any, error)
 }
 
 func (o scheduledFlowOpt) apply(w *Worker) {
+	if o.inputFn == nil {
+		o.inputFn = func() (any, error) { return struct{}{}, nil }
+	}
 	w.flowSchedules = append(w.flowSchedules, flowSchedule{
 		flowName: o.flowName,
 		schedule: o.schedule,
+		inputFn:  o.inputFn,
 	})
 }
 
-// WithScheduledFlow registers a scheduled flow execution using cron syntax
-func WithScheduledFlow(flowName string, schedule string) WorkerOpt {
-	return &scheduledFlowOpt{flowName: flowName, schedule: schedule}
+// WithScheduledFlow registers a scheduled flow execution using cron syntax.
+// The input function can be used to provide dynamic input at execution time.
+// If the input function is nil, an empty JSON object will be used as input to the flow.
+func WithScheduledFlow(flowName string, schedule string, inputFn func() (any, error)) WorkerOpt {
+	return &scheduledFlowOpt{flowName: flowName, schedule: schedule, inputFn: inputFn}
 }
 
-type gcOpt struct {
-	schedule string
+// WithGC registers a garbage collection task to clean up expired queues and stale workers
+func WithGC(schedule string) WorkerOpt {
+	return &scheduledTaskOpt{taskName: "gc", schedule: schedule}
 }
 
-func WithGC() WorkerOpt {
-	return &gcOpt{schedule: "@every 10m"}
-}
-
-func (o *gcOpt) Schedule(schedule string) *gcOpt {
-	o.schedule = schedule
-	return o
-}
-
-func (o gcOpt) apply(w *Worker) {
-	w.tasks = append(w.tasks, NewTask("gc", func(ctx context.Context, input struct{}) (struct{}, error) {
-		return struct{}{}, GC(ctx, w.conn)
-	}))
-	w.taskSchedules = append(w.taskSchedules, taskSchedule{
-		taskName: "gc",
-		schedule: o.schedule,
-	})
+// WithDefaultGC registers a garbage collection task to clean up
+// expired queues and stale workers every 10 minutes
+func WithDefaultGC() WorkerOpt {
+	return WithGC("@every 10m")
 }
 
 // NewWorker creates a new worker with the given options
@@ -285,7 +289,23 @@ func (w *Worker) Start(ctx context.Context) error {
 					scheduledTime = entry.Next
 				}
 
-				_, err := RunTaskWithOpts(ctx, w.conn, ts.taskName, struct{}{}, RunTaskOpts{
+				var inputJSON json.RawMessage
+				if ts.inputFn != nil {
+					input, err := ts.inputFn()
+					if err != nil {
+						w.logger.ErrorContext(ctx, "worker: failed to get scheduled task input", "task", ts.taskName, "error", err)
+						return
+					}
+					inputJSON, err = json.Marshal(input)
+					if err != nil {
+						w.logger.ErrorContext(ctx, "worker: failed to marshal scheduled task input", "task", ts.taskName, "error", err)
+						return
+					}
+				} else {
+					inputJSON = json.RawMessage("{}")
+				}
+
+				_, err := RunTaskWithOpts(ctx, w.conn, ts.taskName, inputJSON, RunTaskOpts{
 					DeduplicationID: fmt.Sprint(scheduledTime),
 				})
 				if err != nil {
@@ -307,7 +327,23 @@ func (w *Worker) Start(ctx context.Context) error {
 					scheduledTime = entry.Next
 				}
 
-				_, err := RunFlowWithOpts(ctx, w.conn, fs.flowName, struct{}{}, RunFlowOpts{
+				var inputJSON json.RawMessage
+				if fs.inputFn != nil {
+					input, err := fs.inputFn()
+					if err != nil {
+						w.logger.ErrorContext(ctx, "worker: failed to get scheduled flow input", "flow", fs.flowName, "error", err)
+						return
+					}
+					inputJSON, err = json.Marshal(input)
+					if err != nil {
+						w.logger.ErrorContext(ctx, "worker: failed to marshal scheduled flow input", "flow", fs.flowName, "error", err)
+						return
+					}
+				} else {
+					inputJSON = json.RawMessage("{}")
+				}
+
+				_, err := RunFlowWithOpts(ctx, w.conn, fs.flowName, inputJSON, RunFlowOpts{
 					DeduplicationID: fmt.Sprint(scheduledTime),
 				})
 				if err != nil {

@@ -115,14 +115,6 @@ task := catbird.NewTask("send-email", func(ctx context.Context, input EmailReque
 worker, err := client.NewWorker(ctx, catbird.WithTask(task))
 go worker.Start(ctx)
 
-// Schedule a task to run periodically (using cron syntax)
-worker, err = client.NewWorker(ctx,
-    catbird.WithTask(task),
-    catbird.WithScheduledTask("send-email", "@hourly"), // Run every hour
-    catbird.WithGC(), // Enable garbage collection to clean up expired queues and stale workers
-)
-go worker.Start(ctx)
-
 // Run the task
 handle, err := client.RunTask(ctx, "send-email", EmailRequest{
     To:      "user@example.com",
@@ -140,6 +132,14 @@ handle, err = client.RunTaskWithOpts(ctx, "send-email", EmailRequest{
 // Get result
 var result EmailResponse
 err = handle.WaitForOutput(ctx, &result)
+
+// Schedule a task to run periodically (using cron syntax)
+worker, err = client.NewWorker(ctx,
+    catbird.WithTask(sendEmailsTask),
+    catbird.WithScheduledTask("send-emails", "@hourly", nil), // Run every hour
+    catbird.WithDefaultGC(), // Enable garbage collection to clean up expired queues and stale workers
+)
+go worker.Start(ctx)
 ```
 
 ### Workflow (Multi-Step Flow)
@@ -190,7 +190,7 @@ go worker.Start(ctx)
 // Schedule a flow to run periodically (using cron syntax)
 worker, err = client.NewWorker(ctx,
     catbird.WithFlow(flow),
-    catbird.WithScheduledFlow("order-processing", "0 2 * * *"), // Run daily at 2 AM
+    catbird.WithScheduledFlow("order-processing", "0 2 * * *", nil), // Run daily at 2 AM
 )
 go worker.Start(ctx)
 

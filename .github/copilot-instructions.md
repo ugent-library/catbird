@@ -61,9 +61,9 @@ NewFlow("workflow",
 
 - **Worker lifecycle**: `client.NewWorker(ctx, opts...)` → `worker.Start(ctx)` → `worker.Wait()` (graceful shutdown with timeout)
 - **Options pattern**: All configs use receiver interface `apply(&target)` (HandlerOpt, WorkerOpt, etc.)
-- **Conn interface**: Abstracts pgx; accepts `*pgxpool.Pool`, `*pgx.Conn`, or `pgx.Tx`
+- **Conn interface**: Abstracts pgx; accepts `*pgxpool.Pool`, `*pgx.Conn` or `pgx.Tx`
 - **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `WithLogger()`
-- **Scheduled tasks/flows**: Use robfig/cron syntax; `WithScheduledTask("name", "@hourly")` or `WithGC()`
+- **Scheduled tasks/flows**: Use robfig/cron syntax; `WithScheduledTask("name", "@hourly")`, `WithDefaultGC()` or `WithGC()`
 - **Deduplication**: Messages support `DeduplicationID` field to prevent duplicates
 - **Topic bindings**: Explicit via `Bind(queue, pattern)`; wildcards `?` (single token) and `*` (multi-token tail as `.*`). Foreign key CASCADE deletes bindings when queue is deleted. Pattern validation at bind time; regex precompiled in PostgreSQL.
 - **Task/Flow execution**: `client.RunTask()` or `client.RunFlow()` return handles with `WaitForOutput()` to block until completion

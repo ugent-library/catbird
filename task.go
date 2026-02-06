@@ -537,7 +537,7 @@ func GetTask(ctx context.Context, conn Conn, name string) (*TaskInfo, error) {
 
 // ListTasks returns all tasks
 func ListTasks(ctx context.Context, conn Conn) ([]*TaskInfo, error) {
-	q := `SELECT name, created_at FROM cb_tasks;`
+	q := `SELECT name, created_at FROM cb_tasks ORDER BY name;`
 	rows, err := conn.Query(ctx, q)
 	if err != nil {
 		return nil, err
@@ -654,7 +654,7 @@ func GetFlow(ctx context.Context, conn Conn, name string) (*FlowInfo, error) {
 
 // ListFlows returns all flows
 func ListFlows(ctx context.Context, conn Conn) ([]*FlowInfo, error) {
-	q := `SELECT * FROM cb_flow_info;`
+	q := `SELECT * FROM cb_flow_info ORDER BY name;`
 	rows, err := conn.Query(ctx, q)
 	if err != nil {
 		return nil, err
