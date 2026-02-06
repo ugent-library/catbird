@@ -4,7 +4,6 @@
 - [ ] Fair queueing? https://docs.hatchet.run/blog/multi-tenant-queues
 
 ## Worker & Execution
-- [ ] Exponential backoff
 - [ ] Pause tasks - wait for signal
 - [ ] RunTaskWait / RunFlowWait long polling
 - [ ] Add queue, task, flow and step description fields

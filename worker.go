@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -391,14 +393,14 @@ func (w *Worker) handleTask(ctx context.Context, t *Task, msg taskMessage, stopH
 	w.logger.DebugContext(ctx, "worker: handleTask",
 		"task", t.Name,
 		"id", msg.ID,
-		"deduplication_id", msg.DeduplicationID,
+		"deliveries", msg.Deliveries,
 		"input", string(msg.Input),
 	)
 
 	fnCtx := ctx
-	if h.timeout > 0 {
+	if h.maxDuration > 0 {
 		var cancel context.CancelFunc
-		fnCtx, cancel = context.WithTimeout(ctx, time.Duration(h.timeout))
+		fnCtx, cancel = context.WithTimeout(ctx, time.Duration(h.maxDuration))
 		defer cancel()
 	}
 
@@ -419,13 +421,13 @@ func (w *Worker) handleTask(ctx context.Context, t *Task, msg taskMessage, stopH
 	if err != nil {
 		w.logger.ErrorContext(ctx, "worker: failed", "task", t.Name, "error", err)
 
-		if msg.Deliveries > h.retries {
+		if msg.Deliveries > h.maxRetries {
 			q := `SELECT * FROM cb_fail_task(name => $1, id => $2, error_message => $3);`
 			if _, err := w.conn.Exec(ctx, q, t.Name, msg.ID, err.Error()); err != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot mark task as failed", "task", t.Name, "error", err)
 			}
-		} else if h.retryDelay > 0 {
-			if err := hideTasks(ctx, w.conn, t.Name, []int64{msg.ID}, h.retryDelay); err != nil {
+		} else {
+			if err := hideTasks(ctx, w.conn, t.Name, []int64{msg.ID}, backoffWithFullJitter(msg.Deliveries-1, h.minDelay, h.maxDelay)); err != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot delay next run", "task", t.Name, "error", err)
 			}
 		}
@@ -443,19 +445,19 @@ func (w *Worker) handleStep(ctx context.Context, flowName string, s *Step, msg s
 	if w.logger.Enabled(ctx, slog.LevelDebug) {
 		stepOutputsJSON, _ := json.Marshal(msg.StepOutputs)
 		w.logger.DebugContext(ctx, "worker: handleStep",
-			"flow_name", flowName,
-			"name", s.Name,
+			"flow", flowName,
+			"step", s.Name,
 			"id", msg.ID,
-			"flow_run_id", msg.FlowRunID,
+			"deliveries", msg.Deliveries,
 			"flow_input", string(msg.FlowInput),
 			"step_outputs", string(stepOutputsJSON),
 		)
 	}
 
 	fnCtx := ctx
-	if h.timeout > 0 {
+	if h.maxDuration > 0 {
 		var cancel context.CancelFunc
-		fnCtx, cancel = context.WithTimeout(ctx, time.Duration(h.timeout))
+		fnCtx, cancel = context.WithTimeout(ctx, time.Duration(h.maxDuration))
 		defer cancel()
 	}
 
@@ -476,13 +478,13 @@ func (w *Worker) handleStep(ctx context.Context, flowName string, s *Step, msg s
 	if err != nil {
 		w.logger.ErrorContext(ctx, "worker: failed", "flow", flowName, "step", s.Name, "error", err)
 
-		if msg.Deliveries > h.retries {
+		if msg.Deliveries > h.maxRetries {
 			q := `SELECT * FROM cb_fail_step(flow_name => $1, step_name => $2, step_id => $3, error_message => $4);`
 			if _, err := w.conn.Exec(ctx, q, flowName, s.Name, msg.ID, err.Error()); err != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot mark step as failed", "flow", flowName, "step", s.Name, "error", err)
 			}
-		} else if h.retryDelay > 0 {
-			if err := hideSteps(ctx, w.conn, flowName, s.Name, []int64{msg.ID}, h.retryDelay); err != nil {
+		} else {
+			if err := hideSteps(ctx, w.conn, flowName, s.Name, []int64{msg.ID}, backoffWithFullJitter(msg.Deliveries-1, h.minDelay, h.maxDelay)); err != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot delay next run", "flow", flowName, "step", s.Name, "error", err)
 			}
 		}
@@ -550,16 +552,15 @@ func startHandlerWorkers[T handlerMessage](
 }
 
 type taskMessage struct {
-	ID              int64           `json:"id"`
-	DeduplicationID string          `json:"deduplication_id,omitempty"`
-	Input           json.RawMessage `json:"input"`
-	Deliveries      int             `json:"deliveries"`
+	ID         int64           `json:"id"`
+	Deliveries int             `json:"deliveries"`
+	Input      json.RawMessage `json:"input"`
 }
 
 func (m taskMessage) getID() int64 { return m.ID }
 
 func readTasks(ctx context.Context, conn Conn, name string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]taskMessage, error) {
-	q := `SELECT * FROM cb_read_tasks(name => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
+	q := `SELECT id, deliveries, input FROM cb_read_tasks(name => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
 
 	rows, err := conn.Query(ctx, q, name, quantity, hideFor.Milliseconds(), pollFor.Milliseconds(), pollInterval.Milliseconds())
 	if err != nil {
@@ -570,7 +571,7 @@ func readTasks(ctx context.Context, conn Conn, name string, quantity int, hideFo
 }
 
 func readSteps(ctx context.Context, conn Conn, flowName, stepName string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]stepMessage, error) {
-	q := `SELECT * FROM cb_read_steps(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
+	q := `SELECT id, deliveries, flow_input, step_outputs FROM cb_read_steps(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
 
 	rows, err := conn.Query(ctx, q, flowName, stepName, quantity, hideFor.Milliseconds(), pollFor.Milliseconds(), pollInterval.Milliseconds())
 	if err != nil {
@@ -671,6 +672,16 @@ func (mh *messageHider[T]) stopHiding(id int64) {
 	mh.mu.Unlock()
 }
 
+// backoffWithFullJitter calculates the next backoff duration using full jitter strategy.
+// The first attempt should be 0.
+func backoffWithFullJitter(attempt int, minDelay, maxDelay time.Duration) time.Duration {
+	delay := time.Duration(float64(minDelay) * math.Pow(2, float64(attempt)))
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	return time.Duration(rand.Int63n(int64(delay)))
+}
+
 func scanCollectibleTaskMessage(row pgx.CollectableRow) (taskMessage, error) {
 	return scanTaskMessage(row)
 }
@@ -678,19 +689,12 @@ func scanCollectibleTaskMessage(row pgx.CollectableRow) (taskMessage, error) {
 func scanTaskMessage(row pgx.Row) (taskMessage, error) {
 	rec := taskMessage{}
 
-	var deduplicationID *string
-
 	if err := row.Scan(
 		&rec.ID,
-		&deduplicationID,
-		&rec.Input,
 		&rec.Deliveries,
+		&rec.Input,
 	); err != nil {
 		return rec, err
-	}
-
-	if deduplicationID != nil {
-		rec.DeduplicationID = *deduplicationID
 	}
 
 	return rec, nil
@@ -707,8 +711,6 @@ func scanStepMessage(row pgx.Row) (stepMessage, error) {
 
 	if err := row.Scan(
 		&rec.ID,
-		&rec.FlowRunID,
-		&rec.StepName,
 		&rec.Deliveries,
 		&rec.FlowInput,
 		&stepOutputs,

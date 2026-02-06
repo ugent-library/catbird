@@ -28,9 +28,10 @@ var (
 type handlerOpts struct {
 	concurrency int
 	batchSize   int
-	timeout     time.Duration
-	retries     int
-	retryDelay  time.Duration
+	maxDuration time.Duration
+	maxRetries  int
+	minDelay    time.Duration
+	maxDelay    time.Duration
 }
 
 // HandlerOpt is an option for configuring task and flow step handlers
@@ -51,17 +52,17 @@ func WithConcurrency(n int) HandlerOpt {
 	return concurrencyOpt{concurrency: n}
 }
 
-type timeoutOpt struct {
-	timeout time.Duration
+type maxDurationOpt struct {
+	maxDuration time.Duration
 }
 
-func (o timeoutOpt) apply(h *handlerOpts) {
-	h.timeout = o.timeout
+func (o maxDurationOpt) apply(h *handlerOpts) {
+	h.maxDuration = o.maxDuration
 }
 
-// WithTimeout sets the timeout for handler execution
-func WithTimeout(d time.Duration) HandlerOpt {
-	return timeoutOpt{timeout: d}
+// WithMaxDuration sets the maximum duration for handler execution
+func WithMaxDuration(d time.Duration) HandlerOpt {
+	return maxDurationOpt{maxDuration: d}
 }
 
 type batchSizeOpt struct {
@@ -77,30 +78,32 @@ func WithBatchSize(n int) HandlerOpt {
 	return batchSizeOpt{batchSize: n}
 }
 
-type retriesOpt struct {
-	retries int
+type maxRetriesOpt struct {
+	maxRetries int
 }
 
-func (o retriesOpt) apply(h *handlerOpts) {
-	h.retries = o.retries
+func (o maxRetriesOpt) apply(h *handlerOpts) {
+	h.maxRetries = o.maxRetries
 }
 
-// WithRetries sets the number of retry attempts for failed handlers
-func WithRetries(n int) HandlerOpt {
-	return retriesOpt{retries: n}
+// WithMaxRetries sets the number of retry attempts for failed handlers
+func WithMaxRetries(n int) HandlerOpt {
+	return maxRetriesOpt{maxRetries: n}
 }
 
-type retryDelayOpt struct {
-	delay time.Duration
+type backoffOpt struct {
+	minDelay time.Duration
+	maxDelay time.Duration
 }
 
-func (o retryDelayOpt) apply(h *handlerOpts) {
-	h.retryDelay = o.delay
+func (o backoffOpt) apply(h *handlerOpts) {
+	h.minDelay = o.minDelay
+	h.maxDelay = o.maxDelay
 }
 
-// WithRetryDelay sets the initial delay between retry attempts
-func WithRetryDelay(d time.Duration) HandlerOpt {
-	return retryDelayOpt{delay: d}
+// WithBackoff sets the delay between retries, exponentially backing off from minDelay to maxDelay
+func WithBackoff(minDelay, maxDelay time.Duration) HandlerOpt {
+	return backoffOpt{minDelay: minDelay, maxDelay: maxDelay}
 }
 
 // Task represents a task definition with a generic typed handler
@@ -171,8 +174,6 @@ func Dependency(name string) *StepDependency {
 
 type stepMessage struct {
 	ID          int64                      `json:"id"`
-	FlowRunID   int64                      `json:"flow_run_id"`
-	StepName    string                     `json:"step_name"`
 	Deliveries  int                        `json:"deliveries"`
 	FlowInput   json.RawMessage            `json:"flow_input"`
 	StepOutputs map[string]json.RawMessage `json:"step_outputs"`
