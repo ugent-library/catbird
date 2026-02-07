@@ -673,9 +673,9 @@ func (mh *messageHider[T]) stopHiding(id int64) {
 }
 
 // backoffWithFullJitter calculates the next backoff duration using full jitter strategy.
-// The first attempt should be 0.
-func backoffWithFullJitter(attempt int, minDelay, maxDelay time.Duration) time.Duration {
-	delay := time.Duration(float64(minDelay) * math.Pow(2, float64(attempt)))
+// The first retryAttempt should be 0.
+func backoffWithFullJitter(retryAttempt int, minDelay, maxDelay time.Duration) time.Duration {
+	delay := time.Duration(float64(minDelay) * math.Pow(2, float64(retryAttempt)))
 	if delay > maxDelay {
 		delay = maxDelay
 	}
