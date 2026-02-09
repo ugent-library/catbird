@@ -34,6 +34,34 @@ type handlerOpts struct {
 	maxDelay    time.Duration
 }
 
+// Validate checks handler options for consistency.
+func (h *handlerOpts) Validate() error {
+	if h.concurrency <= 0 {
+		return fmt.Errorf("concurrency must be greater than zero")
+	}
+	if h.batchSize <= 0 {
+		return fmt.Errorf("batch size must be greater than zero")
+	}
+	if h.maxDuration < 0 {
+		return fmt.Errorf("max duration cannot be negative")
+	}
+	if h.maxRetries == 0 && (h.minDelay > 0 || h.maxDelay > 0) {
+		return fmt.Errorf("backoff configured but max retries is zero")
+	}
+	if h.minDelay < 0 {
+		return fmt.Errorf("backoff minimum delay cannot be negative")
+	}
+	if h.maxDelay < 0 {
+		return fmt.Errorf("backoff maximum delay cannot be negative")
+	}
+	if h.minDelay > 0 || h.maxDelay > 0 {
+		if h.maxDelay <= h.minDelay {
+			return fmt.Errorf("backoff maximum delay must be greater than minimum delay")
+		}
+	}
+	return nil
+}
+
 // HandlerOpt is an option for configuring task and flow step handlers
 type HandlerOpt func(*handlerOpts)
 
@@ -81,7 +109,7 @@ type Task struct {
 
 type taskHandler struct {
 	handlerOpts
-	fn func(context.Context, []byte) ([]byte, error)
+	fn func(context.Context, taskMessage) ([]byte, error)
 }
 
 // NewTask creates a new task with a generic handler function
@@ -93,9 +121,9 @@ func NewTask[In, Out any](name string, fn func(context.Context, In) (Out, error)
 			concurrency: 1,
 			batchSize:   10,
 		},
-		fn: func(ctx context.Context, b []byte) ([]byte, error) {
+		fn: func(ctx context.Context, msg taskMessage) ([]byte, error) {
 			var in In
-			if err := json.Unmarshal(b, &in); err != nil {
+			if err := json.Unmarshal(msg.Input, &in); err != nil {
 				return nil, err
 			}
 
@@ -110,6 +138,10 @@ func NewTask[In, Out any](name string, fn func(context.Context, In) (Out, error)
 
 	for _, opt := range opts {
 		opt(&h.handlerOpts)
+	}
+
+	if err := h.handlerOpts.Validate(); err != nil {
+		panic(err)
 	}
 
 	return &Task{
@@ -428,6 +460,10 @@ func newStepHandler(fn func(context.Context, stepMessage) ([]byte, error), opts 
 
 	for _, opt := range opts {
 		opt(&h.handlerOpts)
+	}
+
+	if err := h.handlerOpts.Validate(); err != nil {
+		panic(err)
 	}
 
 	return h

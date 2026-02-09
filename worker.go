@@ -438,7 +438,7 @@ func (w *Worker) handleTask(ctx context.Context, t *Task, msg taskMessage, stopH
 				err = fmt.Errorf("task handler panic: %v", r)
 			}
 		}()
-		out, err = h.fn(fnCtx, msg.Input)
+		out, err = h.fn(fnCtx, msg)
 	}()
 
 	stopHiding(msg.ID)
