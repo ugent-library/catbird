@@ -182,7 +182,7 @@ func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, erro
 //   - if WithShutdownTimeout is set to a value > 0, that duration is used as a
 //     grace period for in‑flight handlers after ctx is cancelled; once the
 //     grace period expires the handler context is cancelled and remaining
-//     handlers are asked to stop
+//     handlers are asked to stop. The default shutdown timeout is 5 seconds.
 //   - if WithShutdownTimeout is not set or set to 0, there is no grace period:
 //     the handler context is cancelled immediately once ctx is cancelled and
 //     Start returns after all goroutines finish
