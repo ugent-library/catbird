@@ -60,112 +60,77 @@ type flowSchedule struct {
 }
 
 // WorkerOpt is an option for configuring a worker
-type WorkerOpt interface {
-	apply(*Worker)
-}
-
-type taskOpt struct {
-	task *Task
-}
-
-func (o taskOpt) apply(w *Worker) {
-	w.tasks = append(w.tasks, o.task)
-}
+type WorkerOpt func(*Worker)
 
 // WithTask registers a task with the worker
 func WithTask(t *Task) WorkerOpt {
-	return &taskOpt{task: t}
-}
-
-type flowOpt struct {
-	flow *Flow
-}
-
-func (o flowOpt) apply(w *Worker) {
-	w.flows = append(w.flows, o.flow)
+	return func(w *Worker) {
+		w.tasks = append(w.tasks, t)
+	}
 }
 
 // WithFlow registers a flow with the worker
 func WithFlow(f *Flow) WorkerOpt {
-	return &flowOpt{flow: f}
-}
-
-type loggerOpt struct {
-	logger *slog.Logger
-}
-
-func (o loggerOpt) apply(w *Worker) {
-	w.logger = o.logger
+	return func(w *Worker) {
+		w.flows = append(w.flows, f)
+	}
 }
 
 // WithLogger sets a custom logger for the worker
 func WithLogger(l *slog.Logger) WorkerOpt {
-	return &loggerOpt{logger: l}
-}
-
-type shutdownTimeoutOpt struct {
-	shutdownTimeout time.Duration
-}
-
-func (o shutdownTimeoutOpt) apply(w *Worker) {
-	w.shutdownTimeout = o.shutdownTimeout
-}
-
-func WithShutdownTimeout(d time.Duration) WorkerOpt {
-	return &shutdownTimeoutOpt{shutdownTimeout: d}
-}
-
-type scheduledTaskOpt struct {
-	taskName string
-	schedule string
-	inputFn  func() (any, error)
-}
-
-func (o scheduledTaskOpt) apply(w *Worker) {
-	if o.inputFn == nil {
-		o.inputFn = func() (any, error) { return struct{}{}, nil }
+	return func(w *Worker) {
+		w.logger = l
 	}
-	w.taskSchedules = append(w.taskSchedules, taskSchedule{
-		taskName: o.taskName,
-		schedule: o.schedule,
-		inputFn:  o.inputFn,
-	})
+}
+
+// WithShutdownTimeout sets the shutdown timeout for the worker
+func WithShutdownTimeout(d time.Duration) WorkerOpt {
+	return func(w *Worker) {
+		w.shutdownTimeout = d
+	}
 }
 
 // WithScheduledTask registers a scheduled task execution using cron syntax.
 // The input function can be used to provide dynamic input at execution time.
 // If the input function is nil, an empty JSON object will be used as input to the task.
 func WithScheduledTask(taskName string, schedule string, inputFn func() (any, error)) WorkerOpt {
-	return &scheduledTaskOpt{taskName: taskName, schedule: schedule, inputFn: inputFn}
-}
-
-type scheduledFlowOpt struct {
-	flowName string
-	schedule string
-	inputFn  func() (any, error)
-}
-
-func (o scheduledFlowOpt) apply(w *Worker) {
-	if o.inputFn == nil {
-		o.inputFn = func() (any, error) { return struct{}{}, nil }
+	return func(w *Worker) {
+		if inputFn == nil {
+			inputFn = func() (any, error) { return struct{}{}, nil }
+		}
+		w.taskSchedules = append(w.taskSchedules, taskSchedule{
+			taskName: taskName,
+			schedule: schedule,
+			inputFn:  inputFn,
+		})
 	}
-	w.flowSchedules = append(w.flowSchedules, flowSchedule{
-		flowName: o.flowName,
-		schedule: o.schedule,
-		inputFn:  o.inputFn,
-	})
 }
 
 // WithScheduledFlow registers a scheduled flow execution using cron syntax.
 // The input function can be used to provide dynamic input at execution time.
 // If the input function is nil, an empty JSON object will be used as input to the flow.
 func WithScheduledFlow(flowName string, schedule string, inputFn func() (any, error)) WorkerOpt {
-	return &scheduledFlowOpt{flowName: flowName, schedule: schedule, inputFn: inputFn}
+	return func(w *Worker) {
+		if inputFn == nil {
+			inputFn = func() (any, error) { return struct{}{}, nil }
+		}
+		w.flowSchedules = append(w.flowSchedules, flowSchedule{
+			flowName: flowName,
+			schedule: schedule,
+			inputFn:  inputFn,
+		})
+	}
 }
 
 // WithGC registers a garbage collection task to clean up expired queues and stale workers
 func WithGC(schedule string) WorkerOpt {
-	return &scheduledTaskOpt{taskName: "gc", schedule: schedule}
+	return func(w *Worker) {
+		w.taskSchedules = append(w.taskSchedules, taskSchedule{
+			taskName: "gc",
+			schedule: schedule,
+			inputFn:  func() (any, error) { return struct{}{}, nil },
+		})
+	}
 }
 
 // WithDefaultGC registers a garbage collection task to clean up
@@ -183,7 +148,7 @@ func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, erro
 		logger: slog.Default(),
 	}
 	for _, opt := range opts {
-		opt.apply(w)
+		opt(w)
 	}
 
 	for _, t := range w.tasks {

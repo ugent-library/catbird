@@ -35,75 +35,42 @@ type handlerOpts struct {
 }
 
 // HandlerOpt is an option for configuring task and flow step handlers
-type HandlerOpt interface {
-	apply(*handlerOpts)
-}
-
-type concurrencyOpt struct {
-	concurrency int
-}
-
-func (o concurrencyOpt) apply(h *handlerOpts) {
-	h.concurrency = o.concurrency
-}
+type HandlerOpt func(*handlerOpts)
 
 // WithConcurrency sets the number of concurrent handler executions
 func WithConcurrency(n int) HandlerOpt {
-	return concurrencyOpt{concurrency: n}
-}
-
-type maxDurationOpt struct {
-	maxDuration time.Duration
-}
-
-func (o maxDurationOpt) apply(h *handlerOpts) {
-	h.maxDuration = o.maxDuration
+	return func(h *handlerOpts) {
+		h.concurrency = n
+	}
 }
 
 // WithMaxDuration sets the maximum duration for handler execution
 func WithMaxDuration(d time.Duration) HandlerOpt {
-	return maxDurationOpt{maxDuration: d}
-}
-
-type batchSizeOpt struct {
-	batchSize int
-}
-
-func (o batchSizeOpt) apply(h *handlerOpts) {
-	h.batchSize = o.batchSize
+	return func(h *handlerOpts) {
+		h.maxDuration = d
+	}
 }
 
 // WithBatchSize sets the number of messages to read per batch
 func WithBatchSize(n int) HandlerOpt {
-	return batchSizeOpt{batchSize: n}
-}
-
-type maxRetriesOpt struct {
-	maxRetries int
-}
-
-func (o maxRetriesOpt) apply(h *handlerOpts) {
-	h.maxRetries = o.maxRetries
+	return func(h *handlerOpts) {
+		h.batchSize = n
+	}
 }
 
 // WithMaxRetries sets the number of retry attempts for failed handlers
 func WithMaxRetries(n int) HandlerOpt {
-	return maxRetriesOpt{maxRetries: n}
-}
-
-type backoffOpt struct {
-	minDelay time.Duration
-	maxDelay time.Duration
-}
-
-func (o backoffOpt) apply(h *handlerOpts) {
-	h.minDelay = o.minDelay
-	h.maxDelay = o.maxDelay
+	return func(h *handlerOpts) {
+		h.maxRetries = n
+	}
 }
 
 // WithBackoff sets the delay between retries, exponentially backing off from minDelay to maxDelay
 func WithBackoff(minDelay, maxDelay time.Duration) HandlerOpt {
-	return backoffOpt{minDelay: minDelay, maxDelay: maxDelay}
+	return func(h *handlerOpts) {
+		h.minDelay = minDelay
+		h.maxDelay = maxDelay
+	}
 }
 
 // Task represents a task definition with a generic typed handler
@@ -142,7 +109,7 @@ func NewTask[In, Out any](name string, fn func(context.Context, In) (Out, error)
 	}
 
 	for _, opt := range opts {
-		opt.apply(&h.handlerOpts)
+		opt(&h.handlerOpts)
 	}
 
 	return &Task{
@@ -199,28 +166,18 @@ func NewFlow(name string, opts ...FlowOpt) *Flow {
 		Name: name,
 	}
 	for _, opt := range opts {
-		opt.apply(f)
+		opt(f)
 	}
 	return f
 }
 
-type FlowOpt interface {
-	apply(*Flow)
-}
-
-type stepOpt struct {
-	step *Step
-}
-
-func (o stepOpt) apply(f *Flow) {
-	f.Steps = append(f.Steps, o.step)
-}
+type FlowOpt func(*Flow)
 
 // InitialStep creates a flow step with no dependencies
 // The handler receives the flow input directly and produces output
 // Input and output types are automatically marshaled to/from JSON
 func InitialStep[In, Out any](name string, fn func(context.Context, In) (Out, error), opts ...HandlerOpt) FlowOpt {
-	return stepOpt{step: &Step{
+	step := &Step{
 		Name:      name,
 		DependsOn: nil,
 		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
@@ -234,13 +191,16 @@ func InitialStep[In, Out any](name string, fn func(context.Context, In) (Out, er
 			}
 			return json.Marshal(out)
 		}, opts...),
-	}}
+	}
+	return func(f *Flow) {
+		f.Steps = append(f.Steps, step)
+	}
 }
 
 // StepWithOneDependency creates a flow step that depends on one previous step
 // The handler receives the flow input and the output of the dependency step
 func StepWithOneDependency[In, Dep1Out, Out any](name string, dep1 *StepDependency, fn func(context.Context, In, Dep1Out) (Out, error), opts ...HandlerOpt) FlowOpt {
-	return stepOpt{step: &Step{
+	step := &Step{
 		Name:      name,
 		DependsOn: []*StepDependency{dep1},
 		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
@@ -255,13 +215,16 @@ func StepWithOneDependency[In, Dep1Out, Out any](name string, dep1 *StepDependen
 			}
 			return json.Marshal(out)
 		}, opts...),
-	}}
+	}
+	return func(f *Flow) {
+		f.Steps = append(f.Steps, step)
+	}
 }
 
 // StepWithTwoDependencies creates a flow step that depends on two previous steps
 // The handler receives the flow input and the outputs of both dependency steps
 func StepWithTwoDependencies[In, Dep1Out, Dep2Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out) (Out, error), opts ...HandlerOpt) FlowOpt {
-	return stepOpt{step: &Step{
+	step := &Step{
 		Name:      name,
 		DependsOn: []*StepDependency{dep1, dep2},
 		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
@@ -277,13 +240,16 @@ func StepWithTwoDependencies[In, Dep1Out, Dep2Out, Out any](name string, dep1 *S
 			}
 			return json.Marshal(out)
 		}, opts...),
-	}}
+	}
+	return func(f *Flow) {
+		f.Steps = append(f.Steps, step)
+	}
 }
 
 // StepWithThreeDependencies creates a flow step that depends on three previous steps
 // The handler receives the flow input and the outputs of all three dependency steps
 func StepWithThreeDependencies[In, Dep1Out, Dep2Out, Dep3Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out) (Out, error), opts ...HandlerOpt) FlowOpt {
-	return stepOpt{step: &Step{
+	step := &Step{
 		Name:      name,
 		DependsOn: []*StepDependency{dep1, dep2, dep3},
 		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
@@ -300,13 +266,16 @@ func StepWithThreeDependencies[In, Dep1Out, Dep2Out, Dep3Out, Out any](name stri
 			}
 			return json.Marshal(out)
 		}, opts...),
-	}}
+	}
+	return func(f *Flow) {
+		f.Steps = append(f.Steps, step)
+	}
 }
 
 // StepWithFourDependencies creates a flow step that depends on four previous steps
 // The handler receives the flow input and the outputs of all four dependency steps
 func StepWithFourDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, dep4 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out) (Out, error), opts ...HandlerOpt) FlowOpt {
-	return stepOpt{step: &Step{
+	step := &Step{
 		Name:      name,
 		DependsOn: []*StepDependency{dep1, dep2, dep3, dep4},
 		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
@@ -324,13 +293,16 @@ func StepWithFourDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Out any](n
 			}
 			return json.Marshal(out)
 		}, opts...),
-	}}
+	}
+	return func(f *Flow) {
+		f.Steps = append(f.Steps, step)
+	}
 }
 
 // StepWithFiveDependencies creates a flow step that depends on five previous steps
 // The handler receives the flow input and the outputs of all five dependency steps
 func StepWithFiveDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, dep4 *StepDependency, dep5 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out) (Out, error), opts ...HandlerOpt) FlowOpt {
-	return stepOpt{step: &Step{
+	step := &Step{
 		Name:      name,
 		DependsOn: []*StepDependency{dep1, dep2, dep3, dep4, dep5},
 		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
@@ -349,13 +321,16 @@ func StepWithFiveDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, O
 			}
 			return json.Marshal(out)
 		}, opts...),
-	}}
+	}
+	return func(f *Flow) {
+		f.Steps = append(f.Steps, step)
+	}
 }
 
 // StepWithSixDependencies creates a flow step that depends on six previous steps
 // The handler receives the flow input and the outputs of all six dependency steps
 func StepWithSixDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, dep4 *StepDependency, dep5 *StepDependency, dep6 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out) (Out, error), opts ...HandlerOpt) FlowOpt {
-	return stepOpt{step: &Step{
+	step := &Step{
 		Name:      name,
 		DependsOn: []*StepDependency{dep1, dep2, dep3, dep4, dep5, dep6},
 		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
@@ -375,13 +350,16 @@ func StepWithSixDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, De
 			}
 			return json.Marshal(out)
 		}, opts...),
-	}}
+	}
+	return func(f *Flow) {
+		f.Steps = append(f.Steps, step)
+	}
 }
 
 // StepWithSevenDependencies creates a flow step that depends on seven previous steps
 // The handler receives the flow input and the outputs of all seven dependency steps
 func StepWithSevenDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, dep4 *StepDependency, dep5 *StepDependency, dep6 *StepDependency, dep7 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out) (Out, error), opts ...HandlerOpt) FlowOpt {
-	return stepOpt{step: &Step{
+	step := &Step{
 		Name:      name,
 		DependsOn: []*StepDependency{dep1, dep2, dep3, dep4, dep5, dep6, dep7},
 		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
@@ -402,13 +380,16 @@ func StepWithSevenDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, 
 			}
 			return json.Marshal(out)
 		}, opts...),
-	}}
+	}
+	return func(f *Flow) {
+		f.Steps = append(f.Steps, step)
+	}
 }
 
 // StepWithEightDependencies creates a flow step that depends on eight previous steps
 // The handler receives the flow input and the outputs of all eight dependency steps
 func StepWithEightDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out, Dep8Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, dep4 *StepDependency, dep5 *StepDependency, dep6 *StepDependency, dep7 *StepDependency, dep8 *StepDependency, fn func(context.Context, In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, Dep6Out, Dep7Out, Dep8Out) (Out, error), opts ...HandlerOpt) FlowOpt {
-	return stepOpt{step: &Step{
+	step := &Step{
 		Name:      name,
 		DependsOn: []*StepDependency{dep1, dep2, dep3, dep4, dep5, dep6, dep7, dep8},
 		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
@@ -430,7 +411,10 @@ func StepWithEightDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, 
 			}
 			return json.Marshal(out)
 		}, opts...),
-	}}
+	}
+	return func(f *Flow) {
+		f.Steps = append(f.Steps, step)
+	}
 }
 
 func newStepHandler(fn func(context.Context, stepMessage) ([]byte, error), opts ...HandlerOpt) *stepHandler {
@@ -443,7 +427,7 @@ func newStepHandler(fn func(context.Context, stepMessage) ([]byte, error), opts 
 	}
 
 	for _, opt := range opts {
-		opt.apply(&h.handlerOpts)
+		opt(&h.handlerOpts)
 	}
 
 	return h

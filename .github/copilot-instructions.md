@@ -60,7 +60,7 @@ NewFlow("workflow",
 ## Key Conventions
 
 - **Worker lifecycle**: `client.NewWorker(ctx, opts...)` → `worker.Start(ctx)` → `worker.Wait()` (graceful shutdown with timeout)
-- **Options pattern**: All configs use receiver interface `apply(&target)` (HandlerOpt, WorkerOpt, etc.)
+- **Options pattern**: Most configs use closure functional options (HandlerOpt, WorkerOpt, etc.). But performance critical runtime functions use function variants (`...WithOpts`) that take a config struct.
 - **Conn interface**: Abstracts pgx; accepts `*pgxpool.Pool`, `*pgx.Conn` or `pgx.Tx`
 - **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `WithLogger()`
 - **Scheduled tasks/flows**: Use robfig/cron syntax; `WithScheduledTask("name", "@hourly")`, `WithDefaultGC()` or `WithGC()`
