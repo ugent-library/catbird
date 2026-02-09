@@ -76,14 +76,14 @@ func WithFlow(f *Flow) WorkerOpt {
 	}
 }
 
-// WithLogger sets a custom logger for the worker
+// WithLogger sets a custom logger for the worker. Default is slog.Default().
 func WithLogger(l *slog.Logger) WorkerOpt {
 	return func(w *Worker) {
 		w.logger = l
 	}
 }
 
-// WithShutdownTimeout sets the shutdown timeout for the worker
+// WithShutdownTimeout sets the shutdown timeout for the worker. Default is 5 seconds.
 func WithShutdownTimeout(d time.Duration) WorkerOpt {
 	return func(w *Worker) {
 		w.shutdownTimeout = d
@@ -143,9 +143,10 @@ func WithDefaultGC() WorkerOpt {
 // The worker will register all tasks and flows it has been configured with
 func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, error) {
 	w := &Worker{
-		id:     uuid.NewString(),
-		conn:   conn,
-		logger: slog.Default(),
+		id:              uuid.NewString(),
+		conn:            conn,
+		logger:          slog.Default(),
+		shutdownTimeout: 5 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(w)
