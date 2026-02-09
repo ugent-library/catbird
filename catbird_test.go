@@ -332,10 +332,7 @@ func TestTaskRunAndWait(t *testing.T) {
 		return in.Value * 2, nil
 	})
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
 	worker, err := client.NewWorker(t.Context(),
-		WithLogger(logger),
 		WithTask(task),
 	)
 	if err != nil {
@@ -381,11 +378,7 @@ func TestFlowCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Test that we can run the flow (implicit verification it was created)
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
 	worker, err := client.NewWorker(t.Context(),
-		WithLogger(logger),
 		WithFlow(flow),
 	)
 	if err != nil {
@@ -433,10 +426,7 @@ func TestFlowSingleStep(t *testing.T) {
 		}),
 	)
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
 	worker, err := client.NewWorker(t.Context(),
-		WithLogger(logger),
 		WithFlow(flow),
 	)
 	if err != nil {
@@ -494,10 +484,7 @@ func TestFlowWithDependencies(t *testing.T) {
 			}),
 	)
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
 	worker, err := client.NewWorker(t.Context(),
-		WithLogger(logger),
 		WithFlow(flow),
 	)
 	if err != nil {
@@ -538,8 +525,6 @@ func TestFlowWithDependencies(t *testing.T) {
 func TestFlowListFlows(t *testing.T) {
 	client := getTestClient(t)
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
 	// Create multiple flows
 	flows := make([]*Flow, 2)
 
@@ -569,7 +554,6 @@ func TestFlowListFlows(t *testing.T) {
 
 	// Start worker to execute flows
 	worker, err := client.NewWorker(t.Context(),
-		WithLogger(logger),
 		WithFlow(flow1),
 		WithFlow(flow2),
 	)
@@ -751,10 +735,7 @@ func TestTaskPanicRecovery(t *testing.T) {
 		panic("intentional panic in task")
 	})
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
 	worker, err := client.NewWorker(t.Context(),
-		WithLogger(logger),
 		WithTask(task),
 	)
 	if err != nil {
@@ -812,10 +793,7 @@ func TestFlowStepPanicRecovery(t *testing.T) {
 			}),
 	)
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
 	worker, err := client.NewWorker(t.Context(),
-		WithLogger(logger),
 		WithFlow(flow),
 	)
 	if err != nil {
