@@ -45,19 +45,20 @@ func (h *handlerOpts) Validate() error {
 	if h.maxDuration < 0 {
 		return fmt.Errorf("max duration cannot be negative")
 	}
-	if h.maxRetries == 0 && (h.minDelay > 0 || h.maxDelay > 0) {
-		return fmt.Errorf("backoff configured but max retries is zero")
-	}
 	if h.minDelay < 0 {
 		return fmt.Errorf("backoff minimum delay cannot be negative")
 	}
 	if h.maxDelay < 0 {
 		return fmt.Errorf("backoff maximum delay cannot be negative")
 	}
-	if h.minDelay > 0 || h.maxDelay > 0 {
-		if h.maxDelay <= h.minDelay {
-			return fmt.Errorf("backoff maximum delay must be greater than minimum delay")
-		}
+	if h.maxDelay > 0 && h.maxDelay <= h.minDelay {
+		return fmt.Errorf("backoff maximum delay must be greater than minimum delay")
+	}
+	if h.maxRetries < 0 {
+		return fmt.Errorf("max retries cannot be negative")
+	}
+	if h.maxRetries == 0 && h.maxDelay > 0 {
+		return fmt.Errorf("backoff configured but max retries is zero")
 	}
 	return nil
 }
