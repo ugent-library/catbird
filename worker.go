@@ -177,8 +177,6 @@ func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, erro
 // Shutdown behaviour:
 //   - when ctx is cancelled the worker immediately stops reading new work and
 //     begins shutting down
-//   - in‑flight handlers are allowed to continue running under an internal
-//     handler context
 //   - if WithShutdownTimeout is set to a value > 0, that duration is used as a
 //     grace period for in‑flight handlers after ctx is cancelled; once the
 //     grace period expires the handler context is cancelled and remaining
