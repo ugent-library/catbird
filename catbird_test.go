@@ -854,3 +854,119 @@ func TestFlowStepPanicRecovery(t *testing.T) {
 		t.Fatalf("expected flow status failed, got %s", flowRuns[0].Status)
 	}
 }
+
+func TestWorkerShutdownImmediateWhenNoTimeout(t *testing.T) {
+	t.Helper()
+
+	w := &Worker{
+		shutdownTimeout: 0,
+	}
+
+	var wg sync.WaitGroup
+
+	// Simulate a handler goroutine that runs until handlerCtx is cancelled.
+	handlerCtx, handlerCancel := context.WithCancel(context.Background())
+	wg.Add(1)
+
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer wg.Done()
+		close(started)
+		<-handlerCtx.Done()
+		close(stopped)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- w.waitForShutdown(ctx, handlerCancel, &wg)
+	}()
+
+	<-started
+
+	// Trigger shutdown and ensure we don't wait for a grace period when
+	// shutdownTimeout is zero.
+	start := time.Now()
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("waitForShutdown returned error: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("waitForShutdown did not return promptly with zero shutdownTimeout")
+	}
+
+	if time.Since(start) > 400*time.Millisecond {
+		t.Fatalf("waitForShutdown took too long with zero shutdownTimeout: %s", time.Since(start))
+	}
+
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("handler was not cancelled immediately when shutdownTimeout is zero")
+	}
+}
+
+func TestWorkerShutdownWithGracePeriod(t *testing.T) {
+	t.Helper()
+
+	grace := 200 * time.Millisecond
+	w := &Worker{
+		shutdownTimeout: grace,
+	}
+
+	var wg sync.WaitGroup
+
+	// Simulate a handler goroutine that only stops when handlerCtx is
+	// cancelled. This lets us observe the grace period behaviour.
+	handlerCtx, handlerCancel := context.WithCancel(context.Background())
+	wg.Add(1)
+
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer wg.Done()
+		close(started)
+		<-handlerCtx.Done()
+		close(stopped)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- w.waitForShutdown(ctx, handlerCancel, &wg)
+	}()
+
+	<-started
+
+	// Trigger shutdown and measure how long waitForShutdown takes to return.
+	cancel()
+	start := time.Now()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("waitForShutdown returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waitForShutdown did not return within expected time")
+	}
+
+	elapsed := time.Since(start)
+	if elapsed < grace {
+		t.Fatalf("waitForShutdown returned before grace period elapsed: got %s, want at least %s", elapsed, grace)
+	}
+
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("handler was not cancelled after grace period elapsed")
+	}
+}

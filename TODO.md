@@ -8,7 +8,6 @@
 - [ ] Pause tasks - wait for signal
 - [ ] RunTaskWait / RunFlowWait long polling
 - [ ] Add queue, task, flow and step description fields
-- [ ] Improve graceful shutdown
 
 ## Features
 - [ ] Schemas for task/flow input/output? https://opensource.googleblog.com/2026/01/a-json-schema-package-for-go.html

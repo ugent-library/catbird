@@ -166,13 +166,36 @@ func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, erro
 	return w, nil
 }
 
-// Start begins processing tasks and flows
-// The worker will poll for new work and execute handlers until the context is cancelled
+// Start begins processing tasks and flows.
+//
+// The worker will:
+//   - poll for new work and execute task and flow step handlers while ctx is active
+//   - run any configured cron-style task and flow schedules
+//   - send periodic heartbeats while it is running
+//
+// Shutdown behaviour:
+//   - when ctx is cancelled the worker immediately stops reading new work and
+//     begins shutting down
+//   - in‑flight handlers are allowed to continue running under an internal
+//     handler context
+//   - if WithShutdownTimeout is set to a value > 0, that duration is used as a
+//     grace period for in‑flight handlers after ctx is cancelled; once the
+//     grace period expires the handler context is cancelled and remaining
+//     handlers are asked to stop
+//   - if WithShutdownTimeout is not set or set to 0, there is no grace period:
+//     the handler context is cancelled immediately once ctx is cancelled and
+//     Start returns after all goroutines finish
 func (w *Worker) Start(ctx context.Context) error {
 	var scheduler *cron.Cron
 	var wg sync.WaitGroup
 	var taskHandlers = make([]*TaskHandlerInfo, 0)
 	var stepHandlers = make([]*StepHandlerInfo, 0)
+
+	// handlerCtx is used for in-flight handler execution so that when the
+	// worker's context is cancelled we can stop reading new work while still
+	// giving existing handlers a grace period to finish.
+	handlerCtx, handlerCancel := context.WithCancel(context.Background())
+	defer handlerCancel()
 
 	wg.Go(func() {
 		ticker := time.NewTicker(10 * time.Second)
@@ -198,16 +221,17 @@ func (w *Worker) Start(ctx context.Context) error {
 
 			startHandlerWorkers(
 				ctx,
+				handlerCtx,
 				&wg,
-				func() ([]taskMessage, error) {
-					msgs, err := readTasks(ctx, w.conn, t.Name, h.batchSize, 10*time.Minute, 10*time.Second, 100*time.Millisecond)
+				func(readCtx context.Context) ([]taskMessage, error) {
+					msgs, err := readTasks(readCtx, w.conn, t.Name, h.batchSize, 10*time.Minute, 10*time.Second, 100*time.Millisecond)
 					if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 						w.logger.ErrorContext(ctx, "worker: cannot read messages", "handler", t.Name, "error", err)
 					}
 					return msgs, err
 				},
-				func(msg taskMessage) {
-					w.handleTask(ctx, t, msg, msgHider.stopHiding)
+				func(handleCtx context.Context, msg taskMessage) {
+					w.handleTask(handleCtx, t, msg, msgHider.stopHiding)
 				},
 				msgHider,
 				h.concurrency,
@@ -224,16 +248,17 @@ func (w *Worker) Start(ctx context.Context) error {
 
 				startHandlerWorkers(
 					ctx,
+					handlerCtx,
 					&wg,
-					func() ([]stepMessage, error) {
-						msgs, err := readSteps(ctx, w.conn, f.Name, s.Name, h.batchSize, 10*time.Minute, 10*time.Second, 100*time.Millisecond)
+					func(readCtx context.Context) ([]stepMessage, error) {
+						msgs, err := readSteps(readCtx, w.conn, f.Name, s.Name, h.batchSize, 10*time.Minute, 10*time.Second, 100*time.Millisecond)
 						if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 							w.logger.ErrorContext(ctx, "worker: cannot read steps", "flow", f.Name, "step", s.Name, "error", err)
 						}
 						return msgs, err
 					},
-					func(msg stepMessage) {
-						w.handleStep(ctx, f.Name, s, msg, msgHider.stopHiding)
+					func(handleCtx context.Context, msg stepMessage) {
+						w.handleStep(handleCtx, f.Name, s, msg, msgHider.stopHiding)
 					},
 					msgHider,
 					h.concurrency,
@@ -347,9 +372,45 @@ func (w *Worker) Start(ctx context.Context) error {
 		return fmt.Errorf("worker: cannot mark as started: %w", err)
 	}
 
-	wg.Wait()
+	return w.waitForShutdown(ctx, handlerCancel, &wg)
+}
 
-	return nil
+// waitForShutdown blocks until all worker goroutines have finished.
+// When ctx is cancelled it optionally gives handlers a grace period according
+// to w.shutdownTimeout before cancelling the handler context.
+func (w *Worker) waitForShutdown(ctx context.Context, handlerCancel context.CancelFunc, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		wg.Wait()
+	}()
+
+	for {
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			// Shutdown requested. If a shutdown timeout is configured, give
+			// handlers a grace period to finish. Otherwise cancel them
+			// immediately.
+			if w.shutdownTimeout > 0 {
+				select {
+				case <-done:
+					return nil
+				case <-time.After(w.shutdownTimeout):
+					handlerCancel()
+					<-done
+					return nil
+				}
+			}
+
+			// No grace period configured: cancel handlers right away and wait
+			// for all goroutines to finish.
+			handlerCancel()
+			<-done
+			return nil
+		}
+	}
 }
 
 func (w *Worker) handleTask(ctx context.Context, t *Task, msg taskMessage, stopHiding func(id int64)) {
@@ -462,16 +523,17 @@ func (w *Worker) handleStep(ctx context.Context, flowName string, s *Step, msg s
 }
 
 func startHandlerWorkers[T handlerMessage](
-	ctx context.Context,
+	shutdownCtx context.Context,
+	handlerCtx context.Context,
 	wg *sync.WaitGroup,
-	readFn func() ([]T, error),
-	handleFn func(T),
+	readFn func(context.Context) ([]T, error),
+	handleFn func(context.Context, T),
 	msgHider *messageHider[T],
 	concurrency int,
 ) {
 	// hider
 	wg.Go(func() {
-		msgHider.start(ctx)
+		msgHider.start(handlerCtx)
 	})
 
 	// producer
@@ -481,12 +543,12 @@ func startHandlerWorkers[T handlerMessage](
 		for {
 			// Check for cancellation before reading
 			select {
-			case <-ctx.Done():
+			case <-shutdownCtx.Done():
 				return
 			default:
 			}
 
-			msgs, err := readFn()
+			msgs, err := readFn(shutdownCtx)
 			if err != nil {
 				return
 			}
@@ -498,7 +560,7 @@ func startHandlerWorkers[T handlerMessage](
 
 			for _, msg := range msgs {
 				select {
-				case <-ctx.Done():
+				case <-shutdownCtx.Done():
 					return
 				case msgChan <- msg:
 				}
@@ -510,7 +572,7 @@ func startHandlerWorkers[T handlerMessage](
 	for i := 0; i < concurrency; i++ {
 		wg.Go(func() {
 			for msg := range msgChan {
-				handleFn(msg)
+				handleFn(handlerCtx, msg)
 			}
 		})
 	}
