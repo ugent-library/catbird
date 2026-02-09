@@ -142,7 +142,7 @@ func NewTask[In, Out any](name string, fn func(context.Context, In) (Out, error)
 	}
 
 	if err := h.handlerOpts.Validate(); err != nil {
-		panic(err)
+		panic(fmt.Errorf("invalid handler options for task %s: %v", name, err))
 	}
 
 	return &Task{
@@ -213,7 +213,7 @@ func InitialStep[In, Out any](name string, fn func(context.Context, In) (Out, er
 	step := &Step{
 		Name:      name,
 		DependsOn: nil,
-		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
+		handler: newStepHandler(name, func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			if err := json.Unmarshal(p.FlowInput, &in); err != nil {
 				return nil, err
@@ -236,7 +236,7 @@ func StepWithOneDependency[In, Dep1Out, Out any](name string, dep1 *StepDependen
 	step := &Step{
 		Name:      name,
 		DependsOn: []*StepDependency{dep1},
-		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
+		handler: newStepHandler(name, func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			var dep1Out Dep1Out
 			if err := unmarshalStepArgs(p, []string{dep1.Name}, &in, []any{&dep1Out}); err != nil {
@@ -260,7 +260,7 @@ func StepWithTwoDependencies[In, Dep1Out, Dep2Out, Out any](name string, dep1 *S
 	step := &Step{
 		Name:      name,
 		DependsOn: []*StepDependency{dep1, dep2},
-		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
+		handler: newStepHandler(name, func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			var dep1Out Dep1Out
 			var dep2Out Dep2Out
@@ -285,7 +285,7 @@ func StepWithThreeDependencies[In, Dep1Out, Dep2Out, Dep3Out, Out any](name stri
 	step := &Step{
 		Name:      name,
 		DependsOn: []*StepDependency{dep1, dep2, dep3},
-		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
+		handler: newStepHandler(name, func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			var dep1Out Dep1Out
 			var dep2Out Dep2Out
@@ -311,7 +311,7 @@ func StepWithFourDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Out any](n
 	step := &Step{
 		Name:      name,
 		DependsOn: []*StepDependency{dep1, dep2, dep3, dep4},
-		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
+		handler: newStepHandler(name, func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			var dep1Out Dep1Out
 			var dep2Out Dep2Out
@@ -338,7 +338,7 @@ func StepWithFiveDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, O
 	step := &Step{
 		Name:      name,
 		DependsOn: []*StepDependency{dep1, dep2, dep3, dep4, dep5},
-		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
+		handler: newStepHandler(name, func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			var dep1Out Dep1Out
 			var dep2Out Dep2Out
@@ -366,7 +366,7 @@ func StepWithSixDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, De
 	step := &Step{
 		Name:      name,
 		DependsOn: []*StepDependency{dep1, dep2, dep3, dep4, dep5, dep6},
-		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
+		handler: newStepHandler(name, func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			var dep1Out Dep1Out
 			var dep2Out Dep2Out
@@ -395,7 +395,7 @@ func StepWithSevenDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, 
 	step := &Step{
 		Name:      name,
 		DependsOn: []*StepDependency{dep1, dep2, dep3, dep4, dep5, dep6, dep7},
-		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
+		handler: newStepHandler(name, func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			var dep1Out Dep1Out
 			var dep2Out Dep2Out
@@ -425,7 +425,7 @@ func StepWithEightDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, 
 	step := &Step{
 		Name:      name,
 		DependsOn: []*StepDependency{dep1, dep2, dep3, dep4, dep5, dep6, dep7, dep8},
-		handler: newStepHandler(func(ctx context.Context, p stepMessage) ([]byte, error) {
+		handler: newStepHandler(name, func(ctx context.Context, p stepMessage) ([]byte, error) {
 			var in In
 			var dep1Out Dep1Out
 			var dep2Out Dep2Out
@@ -450,7 +450,7 @@ func StepWithEightDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, 
 	}
 }
 
-func newStepHandler(fn func(context.Context, stepMessage) ([]byte, error), opts ...HandlerOpt) *stepHandler {
+func newStepHandler(name string, fn func(context.Context, stepMessage) ([]byte, error), opts ...HandlerOpt) *stepHandler {
 	h := &stepHandler{
 		handlerOpts: handlerOpts{
 			concurrency: 1,
@@ -464,7 +464,7 @@ func newStepHandler(fn func(context.Context, stepMessage) ([]byte, error), opts 
 	}
 
 	if err := h.handlerOpts.Validate(); err != nil {
-		panic(err)
+		panic(fmt.Errorf("invalid handler options for step %s: %v", name, err))
 	}
 
 	return h
