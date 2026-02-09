@@ -283,7 +283,7 @@ func (a *App) handleTask(w http.ResponseWriter, r *http.Request) {
 
 	a.render(w, r, a.task, struct {
 		Task     *catbird.TaskInfo
-		TaskRuns []*catbird.TaskRunInfo
+		TaskRuns []*catbird.RunInfo
 	}{
 		Task:     task,
 		TaskRuns: taskRuns,
@@ -321,7 +321,7 @@ func (a *App) handleFlow(w http.ResponseWriter, r *http.Request) {
 
 	a.render(w, r, a.flow, struct {
 		Flow     *catbird.FlowInfo
-		FlowRuns []*catbird.FlowRunInfo
+		FlowRuns []*catbird.RunInfo
 	}{
 		Flow:     flow,
 		FlowRuns: flowRuns,
@@ -376,7 +376,7 @@ func (a *App) handleTaskRuns(w http.ResponseWriter, r *http.Request) {
 	// Render just the task runs table partial
 	if err := a.task.ExecuteTemplate(w, "task_runs_table", struct {
 		Task     *catbird.TaskInfo
-		TaskRuns []*catbird.TaskRunInfo
+		TaskRuns []*catbird.RunInfo
 	}{
 		Task:     task,
 		TaskRuns: taskRuns,
@@ -452,7 +452,7 @@ func (a *App) handleFlowRuns(w http.ResponseWriter, r *http.Request) {
 	// Render just the flow runs table partial
 	if err := a.flow.ExecuteTemplate(w, "flow_runs_table", struct {
 		Flow     *catbird.FlowInfo
-		FlowRuns []*catbird.FlowRunInfo
+		FlowRuns []*catbird.RunInfo
 	}{
 		Flow:     flow,
 		FlowRuns: flowRuns,

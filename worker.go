@@ -24,6 +24,15 @@ type WorkerInfo struct {
 	LastHeartbeatAt time.Time          `json:"last_heartbeat_at"`
 }
 
+type TaskHandlerInfo struct {
+	TaskName string `json:"task_name"`
+}
+
+type StepHandlerInfo struct {
+	FlowName string `json:"flow_name"`
+	StepName string `json:"step_name"`
+}
+
 // ListWorkers returns all registered workers.
 func ListWorkers(ctx context.Context, conn Conn) ([]*WorkerInfo, error) {
 	q := `SELECT id, started_at, last_heartbeat_at, task_handlers, step_handlers FROM cb_worker_info ORDER BY last_heartbeat_at DESC;`

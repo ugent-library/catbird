@@ -493,18 +493,6 @@ type TaskInfo struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-type TaskRunInfo struct {
-	ID              int64           `json:"id"`
-	DeduplicationID string          `json:"deduplication_id,omitempty"`
-	Status          string          `json:"status"`
-	Input           json.RawMessage `json:"input,omitempty"`
-	Output          json.RawMessage `json:"output,omitempty"`
-	ErrorMessage    string          `json:"error_message,omitempty"`
-	StartedAt       time.Time       `json:"started_at,omitzero"`
-	CompletedAt     time.Time       `json:"completed_at,omitzero"`
-	FailedAt        time.Time       `json:"failed_at,omitzero"`
-}
-
 type FlowInfo struct {
 	Name      string     `json:"name"`
 	Steps     []StepInfo `json:"steps"`
@@ -520,7 +508,7 @@ type StepDependencyInfo struct {
 	Name string `json:"name"`
 }
 
-type FlowRunInfo struct {
+type RunInfo struct {
 	ID              int64           `json:"id"`
 	DeduplicationID string          `json:"deduplication_id,omitempty"`
 	Status          string          `json:"status"`
@@ -530,15 +518,6 @@ type FlowRunInfo struct {
 	StartedAt       time.Time       `json:"started_at,omitzero"`
 	CompletedAt     time.Time       `json:"completed_at,omitzero"`
 	FailedAt        time.Time       `json:"failed_at,omitzero"`
-}
-
-type TaskHandlerInfo struct {
-	TaskName string `json:"task_name"`
-}
-
-type StepHandlerInfo struct {
-	FlowName string `json:"flow_name"`
-	StepName string `json:"step_name"`
 }
 
 // CreateTask creates a new task definition.
@@ -573,13 +552,13 @@ type RunTaskOpts struct {
 
 // RunTask enqueues a task execution and returns a handle for monitoring
 // progress and retrieving output.
-func RunTask(ctx context.Context, conn Conn, name string, input any) (*TaskHandle, error) {
+func RunTask(ctx context.Context, conn Conn, name string, input any) (*RunHandle, error) {
 	return RunTaskWithOpts(ctx, conn, name, input, RunTaskOpts{})
 }
 
 // RunTaskWithOpts enqueues a task with options for deduplication and returns
 // a handle for monitoring.
-func RunTaskWithOpts(ctx context.Context, conn Conn, name string, input any, opts RunTaskOpts) (*TaskHandle, error) {
+func RunTaskWithOpts(ctx context.Context, conn Conn, name string, input any, opts RunTaskOpts) (*RunHandle, error) {
 	b, err := json.Marshal(input)
 	if err != nil {
 		return nil, err
@@ -592,28 +571,19 @@ func RunTaskWithOpts(ctx context.Context, conn Conn, name string, input any, opt
 		return nil, err
 	}
 
-	return &TaskHandle{conn: conn, name: name, id: id}, nil
+	return &RunHandle{conn: conn, getFn: GetTaskRun, Name: name, ID: id}, nil
 }
 
-// TaskHandle is a handle to a running or completed task execution
-type TaskHandle struct {
-	conn Conn
-	name string
-	id   int64
-}
-
-// Name returns the task name
-func (h *TaskHandle) Name() string {
-	return h.name
-}
-
-// ID returns the task run ID
-func (h *TaskHandle) ID() int64 {
-	return h.id
+// RunHandle is a handle to a running or completed task execution
+type RunHandle struct {
+	conn  Conn
+	getFn func(context.Context, Conn, string, int64) (*RunInfo, error)
+	Name  string
+	ID    int64
 }
 
 // WaitForOutput blocks until the task completes and unmarshals the output
-func (h *TaskHandle) WaitForOutput(ctx context.Context, out any) error {
+func (h *RunHandle) WaitForOutput(ctx context.Context, out any) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -622,7 +592,7 @@ func (h *TaskHandle) WaitForOutput(ctx context.Context, out any) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			info, err := GetTaskRun(ctx, h.conn, h.name, h.id)
+			info, err := h.getFn(ctx, h.conn, h.Name, h.ID)
 			if err != nil {
 				return err
 			}
@@ -637,21 +607,21 @@ func (h *TaskHandle) WaitForOutput(ctx context.Context, out any) error {
 }
 
 // GetTaskRun retrieves a specific task run result by ID.
-func GetTaskRun(ctx context.Context, conn Conn, name string, id int64) (*TaskRunInfo, error) {
+func GetTaskRun(ctx context.Context, conn Conn, name string, id int64) (*RunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(name))
 	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
-	return scanTaskRun(conn.QueryRow(ctx, query, id))
+	return scanRun(conn.QueryRow(ctx, query, id))
 }
 
 // ListTaskRuns returns recent task runs for the specified task.
-func ListTaskRuns(ctx context.Context, conn Conn, name string) ([]*TaskRunInfo, error) {
+func ListTaskRuns(ctx context.Context, conn Conn, name string) ([]*RunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(name))
 	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, scanCollectibleTaskRun)
+	return pgx.CollectRows(rows, scanCollectibleRun)
 }
 
 // CreateFlow creates a new flow definition.
@@ -689,13 +659,13 @@ type RunFlowOpts struct {
 }
 
 // RunFlow enqueues a flow execution and returns a handle for monitoring.
-func RunFlow(ctx context.Context, conn Conn, name string, input any) (*FlowHandle, error) {
+func RunFlow(ctx context.Context, conn Conn, name string, input any) (*RunHandle, error) {
 	return RunFlowWithOpts(ctx, conn, name, input, RunFlowOpts{})
 }
 
 // RunFlowWithOpts enqueues a flow with options for deduplication and returns
 // a handle for monitoring.
-func RunFlowWithOpts(ctx context.Context, conn Conn, name string, input any, opts RunFlowOpts) (*FlowHandle, error) {
+func RunFlowWithOpts(ctx context.Context, conn Conn, name string, input any, opts RunFlowOpts) (*RunHandle, error) {
 	b, err := json.Marshal(input)
 	if err != nil {
 		return nil, err
@@ -706,62 +676,25 @@ func RunFlowWithOpts(ctx context.Context, conn Conn, name string, input any, opt
 	if err != nil {
 		return nil, err
 	}
-	return &FlowHandle{id: id, name: name, conn: conn}, nil
-}
-
-// FlowHandle is a handle to a running or completed flow execution
-type FlowHandle struct {
-	id   int64
-	name string
-	conn Conn
-}
-
-// ID returns the flow run ID
-func (h *FlowHandle) ID() int64 {
-	return h.id
-}
-
-// WaitForOutput blocks until the flow completes and unmarshals the output
-// Flow output contains combined JSON object of all step outputs
-func (h *FlowHandle) WaitForOutput(ctx context.Context, out any) error {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			info, err := GetFlowRun(ctx, h.conn, h.name, h.id)
-			if err != nil {
-				return err
-			}
-			switch info.Status {
-			case StatusCompleted:
-				return json.Unmarshal(info.Output, out)
-			case StatusFailed:
-				return fmt.Errorf("%w: %s", ErrFlowFailed, info.ErrorMessage)
-			}
-		}
-	}
+	return &RunHandle{conn: conn, getFn: GetFlowRun, Name: name, ID: id}, nil
 }
 
 // GetFlowRun retrieves a specific flow run result by ID.
-func GetFlowRun(ctx context.Context, conn Conn, name string, id int64) (*FlowRunInfo, error) {
+func GetFlowRun(ctx context.Context, conn Conn, name string, id int64) (*RunInfo, error) {
 	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(name))
 	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
-	return scanFlowRun(conn.QueryRow(ctx, query, id))
+	return scanRun(conn.QueryRow(ctx, query, id))
 }
 
 // ListFlowRuns returns recent flow runs for the specified flow.
-func ListFlowRuns(ctx context.Context, conn Conn, name string) ([]*FlowRunInfo, error) {
+func ListFlowRuns(ctx context.Context, conn Conn, name string) ([]*RunInfo, error) {
 	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(name))
 	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, scanCollectibleFlowRun)
+	return pgx.CollectRows(rows, scanCollectibleRun)
 }
 
 func scanCollectibleTask(row pgx.CollectableRow) (*TaskInfo, error) {
@@ -776,56 +709,6 @@ func scanTask(row pgx.Row) (*TaskInfo, error) {
 		&rec.CreatedAt,
 	); err != nil {
 		return nil, err
-	}
-
-	return &rec, nil
-}
-
-func scanCollectibleTaskRun(row pgx.CollectableRow) (*TaskRunInfo, error) {
-	return scanTaskRun(row)
-}
-
-func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
-	rec := TaskRunInfo{}
-
-	var deduplicationID *string
-	var input *json.RawMessage
-	var output *json.RawMessage
-	var errorMessage *string
-	var completedAt *time.Time
-	var failedAt *time.Time
-
-	if err := row.Scan(
-		&rec.ID,
-		&deduplicationID,
-		&rec.Status,
-		&input,
-		&output,
-		&errorMessage,
-		&rec.StartedAt,
-		&completedAt,
-		&failedAt,
-	); err != nil {
-		return nil, err
-	}
-
-	if deduplicationID != nil {
-		rec.DeduplicationID = *deduplicationID
-	}
-	if input != nil {
-		rec.Input = *input
-	}
-	if output != nil {
-		rec.Output = *output
-	}
-	if errorMessage != nil {
-		rec.ErrorMessage = *errorMessage
-	}
-	if completedAt != nil {
-		rec.CompletedAt = *completedAt
-	}
-	if failedAt != nil {
-		rec.FailedAt = *failedAt
 	}
 
 	return &rec, nil
@@ -855,12 +738,12 @@ func scanFlow(row pgx.Row) (*FlowInfo, error) {
 	return &rec, nil
 }
 
-func scanCollectibleFlowRun(row pgx.CollectableRow) (*FlowRunInfo, error) {
-	return scanFlowRun(row)
+func scanCollectibleRun(row pgx.CollectableRow) (*RunInfo, error) {
+	return scanRun(row)
 }
 
-func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
-	rec := FlowRunInfo{}
+func scanRun(row pgx.Row) (*RunInfo, error) {
+	rec := RunInfo{}
 
 	var deduplicationID *string
 	var input *json.RawMessage

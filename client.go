@@ -131,23 +131,23 @@ func (c *Client) ListTasks(ctx context.Context) ([]*TaskInfo, error) {
 
 // RunTask enqueues a task execution and returns a handle for monitoring
 // progress and retrieving output.
-func (c *Client) RunTask(ctx context.Context, name string, input any) (*TaskHandle, error) {
+func (c *Client) RunTask(ctx context.Context, name string, input any) (*RunHandle, error) {
 	return RunTask(ctx, c.Conn, name, input)
 }
 
 // RunTaskWithOpts enqueues a task with options for deduplication and returns
 // a handle for monitoring.
-func (c *Client) RunTaskWithOpts(ctx context.Context, name string, input any, opts RunTaskOpts) (*TaskHandle, error) {
+func (c *Client) RunTaskWithOpts(ctx context.Context, name string, input any, opts RunTaskOpts) (*RunHandle, error) {
 	return RunTaskWithOpts(ctx, c.Conn, name, input, opts)
 }
 
 // GetTaskRun retrieves a specific task run result by ID.
-func (c *Client) GetTaskRun(ctx context.Context, name string, id int64) (*TaskRunInfo, error) {
+func (c *Client) GetTaskRun(ctx context.Context, name string, id int64) (*RunInfo, error) {
 	return GetTaskRun(ctx, c.Conn, name, id)
 }
 
 // ListTaskRuns returns recent task runs for the specified task.
-func (c *Client) ListTaskRuns(ctx context.Context, name string) ([]*TaskRunInfo, error) {
+func (c *Client) ListTaskRuns(ctx context.Context, name string) ([]*RunInfo, error) {
 	return ListTaskRuns(ctx, c.Conn, name)
 }
 
@@ -167,23 +167,23 @@ func (c *Client) ListFlows(ctx context.Context) ([]*FlowInfo, error) {
 }
 
 // RunFlow enqueues a flow execution and returns a handle for monitoring.
-func (c *Client) RunFlow(ctx context.Context, name string, input any) (*FlowHandle, error) {
+func (c *Client) RunFlow(ctx context.Context, name string, input any) (*RunHandle, error) {
 	return RunFlow(ctx, c.Conn, name, input)
 }
 
 // RunFlowWithOpts enqueues a flow with options for deduplication and returns
 // a handle for monitoring.
-func (c *Client) RunFlowWithOpts(ctx context.Context, name string, input any, opts RunFlowOpts) (*FlowHandle, error) {
+func (c *Client) RunFlowWithOpts(ctx context.Context, name string, input any, opts RunFlowOpts) (*RunHandle, error) {
 	return RunFlowWithOpts(ctx, c.Conn, name, input, opts)
 }
 
 // GetFlowRun retrieves a specific flow run result by ID.
-func (c *Client) GetFlowRun(ctx context.Context, name string, id int64) (*FlowRunInfo, error) {
+func (c *Client) GetFlowRun(ctx context.Context, name string, id int64) (*RunInfo, error) {
 	return GetFlowRun(ctx, c.Conn, name, id)
 }
 
 // ListFlowRuns returns recent flow runs for the specified flow.
-func (c *Client) ListFlowRuns(ctx context.Context, name string) ([]*FlowRunInfo, error) {
+func (c *Client) ListFlowRuns(ctx context.Context, name string) ([]*RunInfo, error) {
 	return ListFlowRuns(ctx, c.Conn, name)
 }
 
