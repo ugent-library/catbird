@@ -176,8 +176,12 @@ func (w *taskWorker) handle(ctx context.Context, msg taskMessage) {
 				delay = time.Second
 			}
 			w.logger.WarnContext(ctx, "worker: circuit breaker open", "task", w.task.Name, "retry_in", delay)
+			delayMs := delay.Milliseconds()
+			if delayMs <= 0 {
+				delayMs = 1
+			}
 			q := `SELECT * FROM cb_hide_tasks(name => $1, ids => $2, hide_for => $3);`
-			if _, err := execWithRetry(ctx, w.conn, q, w.task.Name, []int64{msg.ID}, delay.Milliseconds()); err != nil {
+			if _, err := execWithRetry(ctx, w.conn, q, w.task.Name, []int64{msg.ID}, delayMs); err != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot delay task due to open circuit", "task", w.task.Name, "error", err)
 			}
 			return

@@ -6,10 +6,11 @@ Catbird is a PostgreSQL-based message queue with task and workflow execution eng
 
 **Core Pattern**: Message-driven workers using PostgreSQL as the queue backend (adapted from pgmq and pgflow projects). **Database is the sole coordinator**—no external service discovery or locking needed; scale workers horizontally and PostgreSQL handles message distribution & state management.
 
-**Three Main Components**:
+**Main Components**:
 1. **Client** (`client.go`): Facade delegating to standalone functions; call `catbird.New(conn)` to create
-2. **Worker** (`worker.go`): Runs tasks, flows, and scheduled jobs; initialized with `catbird.NewWorker(ctx, conn, opts...)`. Multiple workers can run concurrently; DB ensures each message is processed exactly once.
-3. **Dashboard** (`dashboard/`): Web UI for starting task/flow runs, monitoring progress in real-time, and viewing results; served via CLI `cb dashboard`
+2. **Worker** (`worker.go`): Runs tasks and flows; initialized with `catbird.NewWorker(ctx, conn, opts...)`. Multiple workers can run concurrently; DB ensures each message is processed exactly once.
+3. **Scheduler** (`scheduler.go`): Manages cron-based task and flow scheduling using robfig/cron; created internally by worker when using `WithScheduledTask` or `WithScheduledFlow`. Can also be used standalone.
+4. **Dashboard** (`dashboard/`): Web UI for starting task/flow runs, monitoring progress in real-time, and viewing results; served via CLI `cb dashboard`
 
 **Two Independent Systems**:
 1. **Generic Message Queues**: `Send()`, `Dispatch()`, `Read()` operations similar to pgmq/SQS. Messages stored in queue tables; independent from tasks/flows. **Topic routing** via explicit bindings with wildcard support (`?` for single token, `*` for multi-token tail). Bindings stored in `cb_bindings` table with pattern type (exact/wildcard), prefix extraction for indexed filtering, and precompiled regexes.
@@ -92,7 +93,8 @@ go mod download
 ## Critical Files
 
 - [catbird.go](/catbird.go): Message, Task, Flow, Step, Options definitions
-- [worker.go](/worker.go): Worker struct, scheduling, polling logic
+- [worker.go](/worker.go): Worker struct, task/flow execution, polling logic
+- [scheduler.go](/scheduler.go): Cron-based scheduling for tasks and flows
 - [client.go](/client.go): Public API (delegation layer)
 - [dashboard/handler.go](/dashboard/handler.go): HTTP routes & templating
 - [migrations/](/migrations/): Database schema (versioned)

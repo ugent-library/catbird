@@ -15,7 +15,7 @@ func TestWorkerShutdownImmediateWhenNoTimeout(t *testing.T) {
 	t.Helper()
 
 	w := &Worker{
-		gracefulShutdown: 0,
+		shutdownTimeout: 0,
 	}
 
 	var wg sync.WaitGroup
@@ -73,7 +73,7 @@ func TestWorkerShutdownWithGracePeriod(t *testing.T) {
 
 	grace := 200 * time.Millisecond
 	w := &Worker{
-		gracefulShutdown: grace,
+		shutdownTimeout: grace,
 	}
 
 	var wg sync.WaitGroup

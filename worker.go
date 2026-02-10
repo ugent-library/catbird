@@ -10,7 +10,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/robfig/cron/v3"
 )
 
 type WorkerInfo struct {
@@ -43,26 +42,13 @@ func ListWorkers(ctx context.Context, conn Conn) ([]*WorkerInfo, error) {
 
 // Worker processes tasks and flows from the queue
 type Worker struct {
-	id               string
-	conn             Conn
-	logger           *slog.Logger
-	tasks            []*Task
-	flows            []*Flow
-	flowSchedules    []flowSchedule
-	taskSchedules    []taskSchedule
-	gracefulShutdown time.Duration
-}
-
-type taskSchedule struct {
-	taskName string
-	schedule string
-	inputFn  func() (any, error)
-}
-
-type flowSchedule struct {
-	flowName string
-	schedule string
-	inputFn  func() (any, error)
+	id              string
+	conn            Conn
+	logger          *slog.Logger
+	tasks           []*Task
+	flows           []*Flow
+	scheduler       *Scheduler
+	shutdownTimeout time.Duration
 }
 
 // WorkerOpt is an option for configuring a worker
@@ -92,39 +78,31 @@ func WithLogger(l *slog.Logger) WorkerOpt {
 // WithGracefulShutdown sets the graceful shutdown timeout for the worker. Default is 5 seconds.
 func WithGracefulShutdown(d time.Duration) WorkerOpt {
 	return func(w *Worker) {
-		w.gracefulShutdown = d
+		w.shutdownTimeout = d
 	}
 }
 
 // WithScheduledTask registers a scheduled task execution using cron syntax.
-// The input function can be used to provide dynamic input at execution time.
-// If the input function is nil, an empty JSON object will be used as input to the task.
-func WithScheduledTask(taskName string, schedule string, inputFn func() (any, error)) WorkerOpt {
+// The WithInput option can be used to provide dynamic input at execution time.
+// Otherwise an empty JSON object will be used as input to the task.
+func WithScheduledTask(taskName string, schedule string, opts ...ScheduleOpt) WorkerOpt {
 	return func(w *Worker) {
-		if inputFn == nil {
-			inputFn = func() (any, error) { return struct{}{}, nil }
+		if w.scheduler == nil {
+			w.scheduler = NewScheduler(w.conn, w.logger)
 		}
-		w.taskSchedules = append(w.taskSchedules, taskSchedule{
-			taskName: taskName,
-			schedule: schedule,
-			inputFn:  inputFn,
-		})
+		w.scheduler.AddTask(taskName, schedule, opts...)
 	}
 }
 
 // WithScheduledFlow registers a scheduled flow execution using cron syntax.
-// The input function can be used to provide dynamic input at execution time.
-// If the input function is nil, an empty JSON object will be used as input to the flow.
-func WithScheduledFlow(flowName string, schedule string, inputFn func() (any, error)) WorkerOpt {
+// The WithInput option can be used to provide dynamic input at execution time.
+// Otherwise an empty JSON object will be used as input to the flow.
+func WithScheduledFlow(flowName string, schedule string, opts ...ScheduleOpt) WorkerOpt {
 	return func(w *Worker) {
-		if inputFn == nil {
-			inputFn = func() (any, error) { return struct{}{}, nil }
+		if w.scheduler == nil {
+			w.scheduler = NewScheduler(w.conn, w.logger)
 		}
-		w.flowSchedules = append(w.flowSchedules, flowSchedule{
-			flowName: flowName,
-			schedule: schedule,
-			inputFn:  inputFn,
-		})
+		w.scheduler.AddFlow(flowName, schedule, opts...)
 	}
 }
 
@@ -134,10 +112,10 @@ func WithScheduledFlow(flowName string, schedule string, inputFn func() (any, er
 // expired queues and stale worker heartbeats.
 func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, error) {
 	w := &Worker{
-		id:               uuid.NewString(),
-		conn:             conn,
-		logger:           slog.Default(),
-		gracefulShutdown: 5 * time.Second,
+		id:              uuid.NewString(),
+		conn:            conn,
+		logger:          slog.Default(),
+		shutdownTimeout: 5 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(w)
@@ -148,10 +126,10 @@ func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, erro
 		return struct{}{}, GC(ctx, w.conn)
 	})
 	w.tasks = append(w.tasks, gcTask)
-	w.taskSchedules = append(w.taskSchedules, taskSchedule{
-		taskName: "gc",
-		schedule: "@every 5m",
-	})
+	if w.scheduler == nil {
+		w.scheduler = NewScheduler(w.conn, w.logger)
+	}
+	w.scheduler.AddTask("gc", "@every 5m")
 
 	for _, t := range w.tasks {
 		if err := CreateTask(ctx, w.conn, t); err != nil {
@@ -186,7 +164,6 @@ func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, erro
 //     the handler context is cancelled immediately once ctx is cancelled and
 //     Start returns after all goroutines finish
 func (w *Worker) Start(ctx context.Context) error {
-	var scheduler *cron.Cron
 	var wg sync.WaitGroup
 	var taskHandlers = make([]*TaskHandlerInfo, 0)
 	var stepHandlers = make([]*StepHandlerInfo, 0)
@@ -233,96 +210,15 @@ func (w *Worker) Start(ctx context.Context) error {
 		}
 	}
 
-	// TODO ensure tasks ands flows exist
-	if len(w.taskSchedules) > 0 || len(w.flowSchedules) > 0 {
-		scheduler = cron.New()
-
-		for _, ts := range w.taskSchedules {
-			var entryID cron.EntryID
-			entryID, err := scheduler.AddFunc(ts.schedule, func() {
-				entry := scheduler.Entry(entryID)
-				scheduledTime := entry.Prev
-				if scheduledTime.IsZero() {
-					// use Next if Prev is not set, which will only happen for the first run
-					scheduledTime = entry.Next
-				}
-
-				var inputJSON json.RawMessage
-				if ts.inputFn != nil {
-					input, err := ts.inputFn()
-					if err != nil {
-						w.logger.ErrorContext(ctx, "worker: failed to get scheduled task input", "task", ts.taskName, "error", err)
-						return
-					}
-					inputJSON, err = json.Marshal(input)
-					if err != nil {
-						w.logger.ErrorContext(ctx, "worker: failed to marshal scheduled task input", "task", ts.taskName, "error", err)
-						return
-					}
-				} else {
-					inputJSON = json.RawMessage("{}")
-				}
-
-				_, err := RunTaskWithOpts(ctx, w.conn, ts.taskName, inputJSON, RunTaskOpts{
-					DeduplicationID: fmt.Sprint(scheduledTime),
-				})
-				if err != nil {
-					w.logger.ErrorContext(ctx, "worker: failed to schedule task", "task", ts.taskName, "error", err)
-				}
-			})
-			if err != nil {
-				return fmt.Errorf("worker: failed to register schedule for task %s: %w", ts.taskName, err)
-			}
+	// Start scheduler if configured
+	if w.scheduler != nil {
+		if err := w.scheduler.Start(ctx); err != nil {
+			return err
 		}
-
-		for _, fs := range w.flowSchedules {
-			var entryID cron.EntryID
-			entryID, err := scheduler.AddFunc(fs.schedule, func() {
-				entry := scheduler.Entry(entryID)
-				scheduledTime := entry.Prev
-				if scheduledTime.IsZero() {
-					// use Next if Prev is not set, which will only happen for the first run
-					scheduledTime = entry.Next
-				}
-
-				var inputJSON json.RawMessage
-				if fs.inputFn != nil {
-					input, err := fs.inputFn()
-					if err != nil {
-						w.logger.ErrorContext(ctx, "worker: failed to get scheduled flow input", "flow", fs.flowName, "error", err)
-						return
-					}
-					inputJSON, err = json.Marshal(input)
-					if err != nil {
-						w.logger.ErrorContext(ctx, "worker: failed to marshal scheduled flow input", "flow", fs.flowName, "error", err)
-						return
-					}
-				} else {
-					inputJSON = json.RawMessage("{}")
-				}
-
-				_, err := RunFlowWithOpts(ctx, w.conn, fs.flowName, inputJSON, RunFlowOpts{
-					DeduplicationID: fmt.Sprint(scheduledTime),
-				})
-				if err != nil {
-					w.logger.ErrorContext(ctx, "worker: failed to schedule flow", "flow", fs.flowName, "error", err)
-				}
-			})
-			if err != nil {
-				return fmt.Errorf("worker: failed to register schedule for flow %s: %w", fs.flowName, err)
-			}
-		}
-
-		scheduler.Start()
 
 		wg.Go(func() {
 			<-ctx.Done()
-
-			stopCtx := scheduler.Stop()
-			select {
-			case <-stopCtx.Done():
-			case <-time.After(w.gracefulShutdown):
-			}
+			w.scheduler.Stop(handlerCtx)
 		})
 	}
 
@@ -347,35 +243,33 @@ func (w *Worker) Start(ctx context.Context) error {
 func (w *Worker) waitForShutdown(ctx context.Context, handlerCancel context.CancelFunc, wg *sync.WaitGroup) error {
 	done := make(chan struct{})
 	go func() {
-		defer close(done)
 		wg.Wait()
+		close(done)
 	}()
 
-	for {
-		select {
-		case <-done:
-			return nil
-		case <-ctx.Done():
-			// Shutdown requested. If a graceful shutdown timeout is configured, give
-			// handlers a grace period to finish. Otherwise cancel them
-			// immediately.
-			if w.gracefulShutdown > 0 {
-				select {
-				case <-done:
-					return nil
-				case <-time.After(w.gracefulShutdown):
-					handlerCancel()
-					<-done
-					return nil
-				}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		// Shutdown requested. If a graceful shutdown timeout is configured, give
+		// handlers a grace period to finish. Otherwise cancel them
+		// immediately.
+		if w.shutdownTimeout > 0 {
+			select {
+			case <-done:
+				return nil
+			case <-time.After(w.shutdownTimeout):
+				handlerCancel()
+				<-done
+				return nil
 			}
-
-			// No grace period configured: cancel handlers right away and wait
-			// for all goroutines to finish.
-			handlerCancel()
-			<-done
-			return nil
 		}
+
+		// No grace period configured: cancel handlers right away and wait
+		// for all goroutines to finish.
+		handlerCancel()
+		<-done
+		return nil
 	}
 }
 

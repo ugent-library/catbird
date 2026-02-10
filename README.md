@@ -142,7 +142,7 @@ err = handle.WaitForOutput(ctx, &result)
 // Schedule a task to run periodically (using cron syntax)
 worker, err = client.NewWorker(ctx,
     catbird.WithTask(sendEmailsTask),
-    catbird.WithScheduledTask("send-emails", "@hourly", nil), // Run every hour
+    catbird.WithScheduledTask("send-emails", "@hourly"), // Run every hour
 )
 go worker.Start(ctx)
 ```
