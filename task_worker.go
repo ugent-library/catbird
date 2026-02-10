@@ -54,6 +54,8 @@ func (w *taskWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 	wg.Go(func() {
 		defer close(messages)
 
+		retryAttempt := 0
+
 		for {
 			select {
 			case <-shutdownCtx.Done():
@@ -63,11 +65,27 @@ func (w *taskWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 
 			msgs, err := w.readMessages(shutdownCtx)
 			if err != nil {
-				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-					w.logger.ErrorContext(shutdownCtx, "worker: cannot read tasks", "task", w.task.Name, "error", err)
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return
 				}
-				return // TODO: consider pausing and retrying on transient errors instead of exiting
+
+				w.logger.ErrorContext(shutdownCtx, "worker: cannot read task messages", "task", w.task.Name, "error", err)
+
+				delay := backoffWithFullJitter(retryAttempt, 250*time.Millisecond, 5*time.Second)
+				retryAttempt++
+				timer := time.NewTimer(delay)
+				select {
+				case <-shutdownCtx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				continue
 			}
+
+			// Success: reset backoff
+			retryAttempt = 0
+
 			if len(msgs) == 0 {
 				continue
 			}
@@ -126,9 +144,9 @@ func (w *taskWorker) hideInFlight(ctx context.Context) {
 	}
 
 	q := `SELECT * FROM cb_hide_tasks(name => $1, ids => $2, hide_for => $3);`
-	_, err := w.conn.Exec(ctx, q, w.task.Name, ids, (10 * time.Minute).Milliseconds())
+	_, err := execWithRetry(ctx, w.conn, q, w.task.Name, ids, (10 * time.Minute).Milliseconds())
 
-	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		w.logger.ErrorContext(ctx, "worker: cannot hide in-flight tasks", "task", w.task.Name, "error", err)
 	}
 }
@@ -138,7 +156,7 @@ func (w *taskWorker) readMessages(ctx context.Context) ([]taskMessage, error) {
 
 	q := `SELECT id, deliveries, input FROM cb_read_tasks(name => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
 
-	rows, err := w.conn.Query(ctx, q, w.task.Name, h.batchSize, (10 * time.Minute).Milliseconds(), (10 * time.Second).Milliseconds(), (100 * time.Millisecond).Milliseconds())
+	rows, err := queryWithRetry(ctx, w.conn, q, w.task.Name, h.batchSize, (10 * time.Minute).Milliseconds(), (10 * time.Second).Milliseconds(), (100 * time.Millisecond).Milliseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -184,19 +202,19 @@ func (w *taskWorker) handle(ctx context.Context, msg taskMessage) {
 
 		if msg.Deliveries > h.maxRetries {
 			q := `SELECT * FROM cb_fail_task(name => $1, id => $2, error_message => $3);`
-			if _, err := w.conn.Exec(ctx, q, w.task.Name, msg.ID, err.Error()); err != nil {
+			if _, err := execWithRetry(ctx, w.conn, q, w.task.Name, msg.ID, err.Error()); err != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot mark task as failed", "task", w.task.Name, "error", err)
 			}
 		} else {
 			delay := backoffWithFullJitter(msg.Deliveries-1, h.minDelay, h.maxDelay)
 			q := `SELECT * FROM cb_hide_tasks(name => $1, ids => $2, hide_for => $3);`
-			if _, err := w.conn.Exec(ctx, q, w.task.Name, []int64{msg.ID}, delay.Milliseconds()); err != nil {
+			if _, err := execWithRetry(ctx, w.conn, q, w.task.Name, []int64{msg.ID}, delay.Milliseconds()); err != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot delay next task run", "task", w.task.Name, "error", err)
 			}
 		}
 	} else {
 		q := `SELECT * FROM cb_complete_task(name => $1, id => $2, output => $3);`
-		if _, err := w.conn.Exec(ctx, q, w.task.Name, msg.ID, out); err != nil {
+		if _, err := execWithRetry(ctx, w.conn, q, w.task.Name, msg.ID, out); err != nil {
 			w.logger.ErrorContext(ctx, "worker: cannot mark task as completed", "task", w.task.Name, "error", err)
 		}
 	}

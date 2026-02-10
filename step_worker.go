@@ -20,17 +20,17 @@ type stepWorker struct {
 	step     *Step
 
 	// In-flight message tracking
-	inFlightIDs   map[int64]struct{}
-	inFlightIDsMu sync.Mutex
+	inFlight   map[int64]struct{}
+	inFlightMu sync.Mutex
 }
 
 func newStepWorker(conn Conn, logger *slog.Logger, flowName string, step *Step) *stepWorker {
 	return &stepWorker{
-		conn:        conn,
-		logger:      logger,
-		flowName:    flowName,
-		step:        step,
-		inFlightIDs: make(map[int64]struct{}),
+		conn:     conn,
+		logger:   logger,
+		flowName: flowName,
+		step:     step,
+		inFlight: make(map[int64]struct{}),
 	}
 }
 
@@ -53,8 +53,11 @@ func (w *stepWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 	})
 
 	// Start producer
+	// Start producer
 	wg.Go(func() {
 		defer close(messages)
+
+		retryAttempt := 0
 
 		for {
 			select {
@@ -65,11 +68,27 @@ func (w *stepWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 
 			msgs, err := w.readMessages(shutdownCtx)
 			if err != nil {
-				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-					w.logger.ErrorContext(shutdownCtx, "worker: cannot read steps", "flow", w.flowName, "step", w.step.Name, "error", err)
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return
 				}
-				return // TODO: consider pausing and retrying on transient errors instead of exiting
+
+				w.logger.ErrorContext(shutdownCtx, "worker: cannot read step messages", "flow", w.flowName, "step", w.step.Name, "error", err)
+
+				delay := backoffWithFullJitter(retryAttempt, 250*time.Millisecond, 5*time.Second)
+				retryAttempt++
+				timer := time.NewTimer(delay)
+				select {
+				case <-shutdownCtx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				continue
 			}
+
+			// Success: reset backoff
+			retryAttempt = 0
+
 			if len(msgs) == 0 {
 				continue
 			}
@@ -96,39 +115,39 @@ func (w *stepWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 	}
 }
 
-func (w *stepWorker) getInFlightIDs() []int64 {
-	w.inFlightIDsMu.Lock()
-	defer w.inFlightIDsMu.Unlock()
+func (w *stepWorker) getInFlight() []int64 {
+	w.inFlightMu.Lock()
+	defer w.inFlightMu.Unlock()
 
-	ids := make([]int64, 0, len(w.inFlightIDs))
-	for id := range w.inFlightIDs {
+	ids := make([]int64, 0, len(w.inFlight))
+	for id := range w.inFlight {
 		ids = append(ids, id)
 	}
 	return ids
 }
 
 func (w *stepWorker) markInFlight(msgs []stepMessage) {
-	w.inFlightIDsMu.Lock()
+	w.inFlightMu.Lock()
 	for _, msg := range msgs {
-		w.inFlightIDs[msg.ID] = struct{}{}
+		w.inFlight[msg.ID] = struct{}{}
 	}
-	w.inFlightIDsMu.Unlock()
+	w.inFlightMu.Unlock()
 }
 
 func (w *stepWorker) removeInFlight(id int64) {
-	w.inFlightIDsMu.Lock()
-	delete(w.inFlightIDs, id)
-	w.inFlightIDsMu.Unlock()
+	w.inFlightMu.Lock()
+	delete(w.inFlight, id)
+	w.inFlightMu.Unlock()
 }
 
 func (w *stepWorker) hideInFlight(ctx context.Context) {
-	ids := w.getInFlightIDs()
+	ids := w.getInFlight()
 	if len(ids) == 0 {
 		return
 	}
 
 	q := `SELECT * FROM cb_hide_steps(flow_name => $1, step_name => $2, ids => $3, hide_for => $4);`
-	_, err := w.conn.Exec(ctx, q, w.flowName, w.step.Name, w.getInFlightIDs(), (10 * time.Minute).Milliseconds())
+	_, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.Name, w.getInFlight(), (10 * time.Minute).Milliseconds())
 
 	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		w.logger.ErrorContext(ctx, "worker: cannot hide in-flight steps", "flow", w.flowName, "step", w.step.Name, "error", err)
@@ -140,7 +159,7 @@ func (w *stepWorker) readMessages(ctx context.Context) ([]stepMessage, error) {
 
 	q := `SELECT id, deliveries, flow_input, step_outputs FROM cb_read_steps(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
 
-	rows, err := w.conn.Query(ctx, q, w.flowName, w.step.Name, h.batchSize, (10 * time.Minute).Milliseconds(), (10 * time.Second).Milliseconds(), (100 * time.Millisecond).Milliseconds())
+	rows, err := queryWithRetry(ctx, w.conn, q, w.flowName, w.step.Name, h.batchSize, (10 * time.Minute).Milliseconds(), (10 * time.Second).Milliseconds(), (100 * time.Millisecond).Milliseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -191,19 +210,19 @@ func (w *stepWorker) handle(ctx context.Context, msg stepMessage) {
 
 		if msg.Deliveries > h.maxRetries {
 			q := `SELECT * FROM cb_fail_step(flow_name => $1, step_name => $2, step_id => $3, error_message => $4);`
-			if _, err := w.conn.Exec(ctx, q, w.flowName, w.step.Name, msg.ID, err.Error()); err != nil {
+			if _, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.Name, msg.ID, err.Error()); err != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot mark step as failed", "flow", w.flowName, "step", w.step.Name, "error", err)
 			}
 		} else {
 			delay := backoffWithFullJitter(msg.Deliveries-1, h.minDelay, h.maxDelay)
 			q := `SELECT * FROM cb_hide_steps(flow_name => $1, step_name => $2, ids => $3, hide_for => $4);`
-			if _, err := w.conn.Exec(ctx, q, w.flowName, w.step.Name, []int64{msg.ID}, delay.Milliseconds()); err != nil {
+			if _, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.Name, []int64{msg.ID}, delay.Milliseconds()); err != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot delay next step run", "flow", w.flowName, "step", w.step.Name, "error", err)
 			}
 		}
 	} else {
 		q := `SELECT * FROM cb_complete_step(flow_name => $1, step_name => $2, step_id => $3, output => $4);`
-		if _, err := w.conn.Exec(ctx, q, w.flowName, w.step.Name, msg.ID, out); err != nil {
+		if _, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.Name, msg.ID, out); err != nil {
 			w.logger.ErrorContext(ctx, "worker: cannot mark step as completed", "flow", w.flowName, "step", w.step.Name, "error", err)
 		}
 	}

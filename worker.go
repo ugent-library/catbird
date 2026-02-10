@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"math"
-	"math/rand"
 	"sync"
 	"time"
 
@@ -413,14 +411,4 @@ func scanWorker(row pgx.Row) (*WorkerInfo, error) {
 	}
 
 	return &rec, nil
-}
-
-// backoffWithFullJitter calculates the next backoff duration using full jitter strategy.
-// The first retryAttempt should be 0.
-func backoffWithFullJitter(retryAttempt int, minDelay, maxDelay time.Duration) time.Duration {
-	delay := time.Duration(float64(minDelay) * math.Pow(2, float64(retryAttempt)))
-	if delay > maxDelay {
-		delay = maxDelay
-	}
-	return time.Duration(rand.Int63n(int64(delay)))
 }

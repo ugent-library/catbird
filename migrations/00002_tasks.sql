@@ -470,8 +470,6 @@ BEGIN
       jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb))
     );
 
-    -- TODO validate steps (e.g., dependencies refer to existing steps, no circular dependencies, etc.)
-
     _dep_idx := 0;
     FOR _dep IN SELECT jsonb_array_elements(coalesce(_step->'depends_on', '[]'::jsonb))
     LOOP
