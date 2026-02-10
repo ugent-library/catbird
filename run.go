@@ -22,9 +22,14 @@ type RunInfo struct {
 	FailedAt        time.Time       `json:"failed_at,omitzero"`
 }
 
+// OutputAs unmarshals the output of a completed run.
+// Returns an error if the run has failed or is not completed yet.
 func (r *RunInfo) OutputAs(out any) error {
 	if r.Status == StatusFailed {
 		return fmt.Errorf("%w: %s", ErrRunFailed, r.ErrorMessage)
+	}
+	if r.Status != StatusCompleted {
+		return fmt.Errorf("run not completed: current status is %s", r.Status)
 	}
 	return json.Unmarshal(r.Output, out)
 }
