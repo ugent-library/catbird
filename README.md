@@ -17,6 +17,7 @@ A PostgreSQL-powered message queue and task execution engine. Catbird brings rel
 - **Flexible workflows**: Multi-step DAGs with dependency tracking and cascading data between steps.
 - **Built-in persistence**: All state (queues, tasks, flows, runs) lives in PostgreSQL for auditability and recovery.
 - **Worker management**: Simple worker lifecycle with graceful shutdown, configurable concurrency, and built-in retries.
+- **Resiliency features**: Handler retries with backoff, optional circuit breaker protection, and PostgreSQL retry logic for transient errors.
 - **Dashboard**: Web UI to trigger task/flow runs, monitor progress in real-time, and view results.
 
 ## Quick Start
@@ -113,6 +114,7 @@ task := catbird.NewTask("send-email", func(ctx context.Context, input EmailReque
     catbird.WithConcurrency(5), // Allow up to 5 concurrent executions
     catbird.WithMaxRetries(3), // Retry 3 times
     catbird.WithBackoff(500*time.Millisecond, 10*time.Second), // Exponential backoff between 500ms and 10s
+    catbird.WithCircuitBreaker(5, 30*time.Second), // Open after 5 consecutive failures
 )
 
 // Start a worker that handles the send-email task
@@ -144,6 +146,8 @@ worker, err = client.NewWorker(ctx,
 )
 go worker.Start(ctx)
 ```
+
+Catbird includes multiple resiliency layers for transient failures. Handlers can retry with [WithMaxRetries](https://pkg.go.dev/github.com/ugent-library/catbird#WithMaxRetries) and exponential jittered backoff via [WithBackoff](https://pkg.go.dev/github.com/ugent-library/catbird#WithBackoff), and you can wrap external calls with a circuit breaker using [WithCircuitBreaker](https://pkg.go.dev/github.com/ugent-library/catbird#WithCircuitBreaker) to avoid cascading outages. On the infrastructure side, PostgreSQL operations are issued with retry logic for transient errors to keep workers making progress even if the database briefly hiccups.
 
 ### Workflow (Multi-Step Flow)
 

@@ -10,21 +10,6 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Status constants for task and flow runs
-const (
-	StatusCreated   = "created"
-	StatusStarted   = "started"
-	StatusCompleted = "completed"
-	StatusFailed    = "failed"
-)
-
-var (
-	// ErrTaskFailed is returned when a task run fails
-	ErrTaskFailed = fmt.Errorf("task failed")
-	// ErrFlowFailed is returned when a flow run fails
-	ErrFlowFailed = fmt.Errorf("flow failed")
-)
-
 // Task represents a task definition with a generic typed handler
 type Task struct {
 	Name    string `json:"name"`
@@ -70,7 +55,7 @@ func NewTask[In, Out any](name string, fn func(context.Context, In) (Out, error)
 		opt(&h.handlerOpts)
 	}
 
-	if err := h.handlerOpts.Validate(); err != nil {
+	if err := h.handlerOpts.validate(); err != nil {
 		panic(fmt.Errorf("invalid handler options for task %s: %v", name, err))
 	}
 

@@ -22,6 +22,13 @@ type RunInfo struct {
 	FailedAt        time.Time       `json:"failed_at,omitzero"`
 }
 
+func (r *RunInfo) OutputAs(out any) error {
+	if r.Status == StatusFailed {
+		return fmt.Errorf("%w: %s", ErrRunFailed, r.ErrorMessage)
+	}
+	return json.Unmarshal(r.Output, out)
+}
+
 // RunHandle is a handle to a task or flow execution
 type RunHandle struct {
 	conn  Conn
@@ -48,7 +55,7 @@ func (h *RunHandle) WaitForOutput(ctx context.Context, out any) error {
 			case StatusCompleted:
 				return json.Unmarshal(info.Output, out)
 			case StatusFailed:
-				return fmt.Errorf("%w: %s", ErrTaskFailed, info.ErrorMessage)
+				return fmt.Errorf("%w: %s", ErrRunFailed, info.ErrorMessage)
 			}
 		}
 	}

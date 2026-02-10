@@ -31,7 +31,7 @@ Key: Migrations use goose with `DisableVersioning` + embedded FS. Schema version
 // Handler fn: (context.Context, InputType) -> (OutputType, error)
 task := catbird.NewTask("my_task", func(ctx context.Context, input MyInput) (MyOutput, error) {
     return MyOutput{}, nil
-}, catbird.WithConcurrency(5), catbird.WithMaxRetries(3))
+}, catbird.WithConcurrency(5), catbird.WithMaxRetries(3), catbird.WithCircuitBreaker(5, 30*time.Second))
 ```
 - Input/output marshaled as JSON automatically
 - Options are applied via `HandlerOpt` interface (see `concurrencyOpt`, `retriesOpt`, etc. pattern)
@@ -103,4 +103,5 @@ go mod download
 2. **Context propagation**: All DB ops accept `context.Context` first param
 3. **JSON payloads**: Custom types → JSON via generics; validation happens in handler
 4. **Retries**: Built-in with configurable exponential backoff with full jitter (see `WithBackoff(min, max)`)
-5. **Concurrency**: Default 1 per handler; tweak with `WithConcurrency(n)`
+5. **Circuit breaker**: Optional per-handler protection for external dependencies (see `WithCircuitBreaker(failures, openTimeout)`)
+6. **Concurrency**: Default 1 per handler; tweak with `WithConcurrency(n)`

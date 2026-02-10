@@ -6,16 +6,17 @@ import (
 )
 
 type handlerOpts struct {
-	concurrency int
-	batchSize   int
-	maxDuration time.Duration
-	maxRetries  int
-	minDelay    time.Duration
-	maxDelay    time.Duration
+	concurrency    int
+	batchSize      int
+	maxDuration    time.Duration
+	maxRetries     int
+	minDelay       time.Duration
+	maxDelay       time.Duration
+	circuitBreaker *circuitBreaker
 }
 
-// Validate checks handler options for consistency.
-func (h *handlerOpts) Validate() error {
+// validate checks handler options for consistency.
+func (h *handlerOpts) validate() error {
 	if h.concurrency <= 0 {
 		return fmt.Errorf("concurrency must be greater than zero")
 	}
@@ -39,6 +40,11 @@ func (h *handlerOpts) Validate() error {
 	}
 	if h.maxRetries == 0 && h.maxDelay > 0 {
 		return fmt.Errorf("backoff configured but max retries is zero")
+	}
+	if h.circuitBreaker != nil {
+		if err := h.circuitBreaker.validate(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -79,5 +85,14 @@ func WithBackoff(minDelay, maxDelay time.Duration) HandlerOpt {
 	return func(h *handlerOpts) {
 		h.minDelay = minDelay
 		h.maxDelay = maxDelay
+	}
+}
+
+// WithCircuitBreaker configures a circuit breaker for handler execution.
+// failureThreshold is the number of consecutive failures before opening.
+// openTimeout controls how long the circuit stays open before trying again.
+func WithCircuitBreaker(failureThreshold int, openTimeout time.Duration) HandlerOpt {
+	return func(h *handlerOpts) {
+		h.circuitBreaker = newCircuitBreaker(failureThreshold, openTimeout)
 	}
 }

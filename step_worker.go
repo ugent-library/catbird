@@ -172,6 +172,21 @@ func (w *stepWorker) handle(ctx context.Context, msg stepMessage) {
 
 	h := w.step.handler
 
+	if h.circuitBreaker != nil {
+		allowed, delay := h.circuitBreaker.allow(time.Now())
+		if !allowed {
+			if delay <= 0 {
+				delay = time.Second
+			}
+			w.logger.WarnContext(ctx, "worker: circuit breaker open", "flow", w.flowName, "step", w.step.Name, "retry_in", delay)
+			q := `SELECT * FROM cb_hide_steps(flow_name => $1, step_name => $2, ids => $3, hide_for => $4);`
+			if _, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.Name, []int64{msg.ID}, delay.Milliseconds()); err != nil {
+				w.logger.ErrorContext(ctx, "worker: cannot delay step due to open circuit", "flow", w.flowName, "step", w.step.Name, "error", err)
+			}
+			return
+		}
+	}
+
 	if w.logger.Enabled(ctx, slog.LevelDebug) {
 		stepOutputsJSON, _ := json.Marshal(msg.StepOutputs)
 		w.logger.DebugContext(ctx, "worker: handleStep",
@@ -206,6 +221,9 @@ func (w *stepWorker) handle(ctx context.Context, msg stepMessage) {
 
 	// Handle result
 	if err != nil {
+		if h.circuitBreaker != nil {
+			h.circuitBreaker.recordFailure(time.Now())
+		}
 		w.logger.ErrorContext(ctx, "worker: failed", "flow", w.flowName, "step", w.step.Name, "error", err)
 
 		if msg.Deliveries > h.maxRetries {
@@ -221,6 +239,9 @@ func (w *stepWorker) handle(ctx context.Context, msg stepMessage) {
 			}
 		}
 	} else {
+		if h.circuitBreaker != nil {
+			h.circuitBreaker.recordSuccess()
+		}
 		q := `SELECT * FROM cb_complete_step(flow_name => $1, step_name => $2, step_id => $3, output => $4);`
 		if _, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.Name, msg.ID, out); err != nil {
 			w.logger.ErrorContext(ctx, "worker: cannot mark step as completed", "flow", w.flowName, "step", w.step.Name, "error", err)

@@ -330,7 +330,7 @@ func newStepHandler(name string, fn func(context.Context, stepMessage) ([]byte, 
 		opt(&h.handlerOpts)
 	}
 
-	if err := h.handlerOpts.Validate(); err != nil {
+	if err := h.handlerOpts.validate(); err != nil {
 		panic(fmt.Errorf("invalid handler options for step %s: %v", name, err))
 	}
 

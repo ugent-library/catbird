@@ -169,6 +169,21 @@ func (w *taskWorker) handle(ctx context.Context, msg taskMessage) {
 
 	h := w.task.handler
 
+	if h.circuitBreaker != nil {
+		allowed, delay := h.circuitBreaker.allow(time.Now())
+		if !allowed {
+			if delay <= 0 {
+				delay = time.Second
+			}
+			w.logger.WarnContext(ctx, "worker: circuit breaker open", "task", w.task.Name, "retry_in", delay)
+			q := `SELECT * FROM cb_hide_tasks(name => $1, ids => $2, hide_for => $3);`
+			if _, err := execWithRetry(ctx, w.conn, q, w.task.Name, []int64{msg.ID}, delay.Milliseconds()); err != nil {
+				w.logger.ErrorContext(ctx, "worker: cannot delay task due to open circuit", "task", w.task.Name, "error", err)
+			}
+			return
+		}
+	}
+
 	w.logger.DebugContext(ctx, "worker: handleTask",
 		"task", w.task.Name,
 		"id", msg.ID,
@@ -198,6 +213,9 @@ func (w *taskWorker) handle(ctx context.Context, msg taskMessage) {
 
 	// Handle result
 	if err != nil {
+		if h.circuitBreaker != nil {
+			h.circuitBreaker.recordFailure(time.Now())
+		}
 		w.logger.ErrorContext(ctx, "worker: failed", "task", w.task.Name, "error", err)
 
 		if msg.Deliveries > h.maxRetries {
@@ -213,6 +231,9 @@ func (w *taskWorker) handle(ctx context.Context, msg taskMessage) {
 			}
 		}
 	} else {
+		if h.circuitBreaker != nil {
+			h.circuitBreaker.recordSuccess()
+		}
 		q := `SELECT * FROM cb_complete_task(name => $1, id => $2, output => $3);`
 		if _, err := execWithRetry(ctx, w.conn, q, w.task.Name, msg.ID, out); err != nil {
 			w.logger.ErrorContext(ctx, "worker: cannot mark task as completed", "task", w.task.Name, "error", err)
