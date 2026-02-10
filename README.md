@@ -213,6 +213,66 @@ err = handle.WaitForOutput(ctx, &results)
 // results contains output from all steps: validate, charge, check, ship
 ```
 
+### Workflow with Signals (Human-in-the-Loop)
+
+Signals enable workflows that wait for external input before proceeding, such as approval workflows or webhooks.
+
+```go
+type ApprovalInput struct {
+    ApproverID string `json:"approver_id"`
+    Approved   bool   `json:"approved"`
+}
+
+// Define a flow with an approval step that requires a signal
+flow := catbird.NewFlow("document_approval",
+    catbird.InitialStep("submit", func(ctx context.Context, doc Document) (string, error) {
+        // Submit document for review
+        return doc.ID, nil
+    }),
+    catbird.StepWithOneDependencyAndSignal("approve",
+        catbird.Dependency("submit"),
+        func(ctx context.Context, doc Document, approval ApprovalInput, docID string) (string, error) {
+            if !approval.Approved {
+                return "", fmt.Errorf("approval denied by %s", approval.ApproverID)
+            }
+            return fmt.Sprintf("Approved by %s: %s", approval.ApproverID, docID), nil
+        }),
+    catbird.StepWithOneDependency("publish",
+        catbird.Dependency("approve"),
+        func(ctx context.Context, doc Document, status string) (string, error) {
+            // Publish the approved document
+            return "Published: " + status, nil
+        }),
+)
+
+// Start worker
+worker, err := client.NewWorker(ctx, catbird.WithFlow(flow))
+go worker.Start(ctx)
+
+// Run the flow
+handle, err := client.RunFlow(ctx, "document_approval", myDocument)
+
+// Later, when approval is received (e.g., from a webhook or UI):
+err = client.SignalFlow(ctx, "document_approval", handle.ID, "approve", ApprovalInput{
+    ApproverID: "user123",
+    Approved:   true,
+})
+
+// Wait for completion
+var results map[string]any
+err = handle.WaitForOutput(ctx, &results)
+// results["approve"] contains "Approved by user123: doc-id"
+// results["publish"] contains "Published: Approved by user123: doc-id"
+```
+
+Signal variants available:
+- `InitialStepWithSignal` - first step requires signal
+- `StepWithOneDependencyAndSignal` - step with 1 dependency + signal
+- `StepWithTwoDependenciesAndSignal` - step with 2 dependencies + signal
+- `StepWithThreeDependenciesAndSignal` - step with 3 dependencies + signal
+
+A step with both dependencies and a signal waits for **both** conditions: all dependencies must complete **and** the signal must be delivered before the step executes.
+
 ## Resiliency
 
 Catbird includes multiple resiliency layers for transient failures. Handlers can retry with [WithMaxRetries](https://pkg.go.dev/github.com/ugent-library/catbird#WithMaxRetries) and exponential jittered backoff via [WithBackoff](https://pkg.go.dev/github.com/ugent-library/catbird#WithBackoff), and you can wrap external calls with a circuit breaker using [WithCircuitBreaker](https://pkg.go.dev/github.com/ugent-library/catbird#WithCircuitBreaker) to avoid cascading outages. On the infrastructure side, PostgreSQL operations are issued with retry logic for transient errors to keep workers making progress even if the database briefly hiccups.

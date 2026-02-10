@@ -499,3 +499,211 @@ func TestStepCircuitBreaker(t *testing.T) {
 		t.Fatalf("expected circuit breaker delay at least %s, got %s", openTimeout-50*time.Millisecond, delta)
 	}
 }
+
+func TestFlowWithSignal(t *testing.T) {
+	client := getTestClient(t)
+
+	type ApprovalInput struct {
+		ApproverID string `json:"approver_id"`
+		Approved   bool   `json:"approved"`
+	}
+
+	type FlowOutput struct {
+		Submit  string `json:"submit"`
+		Approve string `json:"approve"`
+		Publish string `json:"publish"`
+	}
+
+	flow := NewFlow("signal_approval_flow",
+		InitialStep("submit", func(ctx context.Context, doc string) (string, error) {
+			return "submitted: " + doc, nil
+		}),
+		StepWithOneDependencyAndSignal("approve",
+			Dependency("submit"),
+			func(ctx context.Context, doc string, approval ApprovalInput, submitResult string) (string, error) {
+				if !approval.Approved {
+					return "", fmt.Errorf("approval denied by %s", approval.ApproverID)
+				}
+				return fmt.Sprintf("approved by %s: %s", approval.ApproverID, submitResult), nil
+			}),
+		StepWithOneDependency("publish",
+			Dependency("approve"),
+			func(ctx context.Context, doc string, approveResult string) (string, error) {
+				return "published: " + approveResult, nil
+			}),
+	)
+
+	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		if err := worker.Start(t.Context()); err != nil {
+			t.Logf("worker error: %s", err)
+		}
+	}()
+
+	// Give worker time to start
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), "signal_approval_flow", "my_document")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait a bit for submit step to complete
+	time.Sleep(200 * time.Millisecond)
+
+	// Deliver approval signal
+	err = client.SignalFlow(t.Context(), "signal_approval_flow", h.ID, "approve", ApprovalInput{
+		ApproverID: "user123",
+		Approved:   true,
+	})
+	if err != nil {
+		t.Fatalf("signal delivery failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var result FlowOutput
+	if err := h.WaitForOutput(ctx, &result); err != nil {
+		t.Fatalf("wait for output failed: %v", err)
+	}
+
+	if result.Submit != "submitted: my_document" {
+		t.Fatalf("unexpected submit result: %s", result.Submit)
+	}
+	if result.Approve != "approved by user123: submitted: my_document" {
+		t.Fatalf("unexpected approve result: %s", result.Approve)
+	}
+	if result.Publish != "published: approved by user123: submitted: my_document" {
+		t.Fatalf("unexpected publish result: %s", result.Publish)
+	}
+}
+
+func TestFlowWithInitialSignal(t *testing.T) {
+	client := getTestClient(t)
+
+	type TriggerInput struct {
+		Action string `json:"action"`
+	}
+
+	type FlowOutput struct {
+		Start  string `json:"start"`
+		Finish string `json:"finish"`
+	}
+
+	flow := NewFlow("signal_trigger_flow",
+		InitialStepWithSignal("start",
+			func(ctx context.Context, data string, trigger TriggerInput) (string, error) {
+				return fmt.Sprintf("started with %s from %s", trigger.Action, data), nil
+			}),
+		StepWithOneDependency("finish",
+			Dependency("start"),
+			func(ctx context.Context, data string, startResult string) (string, error) {
+				return "completed: " + startResult, nil
+			}),
+	)
+
+	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		if err := worker.Start(t.Context()); err != nil {
+			t.Logf("worker error: %s", err)
+		}
+	}()
+
+	// Give worker time to start
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), "signal_trigger_flow", "workflow_data")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Deliver signal to initial step
+	err = client.SignalFlow(t.Context(), "signal_trigger_flow", h.ID, "start", TriggerInput{
+		Action: "manual_trigger",
+	})
+	if err != nil {
+		t.Fatalf("signal delivery failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var result FlowOutput
+	if err := h.WaitForOutput(ctx, &result); err != nil {
+		t.Fatalf("wait for output failed: %v", err)
+	}
+
+	if result.Start != "started with manual_trigger from workflow_data" {
+		t.Fatalf("unexpected start result: %s", result.Start)
+	}
+	if result.Finish != "completed: started with manual_trigger from workflow_data" {
+		t.Fatalf("unexpected finish result: %s", result.Finish)
+	}
+}
+
+func TestFlowSignalAlreadyDelivered(t *testing.T) {
+	client := getTestClient(t)
+
+	type SignalData struct {
+		Value int `json:"value"`
+	}
+
+	flow := NewFlow("signal_duplicate_flow",
+		InitialStepWithSignal("step1",
+			func(ctx context.Context, in string, sig SignalData) (string, error) {
+				return fmt.Sprintf("%s: %d", in, sig.Value), nil
+			}),
+	)
+
+	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		if err := worker.Start(t.Context()); err != nil {
+			t.Logf("worker error: %s", err)
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), "signal_duplicate_flow", "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Deliver signal first time (should succeed)
+	err = client.SignalFlow(t.Context(), "signal_duplicate_flow", h.ID, "step1", SignalData{Value: 42})
+	if err != nil {
+		t.Fatalf("first signal delivery failed: %v", err)
+	}
+
+	// Try to deliver signal second time (should fail)
+	err = client.SignalFlow(t.Context(), "signal_duplicate_flow", h.ID, "step1", SignalData{Value: 99})
+	if err == nil {
+		t.Fatal("expected error when delivering signal twice, got nil")
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var result map[string]string
+	if err := h.WaitForOutput(ctx, &result); err != nil {
+		t.Fatalf("wait for output failed: %v", err)
+	}
+
+	// Verify first signal was used, not second
+	if result["step1"] != "input: 42" {
+		t.Fatalf("unexpected result (should use first signal): %s", result["step1"])
+	}
+}

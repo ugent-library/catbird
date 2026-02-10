@@ -187,6 +187,13 @@ func (c *Client) ListFlowRuns(ctx context.Context, name string) ([]*RunInfo, err
 	return ListFlowRuns(ctx, c.Conn, name)
 }
 
+// SignalFlow delivers a signal to a waiting step in a flow run.
+// The step must have been defined with a signal variant (e.g., InitialStepWithSignal).
+// Returns an error if the signal was already delivered or the step doesn't require a signal.
+func (c *Client) SignalFlow(ctx context.Context, flowName string, flowRunID int64, stepName string, input any) error {
+	return SignalFlow(ctx, c.Conn, flowName, flowRunID, stepName, input)
+}
+
 // NewWorker creates a new worker that processes task and flow executions.
 // Configure the worker with options like WithTask, WithFlow, and WithScheduledTask.
 func (c *Client) NewWorker(ctx context.Context, opts ...WorkerOpt) (*Worker, error) {

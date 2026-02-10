@@ -157,7 +157,7 @@ func (w *stepWorker) hideInFlight(ctx context.Context) {
 func (w *stepWorker) readMessages(ctx context.Context) ([]stepMessage, error) {
 	h := w.step.handler
 
-	q := `SELECT id, deliveries, flow_input, step_outputs FROM cb_read_steps(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
+	q := `SELECT id, deliveries, flow_input, step_outputs, signal_input FROM cb_read_steps(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
 
 	rows, err := queryWithRetry(ctx, w.conn, q, w.flowName, w.step.Name, h.batchSize, (10 * time.Minute).Milliseconds(), (10 * time.Second).Milliseconds(), (100 * time.Millisecond).Milliseconds())
 	if err != nil {
@@ -263,6 +263,7 @@ func scanStepMessage(row pgx.Row) (stepMessage, error) {
 		&rec.Deliveries,
 		&rec.FlowInput,
 		&stepOutputs,
+		&rec.SignalInput,
 	); err != nil {
 		return rec, err
 	}

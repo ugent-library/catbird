@@ -17,6 +17,7 @@ type Flow struct {
 
 type Step struct {
 	Name      string            `json:"name"`
+	HasSignal bool              `json:"has_signal"`
 	DependsOn []*StepDependency `json:"depends_on,omitempty"`
 	handler   *stepHandler
 }
@@ -66,6 +67,7 @@ type stepMessage struct {
 	Deliveries  int                        `json:"deliveries"`
 	FlowInput   json.RawMessage            `json:"flow_input"`
 	StepOutputs map[string]json.RawMessage `json:"step_outputs"`
+	SignalInput json.RawMessage            `json:"signal_input"`
 }
 
 type stepHandler struct {
@@ -317,6 +319,137 @@ func StepWithEightDependencies[In, Dep1Out, Dep2Out, Dep3Out, Dep4Out, Dep5Out, 
 	}
 }
 
+// InitialStepWithSignal creates a flow step with no dependencies that requires a signal
+// The handler receives the flow input and signal input, then produces output
+// Step waits for signal delivery via Signal() before executing
+func InitialStepWithSignal[In, SigIn, Out any](name string, fn func(context.Context, In, SigIn) (Out, error), opts ...HandlerOpt) FlowOpt {
+	step := &Step{
+		Name:      name,
+		HasSignal: true,
+		DependsOn: nil,
+		handler: newStepHandler(name, func(ctx context.Context, p stepMessage) ([]byte, error) {
+			var in In
+			var sigIn SigIn
+			if err := json.Unmarshal(p.FlowInput, &in); err != nil {
+				return nil, err
+			}
+			if err := json.Unmarshal(p.SignalInput, &sigIn); err != nil {
+				return nil, err
+			}
+			out, err := fn(ctx, in, sigIn)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(out)
+		}, opts...),
+	}
+	return func(f *Flow) {
+		f.Steps = append(f.Steps, step)
+	}
+}
+
+// StepWithOneDependencyAndSignal creates a flow step with one dependency that requires a signal
+// The handler receives the flow input, signal input, and the output of the dependency step
+// Step waits for both dependency completion AND signal delivery before executing
+func StepWithOneDependencyAndSignal[In, SigIn, Dep1Out, Out any](name string, dep1 *StepDependency, fn func(context.Context, In, SigIn, Dep1Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+	step := &Step{
+		Name:      name,
+		HasSignal: true,
+		DependsOn: []*StepDependency{dep1},
+		handler: newStepHandler(name, func(ctx context.Context, p stepMessage) ([]byte, error) {
+			var in In
+			var sigIn SigIn
+			var dep1Out Dep1Out
+			if err := json.Unmarshal(p.FlowInput, &in); err != nil {
+				return nil, err
+			}
+			if err := json.Unmarshal(p.SignalInput, &sigIn); err != nil {
+				return nil, err
+			}
+			if err := unmarshalStepArgs(p, []string{dep1.Name}, &in, []any{&dep1Out}); err != nil {
+				return nil, err
+			}
+			out, err := fn(ctx, in, sigIn, dep1Out)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(out)
+		}, opts...),
+	}
+	return func(f *Flow) {
+		f.Steps = append(f.Steps, step)
+	}
+}
+
+// StepWithTwoDependenciesAndSignal creates a flow step with two dependencies that requires a signal
+// The handler receives the flow input, signal input, and the outputs of both dependency steps
+// Step waits for both dependencies to complete AND signal delivery before executing
+func StepWithTwoDependenciesAndSignal[In, SigIn, Dep1Out, Dep2Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, fn func(context.Context, In, SigIn, Dep1Out, Dep2Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+	step := &Step{
+		Name:      name,
+		HasSignal: true,
+		DependsOn: []*StepDependency{dep1, dep2},
+		handler: newStepHandler(name, func(ctx context.Context, p stepMessage) ([]byte, error) {
+			var in In
+			var sigIn SigIn
+			var dep1Out Dep1Out
+			var dep2Out Dep2Out
+			if err := json.Unmarshal(p.FlowInput, &in); err != nil {
+				return nil, err
+			}
+			if err := json.Unmarshal(p.SignalInput, &sigIn); err != nil {
+				return nil, err
+			}
+			if err := unmarshalStepArgs(p, []string{dep1.Name, dep2.Name}, &in, []any{&dep1Out, &dep2Out}); err != nil {
+				return nil, err
+			}
+			out, err := fn(ctx, in, sigIn, dep1Out, dep2Out)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(out)
+		}, opts...),
+	}
+	return func(f *Flow) {
+		f.Steps = append(f.Steps, step)
+	}
+}
+
+// StepWithThreeDependenciesAndSignal creates a flow step with three dependencies that requires a signal
+// The handler receives the flow input, signal input, and the outputs of all three dependency steps
+// Step waits for all dependencies to complete AND signal delivery before executing
+func StepWithThreeDependenciesAndSignal[In, SigIn, Dep1Out, Dep2Out, Dep3Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, fn func(context.Context, In, SigIn, Dep1Out, Dep2Out, Dep3Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+	step := &Step{
+		Name:      name,
+		HasSignal: true,
+		DependsOn: []*StepDependency{dep1, dep2, dep3},
+		handler: newStepHandler(name, func(ctx context.Context, p stepMessage) ([]byte, error) {
+			var in In
+			var sigIn SigIn
+			var dep1Out Dep1Out
+			var dep2Out Dep2Out
+			var dep3Out Dep3Out
+			if err := json.Unmarshal(p.FlowInput, &in); err != nil {
+				return nil, err
+			}
+			if err := json.Unmarshal(p.SignalInput, &sigIn); err != nil {
+				return nil, err
+			}
+			if err := unmarshalStepArgs(p, []string{dep1.Name, dep2.Name, dep3.Name}, &in, []any{&dep1Out, &dep2Out, &dep3Out}); err != nil {
+				return nil, err
+			}
+			out, err := fn(ctx, in, sigIn, dep1Out, dep2Out, dep3Out)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(out)
+		}, opts...),
+	}
+	return func(f *Flow) {
+		f.Steps = append(f.Steps, step)
+	}
+}
+
 func newStepHandler(name string, fn func(context.Context, stepMessage) ([]byte, error), opts ...HandlerOpt) *stepHandler {
 	h := &stepHandler{
 		handlerOpts: handlerOpts{
@@ -426,6 +559,27 @@ func ListFlowRuns(ctx context.Context, conn Conn, name string) ([]*RunInfo, erro
 		return nil, err
 	}
 	return pgx.CollectRows(rows, scanCollectibleRun)
+}
+
+// SignalFlow delivers a signal to a waiting step in a flow run.
+// The step must have been defined with a signal variant (e.g., InitialStepWithSignal, StepWithOneDependencyAndSignal).
+// Signals enable human-in-the-loop workflows where a step waits for external input before executing.
+// Returns an error if the signal was already delivered or the step doesn't require a signal.
+func SignalFlow(ctx context.Context, conn Conn, flowName string, flowRunID int64, stepName string, input any) error {
+	b, err := json.Marshal(input)
+	if err != nil {
+		return err
+	}
+	q := `SELECT cb_signal_flow($1::text, $2::bigint, $3::text, $4::jsonb);`
+	var delivered bool
+	err = conn.QueryRow(ctx, q, flowName, flowRunID, stepName, b).Scan(&delivered)
+	if err != nil {
+		return err
+	}
+	if !delivered {
+		return fmt.Errorf("signal not delivered: step may not require signal or signal already delivered")
+	}
+	return nil
 }
 
 func scanCollectibleFlow(row pgx.CollectableRow) (*FlowInfo, error) {

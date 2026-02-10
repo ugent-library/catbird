@@ -12,14 +12,15 @@ BEGIN
             input jsonb
        );
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'cb_step_message') THEN
-        CREATE TYPE cb_step_message AS (
-            id bigint,
-            deliveries int,
-            flow_input jsonb,
-            step_outputs jsonb
-        );
-    END IF;
+    -- Drop and recreate cb_step_message to ensure it has the latest structure (including signal_input)
+    DROP TYPE IF EXISTS cb_step_message CASCADE;
+    CREATE TYPE cb_step_message AS (
+        id bigint,
+        deliveries int,
+        flow_input jsonb,
+        step_outputs jsonb,
+        signal_input jsonb
+    );
 END$$;
 -- +goose statementend
 
@@ -40,12 +41,24 @@ CREATE TABLE IF NOT EXISTS cb_steps (
     name text NOT NULL,
     idx int NOT NULL DEFAULT 0,
     dependency_count int NOT NULL DEFAULT 0,
+    has_signal boolean NOT NULL DEFAULT false,
     PRIMARY KEY (flow_name, name),
     UNIQUE (flow_name, idx),
     CONSTRAINT name_valid CHECK (name <> ''),
     CONSTRAINT idx_valid CHECK (idx >= 0),
     CONSTRAINT dependency_count_valid CHECK (dependency_count >= 0)
 );
+
+-- Add has_signal column if it doesn't exist (for in-place development)
+-- +goose statementbegin
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                   WHERE table_name = 'cb_steps' AND column_name = 'has_signal') THEN
+        ALTER TABLE cb_steps ADD COLUMN has_signal boolean NOT NULL DEFAULT false;
+    END IF;
+END$$;
+-- +goose statementend
 
 CREATE TABLE IF NOT EXISTS cb_step_dependencies (
     flow_name text NOT NULL REFERENCES cb_flows (name),
@@ -419,6 +432,7 @@ BEGIN
       SELECT jsonb_agg(
         jsonb_build_object(
           'name', s.name,
+          'has_signal', s.has_signal,
           'depends_on', COALESCE(
             (SELECT jsonb_agg(jsonb_build_object('name', sd.dependency_name) ORDER BY sd.idx)
              FROM cb_step_dependencies sd
@@ -438,6 +452,9 @@ BEGIN
       CASE
         WHEN step_elem ? 'depends_on' THEN step_elem
         ELSE step_elem || jsonb_build_object('depends_on', '[]'::jsonb)
+      END || CASE
+        WHEN step_elem ? 'has_signal' THEN '{}'::jsonb
+        ELSE jsonb_build_object('has_signal', false)
       END
     )
     FROM jsonb_array_elements(steps) AS step_elem
@@ -462,12 +479,13 @@ BEGIN
       RAISE EXCEPTION 'cb: step name "%" is too long, maximum length is 58', _step_name;
     END IF;
 
-    INSERT INTO cb_steps (flow_name, name, idx, dependency_count)
+    INSERT INTO cb_steps (flow_name, name, idx, dependency_count, has_signal)
     VALUES (
       cb_create_flow.name,
       _step_name,
       _idx,
-      jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb))
+      jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb)),
+      coalesce((_step->>'has_signal')::boolean, false)
     );
 
     _dep_idx := 0;
@@ -520,6 +538,7 @@ BEGIN
       deliveries int NOT NULL DEFAULT 0,
       output jsonb,
       error_message text,
+      signal_input jsonb,
       remaining_dependencies int NOT NULL DEFAULT 0,
       deliver_at timestamptz NOT NULL DEFAULT now(),
       created_at timestamptz NOT NULL DEFAULT now(),
@@ -644,20 +663,24 @@ BEGIN
     RETURN;
   END IF;
 
-  -- Start all steps with no dependencies
+  -- Start all steps with no dependencies and no signal requirement (or signal already received)
   EXECUTE format(
     $QUERY$
-    UPDATE %I
+    UPDATE %I sr
     SET status = 'started',
         started_at = now(),
         deliver_at = now()
-    WHERE flow_run_id = $1
-      AND status = 'created'
-      AND remaining_dependencies = 0
+    FROM cb_steps s
+    WHERE sr.flow_run_id = $1
+      AND sr.status = 'created'
+      AND sr.remaining_dependencies = 0
+      AND sr.step_name = s.name
+      AND s.flow_name = $2
+      AND (NOT s.has_signal OR sr.signal_input IS NOT NULL)
     $QUERY$,
     _s_table
   )
-  USING cb_start_steps.flow_run_id;
+  USING cb_start_steps.flow_run_id, cb_start_steps.flow_name;
 END;
 $$;
 -- +goose statementend
@@ -742,7 +765,8 @@ BEGIN
                        FROM cb_step_dependencies
                        WHERE flow_name = $4 AND step_name = m.step_name
                      )
-                  ) AS step_outputs;
+                  ) AS step_outputs,
+                  m.signal_input;
         $QUERY$,
         _s_table, _f_table, _s_table, _f_table, _f_table, _s_table
       );
@@ -953,6 +977,54 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_signal_flow: Deliver a signal to a waiting step run
+-- Atomically delivers signal input to a step that requires it, then starts the step if all conditions are met
+-- Parameters:
+--   flow_name: Flow name
+--   flow_run_id: Flow run ID
+--   step_name: Step name within the flow
+--   input: JSON signal input data
+-- Returns: boolean - true if signal was delivered, false if already signaled or step doesn't require signal
+CREATE OR REPLACE FUNCTION cb_signal_flow(flow_name text, flow_run_id bigint, step_name text, input jsonb)
+RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+  _s_table text := cb_table_name(cb_signal_flow.flow_name, 's');
+  _updated boolean;
+BEGIN
+  -- Atomically update signal_input - only succeeds if step is created, requires signal, and not already signaled
+  EXECUTE format(
+    $QUERY$
+    UPDATE %I sr
+    SET signal_input = $3
+    FROM cb_steps s
+    WHERE sr.flow_run_id = $1
+      AND sr.step_name = $2
+      AND sr.status = 'created'
+      AND sr.signal_input IS NULL
+      AND s.flow_name = $4
+      AND s.name = sr.step_name
+      AND s.has_signal = true
+    RETURNING true
+    $QUERY$,
+    _s_table
+  )
+  USING cb_signal_flow.flow_run_id, cb_signal_flow.step_name, cb_signal_flow.input, cb_signal_flow.flow_name
+  INTO _updated;
+
+  IF _updated IS NULL THEN
+    RETURN false;
+  END IF;
+
+  -- Try to start steps now that signal has been delivered
+  PERFORM cb_start_steps(cb_signal_flow.flow_name, cb_signal_flow.flow_run_id);
+
+  RETURN true;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
 -- cb_delete_flow: Delete a flow definition and all its runs
 -- Removes the flow metadata, handlers, steps, and drops the associated tables
 -- Parameters:
@@ -1089,6 +1161,7 @@ CREATE OR REPLACE VIEW cb_flow_info AS
       s.flow_name,
       jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
         'name', s.name,
+        'has_signal', s.has_signal,
         'depends_on', (
           SELECT jsonb_agg(jsonb_build_object('name', s_d.dependency_name))
           FROM cb_step_dependencies AS s_d
@@ -1146,6 +1219,7 @@ DROP VIEW IF EXISTS cb_worker_info;
 DROP VIEW IF EXISTS cb_flow_info;
 DROP FUNCTION IF EXISTS cb_worker_heartbeat(uuid);
 DROP FUNCTION IF EXISTS cb_worker_started(uuid, jsonb, jsonb);
+DROP FUNCTION IF EXISTS cb_signal_flow(text, bigint, text, jsonb);
 DROP FUNCTION IF EXISTS cb_fail_step(text, text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_step(text, text, bigint, jsonb);
 DROP FUNCTION IF EXISTS cb_hide_steps(text, text, bigint[], integer);

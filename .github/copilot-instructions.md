@@ -38,7 +38,7 @@ task := catbird.NewTask("my_task", func(ctx context.Context, input MyInput) (MyO
 - Options are applied via `HandlerOpt` interface (see `concurrencyOpt`, `retriesOpt`, etc. pattern)
 - Payloads are `json.RawMessage`; handlers receive `[]byte`
 
-**Flows**: Multi-step DAGs with dependencies. Steps execute when their dependencies complete (simple DAG semantics). Flow output is the combined JSON object of all step outputs; step names are unique within a flow and form the output keys.
+**Flows**: Multi-step DAGs with dependencies. Steps execute when their dependencies complete (simple DAG semantics). Flow output is the combined JSON object of all step outputs; step names are unique within a flow and form the output keys. **Signals** enable human-in-the-loop workflows: steps can optionally wait for external input via `Signal()` before executing.
 ```go
 NewFlow("workflow",
     InitialStep("step1", func(ctx context.Context, in string) (string, error) {
@@ -49,13 +49,14 @@ NewFlow("workflow",
         func(ctx context.Context, in string, step1Out string) (string, error) {
             return step1Out + " and by step 2", nil
         }),
-    StepWithOneDependency("step3",
+    StepWithOneDependencyAndSignal("approve",  // Waits for signal
         Dependency("step2"),
-        func(ctx context.Context, in string, step2Out string) (string, error) {
-            return step2Out + " and by step 3", nil
+        func(ctx context.Context, in string, approval ApprovalInput, step2Out string) (string, error) {
+            return step2Out + " approved by " + approval.ApproverID, nil
         }),
 )
-// Flow output: { "step1": "...", "step2": "...", "step3": "..." }
+// Flow output: { "step1": "...", "step2": "...", "approve": "..." }
+// Signal delivery: client.SignalFlow(ctx, "workflow", flowRunID, "approve", ApprovalInput{...})
 ```
 
 ## Key Conventions
@@ -69,6 +70,7 @@ NewFlow("workflow",
 - **Deduplication**: Messages support `DeduplicationID` field to prevent duplicates
 - **Topic bindings**: Explicit via `Bind(queue, pattern)`; wildcards `?` (single token) and `*` (multi-token tail as `.*`). Foreign key CASCADE deletes bindings when queue is deleted. Pattern validation at bind time; regex precompiled in PostgreSQL.
 - **Task/Flow execution**: `client.RunTask()` or `client.RunFlow()` return handles with `WaitForOutput()` to block until completion
+- **Workflow signals**: Steps can require signals (external input) before executing. Use `InitialStepWithSignal`, `StepWith*DependenciesAndSignal` variants. Signal delivered via `client.SignalFlow(ctx, flowName, flowRunID, stepName, input)`. Steps with both dependencies and signals wait for **both** conditions before starting. Enables approval workflows, webhooks, and human-in-the-loop patterns.
 
 ## Developer Workflows
 
