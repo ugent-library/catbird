@@ -15,4 +15,3 @@
 - [ ] Flow onfail task (error handling in workflows)?
 - [ ] Deduplication strategies (now only execution deduplication)
 - [ ] Dynamic flows?
-- [ ] Automatic GC

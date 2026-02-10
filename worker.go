@@ -131,25 +131,10 @@ func WithScheduledFlow(flowName string, schedule string, inputFn func() (any, er
 	}
 }
 
-// WithGC registers a garbage collection task to clean up expired queues and stale workers
-func WithGC(schedule string) WorkerOpt {
-	return func(w *Worker) {
-		w.taskSchedules = append(w.taskSchedules, taskSchedule{
-			taskName: "gc",
-			schedule: schedule,
-			inputFn:  func() (any, error) { return struct{}{}, nil },
-		})
-	}
-}
-
-// WithDefaultGC registers a garbage collection task to clean up
-// expired queues and stale workers every 10 minutes
-func WithDefaultGC() WorkerOpt {
-	return WithGC("@every 10m")
-}
-
 // NewWorker creates a new worker with the given options
-// The worker will register all tasks and flows it has been configured with
+// The worker will register all tasks and flows it has been configured with.
+// Garbage collection is automatically enabled and runs every 5 minutes to clean up
+// expired queues and stale worker heartbeats.
 func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, error) {
 	w := &Worker{
 		id:              uuid.NewString(),
@@ -160,6 +145,16 @@ func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, erro
 	for _, opt := range opts {
 		opt(w)
 	}
+
+	// Register built-in garbage collection task (automatic, runs every 5 minutes)
+	gcTask := NewTask("gc", func(ctx context.Context, in struct{}) (struct{}, error) {
+		return struct{}{}, GC(ctx, w.conn)
+	})
+	w.tasks = append(w.tasks, gcTask)
+	w.taskSchedules = append(w.taskSchedules, taskSchedule{
+		taskName: "gc",
+		schedule: "@every 5m",
+	})
 
 	for _, t := range w.tasks {
 		if err := CreateTask(ctx, w.conn, t); err != nil {

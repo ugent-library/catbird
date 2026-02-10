@@ -141,7 +141,6 @@ err = handle.WaitForOutput(ctx, &result)
 worker, err = client.NewWorker(ctx,
     catbird.WithTask(sendEmailsTask),
     catbird.WithScheduledTask("send-emails", "@hourly", nil), // Run every hour
-    catbird.WithDefaultGC(), // Enable garbage collection to clean up expired queues and stale workers
 )
 go worker.Start(ctx)
 ```

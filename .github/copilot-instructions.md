@@ -63,7 +63,8 @@ NewFlow("workflow",
 - **Options pattern**: Most configs use closure functional options (HandlerOpt, WorkerOpt, etc.). But performance critical runtime functions use function variants (`...WithOpts`) that take a config struct.
 - **Conn interface**: Abstracts pgx; accepts `*pgxpool.Pool`, `*pgx.Conn` or `pgx.Tx`
 - **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `WithLogger()`
-- **Scheduled tasks/flows**: Use robfig/cron syntax; `WithScheduledTask("name", "@hourly")`, `WithDefaultGC()` or `WithGC()`
+- **Scheduled tasks/flows**: Use robfig/cron syntax; `WithScheduledTask("name", "@hourly")`
+- **Automatic garbage collection**: All workers automatically run GC every 5 minutes (cleans up expired queues and stale worker heartbeats); no configuration needed
 - **Deduplication**: Messages support `DeduplicationID` field to prevent duplicates
 - **Topic bindings**: Explicit via `Bind(queue, pattern)`; wildcards `?` (single token) and `*` (multi-token tail as `.*`). Foreign key CASCADE deletes bindings when queue is deleted. Pattern validation at bind time; regex precompiled in PostgreSQL.
 - **Task/Flow execution**: `client.RunTask()` or `client.RunFlow()` return handles with `WaitForOutput()` to block until completion
