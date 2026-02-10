@@ -147,8 +147,6 @@ worker, err = client.NewWorker(ctx,
 go worker.Start(ctx)
 ```
 
-Catbird includes multiple resiliency layers for transient failures. Handlers can retry with [WithMaxRetries](https://pkg.go.dev/github.com/ugent-library/catbird#WithMaxRetries) and exponential jittered backoff via [WithBackoff](https://pkg.go.dev/github.com/ugent-library/catbird#WithBackoff), and you can wrap external calls with a circuit breaker using [WithCircuitBreaker](https://pkg.go.dev/github.com/ugent-library/catbird#WithCircuitBreaker) to avoid cascading outages. On the infrastructure side, PostgreSQL operations are issued with retry logic for transient errors to keep workers making progress even if the database briefly hiccups.
-
 ### Workflow (Multi-Step Flow)
 
 Flow structure:
@@ -214,6 +212,10 @@ var results map[string]any
 err = handle.WaitForOutput(ctx, &results)
 // results contains output from all steps: validate, charge, check, ship
 ```
+
+## Resiliency
+
+Catbird includes multiple resiliency layers for transient failures. Handlers can retry with [WithMaxRetries](https://pkg.go.dev/github.com/ugent-library/catbird#WithMaxRetries) and exponential jittered backoff via [WithBackoff](https://pkg.go.dev/github.com/ugent-library/catbird#WithBackoff), and you can wrap external calls with a circuit breaker using [WithCircuitBreaker](https://pkg.go.dev/github.com/ugent-library/catbird#WithCircuitBreaker) to avoid cascading outages. On the infrastructure side, PostgreSQL operations are issued with retry logic for transient errors to keep workers making progress even if the database briefly hiccups.
 
 ## Naming Rules
 
