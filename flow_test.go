@@ -2,8 +2,11 @@ package catbird
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -423,5 +426,76 @@ func TestFlowStepPanicRecovery(t *testing.T) {
 	// Flow should have failed due to step panic
 	if flowRuns[0].Status != "failed" {
 		t.Fatalf("expected flow status failed, got %s", flowRuns[0].Status)
+	}
+}
+
+func TestStepCircuitBreaker(t *testing.T) {
+	client := getTestClient(t)
+
+	openTimeout := 300 * time.Millisecond
+	minBackoff := 10 * time.Millisecond
+	maxBackoff := 20 * time.Millisecond
+
+	var calls int32
+	var mu sync.Mutex
+	var times []time.Time
+
+	flow := NewFlow("circuit_flow",
+		InitialStep("step1", func(ctx context.Context, in string) (string, error) {
+			n := atomic.AddInt32(&calls, 1)
+			mu.Lock()
+			times = append(times, time.Now())
+			mu.Unlock()
+			if n == 1 {
+				return "", fmt.Errorf("intentional failure")
+			}
+			return "ok", nil
+		}, WithMaxRetries(2), WithBackoff(minBackoff, maxBackoff), WithCircuitBreaker(1, openTimeout)),
+	)
+
+	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		if err := worker.Start(t.Context()); err != nil {
+			t.Logf("worker error: %s", err)
+		}
+	}()
+
+	// Give worker time to start
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), "circuit_flow", "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var result map[string]string
+	if err := h.WaitForOutput(ctx, &result); err != nil {
+		t.Fatalf("wait for output failed: %v", err)
+	}
+	if result["step1"] != "ok" {
+		t.Fatalf("unexpected result: %s", result["step1"])
+	}
+
+	if atomic.LoadInt32(&calls) != 2 {
+		t.Fatalf("expected 2 handler calls, got %d", calls)
+	}
+
+	mu.Lock()
+	if len(times) < 2 {
+		mu.Unlock()
+		t.Fatalf("expected at least 2 handler timestamps, got %d", len(times))
+	}
+	delta := times[1].Sub(times[0])
+	mu.Unlock()
+
+	if delta < openTimeout-50*time.Millisecond {
+		t.Fatalf("expected circuit breaker delay at least %s, got %s", openTimeout-50*time.Millisecond, delta)
 	}
 }
