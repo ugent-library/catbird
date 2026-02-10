@@ -33,15 +33,15 @@ func (c *Client) GetQueue(ctx context.Context, name string) (*QueueInfo, error) 
 	return GetQueue(ctx, c.Conn, name)
 }
 
+// ListQueues returns all queues
+func (c *Client) ListQueues(ctx context.Context) ([]*QueueInfo, error) {
+	return ListQueues(ctx, c.Conn)
+}
+
 // DeleteQueue deletes a queue and all its messages.
 // Returns true if the queue existed.
 func (c *Client) DeleteQueue(ctx context.Context, name string) (bool, error) {
 	return DeleteQueue(ctx, c.Conn, name)
-}
-
-// ListQueues returns all queues
-func (c *Client) ListQueues(ctx context.Context) ([]*QueueInfo, error) {
-	return ListQueues(ctx, c.Conn)
 }
 
 // Send enqueues a message to the specified queue.
@@ -187,15 +187,15 @@ func (c *Client) ListFlowRuns(ctx context.Context, name string) ([]*RunInfo, err
 	return ListFlowRuns(ctx, c.Conn, name)
 }
 
-// ListWorkers returns all registered workers.
-func (c *Client) ListWorkers(ctx context.Context) ([]*WorkerInfo, error) {
-	return ListWorkers(ctx, c.Conn)
-}
-
 // NewWorker creates a new worker that processes task and flow executions.
 // Configure the worker with options like WithTask, WithFlow, and WithScheduledTask.
 func (c *Client) NewWorker(ctx context.Context, opts ...WorkerOpt) (*Worker, error) {
 	return NewWorker(ctx, c.Conn, opts...)
+}
+
+// ListWorkers returns all registered workers.
+func (c *Client) ListWorkers(ctx context.Context) ([]*WorkerInfo, error) {
+	return ListWorkers(ctx, c.Conn)
 }
 
 // GC runs garbage collection to clean up expired and deleted entries.

@@ -22,11 +22,3 @@ func GC(ctx context.Context, conn Conn) error {
 	_, err := conn.Exec(ctx, q)
 	return err
 }
-
-func ptrOrNil[T comparable](t T) *T {
-	var tt T
-	if t == tt {
-		return nil
-	}
-	return &t
-}

@@ -11,6 +11,14 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+func ptrOrNil[T comparable](t T) *T {
+	var tt T
+	if t == tt {
+		return nil
+	}
+	return &t
+}
+
 // backoffWithFullJitter calculates the next backoff duration using full jitter strategy.
 // The first retryAttempt should be 0.
 func backoffWithFullJitter(retryAttempt int, minDelay, maxDelay time.Duration) time.Duration {
