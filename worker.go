@@ -3,7 +3,6 @@ package catbird
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -46,14 +45,14 @@ func ListWorkers(ctx context.Context, conn Conn) ([]*WorkerInfo, error) {
 
 // Worker processes tasks and flows from the queue
 type Worker struct {
-	id              string
-	conn            Conn
-	logger          *slog.Logger
-	tasks           []*Task
-	flows           []*Flow
-	flowSchedules   []flowSchedule
-	taskSchedules   []taskSchedule
-	shutdownTimeout time.Duration
+	id               string
+	conn             Conn
+	logger           *slog.Logger
+	tasks            []*Task
+	flows            []*Flow
+	flowSchedules    []flowSchedule
+	taskSchedules    []taskSchedule
+	gracefulShutdown time.Duration
 }
 
 type taskSchedule struct {
@@ -92,10 +91,10 @@ func WithLogger(l *slog.Logger) WorkerOpt {
 	}
 }
 
-// WithShutdownTimeout sets the shutdown timeout for the worker. Default is 5 seconds.
-func WithShutdownTimeout(d time.Duration) WorkerOpt {
+// WithGracefulShutdown sets the graceful shutdown timeout for the worker. Default is 5 seconds.
+func WithGracefulShutdown(d time.Duration) WorkerOpt {
 	return func(w *Worker) {
-		w.shutdownTimeout = d
+		w.gracefulShutdown = d
 	}
 }
 
@@ -137,10 +136,10 @@ func WithScheduledFlow(flowName string, schedule string, inputFn func() (any, er
 // expired queues and stale worker heartbeats.
 func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, error) {
 	w := &Worker{
-		id:              uuid.NewString(),
-		conn:            conn,
-		logger:          slog.Default(),
-		shutdownTimeout: 5 * time.Second,
+		id:               uuid.NewString(),
+		conn:             conn,
+		logger:           slog.Default(),
+		gracefulShutdown: 5 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(w)
@@ -181,11 +180,11 @@ func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, erro
 // Shutdown behaviour:
 //   - when ctx is cancelled the worker immediately stops reading new work and
 //     begins shutting down
-//   - if WithShutdownTimeout is set to a value > 0, that duration is used as a
+//   - if WithGracefulShutdown is set to a value > 0, that duration is used as a
 //     grace period for in‑flight handlers after ctx is cancelled; once the
 //     grace period expires the handler context is cancelled and remaining
-//     handlers are asked to stop. The default shutdown timeout is 5 seconds.
-//   - if WithShutdownTimeout is not set or set to 0, there is no grace period:
+//     handlers are asked to stop. The default graceful shutdown timeout is 5 seconds.
+//   - if WithGracefulShutdown is not set or set to 0, there is no grace period:
 //     the handler context is cancelled immediately once ctx is cancelled and
 //     Start returns after all goroutines finish
 func (w *Worker) Start(ctx context.Context) error {
@@ -216,56 +215,22 @@ func (w *Worker) Start(ctx context.Context) error {
 		}
 	})
 
+	// Start task workers
 	for _, t := range w.tasks {
-		if h := t.handler; h != nil {
+		if t.handler != nil {
 			taskHandlers = append(taskHandlers, &TaskHandlerInfo{TaskName: t.Name})
-
-			msgHider := newTaskHider(w.conn, w.logger, t.Name)
-
-			startHandlerWorkers(
-				ctx,
-				handlerCtx,
-				&wg,
-				func(readCtx context.Context) ([]taskMessage, error) {
-					msgs, err := readTasks(readCtx, w.conn, t.Name, h.batchSize, 10*time.Minute, 10*time.Second, 100*time.Millisecond)
-					if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-						w.logger.ErrorContext(ctx, "worker: cannot read messages", "handler", t.Name, "error", err)
-					}
-					return msgs, err
-				},
-				func(handleCtx context.Context, msg taskMessage) {
-					w.handleTask(handleCtx, t, msg, msgHider.stopHiding)
-				},
-				msgHider,
-				h.concurrency,
-			)
+			worker := newTaskWorker(w.conn, w.logger, t)
+			worker.start(ctx, handlerCtx, &wg)
 		}
 	}
 
+	// Start step workers
 	for _, f := range w.flows {
 		for _, s := range f.Steps {
-			if h := s.handler; h != nil {
+			if s.handler != nil {
 				stepHandlers = append(stepHandlers, &StepHandlerInfo{FlowName: f.Name, StepName: s.Name})
-
-				msgHider := newStepHider(w.conn, w.logger, f.Name, s.Name)
-
-				startHandlerWorkers(
-					ctx,
-					handlerCtx,
-					&wg,
-					func(readCtx context.Context) ([]stepMessage, error) {
-						msgs, err := readSteps(readCtx, w.conn, f.Name, s.Name, h.batchSize, 10*time.Minute, 10*time.Second, 100*time.Millisecond)
-						if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-							w.logger.ErrorContext(ctx, "worker: cannot read steps", "flow", f.Name, "step", s.Name, "error", err)
-						}
-						return msgs, err
-					},
-					func(handleCtx context.Context, msg stepMessage) {
-						w.handleStep(handleCtx, f.Name, s, msg, msgHider.stopHiding)
-					},
-					msgHider,
-					h.concurrency,
-				)
+				worker := newStepWorker(w.conn, w.logger, f.Name, s)
+				worker.start(ctx, handlerCtx, &wg)
 			}
 		}
 	}
@@ -358,7 +323,7 @@ func (w *Worker) Start(ctx context.Context) error {
 			stopCtx := scheduler.Stop()
 			select {
 			case <-stopCtx.Done():
-			case <-time.After(w.shutdownTimeout):
+			case <-time.After(w.gracefulShutdown):
 			}
 		})
 	}
@@ -393,14 +358,14 @@ func (w *Worker) waitForShutdown(ctx context.Context, handlerCancel context.Canc
 		case <-done:
 			return nil
 		case <-ctx.Done():
-			// Shutdown requested. If a shutdown timeout is configured, give
+			// Shutdown requested. If a graceful shutdown timeout is configured, give
 			// handlers a grace period to finish. Otherwise cancel them
 			// immediately.
-			if w.shutdownTimeout > 0 {
+			if w.gracefulShutdown > 0 {
 				select {
 				case <-done:
 					return nil
-				case <-time.After(w.shutdownTimeout):
+				case <-time.After(w.gracefulShutdown):
 					handlerCancel()
 					<-done
 					return nil
@@ -414,345 +379,6 @@ func (w *Worker) waitForShutdown(ctx context.Context, handlerCancel context.Canc
 			return nil
 		}
 	}
-}
-
-func (w *Worker) handleTask(ctx context.Context, t *Task, msg taskMessage, stopHiding func(id int64)) {
-	h := t.handler
-
-	w.logger.DebugContext(ctx, "worker: handleTask",
-		"task", t.Name,
-		"id", msg.ID,
-		"deliveries", msg.Deliveries,
-		"input", string(msg.Input),
-	)
-
-	fnCtx := ctx
-	if h.maxDuration > 0 {
-		var cancel context.CancelFunc
-		fnCtx, cancel = context.WithTimeout(ctx, time.Duration(h.maxDuration))
-		defer cancel()
-	}
-
-	var out json.RawMessage
-	var err error
-
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				err = fmt.Errorf("task handler panic: %v", r)
-			}
-		}()
-		out, err = h.fn(fnCtx, msg)
-	}()
-
-	stopHiding(msg.ID)
-
-	if err != nil {
-		w.logger.ErrorContext(ctx, "worker: failed", "task", t.Name, "error", err)
-
-		if msg.Deliveries > h.maxRetries {
-			q := `SELECT * FROM cb_fail_task(name => $1, id => $2, error_message => $3);`
-			if _, err := w.conn.Exec(ctx, q, t.Name, msg.ID, err.Error()); err != nil {
-				w.logger.ErrorContext(ctx, "worker: cannot mark task as failed", "task", t.Name, "error", err)
-			}
-		} else {
-			if err := hideTasks(ctx, w.conn, t.Name, []int64{msg.ID}, backoffWithFullJitter(msg.Deliveries-1, h.minDelay, h.maxDelay)); err != nil {
-				w.logger.ErrorContext(ctx, "worker: cannot delay next run", "task", t.Name, "error", err)
-			}
-		}
-	} else {
-		q := `SELECT * FROM cb_complete_task(name => $1, id => $2, output => $3);`
-		if _, err := w.conn.Exec(ctx, q, t.Name, msg.ID, out); err != nil {
-			w.logger.ErrorContext(ctx, "worker: cannot mark task as completed", "task", t.Name, "error", err)
-		}
-	}
-}
-
-func (w *Worker) handleStep(ctx context.Context, flowName string, s *Step, msg stepMessage, stopHiding func(id int64)) {
-	h := s.handler
-
-	if w.logger.Enabled(ctx, slog.LevelDebug) {
-		stepOutputsJSON, _ := json.Marshal(msg.StepOutputs)
-		w.logger.DebugContext(ctx, "worker: handleStep",
-			"flow", flowName,
-			"step", s.Name,
-			"id", msg.ID,
-			"deliveries", msg.Deliveries,
-			"flow_input", string(msg.FlowInput),
-			"step_outputs", string(stepOutputsJSON),
-		)
-	}
-
-	fnCtx := ctx
-	if h.maxDuration > 0 {
-		var cancel context.CancelFunc
-		fnCtx, cancel = context.WithTimeout(ctx, time.Duration(h.maxDuration))
-		defer cancel()
-	}
-
-	var out json.RawMessage
-	var err error
-
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				err = fmt.Errorf("step handler panic: %v", r)
-			}
-		}()
-		out, err = h.fn(fnCtx, msg)
-	}()
-
-	stopHiding(msg.ID)
-
-	if err != nil {
-		w.logger.ErrorContext(ctx, "worker: failed", "flow", flowName, "step", s.Name, "error", err)
-
-		if msg.Deliveries > h.maxRetries {
-			q := `SELECT * FROM cb_fail_step(flow_name => $1, step_name => $2, step_id => $3, error_message => $4);`
-			if _, err := w.conn.Exec(ctx, q, flowName, s.Name, msg.ID, err.Error()); err != nil {
-				w.logger.ErrorContext(ctx, "worker: cannot mark step as failed", "flow", flowName, "step", s.Name, "error", err)
-			}
-		} else {
-			if err := hideSteps(ctx, w.conn, flowName, s.Name, []int64{msg.ID}, backoffWithFullJitter(msg.Deliveries-1, h.minDelay, h.maxDelay)); err != nil {
-				w.logger.ErrorContext(ctx, "worker: cannot delay next run", "flow", flowName, "step", s.Name, "error", err)
-			}
-		}
-	} else {
-		q := `SELECT * FROM cb_complete_step(flow_name => $1, step_name => $2, step_id => $3, output => $4);`
-		if _, err := w.conn.Exec(ctx, q, flowName, s.Name, msg.ID, out); err != nil {
-			w.logger.ErrorContext(ctx, "worker: cannot mark step as completed", "flow", flowName, "step", s.Name, "error", err)
-		}
-	}
-}
-
-func startHandlerWorkers[T handlerMessage](
-	shutdownCtx context.Context,
-	handlerCtx context.Context,
-	wg *sync.WaitGroup,
-	readFn func(context.Context) ([]T, error),
-	handleFn func(context.Context, T),
-	msgHider *messageHider[T],
-	concurrency int,
-) {
-	// hider
-	wg.Go(func() {
-		msgHider.start(handlerCtx)
-	})
-
-	// producer
-	msgChan := make(chan T)
-	wg.Go(func() {
-		defer close(msgChan)
-		for {
-			// Check for cancellation before reading
-			select {
-			case <-shutdownCtx.Done():
-				return
-			default:
-			}
-
-			msgs, err := readFn(shutdownCtx)
-			if err != nil {
-				return
-			}
-			if len(msgs) == 0 {
-				continue
-			}
-
-			msgHider.hideMessages(msgs)
-
-			for _, msg := range msgs {
-				select {
-				case <-shutdownCtx.Done():
-					return
-				case msgChan <- msg:
-				}
-			}
-		}
-	})
-
-	// consumers
-	for i := 0; i < concurrency; i++ {
-		wg.Go(func() {
-			for msg := range msgChan {
-				handleFn(handlerCtx, msg)
-			}
-		})
-	}
-}
-
-type taskMessage struct {
-	ID         int64           `json:"id"`
-	Deliveries int             `json:"deliveries"`
-	Input      json.RawMessage `json:"input"`
-}
-
-func (m taskMessage) getID() int64 { return m.ID }
-
-func readTasks(ctx context.Context, conn Conn, name string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]taskMessage, error) {
-	q := `SELECT id, deliveries, input FROM cb_read_tasks(name => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
-
-	rows, err := conn.Query(ctx, q, name, quantity, hideFor.Milliseconds(), pollFor.Milliseconds(), pollInterval.Milliseconds())
-	if err != nil {
-		return nil, fmt.Errorf("worker: read tasks: %w", err)
-	}
-
-	return pgx.CollectRows(rows, scanCollectibleTaskMessage)
-}
-
-func readSteps(ctx context.Context, conn Conn, flowName, stepName string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]stepMessage, error) {
-	q := `SELECT id, deliveries, flow_input, step_outputs FROM cb_read_steps(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
-
-	rows, err := conn.Query(ctx, q, flowName, stepName, quantity, hideFor.Milliseconds(), pollFor.Milliseconds(), pollInterval.Milliseconds())
-	if err != nil {
-		return nil, fmt.Errorf("worker: read steps: %w", err)
-	}
-
-	return pgx.CollectRows(rows, scanCollectibleStepMessage)
-}
-
-func hideTasks(ctx context.Context, conn Conn, name string, ids []int64, hideFor time.Duration) error {
-	q := `SELECT * FROM cb_hide_tasks(name => $1, ids => $2, hide_for => $3);`
-	_, err := conn.Exec(ctx, q, name, ids, hideFor.Milliseconds())
-	return fmt.Errorf("worker: hide tasks: %w", err)
-}
-
-func hideSteps(ctx context.Context, conn Conn, flowName, stepName string, ids []int64, hideFor time.Duration) error {
-	q := `SELECT * FROM cb_hide_steps(flow_name => $1, step_name => $2, ids => $3, hide_for => $4);`
-	_, err := conn.Exec(ctx, q, flowName, stepName, ids, hideFor.Milliseconds())
-	return fmt.Errorf("worker: hide steps: %w", err)
-}
-
-type messageHider[T handlerMessage] struct {
-	conn     Conn
-	logger   *slog.Logger
-	ids      map[int64]struct{}
-	mu       sync.Mutex
-	hideFn   func(context.Context, Conn, []int64, time.Duration) error
-	logAttrs []any
-}
-
-func newTaskHider(conn Conn, logger *slog.Logger, name string) *messageHider[taskMessage] {
-	return &messageHider[taskMessage]{
-		conn:   conn,
-		logger: logger,
-		ids:    make(map[int64]struct{}),
-		hideFn: func(ctx context.Context, conn Conn, ids []int64, hideFor time.Duration) error {
-			return hideTasks(ctx, conn, name, ids, hideFor)
-		},
-		logAttrs: []any{"name", name},
-	}
-}
-
-func newStepHider(conn Conn, logger *slog.Logger, flowName, stepName string) *messageHider[stepMessage] {
-	return &messageHider[stepMessage]{
-		conn:   conn,
-		logger: logger,
-		ids:    make(map[int64]struct{}),
-		hideFn: func(ctx context.Context, conn Conn, ids []int64, hideFor time.Duration) error {
-			return hideSteps(ctx, conn, flowName, stepName, ids, hideFor)
-		},
-		logAttrs: []any{"flow", flowName, "step", stepName},
-	}
-}
-
-func (mh *messageHider[T]) start(ctx context.Context) {
-	hideFor := 10 * time.Minute
-	hideTicker := time.NewTicker(30 * time.Second)
-	defer hideTicker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-hideTicker.C:
-			mh.mu.Lock()
-			numIDs := len(mh.ids)
-			if numIDs == 0 {
-				mh.mu.Unlock()
-				continue
-			}
-			ids := make([]int64, 0, numIDs)
-			for id := range mh.ids {
-				ids = append(ids, id)
-			}
-			mh.mu.Unlock()
-
-			if err := mh.hideFn(ctx, mh.conn, ids, hideFor); err != nil {
-				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-					attrs := append(mh.logAttrs, "error", err)
-					mh.logger.ErrorContext(ctx, "worker: cannot hide messages", attrs...)
-				}
-			}
-		}
-	}
-}
-
-func (mh *messageHider[T]) hideMessages(msgs []T) {
-	mh.mu.Lock()
-	for _, msg := range msgs {
-		mh.ids[msg.getID()] = struct{}{}
-	}
-	mh.mu.Unlock()
-}
-
-func (mh *messageHider[T]) stopHiding(id int64) {
-	mh.mu.Lock()
-	delete(mh.ids, id)
-	mh.mu.Unlock()
-}
-
-// backoffWithFullJitter calculates the next backoff duration using full jitter strategy.
-// The first retryAttempt should be 0.
-func backoffWithFullJitter(retryAttempt int, minDelay, maxDelay time.Duration) time.Duration {
-	delay := time.Duration(float64(minDelay) * math.Pow(2, float64(retryAttempt)))
-	if delay > maxDelay {
-		delay = maxDelay
-	}
-	return time.Duration(rand.Int63n(int64(delay)))
-}
-
-func scanCollectibleTaskMessage(row pgx.CollectableRow) (taskMessage, error) {
-	return scanTaskMessage(row)
-}
-
-func scanTaskMessage(row pgx.Row) (taskMessage, error) {
-	rec := taskMessage{}
-
-	if err := row.Scan(
-		&rec.ID,
-		&rec.Deliveries,
-		&rec.Input,
-	); err != nil {
-		return rec, err
-	}
-
-	return rec, nil
-}
-
-func scanCollectibleStepMessage(row pgx.CollectableRow) (stepMessage, error) {
-	return scanStepMessage(row)
-}
-
-func scanStepMessage(row pgx.Row) (stepMessage, error) {
-	rec := stepMessage{}
-
-	var stepOutputs *map[string]json.RawMessage
-
-	if err := row.Scan(
-		&rec.ID,
-		&rec.Deliveries,
-		&rec.FlowInput,
-		&stepOutputs,
-	); err != nil {
-		return rec, err
-	}
-
-	if stepOutputs != nil {
-		rec.StepOutputs = *stepOutputs
-	}
-
-	return rec, nil
 }
 
 func scanCollectibleWorker(row pgx.CollectableRow) (*WorkerInfo, error) {
@@ -787,4 +413,14 @@ func scanWorker(row pgx.Row) (*WorkerInfo, error) {
 	}
 
 	return &rec, nil
+}
+
+// backoffWithFullJitter calculates the next backoff duration using full jitter strategy.
+// The first retryAttempt should be 0.
+func backoffWithFullJitter(retryAttempt int, minDelay, maxDelay time.Duration) time.Duration {
+	delay := time.Duration(float64(minDelay) * math.Pow(2, float64(retryAttempt)))
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	return time.Duration(rand.Int63n(int64(delay)))
 }

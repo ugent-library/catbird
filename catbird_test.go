@@ -837,7 +837,7 @@ func TestWorkerShutdownImmediateWhenNoTimeout(t *testing.T) {
 	t.Helper()
 
 	w := &Worker{
-		shutdownTimeout: 0,
+		gracefulShutdown: 0,
 	}
 
 	var wg sync.WaitGroup
@@ -866,7 +866,7 @@ func TestWorkerShutdownImmediateWhenNoTimeout(t *testing.T) {
 	<-started
 
 	// Trigger shutdown and ensure we don't wait for a grace period when
-	// shutdownTimeout is zero.
+	// gracefulShutdown is zero.
 	start := time.Now()
 	cancel()
 
@@ -876,17 +876,17 @@ func TestWorkerShutdownImmediateWhenNoTimeout(t *testing.T) {
 			t.Fatalf("waitForShutdown returned error: %v", err)
 		}
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("waitForShutdown did not return promptly with zero shutdownTimeout")
+		t.Fatal("waitForShutdown did not return promptly with zero gracefulShutdown")
 	}
 
 	if time.Since(start) > 400*time.Millisecond {
-		t.Fatalf("waitForShutdown took too long with zero shutdownTimeout: %s", time.Since(start))
+		t.Fatalf("waitForShutdown took too long with zero gracefulShutdown: %s", time.Since(start))
 	}
 
 	select {
 	case <-stopped:
 	default:
-		t.Fatal("handler was not cancelled immediately when shutdownTimeout is zero")
+		t.Fatal("handler was not cancelled immediately when gracefulShutdown is zero")
 	}
 }
 
@@ -895,7 +895,7 @@ func TestWorkerShutdownWithGracePeriod(t *testing.T) {
 
 	grace := 200 * time.Millisecond
 	w := &Worker{
-		shutdownTimeout: grace,
+		gracefulShutdown: grace,
 	}
 
 	var wg sync.WaitGroup

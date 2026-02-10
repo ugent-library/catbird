@@ -108,6 +108,12 @@ type Task struct {
 	handler *taskHandler
 }
 
+type taskMessage struct {
+	ID         int64           `json:"id"`
+	Deliveries int             `json:"deliveries"`
+	Input      json.RawMessage `json:"input"`
+}
+
 type taskHandler struct {
 	handlerOpts
 	fn func(context.Context, taskMessage) ([]byte, error)
@@ -177,12 +183,6 @@ type stepMessage struct {
 	Deliveries  int                        `json:"deliveries"`
 	FlowInput   json.RawMessage            `json:"flow_input"`
 	StepOutputs map[string]json.RawMessage `json:"step_outputs"`
-}
-
-func (m stepMessage) getID() int64 { return m.ID }
-
-type handlerMessage interface {
-	getID() int64
 }
 
 type stepHandler struct {
