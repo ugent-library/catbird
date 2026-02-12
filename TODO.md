@@ -1,7 +1,8 @@
 # Catbird TODO
 
 ## Architecture & Design
-- [ ] Fair queueing? https://docs.hatchet.run/blog/multi-tenant-queues
+- [ ] Fair queueing? (see https://docs.hatchet.run/blog/multi-tenant-queues)
+- [ ] Database coordinated scheduling? (see SCHEDULING_ADVANCED.md)
 
 ## Worker & Execution
 - [ ] RunTaskWait / RunFlowWait long polling
@@ -9,6 +10,6 @@
 
 ## Features
 - [ ] Metrics
-- [ ] Schemas for task/flow input/output? https://opensource.googleblog.com/2026/01/a-json-schema-package-for-go.html
-- [ ] Flow onfail task (error handling in workflows)?
-- [ ] Dynamic step subtasks execution (see pgflow)?
+- [ ] Schemas for task/flow input/output? (see https://opensource.googleblog.com/2026/01/a-json-schema-package-for-go.html)
+- [ ] OnFail handlers?
+- [ ] Dynamic step subtasks execution? (see pgflow)
