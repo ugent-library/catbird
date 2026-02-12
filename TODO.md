@@ -3,7 +3,7 @@
 ## Architecture & Design
 - [ ] Fair queueing? (see https://docs.hatchet.run/blog/multi-tenant-queues)
 - [ ] Database coordinated scheduling (see SCHEDULING_ADVANCED.md)
- 
+
 ## Worker & Execution
 - [ ] RunTaskWait / RunFlowWait long polling
 - [ ] Add queue, task, flow and step description fields
