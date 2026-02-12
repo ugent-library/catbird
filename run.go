@@ -11,16 +11,17 @@ import (
 
 // RunInfo represents the details of a task or flow execution
 type RunInfo struct {
-	ID              int64           `json:"id"`
-	DeduplicationID string          `json:"deduplication_id,omitempty"`
-	Status          string          `json:"status"`
-	Input           json.RawMessage `json:"input,omitempty"`
-	Output          json.RawMessage `json:"output,omitempty"`
-	ErrorMessage    string          `json:"error_message,omitempty"`
-	StartedAt       time.Time       `json:"started_at,omitzero"`
-	CompletedAt     time.Time       `json:"completed_at,omitzero"`
-	FailedAt        time.Time       `json:"failed_at,omitzero"`
-	SkippedAt       time.Time       `json:"skipped_at,omitzero"`
+	ID             int64           `json:"id"`
+	ConcurrencyKey string          `json:"concurrency_key,omitempty"`
+	IdempotencyKey string          `json:"idempotency_key,omitempty"`
+	Status         string          `json:"status"`
+	Input          json.RawMessage `json:"input,omitempty"`
+	Output         json.RawMessage `json:"output,omitempty"`
+	ErrorMessage   string          `json:"error_message,omitempty"`
+	StartedAt      time.Time       `json:"started_at,omitzero"`
+	CompletedAt    time.Time       `json:"completed_at,omitzero"`
+	FailedAt       time.Time       `json:"failed_at,omitzero"`
+	SkippedAt      time.Time       `json:"skipped_at,omitzero"`
 }
 
 // OutputAs unmarshals the output of a completed run.
@@ -76,7 +77,8 @@ func scanCollectibleRun(row pgx.CollectableRow) (*RunInfo, error) {
 func scanRun(row pgx.Row) (*RunInfo, error) {
 	rec := RunInfo{}
 
-	var deduplicationID *string
+	var concurrencyKey *string
+	var idempotencyKey *string
 	var input *json.RawMessage
 	var output *json.RawMessage
 	var errorMessage *string
@@ -86,7 +88,8 @@ func scanRun(row pgx.Row) (*RunInfo, error) {
 
 	if err := row.Scan(
 		&rec.ID,
-		&deduplicationID,
+		&concurrencyKey,
+		&idempotencyKey,
 		&rec.Status,
 		&input,
 		&output,
@@ -99,8 +102,11 @@ func scanRun(row pgx.Row) (*RunInfo, error) {
 		return nil, err
 	}
 
-	if deduplicationID != nil {
-		rec.DeduplicationID = *deduplicationID
+	if concurrencyKey != nil {
+		rec.ConcurrencyKey = *concurrencyKey
+	}
+	if idempotencyKey != nil {
+		rec.IdempotencyKey = *idempotencyKey
 	}
 	if input != nil {
 		rec.Input = *input

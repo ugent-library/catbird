@@ -11,5 +11,4 @@
 - [ ] Metrics
 - [ ] Schemas for task/flow input/output? https://opensource.googleblog.com/2026/01/a-json-schema-package-for-go.html
 - [ ] Flow onfail task (error handling in workflows)?
-- [ ] Deduplication strategies (now only execution deduplication)
 - [ ] Dynamic step subtasks execution (see pgflow)?

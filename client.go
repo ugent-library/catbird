@@ -131,13 +131,12 @@ func (c *Client) ListTasks(ctx context.Context) ([]*TaskInfo, error) {
 
 // RunTask enqueues a task execution and returns a handle for monitoring
 // progress and retrieving output.
-func (c *Client) RunTask(ctx context.Context, name string, input any) (*RunHandle, error) {
-	return RunTask(ctx, c.Conn, name, input)
+func (c *Client) RunTask(ctx context.Context, name string, input any, opts ...RunOpts) (*RunHandle, error) {
+	return RunTask(ctx, c.Conn, name, input, opts...)
 }
 
-// RunTaskWithOpts enqueues a task with options for deduplication and returns
-// a handle for monitoring.
-func (c *Client) RunTaskWithOpts(ctx context.Context, name string, input any, opts RunTaskOpts) (*RunHandle, error) {
+// RunTaskWithOpts enqueues a task with options for concurrency/idempotency control.
+func (c *Client) RunTaskWithOpts(ctx context.Context, name string, input any, opts RunOpts) (*RunHandle, error) {
 	return RunTaskWithOpts(ctx, c.Conn, name, input, opts)
 }
 
@@ -167,12 +166,11 @@ func (c *Client) ListFlows(ctx context.Context) ([]*FlowInfo, error) {
 }
 
 // RunFlow enqueues a flow execution and returns a handle for monitoring.
-func (c *Client) RunFlow(ctx context.Context, name string, input any) (*RunHandle, error) {
-	return RunFlow(ctx, c.Conn, name, input)
+func (c *Client) RunFlow(ctx context.Context, name string, input any, opts ...RunOpts) (*RunHandle, error) {
+	return RunFlow(ctx, c.Conn, name, input, opts...)
 }
 
-// RunFlowWithOpts enqueues a flow with options for deduplication and returns
-// a handle for monitoring.
+// RunFlowWithOpts enqueues a flow with options for concurrency/idempotency control.
 func (c *Client) RunFlowWithOpts(ctx context.Context, name string, input any, opts RunFlowOpts) (*RunHandle, error) {
 	return RunFlowWithOpts(ctx, c.Conn, name, input, opts)
 }

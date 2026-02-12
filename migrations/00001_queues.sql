@@ -20,17 +20,17 @@
 -- +goose statementbegin
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'cb_message') THEN
-        CREATE TYPE cb_message AS (
-            id bigint,
-            deduplication_id text,
-            topic text,
-            payload jsonb,
-            deliveries int,
-            created_at timestamptz,
-            deliver_at timestamptz
-        );
-    END IF;
+    -- Drop and recreate cb_message type to ensure it has the latest structure
+    DROP TYPE IF EXISTS cb_message CASCADE;
+    CREATE TYPE cb_message AS (
+        id bigint,
+        idempotency_key text,
+        topic text,
+        payload jsonb,
+        deliveries int,
+        created_at timestamptz,
+        deliver_at timestamptz
+    );
 END$$;
 -- +goose statementend
 
@@ -107,7 +107,7 @@ BEGIN
             $QUERY$
             CREATE UNLOGGED TABLE IF NOT EXISTS %I (
                 id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
-                deduplication_id text,
+                idempotency_key text,
                 topic text,
                 payload jsonb NOT NULL,
                 deliveries int NOT NULL DEFAULT 0,
@@ -122,7 +122,7 @@ BEGIN
             $QUERY$
             CREATE TABLE IF NOT EXISTS %I (
                 id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
-                deduplication_id text,
+                idempotency_key text,
                 topic text,
                 payload jsonb NOT NULL,
                 deliveries int NOT NULL DEFAULT 0,
@@ -134,7 +134,7 @@ BEGIN
         );
     END IF;
 
-    EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (deduplication_id);', _q_table || '_deduplication_id_idx', _q_table);
+    EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (idempotency_key);', _q_table || '_idempotency_key_idx', _q_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (deliver_at);', _q_table || '_deliver_at_idx', _q_table);
 
     -- Insert queue metadata
@@ -182,13 +182,13 @@ $$;
 -- Parameters:
 --   topic: Topic string to route to subscribed queues
 --   payload: JSON message payload
---   deduplication_id: Optional unique ID for deduplication (prevents duplicate messages)
+--   idempotency_key: Optional unique ID for idempotency (prevents duplicate messages)
 --   deliver_at: Optional timestamp when message should become deliverable (default: now)
 -- Returns: void
 CREATE OR REPLACE FUNCTION cb_dispatch(
     topic text,
     payload jsonb,
-    deduplication_id text = null,
+    idempotency_key text = null,
     deliver_at timestamptz = null
 )
 RETURNS void
@@ -216,15 +216,15 @@ BEGIN
         BEGIN
             EXECUTE format(
                 $QUERY$
-                INSERT INTO %I (topic, payload, deduplication_id, deliver_at)
+                INSERT INTO %I (topic, payload, idempotency_key, deliver_at)
                 VALUES ($1, $2, $3, $4)
-                ON CONFLICT (deduplication_id) DO NOTHING;
+                ON CONFLICT (idempotency_key) DO NOTHING;
                 $QUERY$,
                 _q_table
             )
             USING cb_dispatch.topic,
                   cb_dispatch.payload,
-                  cb_dispatch.deduplication_id,
+                  cb_dispatch.idempotency_key,
                   _deliver_at;
         EXCEPTION WHEN undefined_table THEN
             -- Queue was deleted between SELECT and INSERT, skip it
@@ -333,19 +333,19 @@ $$;
 
 -- +goose statementbegin
 -- cb_send: Send a message to a specific queue
--- Enqueues a message in the queue, with optional topic and deduplication
+-- Enqueues a message in the queue, with optional topic and idempotency
 -- Parameters:
 --   queue: Queue name
 --   payload: JSON message payload
 --   topic: Optional topic string for categorization
---   deduplication_id: Optional unique ID for deduplication (prevents duplicate messages)
+--   idempotency_key: Optional unique ID for idempotency (prevents duplicate messages)
 --   deliver_at: Optional timestamp when message should become deliverable (default: now)
 -- Returns: bigint - the message ID
 CREATE OR REPLACE FUNCTION cb_send(
     queue text,
     payload jsonb,
     topic text = null,
-    deduplication_id text = null,
+    idempotency_key text = null,
     deliver_at timestamptz = null
 )
 RETURNS bigint
@@ -357,16 +357,16 @@ DECLARE
 BEGIN
     EXECUTE format(
         $QUERY$
-        INSERT INTO %I (topic, payload, deduplication_id, deliver_at)
+        INSERT INTO %I (topic, payload, idempotency_key, deliver_at)
         VALUES ($1, $2, $3, $4)
-        ON CONFLICT (deduplication_id) DO NOTHING
+        ON CONFLICT (idempotency_key) DO NOTHING
         RETURNING id;
         $QUERY$,
         _q_table
     )
     USING cb_send.topic,
           cb_send.payload,
-          cb_send.deduplication_id,
+          cb_send.idempotency_key,
           _deliver_at
     INTO _id;
 
@@ -416,7 +416,7 @@ BEGIN
         FROM msgs
         WHERE m.id = msgs.id
         RETURNING m.id,
-                  m.deduplication_id,
+                  m.idempotency_key,
                   m.topic,
                   m.payload,
                   m.deliveries,
@@ -498,7 +498,7 @@ BEGIN
             FROM msgs
             WHERE m.id = msgs.id
             RETURNING m.id,
-                      m.deduplication_id,
+                      m.idempotency_key,
                       m.topic,
                       m.payload,
                       m.deliveries,
@@ -653,6 +653,8 @@ DROP FUNCTION IF EXISTS cb_create_queue(text, text[], timestamptz, boolean);
 DROP FUNCTION IF EXISTS cb_delete_queue(text);
 DROP FUNCTION IF EXISTS cb_dispatch(text, jsonb, text, timestamptz);
 DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, timestamptz);
+DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, text, timestamptz);
+DROP FUNCTION IF EXISTS cb_dispatch(text, jsonb, text, text, timestamptz);
 DROP FUNCTION IF EXISTS cb_read(text, int, int);
 DROP FUNCTION IF EXISTS cb_read_poll(text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_hide(text, bigint, integer);

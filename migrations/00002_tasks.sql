@@ -475,7 +475,8 @@ BEGIN
       $QUERY$
       CREATE TABLE IF NOT EXISTS %I (
         id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
-        deduplication_id text,
+        concurrency_key text,
+        idempotency_key text,
         status text NOT NULL DEFAULT 'queued',
         deliveries int NOT NULL DEFAULT 0,
         input jsonb NOT NULL,
@@ -498,7 +499,8 @@ BEGIN
       _t_table
     );
 
-    EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (deduplication_id) WHERE deduplication_id IS NOT NULL AND status IN (''queued'', ''started'')', _t_table || '_deduplication_id_idx', _t_table);
+    EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (concurrency_key) WHERE concurrency_key IS NOT NULL AND status IN (''queued'', ''started'')', _t_table || '_concurrency_key_idx', _t_table);
+    EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN (''queued'', ''started'', ''completed'')', _t_table || '_idempotency_key_idx', _t_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (deliver_at);', _t_table || '_deliver_at_idx', _t_table);
 END;
 $$;
@@ -509,9 +511,15 @@ $$;
 -- Parameters:
 --   name: Task name
 --   input: JSON input data for the task
---   deduplication_id: Optional unique ID for deduplication (prevents duplicate executions)
+--   concurrency_key: Optional key for concurrency control (prevents overlapping runs)
+--   idempotency_key: Optional key for idempotency (prevents duplicate runs including completed)
 -- Returns: bigint - the task run ID
-CREATE OR REPLACE FUNCTION cb_run_task(name text, input jsonb, deduplication_id text = NULL)
+CREATE OR REPLACE FUNCTION cb_run_task(
+    name text,
+    input jsonb,
+    concurrency_key text = NULL,
+    idempotency_key text = NULL
+)
 RETURNS bigint
 LANGUAGE plpgsql AS $$
 #variable_conflict use_column
@@ -519,21 +527,79 @@ DECLARE
     _t_table text := cb_table_name(cb_run_task.name, 't');
     _id bigint;
 BEGIN
+    -- Validate: both keys cannot be set simultaneously
+    IF cb_run_task.concurrency_key IS NOT NULL AND cb_run_task.idempotency_key IS NOT NULL THEN
+        RAISE EXCEPTION 'cb: cannot specify both concurrency_key and idempotency_key';
+    END IF;
+
     -- See https://dba.stackexchange.com/questions/212580/concurrent-transactions-result-in-race-condition-with-unique-constraint-on-inser/213625#213625
-    EXECUTE format(
-    $QUERY$
-    INSERT INTO %I (input, deduplication_id)
-    VALUES ($1, $2)
-    ON CONFLICT (deduplication_id) WHERE deduplication_id IS NOT NULL AND status IN ('queued', 'started') DO UPDATE
-    SET deduplication_id = EXCLUDED.deduplication_id WHERE FALSE -- no-op to force a returning value
-    RETURNING id
-    $QUERY$,
-    _t_table,
-    _t_table
-    )
-    USING cb_run_task.input,
-        cb_run_task.deduplication_id
-    INTO _id;
+    IF cb_run_task.concurrency_key IS NOT NULL THEN
+        -- Concurrency control: dedupe only queued/started
+        EXECUTE format(
+            $QUERY$
+            INSERT INTO %I (input, concurrency_key)
+            VALUES ($1, $2)
+            ON CONFLICT (concurrency_key) WHERE concurrency_key IS NOT NULL AND status IN ('queued', 'started') DO NOTHING
+            RETURNING id
+            $QUERY$,
+            _t_table
+        )
+        USING cb_run_task.input, cb_run_task.concurrency_key
+        INTO _id;
+        
+        -- If duplicate (no row inserted), get the existing row's ID
+        IF _id IS NULL THEN
+            EXECUTE format(
+                $QUERY$
+                SELECT id FROM %I
+                WHERE concurrency_key = $1 AND status IN ('queued', 'started')
+                LIMIT 1
+                $QUERY$,
+                _t_table
+            )
+            USING cb_run_task.concurrency_key
+            INTO _id;
+        END IF;
+    ELSIF cb_run_task.idempotency_key IS NOT NULL THEN
+        -- Idempotency: dedupe queued/started/completed
+        EXECUTE format(
+            $QUERY$
+            INSERT INTO %I (input, idempotency_key)
+            VALUES ($1, $2)
+            ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('queued', 'started', 'completed') DO NOTHING
+            RETURNING id
+            $QUERY$,
+            _t_table
+        )
+        USING cb_run_task.input, cb_run_task.idempotency_key
+        INTO _id;
+        
+        -- If duplicate (no row inserted), get the existing row's ID
+        IF _id IS NULL THEN
+            EXECUTE format(
+                $QUERY$
+                SELECT id FROM %I
+                WHERE idempotency_key = $1 AND status IN ('queued', 'started', 'completed')
+                LIMIT 1
+                $QUERY$,
+                _t_table
+            )
+            USING cb_run_task.idempotency_key
+            INTO _id;
+        END IF;
+    ELSE
+        -- No deduplication
+        EXECUTE format(
+            $QUERY$
+            INSERT INTO %I (input)
+            VALUES ($1)
+            RETURNING id
+            $QUERY$,
+            _t_table
+        )
+        USING cb_run_task.input
+        INTO _id;
+    END IF;
 
     RETURN _id;
 END;
@@ -858,7 +924,8 @@ BEGIN
     $QUERY$
     CREATE TABLE IF NOT EXISTS %I (
       id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
-      deduplication_id text,
+      concurrency_key text,
+      idempotency_key text,
       status text NOT NULL DEFAULT 'started',
       remaining_steps int NOT NULL DEFAULT 0,
       input jsonb NOT NULL,
@@ -880,7 +947,8 @@ BEGIN
     );
 
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (status);', _f_table || '_status_idx', _f_table);
-    EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (deduplication_id) WHERE deduplication_id IS NOT NULL AND status = ''started''', _f_table || '_deduplication_id_idx', _f_table);
+    EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (concurrency_key) WHERE concurrency_key IS NOT NULL AND status = ''started''', _f_table || '_concurrency_key_idx', _f_table);
+    EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN (''started'', ''completed'')', _f_table || '_idempotency_key_idx', _f_table);
 
     -- Create step runs table - includes 'skipped' in status constraint
     EXECUTE format(
@@ -925,9 +993,15 @@ $$ LANGUAGE plpgsql;
 -- Parameters:
 --   name: Flow name
 --   input: JSON input data for the flow
---   deduplication_id: Optional unique ID for deduplication (prevents duplicate executions)
+--   concurrency_key: Optional key for concurrency control (prevents overlapping runs)
+--   idempotency_key: Optional key for idempotency (prevents duplicate runs including completed)
 -- Returns: bigint - the flow run ID
-CREATE OR REPLACE FUNCTION cb_run_flow(name text, input jsonb, deduplication_id text = NULL)
+CREATE OR REPLACE FUNCTION cb_run_flow(
+    name text,
+    input jsonb,
+    concurrency_key text = NULL,
+    idempotency_key text = NULL
+)
 RETURNS bigint
 LANGUAGE plpgsql AS $$
 #variable_conflict use_column
@@ -937,28 +1011,84 @@ DECLARE
     _id bigint;
     _remaining_steps int;
 BEGIN
+    -- Validate: both keys cannot be set simultaneously
+    IF cb_run_flow.concurrency_key IS NOT NULL AND cb_run_flow.idempotency_key IS NOT NULL THEN
+        RAISE EXCEPTION 'cb: cannot specify both concurrency_key and idempotency_key';
+    END IF;
+
     -- Count total steps
     SELECT count(*) INTO _remaining_steps
     FROM cb_steps s
     WHERE s.flow_name = cb_run_flow.name;
 
-    -- Create flow run or get existing 'started' run with same deduplication_id
-    -- Partial unique index ensures only one 'started' run per deduplication_id
-    -- Completed/failed runs don't block new runs with same deduplication_id
-    EXECUTE format(
-    $QUERY$
-    INSERT INTO %I (deduplication_id, input, remaining_steps, status)
-    VALUES ($1, $2, $3, 'started')
-    ON CONFLICT (deduplication_id) WHERE deduplication_id IS NOT NULL AND status = 'started' DO UPDATE
-    SET deduplication_id = EXCLUDED.deduplication_id WHERE FALSE
-    RETURNING id
-    $QUERY$,
-    _f_table
-    )
-    USING cb_run_flow.deduplication_id,
-        cb_run_flow.input,
-        _remaining_steps
-    INTO _id;
+    -- Create flow run or get existing run with same key
+    IF cb_run_flow.concurrency_key IS NOT NULL THEN
+        -- Concurrency control: dedupe only started
+        EXECUTE format(
+            $QUERY$
+            INSERT INTO %I (concurrency_key, input, remaining_steps, status)
+            VALUES ($1, $2, $3, 'started')
+            ON CONFLICT (concurrency_key) WHERE concurrency_key IS NOT NULL AND status = 'started' DO NOTHING
+            RETURNING id
+            $QUERY$,
+            _f_table
+        )
+        USING cb_run_flow.concurrency_key, cb_run_flow.input, _remaining_steps
+        INTO _id;
+        
+        -- If duplicate (no row inserted), get the existing row's ID
+        IF _id IS NULL THEN
+            EXECUTE format(
+                $QUERY$
+                SELECT id FROM %I
+                WHERE concurrency_key = $1 AND status = 'started'
+                LIMIT 1
+                $QUERY$,
+                _f_table
+            )
+            USING cb_run_flow.concurrency_key
+            INTO _id;
+        END IF;
+    ELSIF cb_run_flow.idempotency_key IS NOT NULL THEN
+        -- Idempotency: dedupe started/completed
+        EXECUTE format(
+            $QUERY$
+            INSERT INTO %I (idempotency_key, input, remaining_steps, status)
+            VALUES ($1, $2, $3, 'started')
+            ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('started', 'completed') DO NOTHING
+            RETURNING id
+            $QUERY$,
+            _f_table
+        )
+        USING cb_run_flow.idempotency_key, cb_run_flow.input, _remaining_steps
+        INTO _id;
+        
+        -- If duplicate (no row inserted), get the existing row's ID
+        IF _id IS NULL THEN
+            EXECUTE format(
+                $QUERY$
+                SELECT id FROM %I
+                WHERE idempotency_key = $1 AND status IN ('started', 'completed')
+                LIMIT 1
+                $QUERY$,
+                _f_table
+            )
+            USING cb_run_flow.idempotency_key
+            INTO _id;
+        END IF;
+    ELSE
+        -- No deduplication
+        EXECUTE format(
+            $QUERY$
+            INSERT INTO %I (input, remaining_steps, status)
+            VALUES ($1, $2, 'started')
+            RETURNING id
+            $QUERY$,
+            _f_table
+        )
+        USING cb_run_flow.input, _remaining_steps
+        INTO _id;
+    END IF;
 
     -- Create step runs for all steps in a single INSERT
     EXECUTE format(
@@ -1704,6 +1834,7 @@ DROP FUNCTION IF EXISTS cb_hide_steps(text, text, bigint[], integer);
 DROP FUNCTION IF EXISTS cb_read_steps(text, text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_start_steps(text, bigint);
 DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text);
+DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text, text);
 DROP FUNCTION IF EXISTS cb_delete_flow(text);
 DROP FUNCTION IF EXISTS cb_create_flow(text, jsonb);
 DROP FUNCTION IF EXISTS cb_fail_task(text, bigint, text);
@@ -1711,6 +1842,7 @@ DROP FUNCTION IF EXISTS cb_complete_task(text, bigint, jsonb);
 DROP FUNCTION IF EXISTS cb_hide_tasks(text, bigint[], integer);
 DROP FUNCTION IF EXISTS cb_read_tasks(text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text);
+DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text, text);
 DROP FUNCTION IF EXISTS cb_delete_task(text);
 DROP FUNCTION IF EXISTS cb_create_task(text);
 DROP FUNCTION IF EXISTS cb_check_reconvergence(text, jsonb);

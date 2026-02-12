@@ -105,8 +105,8 @@ func (s *Scheduler) Start(ctx context.Context) error {
 				return
 			}
 
-			_, err = RunTaskWithOpts(ctx, s.conn, ts.name, inputJSON, RunTaskOpts{
-				DeduplicationID: fmt.Sprint(scheduledTime),
+			_, err = RunTaskWithOpts(ctx, s.conn, ts.name, inputJSON, RunOpts{
+				ConcurrencyKey: fmt.Sprint(scheduledTime),
 			})
 			if err != nil {
 				s.logger.ErrorContext(ctx, "scheduler: failed to schedule task", "task", ts.name, "error", err)
@@ -138,8 +138,8 @@ func (s *Scheduler) Start(ctx context.Context) error {
 				return
 			}
 
-			_, err = RunFlowWithOpts(ctx, s.conn, fs.name, inputJSON, RunFlowOpts{
-				DeduplicationID: fmt.Sprint(scheduledTime),
+			_, err = RunFlowWithOpts(ctx, s.conn, fs.name, inputJSON, RunOpts{
+				ConcurrencyKey: fmt.Sprint(scheduledTime),
 			})
 			if err != nil {
 				s.logger.ErrorContext(ctx, "scheduler: failed to schedule flow", "flow", fs.name, "error", err)

@@ -498,25 +498,26 @@ func ListFlows(ctx context.Context, conn Conn) ([]*FlowInfo, error) {
 	return pgx.CollectRows(rows, scanCollectibleFlow)
 }
 
-type RunFlowOpts struct {
-	DeduplicationID string
-}
+type RunFlowOpts = RunOpts
 
 // RunFlow enqueues a flow execution and returns a handle for monitoring.
-func RunFlow(ctx context.Context, conn Conn, name string, input any) (*RunHandle, error) {
-	return RunFlowWithOpts(ctx, conn, name, input, RunFlowOpts{})
+func RunFlow(ctx context.Context, conn Conn, name string, input any, opts ...RunOpts) (*RunHandle, error) {
+	var o RunOpts
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+	return RunFlowWithOpts(ctx, conn, name, input, o)
 }
 
-// RunFlowWithOpts enqueues a flow with options for deduplication and returns
-// a handle for monitoring.
+// RunFlowWithOpts enqueues a flow with options for concurrency/idempotency control.
 func RunFlowWithOpts(ctx context.Context, conn Conn, name string, input any, opts RunFlowOpts) (*RunHandle, error) {
 	b, err := json.Marshal(input)
 	if err != nil {
 		return nil, err
 	}
-	q := `SELECT * FROM cb_run_flow(name => $1, input => $2, deduplication_id => $3);`
+	q := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4);`
 	var id int64
-	err = conn.QueryRow(ctx, q, name, b, ptrOrNil(opts.DeduplicationID)).Scan(&id)
+	err = conn.QueryRow(ctx, q, name, b, ptrOrNil(opts.ConcurrencyKey), ptrOrNil(opts.IdempotencyKey)).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
@@ -526,14 +527,14 @@ func RunFlowWithOpts(ctx context.Context, conn Conn, name string, input any, opt
 // GetFlowRun retrieves a specific flow run result by ID.
 func GetFlowRun(ctx context.Context, conn Conn, name string, id int64) (*RunInfo, error) {
 	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(name))
-	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at, NULL::timestamptz as skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at, NULL::timestamptz as skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
 	return scanRun(conn.QueryRow(ctx, query, id))
 }
 
 // ListFlowRuns returns recent flow runs for the specified flow.
 func ListFlowRuns(ctx context.Context, conn Conn, name string) ([]*RunInfo, error) {
 	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(name))
-	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at, NULL::timestamptz as skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at, NULL::timestamptz as skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, err

@@ -10,13 +10,13 @@ import (
 
 // Message represents a message in a queue
 type Message struct {
-	ID              int64           `json:"id"`
-	DeduplicationID string          `json:"deduplication_id,omitempty"`
-	Topic           string          `json:"topic"`
-	Payload         json.RawMessage `json:"payload"`
-	Deliveries      int             `json:"deliveries"`
-	CreatedAt       time.Time       `json:"created_at"`
-	DeliverAt       time.Time       `json:"deliver_at"`
+	ID             int64           `json:"id"`
+	IdempotencyKey string          `json:"idempotency_key,omitempty"`
+	Topic          string          `json:"topic"`
+	Payload        json.RawMessage `json:"payload"`
+	Deliveries     int             `json:"deliveries"`
+	CreatedAt      time.Time       `json:"created_at"`
+	DeliverAt      time.Time       `json:"deliver_at"`
 }
 
 type QueueInfo struct {
@@ -70,9 +70,9 @@ func DeleteQueue(ctx context.Context, conn Conn, name string) (bool, error) {
 }
 
 type SendOpts struct {
-	Topic           string
-	DeduplicationID string
-	DeliverAt       time.Time
+	Topic          string
+	IdempotencyKey string
+	DeliverAt      time.Time
 }
 
 // Send enqueues a message to the specified queue.
@@ -81,7 +81,7 @@ func Send(ctx context.Context, conn Conn, queue string, payload any) error {
 	return SendWithOpts(ctx, conn, queue, payload, SendOpts{})
 }
 
-// SendWithOpts enqueues a message with options for topic, deduplication ID,
+// SendWithOpts enqueues a message with options for topic, idempotency key,
 // and delivery time.
 func SendWithOpts(ctx context.Context, conn Conn, queue string, payload any, opts SendOpts) error {
 	b, err := json.Marshal(payload)
@@ -89,8 +89,8 @@ func SendWithOpts(ctx context.Context, conn Conn, queue string, payload any, opt
 		return err
 	}
 
-	q := `SELECT cb_send(queue => $1, payload => $2, topic => $3, deduplication_id => $4, deliver_at => $5);`
-	_, err = conn.Exec(ctx, q, queue, b, ptrOrNil(opts.Topic), ptrOrNil(opts.DeduplicationID), ptrOrNil(opts.DeliverAt))
+	q := `SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, deliver_at => $5);`
+	_, err = conn.Exec(ctx, q, queue, b, ptrOrNil(opts.Topic), ptrOrNil(opts.IdempotencyKey), ptrOrNil(opts.DeliverAt))
 	return err
 }
 
@@ -111,8 +111,8 @@ func Unbind(ctx context.Context, conn Conn, queue string, pattern string) error 
 }
 
 type DispatchOpts struct {
-	DeduplicationID string
-	DeliverAt       *time.Time
+	IdempotencyKey string
+	DeliverAt      *time.Time
 }
 
 // Dispatch sends a message to all queues subscribed to the specified topic.
@@ -121,15 +121,15 @@ func Dispatch(ctx context.Context, conn Conn, topic string, payload any) error {
 }
 
 // DispatchWithOpts sends a message to topic-subscribed queues with options
-// for deduplication ID and delivery time.
+// for idempotency key and delivery time.
 func DispatchWithOpts(ctx context.Context, conn Conn, topic string, payload any, opts DispatchOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 
-	q := `SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => $3, deliver_at => $4);`
-	_, err = conn.Exec(ctx, q, topic, b, ptrOrNil(opts.DeduplicationID), ptrOrNil(opts.DeliverAt))
+	q := `SELECT cb_dispatch(topic => $1, payload => $2, idempotency_key => $3, deliver_at => $4);`
+	_, err = conn.Exec(ctx, q, topic, b, ptrOrNil(opts.IdempotencyKey), ptrOrNil(opts.DeliverAt))
 	return err
 }
 
@@ -198,8 +198,8 @@ func EnqueueSend(batch *pgx.Batch, queue string, payload any, opts SendOpts) err
 	}
 
 	batch.Queue(
-		`SELECT cb_send(queue => $1, payload => $2, topic => $3, deduplication_id => $4, deliver_at => $5);`,
-		queue, b, ptrOrNil(opts.Topic), ptrOrNil(opts.DeduplicationID), ptrOrNil(opts.DeliverAt),
+		`SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, deliver_at => $5);`,
+		queue, b, ptrOrNil(opts.Topic), ptrOrNil(opts.IdempotencyKey), ptrOrNil(opts.DeliverAt),
 	)
 
 	return nil
@@ -213,8 +213,8 @@ func EnqueueDispatch(batch *pgx.Batch, topic string, payload any, opts DispatchO
 	}
 
 	batch.Queue(
-		`SELECT cb_dispatch(topic => $1, payload => $2, deduplication_id => $3, deliver_at => $4);`,
-		topic, b, ptrOrNil(opts.DeduplicationID), ptrOrNil(opts.DeliverAt),
+		`SELECT cb_dispatch(topic => $1, payload => $2, idempotency_key => $3, deliver_at => $4);`,
+		topic, b, ptrOrNil(opts.IdempotencyKey), ptrOrNil(opts.DeliverAt),
 	)
 
 	return nil
@@ -227,12 +227,12 @@ func scanCollectibleMessage(row pgx.CollectableRow) (Message, error) {
 func scanMessage(row pgx.Row) (Message, error) {
 	rec := Message{}
 
-	var deduplicationID *string
+	var idempotencyKey *string
 	var topic *string
 
 	if err := row.Scan(
 		&rec.ID,
-		&deduplicationID,
+		&idempotencyKey,
 		&topic,
 		&rec.Payload,
 		&rec.Deliveries,
@@ -245,8 +245,8 @@ func scanMessage(row pgx.Row) (Message, error) {
 	if topic != nil {
 		rec.Topic = *topic
 	}
-	if deduplicationID != nil {
-		rec.DeduplicationID = *deduplicationID
+	if idempotencyKey != nil {
+		rec.IdempotencyKey = *idempotencyKey
 	}
 
 	return rec, nil

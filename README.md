@@ -51,12 +51,12 @@ err = client.SendWithOpts(ctx, "my-queue", map[string]any{
     DeliverAt: time.Now().Add(5 * time.Minute),
 })
 
-// Send a message with deduplication to prevent duplicates
+// Send a message with idempotency key to prevent duplicates
 err = client.SendWithOpts(ctx, "my-queue", map[string]any{
     "order_id": 789,
     "action":   "process",
 }, catbird.SendOpts{
-    DeduplicationID: "order-789-process",
+    IdempotencyKey: "order-789-process",
 })
 
 // Read messages (hidden from other readers for 30 seconds)
@@ -66,6 +66,105 @@ for _, msg := range messages {
     client.Delete(ctx, "my-queue", msg.ID)
 }
 ```
+
+## Deduplication Strategies
+
+Catbird supports two deduplication strategies for tasks and flows, allowing you to control when duplicate executions are prevented:
+
+### ConcurrencyKey (Temporary Deduplication)
+
+**Use case**: Prevent concurrent/overlapping executions but allow re-runs after completion.
+
+**Semantics**: Deduplicates runs in `queued` or `started` status. Once a run completes (success) or fails, the same key can be used again.
+
+**Example scenarios**:
+- Rate limiting: "Don't process the same user request multiple times concurrently"
+- Resource locking: "Only one indexing job per dataset at a time"
+- Scheduled tasks: "Prevent overlap between hourly cron runs"
+
+```go
+// Task: Prevent concurrent executions
+handle, err := client.RunTaskWithOpts(ctx, "process-user", userID, catbird.RunOpts{
+    ConcurrencyKey: fmt.Sprintf("user-%d", userID),
+})
+
+// Flow: Prevent concurrent workflow runs
+handle, err := client.RunFlowWithOpts(ctx, "order-processing", order, catbird.RunFlowOpts{
+    ConcurrencyKey: fmt.Sprintf("order-%s", order.ID),
+})
+
+// Scheduled tasks automatically use ConcurrencyKey
+worker, err := client.NewWorker(ctx,
+    catbird.WithTask(hourlyTask),
+    catbird.WithScheduledTask("hourly_task", "@hourly"), // Uses ConcurrencyKey internally
+)
+```
+
+**Behavior**:
+- Run 1 (status: `started`) → Run 2 with same key → **Rejected** (duplicate)
+- Run 1 (status: `completed`) → Run 2 with same key → **Allowed** (new execution)
+- Run 1 (status: `failed`) → Run 2 with same key → **Allowed** (retry)
+
+### IdempotencyKey (Permanent Deduplication)
+
+**Use case**: Ensure exactly-once execution—prevent all duplicates including after completion.
+
+**Semantics**: Deduplicates runs in `queued`, `started`, or `completed` status. Once a run completes successfully, the same key can never be used again (unless the completed run is manually deleted from the database).
+
+**Example scenarios**:
+- Payment processing: "Charge this payment exactly once, even if retried"
+- Order fulfillment: "Ship this order exactly once"
+- Webhook delivery: "Process this webhook event exactly once"
+- Audit logging: "Record this event exactly once"
+
+```go
+// Task: Ensure payment is processed exactly once
+handle, err := client.RunTaskWithOpts(ctx, "charge-payment", payment, catbird.RunOpts{
+    IdempotencyKey: fmt.Sprintf("payment-%s", payment.ID),
+})
+
+// Flow: Ensure order is processed exactly once
+handle, err := client.RunFlowWithOpts(ctx, "fulfill-order", order, catbird.RunFlowOpts{
+    IdempotencyKey: fmt.Sprintf("order-%s-fulfillment", order.ID),
+})
+```
+
+**Behavior**:
+- Run 1 (status: `started`) → Run 2 with same key → **Rejected** (duplicate)
+- Run 1 (status: `completed`) → Run 2 with same key → **Rejected** (already executed)
+- Run 1 (status: `failed`) → Run 2 with same key → **Allowed** (retry on failure)
+
+### Comparison Table
+
+| Feature | ConcurrencyKey | IdempotencyKey |
+|---------|----------------|----------------|
+| **Purpose** | Prevent overlapping runs | Ensure exactly-once execution |
+| **Deduplicates** | `queued`, `started` | `queued`, `started`, `completed` |
+| **After completion** | Allows re-run | Rejects duplicate |
+| **After failure** | Allows retry | Allows retry |
+| **Use for** | Rate limiting, resource locking, scheduled tasks | Payments, orders, webhooks, audit logs |
+
+### Important Notes
+
+- **Mutually exclusive**: You cannot provide both `ConcurrencyKey` and `IdempotencyKey` for the same run (returns error)
+- **Return value on duplicate**: When a duplicate is detected, `RunTask()`/`RunFlow()` return a handle with the **existing run's ID**, not an error. This allows you to wait on the existing execution:
+  ```go
+  // First call creates run with ID 123
+  h1, _ := client.RunTaskWithOpts(ctx, "task", input, RunOpts{IdempotencyKey: "key-1"})
+  // h1.ID = 123
+  
+  // Duplicate call returns handle to same run
+  h2, _ := client.RunTaskWithOpts(ctx, "task", input, RunOpts{IdempotencyKey: "key-1"})
+  // h2.ID = 123 (same as h1)
+  
+  // Both handles can wait for the same result
+  h1.WaitForOutput(ctx, &result)
+  h2.WaitForOutput(ctx, &result)  // Returns immediately with same result
+  ```
+- **Failure retries**: Both strategies allow retries when a task/flow fails (`status: failed`). A new run is created (different ID) when retrying a failed execution.
+- **No key = no deduplication**: If you don't provide either key, duplicates are allowed
+- **Scheduled tasks**: Automatically use `ConcurrencyKey` to prevent schedule overlap
+- **Queue messages**: Use `IdempotencyKey` in `SendOpts` for exactly-once message delivery
 
 ### Topic-Based Routing
 
@@ -134,14 +233,6 @@ handle, err := client.RunTask(ctx, "send-email", EmailRequest{
     Subject: "Hello",
 })
 
-// Run a task with deduplication to prevent duplicate executions
-handle, err = client.RunTaskWithOpts(ctx, "send-email", EmailRequest{
-    To:      "user@example.com",
-    Subject: "Welcome",
-}, catbird.RunTaskOpts{
-    DeduplicationID: "email-user123-welcome",
-})
-
 // Get result
 var result EmailResponse
 err = handle.WaitForOutput(ctx, &result)
@@ -208,11 +299,6 @@ go worker.Start(ctx)
 
 // Run the flow
 handle, err := client.RunFlow(ctx, "order-processing", myOrder)
-
-// Run a flow with deduplication to prevent duplicate executions
-handle, err = client.RunFlowWithOpts(ctx, "order-processing", myOrder, catbird.RunFlowOpts{
-    DeduplicationID: "order-12345-processing",
-})
 
 // Get combined results from all steps
 var results map[string]any
@@ -698,15 +784,15 @@ SELECT cb_create_queue(name => 'my_queue', expires_at => null, unlogged => false
 
 -- Send a message
 SELECT cb_send(queue => 'my_queue', payload => '{"user_id": 123, "action": "process"}'::jsonb, 
-               topic => null, deduplication_id => null, deliver_at => null);
+               topic => null, idempotency_key => null, deliver_at => null);
 
--- Send with deduplication and delayed delivery
+-- Send with idempotency and delayed delivery
 SELECT cb_send(queue => 'my_queue', payload => '{"order_id": 789}'::jsonb,
-               topic => null, deduplication_id => 'order-789', deliver_at => now() + '5 minutes'::interval);
+               topic => null, idempotency_key => 'order-789', deliver_at => now() + '5 minutes'::interval);
 
 -- Dispatch to topic-bound queues
 SELECT cb_dispatch(topic => 'events.user.created', payload => '{"user_id": 456}'::jsonb,
-                   deduplication_id => 'user-456-created', deliver_at => null);
+                   idempotency_key => 'user-456-created', deliver_at => null);
 
 -- Read messages (with 30 second visibility timeout)
 SELECT * FROM cb_read(queue => 'my_queue', limit => 10, hide_for => 30);
@@ -727,11 +813,15 @@ SELECT cb_create_task(name => 'send_email');
 
 -- Run a task
 SELECT * FROM cb_run_task(name => 'send_email', input => '{"to": "user@example.com"}'::jsonb, 
-                          deduplication_id => null);
+                          concurrency_key => null, idempotency_key => null);
 
--- Run a task with deduplication
+-- Run a task with ConcurrencyKey (prevent concurrent runs)
 SELECT * FROM cb_run_task(name => 'send_email', input => '{"to": "user@example.com"}'::jsonb, 
-                          deduplication_id => 'email-user123-welcome');
+                          concurrency_key => 'email-user123', idempotency_key => null);
+
+-- Run a task with IdempotencyKey (ensure exactly-once)
+SELECT * FROM cb_run_task(name => 'send_email', input => '{"to": "user@example.com"}'::jsonb, 
+                          concurrency_key => null, idempotency_key => 'email-user123-welcome');
 ```
 
 ### Workflows
@@ -753,11 +843,15 @@ SELECT cb_create_flow(name => 'checkout_with_conditions', steps => '[
 
 -- Run a flow
 SELECT * FROM cb_run_flow(name => 'order_processing', input => '{"order_id": 123}'::jsonb,
-                          deduplication_id => null);
+                          concurrency_key => null, idempotency_key => null);
 
--- Run a flow with deduplication
+-- Run a flow with ConcurrencyKey (prevent concurrent workflow runs)
 SELECT * FROM cb_run_flow(name => 'order_processing', input => '{"order_id": 123}'::jsonb,
-                          deduplication_id => 'order-123-processing');
+                          concurrency_key => 'order-123', idempotency_key => null);
+
+-- Run a flow with IdempotencyKey (ensure exactly-once execution)
+SELECT * FROM cb_run_flow(name => 'order_processing', input => '{"order_id": 123}'::jsonb,
+                          concurrency_key => null, idempotency_key => 'order-123-processing');
 ```
 
 ### Monitoring Task and Flow Runs
@@ -766,13 +860,13 @@ You can query task and flow run information directly:
 
 ```sql
 -- List recent task runs (replace send_email with your task name)
-SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at
+SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at
 FROM cb_t_send_email
 ORDER BY started_at DESC
 LIMIT 20;
 
 -- Get flow run (replace order_processing with your flow name)
-SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at
+SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at
 FROM cb_f_order_processing
 WHERE id = $1;
 ```

@@ -139,9 +139,14 @@ NewFlow("workflow",
 - **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `WithLogger()`
 - **Scheduled tasks/flows**: Use robfig/cron syntax; `WithScheduledTask("name", "@hourly")`
 - **Automatic garbage collection**: All workers automatically run GC every 5 minutes (cleans up expired queues and stale worker heartbeats); no configuration needed
-- **Deduplication**: Messages support `DeduplicationID` field to prevent duplicates
+- **Deduplication strategies**: Two strategies available:
+  - **ConcurrencyKey**: Prevents concurrent/overlapping runs (deduplicates `queued`/`started` status). After completion or failure, same key can be used again.
+  - **IdempotencyKey**: Ensures exactly-once execution (deduplicates `queued`/`started`/`completed` status). After successful completion, same key permanently rejected.
+  - **Return behavior**: When a duplicate is detected, `RunTask()`/`RunFlow()` return the **existing row's ID**, not 0 or an error. This allows callers to wait on the existing execution.
+  - **Failure retries**: Both strategies allow retries when a task/flow fails (`status: failed`).
+  - **Mutually exclusive**: Cannot specify both keys simultaneously (returns error).
 - **Topic bindings**: Explicit via `Bind(queue, pattern)`; wildcards `?` (single token) and `*` (multi-token tail as `.*`). Foreign key CASCADE deletes bindings when queue is deleted. Pattern validation at bind time; regex precompiled in PostgreSQL.
-- **Task/Flow execution**: `client.RunTask()` or `client.RunFlow()` return handles with `WaitForOutput()` to block until completion
+- **Task/Flow execution**: `client.RunTask()` or `client.RunFlow()` return handles with `WaitForOutput()` to block until completion. When deduplication detects an existing run, the handle contains the existing run's ID.
 - **Workflow signals**: Steps can require signals (external input) before executing. Use `InitialStepWithSignal`, `StepWith*DependenciesAndSignal` variants. Signal delivered via `client.SignalFlow(ctx, flowName, flowRunID, stepName, input)`. Steps with both dependencies and signals wait for **both** conditions before starting. Enables approval workflows, webhooks, and human-in-the-loop patterns.
 - **Optional dependencies**: When a step depends on a conditional step (one with `WithCondition()`), use `OptionalDependency("stepName")` and declare the parameter as `Optional[T]`. The `Optional[T]` type has `IsSet bool` and `Value T` fields. Flow construction validates this constraint and panics if violated. Enables reconvergence patterns where multiple branches merge back together.
 

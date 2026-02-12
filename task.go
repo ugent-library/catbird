@@ -96,27 +96,31 @@ func ListTasks(ctx context.Context, conn Conn) ([]*TaskInfo, error) {
 	return pgx.CollectRows(rows, scanCollectibleTask)
 }
 
-type RunTaskOpts struct {
-	DeduplicationID string
+type RunOpts struct {
+	ConcurrencyKey string // Prevents overlapping runs; allows reruns after completion
+	IdempotencyKey string // Prevents all duplicate runs; permanent across all statuses
 }
 
 // RunTask enqueues a task execution and returns a handle for monitoring
 // progress and retrieving output.
-func RunTask(ctx context.Context, conn Conn, name string, input any) (*RunHandle, error) {
-	return RunTaskWithOpts(ctx, conn, name, input, RunTaskOpts{})
+func RunTask(ctx context.Context, conn Conn, name string, input any, opts ...RunOpts) (*RunHandle, error) {
+	var o RunOpts
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+	return RunTaskWithOpts(ctx, conn, name, input, o)
 }
 
-// RunTaskWithOpts enqueues a task with options for deduplication and returns
-// a handle for monitoring.
-func RunTaskWithOpts(ctx context.Context, conn Conn, name string, input any, opts RunTaskOpts) (*RunHandle, error) {
+// RunTaskWithOpts enqueues a task with options for concurrency/idempotency control.
+func RunTaskWithOpts(ctx context.Context, conn Conn, name string, input any, opts RunOpts) (*RunHandle, error) {
 	b, err := json.Marshal(input)
 	if err != nil {
 		return nil, err
 	}
 
-	q := `SELECT * FROM cb_run_task(name => $1, input => $2, deduplication_id => $3);`
+	q := `SELECT * FROM cb_run_task(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4);`
 	var id int64
-	err = conn.QueryRow(ctx, q, name, b, ptrOrNil(opts.DeduplicationID)).Scan(&id)
+	err = conn.QueryRow(ctx, q, name, b, ptrOrNil(opts.ConcurrencyKey), ptrOrNil(opts.IdempotencyKey)).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
@@ -127,14 +131,14 @@ func RunTaskWithOpts(ctx context.Context, conn Conn, name string, input any, opt
 // GetTaskRun retrieves a specific task run result by ID.
 func GetTaskRun(ctx context.Context, conn Conn, name string, id int64) (*RunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(name))
-	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at, skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at, skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
 	return scanRun(conn.QueryRow(ctx, query, id))
 }
 
 // ListTaskRuns returns recent task runs for the specified task.
 func ListTaskRuns(ctx context.Context, conn Conn, name string) ([]*RunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(name))
-	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at, skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at, skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, err
