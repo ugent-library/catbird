@@ -21,6 +21,10 @@ A PostgreSQL-powered message queue and task execution engine. Catbird brings rel
 - **Resiliency features**: Handler retries with backoff, optional circuit breaker protection, and PostgreSQL retry logic for transient errors.
 - **Dashboard**: Web UI to trigger task/flow runs, monitor progress in real-time, and view results.
 
+<p align="center">
+  <img src="screenshots/dashboard-flows.png" alt="Flow Visualization" width="800" />
+</p>
+
 ## Quick Start
 
 ### Basic Queue
@@ -871,10 +875,6 @@ WHERE id = $1;
 ## Dashboard
 
 The dashboard provides a web UI for monitoring and managing queues, tasks, flows, and workers. Monitor execution status in real-time, trigger new runs, and inspect results.
-
-<p align="center">
-  <img src="screenshots/dashboard-flows.png" alt="Flow Visualization" width="800" />
-</p>
 
 ### Running the Dashboard Standalone
 
