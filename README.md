@@ -544,8 +544,6 @@ When `assess_risk` completes with `risk_score: 20`, the `audit` step is skipped.
 
 #### Pattern 2: Divergent Branching
 
-#### Pattern 2: Divergent Branching
-
 Different conditions lead to different execution paths. Each branch handles a specific scenario:
 
 ```go
