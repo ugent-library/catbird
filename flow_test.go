@@ -32,12 +32,7 @@ func TestFlowCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go func() {
-		err := worker.Start(t.Context())
-		if err != nil {
-			t.Logf("worker error: %s", err)
-		}
-	}()
+	startTestWorker(t, worker)
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -51,7 +46,9 @@ func TestFlowCreate(t *testing.T) {
 	}
 
 	var out FlowOutput
-	if err := h.WaitForOutput(t.Context(), &out); err != nil {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
 		t.Fatal(err)
 	}
 
@@ -80,12 +77,7 @@ func TestFlowSingleStep(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go func() {
-		err := worker.Start(t.Context())
-		if err != nil {
-			t.Logf("worker error: %s", err)
-		}
-	}()
+	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
@@ -96,7 +88,9 @@ func TestFlowSingleStep(t *testing.T) {
 	}
 
 	var out FlowOutput
-	if err := h.WaitForOutput(t.Context(), &out); err != nil {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
 		t.Fatal(err)
 	}
 
@@ -119,12 +113,12 @@ func TestFlowWithDependencies(t *testing.T) {
 		InitialStep("step1", func(ctx context.Context, in string) (string, error) {
 			return in + " processed by step 1", nil
 		}),
-		StepWithOneDependency("step2",
+		StepWithDependency("step2",
 			Dependency("step1"),
 			func(ctx context.Context, in string, step1Out string) (string, error) {
 				return step1Out + " and by step 2", nil
 			}),
-		StepWithOneDependency("step3",
+		StepWithDependency("step3",
 			Dependency("step2"),
 			func(ctx context.Context, in string, step2Out string) (string, error) {
 				return step2Out + " and by step 3", nil
@@ -138,12 +132,7 @@ func TestFlowWithDependencies(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go func() {
-		err := worker.Start(t.Context())
-		if err != nil {
-			t.Logf("worker error: %s", err)
-		}
-	}()
+	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
@@ -154,7 +143,9 @@ func TestFlowWithDependencies(t *testing.T) {
 	}
 
 	var out FlowOutput
-	if err := h.WaitForOutput(t.Context(), &out); err != nil {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
 		t.Fatal(err)
 	}
 
@@ -208,11 +199,7 @@ func TestFlowListFlows(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go func() {
-		if err := worker.Start(t.Context()); err != nil {
-			t.Logf("worker error: %s", err)
-		}
-	}()
+	startTestWorker(t, worker)
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -227,7 +214,9 @@ func TestFlowListFlows(t *testing.T) {
 	}
 
 	var out1 FlowOutput
-	if err := h1.WaitForOutput(t.Context(), &out1); err != nil {
+	ctx1, cancel1 := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel1()
+	if err := h1.WaitForOutput(ctx1, &out1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -237,7 +226,9 @@ func TestFlowListFlows(t *testing.T) {
 	}
 
 	var out2 FlowOutput
-	if err := h2.WaitForOutput(t.Context(), &out2); err != nil {
+	ctx2, cancel2 := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel2()
+	if err := h2.WaitForOutput(ctx2, &out2); err != nil {
 		t.Fatal(err)
 	}
 
@@ -301,12 +292,12 @@ func TestFlowComplexDependencies(t *testing.T) {
 		InitialStep("step1", func(ctx context.Context, in string) (int, error) {
 			return 10, nil
 		}),
-		StepWithOneDependency("step2",
+		StepWithDependency("step2",
 			Dependency("step1"),
 			func(ctx context.Context, in string, step1Out int) (int, error) {
 				return step1Out * 2, nil // 20
 			}),
-		StepWithOneDependency("step3",
+		StepWithDependency("step3",
 			Dependency("step1"),
 			func(ctx context.Context, in string, step1Out int) (int, error) {
 				return step1Out * 3, nil // 30
@@ -333,11 +324,7 @@ func TestFlowComplexDependencies(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go func() {
-		if err := worker.Start(t.Context()); err != nil {
-			t.Logf("worker error: %s", err)
-		}
-	}()
+	startTestWorker(t, worker)
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -356,7 +343,9 @@ func TestFlowComplexDependencies(t *testing.T) {
 	}
 
 	var out ComplexOutput
-	if err := h.WaitForOutput(t.Context(), &out); err != nil {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
 		t.Fatal(err)
 	}
 
@@ -382,7 +371,7 @@ func TestFlowStepPanicRecovery(t *testing.T) {
 		InitialStep("step1", func(ctx context.Context, in string) (string, error) {
 			return "success", nil
 		}),
-		StepWithOneDependency("step2",
+		StepWithDependency("step2",
 			Dependency("step1"),
 			func(ctx context.Context, in string, step1Out string) (string, error) {
 				panic("intentional panic in flow step")
@@ -396,12 +385,7 @@ func TestFlowStepPanicRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go func() {
-		err := worker.Start(t.Context())
-		if err != nil {
-			t.Logf("worker error: %s", err)
-		}
-	}()
+	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
@@ -458,11 +442,7 @@ func TestStepCircuitBreaker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go func() {
-		if err := worker.Start(t.Context()); err != nil {
-			t.Logf("worker error: %s", err)
-		}
-	}()
+	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
@@ -518,7 +498,7 @@ func TestFlowWithSignal(t *testing.T) {
 		InitialStep("submit", func(ctx context.Context, doc string) (string, error) {
 			return "submitted: " + doc, nil
 		}),
-		StepWithOneDependencyAndSignal("approve",
+		StepWithDependencyAndSignal("approve",
 			Dependency("submit"),
 			func(ctx context.Context, doc string, approval ApprovalInput, submitResult string) (string, error) {
 				if !approval.Approved {
@@ -526,7 +506,7 @@ func TestFlowWithSignal(t *testing.T) {
 				}
 				return fmt.Sprintf("approved by %s: %s", approval.ApproverID, submitResult), nil
 			}),
-		StepWithOneDependency("publish",
+		StepWithDependency("publish",
 			Dependency("approve"),
 			func(ctx context.Context, doc string, approveResult string) (string, error) {
 				return "published: " + approveResult, nil
@@ -538,11 +518,7 @@ func TestFlowWithSignal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go func() {
-		if err := worker.Start(t.Context()); err != nil {
-			t.Logf("worker error: %s", err)
-		}
-	}()
+	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
@@ -600,7 +576,7 @@ func TestFlowWithInitialSignal(t *testing.T) {
 			func(ctx context.Context, data string, trigger TriggerInput) (string, error) {
 				return fmt.Sprintf("started with %s from %s", trigger.Action, data), nil
 			}),
-		StepWithOneDependency("finish",
+		StepWithDependency("finish",
 			Dependency("start"),
 			func(ctx context.Context, data string, startResult string) (string, error) {
 				return "completed: " + startResult, nil
@@ -612,11 +588,7 @@ func TestFlowWithInitialSignal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go func() {
-		if err := worker.Start(t.Context()); err != nil {
-			t.Logf("worker error: %s", err)
-		}
-	}()
+	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
@@ -669,11 +641,7 @@ func TestFlowSignalAlreadyDelivered(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go func() {
-		if err := worker.Start(t.Context()); err != nil {
-			t.Logf("worker error: %s", err)
-		}
-	}()
+	startTestWorker(t, worker)
 
 	time.Sleep(100 * time.Millisecond)
 

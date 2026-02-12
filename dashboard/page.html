@@ -77,10 +77,17 @@
     integrity="sha384-uO3SXW5IuS1ZpFPKugNNWqTZRRglnUJK6UAZ/gxOX80nxEkN9NcGZTftn6RzhGWE"
     crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/cytoscape@3.33.1/dist/cytoscape.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.min.js"></script>
   <script type="module">
     import hljs from 'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.11.1/build/es/highlight.min.js';
     import hljson from 'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.11.1/build/es/languages/json.min.js';
     hljs.registerLanguage('json', hljson);
+
+    // Register dagre layout extension with Cytoscape
+    if (typeof cytoscape !== 'undefined' && typeof cytoscapeDagre !== 'undefined') {
+      cytoscape.use(cytoscapeDagre);
+    }
 
     htmx.onLoad(function (rootEl) {
       feather.replace();
@@ -108,34 +115,227 @@
           container: el,
           elements: elements,
           layout: {
-            name: 'breadthfirst',
-            directed: true,
-            roots: nodeIds.filter(id => !steps.some(s => s.name === id && s.depends_on))
+            name: 'dagre',
+            rankDir: 'LR',
+            nodeSep: 50,
+            rankSep: 100
           },
           style: [
             {
               selector: 'node',
               style: {
-                'font-size': '10px',
-                'padding': '8px',
+                'shape': 'roundrectangle',
+                'font-size': '9px',
+                'font-weight': '500',
+                'padding': '6px',
                 'color': '#fff',
-                'background-color': '#9747ff',
+                'background-color': '#2d3748',
+                'border-width': '2px',
+                'border-color': '#9747ff',
                 'label': 'data(label)',
                 'text-valign': 'center',
-                'text-halign': 'center'
+                'text-halign': 'center',
+                'text-wrap': 'wrap',
+                'text-max-width': '60px',
+                'width': '70px',
+                'height': '35px'
               }
             },
             {
               selector: 'edge',
               style: {
-                'width': 1,
-                'line-color': '#b478ff',
-                'target-arrow-color': '#b478ff',
+                'width': 2,
+                'line-color': '#9747ff',
+                'target-arrow-color': '#9747ff',
                 'target-arrow-shape': 'triangle',
-                'curve-style': 'bezier'
+                'curve-style': 'bezier',
+                'arrow-scale': 1.2
               }
             }
           ]
+        });
+        
+        // Fit graph after a brief delay to ensure container has dimensions
+        setTimeout(() => {
+          cy.fit(20);
+          cy.maxZoom(1.5);
+          if (cy.zoom() > 1.5) {
+            cy.zoom(1.5);
+            cy.center();
+          }
+        }, 50);
+      });
+
+      // Render step runs with status colors
+      rootEl.querySelectorAll('[data-step-runs]').forEach((el) => {
+        const stepRuns = JSON.parse(el.getAttribute('data-step-runs'));
+        const flowSteps = JSON.parse(el.getAttribute('data-flow-steps'));
+
+        // Find the modal this graph is in
+        const modal = el.closest('.modal');
+        if (!modal) return;
+
+        // Create a map of step name -> run info
+        const stepRunMap = {};
+        stepRuns.forEach((sr) => {
+          stepRunMap[sr.step_name] = {
+            status: sr.status,
+            output: sr.output,
+            error_message: sr.error_message
+          };
+        });
+
+        const elements = [];
+        const nodeIds = [];
+        flowSteps.forEach((step) => {
+          const runInfo = stepRunMap[step.name] || { status: 'created', output: null, error_message: null };
+          const statusBadge = {
+            'completed': '✓',
+            'failed': '✗',
+            'skipped': '⊘',
+            'started': '▶',
+            'created': '○'
+          }[runInfo.status] || '○';
+          elements.push({ 
+            id: step.name, 
+            data: { 
+              id: step.name, 
+              label: `${step.name}\n${statusBadge} ${runInfo.status}`,
+              status: runInfo.status,
+              output: runInfo.output,
+              error_message: runInfo.error_message
+            } 
+          });
+          nodeIds.push(step.name);
+          if (step.depends_on) {
+            step.depends_on.forEach((dep) => {
+              elements.push({ id: `${dep.name}-${step.name}`, data: { source: dep.name, target: step.name } });
+            });
+          }
+        });
+
+        // Create tooltip element
+        let tooltip = document.getElementById('cytoscape-tooltip');
+        if (!tooltip) {
+          tooltip = document.createElement('div');
+          tooltip.id = 'cytoscape-tooltip';
+          tooltip.style.cssText = 'position:absolute;display:none;background:#000;color:#fff;padding:8px 12px;border-radius:4px;font-size:12px;max-width:400px;z-index:9999;pointer-events:none;white-space:pre-wrap;word-wrap:break-word;font-family:monospace;';
+          document.body.appendChild(tooltip);
+        }
+
+        // Render graph when modal is shown (when it has dimensions)
+        modal.addEventListener('shown.bs.modal', function renderGraph() {
+          const cy = cytoscape({
+            container: el,
+            elements: elements,
+            layout: {
+              name: 'dagre',
+              rankDir: 'LR',
+              nodeSep: 50,
+              rankSep: 100
+            },
+            style: [
+              {
+                selector: 'node',
+                style: {
+                  'shape': 'roundrectangle',
+                  'font-size': '9px',
+                  'font-weight': '500',
+                  'padding': '6px',
+                  'color': '#fff',
+                  'background-color': '#2d3748',
+                  'border-width': '2px',
+                  'border-color': '#6c757d',
+                  'label': 'data(label)',
+                  'text-valign': 'center',
+                  'text-halign': 'center',
+                  'text-wrap': 'wrap',
+                  'text-max-width': '65px',
+                  'width': '75px',
+                  'height': '40px'
+                }
+              },
+              {
+                selector: 'node[status="completed"]',
+                style: {
+                  'border-color': '#28a745',
+                  'border-width': '3px'
+                }
+              },
+              {
+                selector: 'node[status="failed"]',
+                style: {
+                  'border-color': '#dc3545',
+                  'border-width': '3px'
+                }
+              },
+              {
+                selector: 'node[status="skipped"]',
+                style: {
+                  'border-color': '#6c757d',
+                  'border-width': '3px',
+                  'background-color': '#1a202c'
+                }
+              },
+              {
+                selector: 'node[status="started"]',
+                style: {
+                  'border-color': '#17a2b8',
+                  'border-width': '3px'
+                }
+              },
+              {
+                selector: 'node[status="created"]',
+                style: {
+                  'border-color': '#9747ff',
+                  'border-width': '3px'
+                }
+              },
+              {
+                selector: 'edge',
+                style: {
+                  'width': 2,
+                  'line-color': '#9747ff',
+                  'target-arrow-color': '#9747ff',
+                  'target-arrow-shape': 'triangle',
+                  'curve-style': 'bezier',
+                  'arrow-scale': 1.5
+                }
+              }
+            ]
+          });
+          
+          cy.fit(20);
+          cy.maxZoom(1.5);
+          if (cy.zoom() > 1.5) {
+            cy.zoom(1.5);
+            cy.center();
+          }
+
+          // Add hover tooltips for nodes with errors
+          cy.on('mouseover', 'node', function(evt) {
+            const node = evt.target;
+            const error = node.data('error_message');
+            
+            if (error) {
+              tooltip.textContent = 'Error:\n' + error;
+              tooltip.style.display = 'block';
+            }
+          });
+
+          cy.on('mousemove', 'node', function(evt) {
+            if (tooltip.style.display === 'block') {
+              tooltip.style.left = (evt.originalEvent.pageX + 10) + 'px';
+              tooltip.style.top = (evt.originalEvent.pageY + 10) + 'px';
+            }
+          });
+
+          cy.on('mouseout', 'node', function(evt) {
+            tooltip.style.display = 'none';
+          });
+          
+          // Remove event listener after first render
+          modal.removeEventListener('shown.bs.modal', renderGraph);
         });
       });
     });

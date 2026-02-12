@@ -207,11 +207,7 @@ func TestTaskRetriesIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go func() {
-		if err := worker.Start(t.Context()); err != nil {
-			t.Logf("worker error: %v", err)
-		}
-	}()
+	startTestWorker(t, worker)
 
 	// give worker time to start
 	time.Sleep(100 * time.Millisecond)

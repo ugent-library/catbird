@@ -13,6 +13,7 @@ type handlerOpts struct {
 	minDelay       time.Duration
 	maxDelay       time.Duration
 	circuitBreaker *circuitBreaker
+	condition      string
 }
 
 // validate checks handler options for consistency.
@@ -94,5 +95,15 @@ func WithBackoff(minDelay, maxDelay time.Duration) HandlerOpt {
 func WithCircuitBreaker(failureThreshold int, openTimeout time.Duration) HandlerOpt {
 	return func(h *handlerOpts) {
 		h.circuitBreaker = newCircuitBreaker(failureThreshold, openTimeout)
+	}
+}
+
+// WithCondition sets a condition that must be satisfied for the handler to execute.
+// If the condition evaluates to false, the task/step is skipped.
+// Condition syntax: "input.field op value" or "dep_name.field op value"
+// Example: WithCondition("input.priority eq high"), WithCondition("validate.score gte 80")
+func WithCondition(expr string) HandlerOpt {
+	return func(h *handlerOpts) {
+		h.condition = expr
 	}
 }

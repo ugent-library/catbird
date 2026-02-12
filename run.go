@@ -20,6 +20,7 @@ type RunInfo struct {
 	StartedAt       time.Time       `json:"started_at,omitzero"`
 	CompletedAt     time.Time       `json:"completed_at,omitzero"`
 	FailedAt        time.Time       `json:"failed_at,omitzero"`
+	SkippedAt       time.Time       `json:"skipped_at,omitzero"`
 }
 
 // OutputAs unmarshals the output of a completed run.
@@ -61,6 +62,8 @@ func (h *RunHandle) WaitForOutput(ctx context.Context, out any) error {
 				return json.Unmarshal(info.Output, out)
 			case StatusFailed:
 				return fmt.Errorf("%w: %s", ErrRunFailed, info.ErrorMessage)
+			case StatusSkipped:
+				return fmt.Errorf("run skipped: condition not met")
 			}
 		}
 	}
@@ -79,6 +82,7 @@ func scanRun(row pgx.Row) (*RunInfo, error) {
 	var errorMessage *string
 	var completedAt *time.Time
 	var failedAt *time.Time
+	var skippedAt *time.Time
 
 	if err := row.Scan(
 		&rec.ID,
@@ -90,6 +94,7 @@ func scanRun(row pgx.Row) (*RunInfo, error) {
 		&rec.StartedAt,
 		&completedAt,
 		&failedAt,
+		&skippedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -111,6 +116,9 @@ func scanRun(row pgx.Row) (*RunInfo, error) {
 	}
 	if failedAt != nil {
 		rec.FailedAt = *failedAt
+	}
+	if skippedAt != nil {
+		rec.SkippedAt = *skippedAt
 	}
 
 	return &rec, nil

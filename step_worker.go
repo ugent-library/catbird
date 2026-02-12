@@ -35,7 +35,7 @@ func newStepWorker(conn Conn, logger *slog.Logger, flowName string, step *Step) 
 }
 
 func (w *stepWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup) {
-	messages := make(chan stepMessage, 100)
+	messages := make(chan stepMessage)
 
 	// Start periodic hiding of in-flight steps
 	wg.Go(func() {
@@ -157,7 +157,7 @@ func (w *stepWorker) hideInFlight(ctx context.Context) {
 func (w *stepWorker) readMessages(ctx context.Context) ([]stepMessage, error) {
 	h := w.step.handler
 
-	q := `SELECT id, deliveries, flow_input, step_outputs, signal_input FROM cb_read_steps(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
+	q := `SELECT id, deliveries, input, step_outputs, signal_input FROM cb_read_steps(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
 
 	rows, err := queryWithRetry(ctx, w.conn, q, w.flowName, w.step.Name, h.batchSize, (10 * time.Minute).Milliseconds(), (10 * time.Second).Milliseconds(), (100 * time.Millisecond).Milliseconds())
 	if err != nil {
@@ -194,7 +194,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepMessage) {
 			"step", w.step.Name,
 			"id", msg.ID,
 			"deliveries", msg.Deliveries,
-			"flow_input", string(msg.FlowInput),
+			"input", string(msg.Input),
 			"step_outputs", string(stepOutputsJSON),
 		)
 	}
@@ -261,7 +261,7 @@ func scanStepMessage(row pgx.Row) (stepMessage, error) {
 	if err := row.Scan(
 		&rec.ID,
 		&rec.Deliveries,
-		&rec.FlowInput,
+		&rec.Input,
 		&stepOutputs,
 		&rec.SignalInput,
 	); err != nil {

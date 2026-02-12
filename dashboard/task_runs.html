@@ -8,6 +8,7 @@
       <th scope="col">Started</th>
       <th scope="col">Completed</th>
       <th scope="col">Failed</th>
+      <th scope="col">Skipped</th>
     </tr>
     {{ range .TaskRuns }}
     <tr>
@@ -25,11 +26,14 @@
         <span class="badge text-bg-success">completed</span>
         {{ else if eq .Status "failed" }}
         <span class="badge text-bg-danger">failed</span>
+        {{ else if eq .Status "skipped" }}
+        <span class="badge text-bg-secondary">skipped</span>
         {{ end }}
       </td>
       <td>{{ formatTime .StartedAt }}</td>
       <td>{{ formatTime .CompletedAt }}</td>
       <td>{{ formatTime .FailedAt }}</td>
+      <td>{{ formatTime .SkippedAt }}</td>
     </tr>
     {{ end }}
   </tbody>

@@ -16,6 +16,7 @@ const (
 	StatusStarted   = "started"
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
+	StatusSkipped   = "skipped" // Step skipped due to condition
 )
 
 var (

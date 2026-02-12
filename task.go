@@ -127,14 +127,14 @@ func RunTaskWithOpts(ctx context.Context, conn Conn, name string, input any, opt
 // GetTaskRun retrieves a specific task run result by ID.
 func GetTaskRun(ctx context.Context, conn Conn, name string, id int64) (*RunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(name))
-	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at, skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
 	return scanRun(conn.QueryRow(ctx, query, id))
 }
 
 // ListTaskRuns returns recent task runs for the specified task.
 func ListTaskRuns(ctx context.Context, conn Conn, name string) ([]*RunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(name))
-	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, deduplication_id, status, input, output, error_message, started_at, completed_at, failed_at, skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, err

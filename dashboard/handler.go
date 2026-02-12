@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"embed"
 	"encoding/json"
+	"errors"
 	"html/template"
 	"log/slog"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/jackc/pgx/v5"
 	"github.com/ugent-library/catbird"
 )
 
@@ -123,6 +125,11 @@ func (a *App) render(w http.ResponseWriter, r *http.Request, t *template.Templat
 }
 
 func (a *App) handleError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, pgx.ErrNoRows) {
+		a.logger.Warn("resource not found", "path", r.URL.Path)
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
 	a.logger.Error("handler error", "error", err)
 	http.Error(w, err.Error(), http.StatusInternalServerError)
 }
@@ -319,12 +326,25 @@ func (a *App) handleFlow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fetch step runs for each flow run
+	stepRunsByFlowRun := make(map[int64][]*catbird.StepRunInfo)
+	for _, flowRun := range flowRuns {
+		stepRuns, err := a.client.GetFlowRunSteps(r.Context(), flowName, flowRun.ID)
+		if err != nil {
+			a.logger.Warn("Failed to fetch step runs", "flow_run_id", flowRun.ID, "error", err)
+			continue
+		}
+		stepRunsByFlowRun[flowRun.ID] = stepRuns
+	}
+
 	a.render(w, r, a.flow, struct {
-		Flow     *catbird.FlowInfo
-		FlowRuns []*catbird.RunInfo
+		Flow              *catbird.FlowInfo
+		FlowRuns          []*catbird.RunInfo
+		StepRunsByFlowRun map[int64][]*catbird.StepRunInfo
 	}{
-		Flow:     flow,
-		FlowRuns: flowRuns,
+		Flow:              flow,
+		FlowRuns:          flowRuns,
+		StepRunsByFlowRun: stepRunsByFlowRun,
 	})
 }
 
@@ -449,13 +469,26 @@ func (a *App) handleFlowRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fetch step runs for each flow run
+	stepRunsByFlowRun := make(map[int64][]*catbird.StepRunInfo)
+	for _, flowRun := range flowRuns {
+		stepRuns, err := a.client.GetFlowRunSteps(r.Context(), flowName, flowRun.ID)
+		if err != nil {
+			a.logger.Warn("Failed to fetch step runs", "flow_run_id", flowRun.ID, "error", err)
+			continue
+		}
+		stepRunsByFlowRun[flowRun.ID] = stepRuns
+	}
+
 	// Render just the flow runs table partial
 	if err := a.flow.ExecuteTemplate(w, "flow_runs_table", struct {
-		Flow     *catbird.FlowInfo
-		FlowRuns []*catbird.RunInfo
+		Flow              *catbird.FlowInfo
+		FlowRuns          []*catbird.RunInfo
+		StepRunsByFlowRun map[int64][]*catbird.StepRunInfo
 	}{
-		Flow:     flow,
-		FlowRuns: flowRuns,
+		Flow:              flow,
+		FlowRuns:          flowRuns,
+		StepRunsByFlowRun: stepRunsByFlowRun,
 	}); err != nil {
 		a.handleError(w, r, err)
 	}

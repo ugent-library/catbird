@@ -1,3 +1,13 @@
+-- Garbage collection routines for expired queues and stale worker heartbeats
+
+-- CONCURRENCY AUDIT:
+-- cb_gc():
+--   - Called by workers every 5 minutes for maintenance (not hot path)
+--   - cb_delete_queue(): Uses advisory lock internally via callback - SAFE
+--   - DELETE FROM cb_workers: Simple DELETE by timestamp, no locks needed - SAFE
+--   - Safe for concurrent GC runs (idempotent, scans by expires_at and timestamp) - SAFE
+-- GC operations are idempotent and cause no race conditions
+
 -- +goose up
 
 -- +goose statementbegin

@@ -33,7 +33,7 @@ func newTaskWorker(conn Conn, logger *slog.Logger, task *Task) *taskWorker {
 }
 
 func (w *taskWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup) {
-	messages := make(chan taskMessage, 100)
+	messages := make(chan taskMessage)
 
 	// Start periodic hiding of in-flight tasks
 	wg.Go(func() {

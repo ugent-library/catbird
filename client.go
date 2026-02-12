@@ -187,6 +187,11 @@ func (c *Client) ListFlowRuns(ctx context.Context, name string) ([]*RunInfo, err
 	return ListFlowRuns(ctx, c.Conn, name)
 }
 
+// GetFlowRunSteps retrieves all step runs for a specific flow run.
+func (c *Client) GetFlowRunSteps(ctx context.Context, flowName string, flowRunID int64) ([]*StepRunInfo, error) {
+	return GetFlowRunSteps(ctx, c.Conn, flowName, flowRunID)
+}
+
 // SignalFlow delivers a signal to a waiting step in a flow run.
 // The step must have been defined with a signal variant (e.g., InitialStepWithSignal).
 // Returns an error if the signal was already delivered or the step doesn't require a signal.

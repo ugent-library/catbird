@@ -49,12 +49,7 @@ func TestTaskRunAndWait(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go func() {
-		err := worker.Start(t.Context())
-		if err != nil {
-			t.Logf("worker error: %s", err)
-		}
-	}()
+	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
@@ -65,7 +60,9 @@ func TestTaskRunAndWait(t *testing.T) {
 	}
 
 	var result int
-	if err := h.WaitForOutput(t.Context(), &result); err != nil {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &result); err != nil {
 		t.Fatal(err)
 	}
 
@@ -88,12 +85,7 @@ func TestTaskPanicRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go func() {
-		err := worker.Start(t.Context())
-		if err != nil {
-			t.Logf("worker error: %s", err)
-		}
-	}()
+	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
@@ -152,11 +144,7 @@ func TestTaskCircuitBreaker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go func() {
-		if err := worker.Start(t.Context()); err != nil {
-			t.Logf("worker error: %s", err)
-		}
-	}()
+	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
