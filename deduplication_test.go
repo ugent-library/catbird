@@ -261,11 +261,16 @@ func TestTaskDeduplicationRetryOnFailure(t *testing.T) {
 func TestFlowConcurrencyKey(t *testing.T) {
 	client := getTestClient(t)
 
+	flowName := fmt.Sprintf("concurrent_flow_%d", time.Now().UnixNano())
+	concurrencyKey := fmt.Sprintf("flow-run-%d", time.Now().UnixNano())
+	input1 := "input"
+	input2 := "input2"
+
 	type FlowOutput struct {
 		Step1 string `json:"step1"`
 	}
 
-	flow := NewFlow("concurrent_flow",
+	flow := NewFlow(flowName,
 		InitialStep("step1", func(ctx context.Context, in string) (string, error) {
 			time.Sleep(200 * time.Millisecond) // Simulate work
 			return in + " processed", nil
@@ -280,8 +285,8 @@ func TestFlowConcurrencyKey(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Run 1: Start first execution
-	h1, err := client.RunFlowWithOpts(t.Context(), "concurrent_flow", "input", RunFlowOpts{
-		ConcurrencyKey: "flow-run-1",
+	h1, err := client.RunFlowWithOpts(t.Context(), flowName, input1, RunFlowOpts{
+		ConcurrencyKey: concurrencyKey,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -290,8 +295,8 @@ func TestFlowConcurrencyKey(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Run 2: Duplicate while running (should return existing ID)
-	h2, err := client.RunFlowWithOpts(t.Context(), "concurrent_flow", "input", RunFlowOpts{
-		ConcurrencyKey: "flow-run-1",
+	h2, err := client.RunFlowWithOpts(t.Context(), flowName, input1, RunFlowOpts{
+		ConcurrencyKey: concurrencyKey,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -307,13 +312,13 @@ func TestFlowConcurrencyKey(t *testing.T) {
 	if err := h1.WaitForOutput(ctx1, &out1); err != nil {
 		t.Fatalf("first run failed: %v", err)
 	}
-	if out1.Step1 != "input processed" {
+	if out1.Step1 != input1+" processed" {
 		t.Fatalf("unexpected output: %s", out1.Step1)
 	}
 
 	// Run 3: After completion, same ConcurrencyKey should create new run
-	h3, err := client.RunFlowWithOpts(t.Context(), "concurrent_flow", "input2", RunFlowOpts{
-		ConcurrencyKey: "flow-run-1",
+	h3, err := client.RunFlowWithOpts(t.Context(), flowName, input2, RunFlowOpts{
+		ConcurrencyKey: concurrencyKey,
 	})
 	if err != nil {
 		t.Fatal(err)
