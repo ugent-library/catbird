@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/robfig/cron/v3"
 )
@@ -45,6 +46,10 @@ func NewScheduler(conn Conn, logger *slog.Logger) *Scheduler {
 // AddTask registers a scheduled task execution using cron syntax.
 // The WithInput option can be used to provide dynamic input at execution time.
 // Otherwise an empty JSON object will be used as input to the task.
+//
+// All scheduled task executions use idempotency deduplication keyed on the
+// scheduled execution time. This means exactly one execution per cron tick will
+// occur even when running multiple workers concurrently.
 func (s *Scheduler) AddTask(taskName string, schedule string, opts ...ScheduleOpt) {
 	entry := scheduleEntry{
 		name:     taskName,
@@ -61,6 +66,10 @@ func (s *Scheduler) AddTask(taskName string, schedule string, opts ...ScheduleOp
 // AddFlow registers a scheduled flow execution using cron syntax.
 // The WithInput option can be used to provide dynamic input at execution time.
 // Otherwise an empty JSON object will be used as input to the flow.
+//
+// All scheduled flow executions use idempotency deduplication keyed on the
+// scheduled execution time. This means exactly one execution per cron tick will
+// occur even when running multiple workers concurrently.
 func (s *Scheduler) AddFlow(flowName string, schedule string, opts ...ScheduleOpt) {
 	entry := scheduleEntry{
 		name:     flowName,
@@ -77,12 +86,21 @@ func (s *Scheduler) AddFlow(flowName string, schedule string, opts ...ScheduleOp
 // Start begins executing scheduled tasks and flows.
 // Returns an error if any schedule fails to register.
 // The scheduler will continue until ctx is cancelled or Stop is called.
+//
+// Deduplication strategy: All scheduled runs use IdempotencyKey derived from
+// the scheduled execution time in UTC (format: "schedule:<unix_seconds>").
+// This ensures:
+// - Multiple workers/machines generate identical keys for the same cron tick
+// - One execution per scheduled tick, even after completion
+// - Retries allowed on failed runs (idempotency persists across completion)
+// - No clock skew or timezone issues (all times normalized to UTC)
 func (s *Scheduler) Start(ctx context.Context) error {
 	if len(s.taskSchedules) == 0 && len(s.flowSchedules) == 0 {
 		return nil
 	}
 
-	s.cron = cron.New()
+	// Initialize cron with UTC location to ensure consistent scheduling across all workers
+	s.cron = cron.New(cron.WithLocation(time.UTC))
 
 	for _, ts := range s.taskSchedules {
 		var entryID cron.EntryID
@@ -106,7 +124,9 @@ func (s *Scheduler) Start(ctx context.Context) error {
 			}
 
 			_, err = RunTaskWithOpts(ctx, s.conn, ts.name, inputJSON, RunOpts{
-				ConcurrencyKey: fmt.Sprint(scheduledTime),
+				// Generate stable idempotency key from scheduled time (UTC seconds)
+				// Format: "schedule:<unix_seconds>" ensures consistent dedup across workers
+				IdempotencyKey: fmt.Sprintf("schedule:%d", scheduledTime.Unix()),
 			})
 			if err != nil {
 				s.logger.ErrorContext(ctx, "scheduler: failed to schedule task", "task", ts.name, "error", err)
@@ -139,7 +159,9 @@ func (s *Scheduler) Start(ctx context.Context) error {
 			}
 
 			_, err = RunFlowWithOpts(ctx, s.conn, fs.name, inputJSON, RunOpts{
-				ConcurrencyKey: fmt.Sprint(scheduledTime),
+				// Generate stable idempotency key from scheduled time (UTC seconds)
+				// Format: "schedule:<unix_seconds>" ensures consistent dedup across workers
+				IdempotencyKey: fmt.Sprintf("schedule:%d", scheduledTime.Unix()),
 			})
 			if err != nil {
 				s.logger.ErrorContext(ctx, "scheduler: failed to schedule flow", "flow", fs.name, "error", err)

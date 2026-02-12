@@ -93,10 +93,10 @@ handle, err := client.RunFlowWithOpts(ctx, "order-processing", order, catbird.Ru
     ConcurrencyKey: fmt.Sprintf("order-%s", order.ID),
 })
 
-// Scheduled tasks automatically use ConcurrencyKey
+// Scheduled tasks automatically use IdempotencyKey (UTC-normalized for multi-worker dedup)
 worker, err := client.NewWorker(ctx,
     catbird.WithTask(hourlyTask),
-    catbird.WithScheduledTask("hourly_task", "@hourly"), // Uses ConcurrencyKey internally
+    catbird.WithScheduledTask("hourly_task", "@hourly"), // Uses IdempotencyKey internally
 )
 ```
 
@@ -386,8 +386,6 @@ Both tasks and flow steps support conditional execution via `WithCondition(expre
 - **Key rule**: If a step can be skipped, downstream steps must use `OptionalDependency(name)` and accept `Optional[T]` parameters to handle missing outputs
 - **Optional outputs**: When a conditional step is skipped, dependent steps receive `Optional[T]{IsSet: false}`
 - **Reconvergence**: Multiple conditional branches can merge back together using `OptionalDependency` and `Optional[T]` checks
-
-### Condition Expression Syntax
 
 ### Condition Expression Syntax
 
