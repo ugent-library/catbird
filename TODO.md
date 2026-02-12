@@ -3,6 +3,7 @@
 ## Architecture & Design
 - [ ] Fair queueing? (see https://docs.hatchet.run/blog/multi-tenant-queues)
 - [ ] Database coordinated scheduling (see SCHEDULING_ADVANCED.md)
+- [ ] Allow workers to provide part of a flow's step handlers (split and multi-language flow execution) 
 
 ## Worker & Execution
 - [ ] RunTaskWait / RunFlowWait long polling

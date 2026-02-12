@@ -164,8 +164,14 @@ func (w *Worker) claimAndEnqueueSchedules(ctx context.Context) error {
         
         schedule := schedules[0]
         
-        // Step 2: Calculate next run time using cron library
-        nextRunAt := calculateNextCronTime(schedule.cron_spec)
+        // Step 2: Calculate next run time using PostgreSQL cron function
+        // (Cron parsing is done in the database, not in worker code)
+        nextRunAt, err := w.db.QueryRow(ctx, `
+            SELECT cb_next_cron_tick($1, $2)
+        `, schedule.CronSpec, schedule.NextRunAt).Scan(&nextRunAt)
+        if err != nil {
+            return err
+        }
         
         // Step 3: Atomically:
         //   - Enqueue the run (with stable idempotency key)
@@ -204,24 +210,53 @@ func (w *Worker) claimAndEnqueueSchedules(ctx context.Context) error {
 }
 ```
 
-### Key Algorithm: Calculate Next Cron Time
+### Key Algorithm: Cron Parsing in PostgreSQL
 
-```go
-// Helper: compute next_run_at using robfig/cron
-func calculateNextCronTime(cronSpec string) (time.Time, error) {
-    // Parse cron spec (same library, UTC location)
-    parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
-    schedule, err := parser.Parse(cronSpec)
-    if err != nil {
-        return time.Time{}, err
-    }
-    
-    // Current execution was at schedule.next_run_at
-    // Calculate next from that time
-    nextScheduledTime := schedule.Next(time.Now().UTC())
-    return nextScheduledTime, nil
-}
+Instead of parsing cron specs in worker code, Catbird implements cron logic entirely in PL/pgSQL. This ensures:
+- **Language-agnostic**: Workers in any language (Go, Python, Node, Ruby) can use the same function
+- **Version consistency**: No cron library version skew across workers
+- **Auditability**: Scheduling logic lives in the database and can be queried/audited directly
+
+**Core function signature:**
+```sql
+CREATE FUNCTION cb_next_cron_tick(
+    cron_spec TEXT,        -- e.g., "@hourly", "0 9 * * *", "*/15 * * * *"
+    from_time TIMESTAMPTZ  -- Base time to calculate next tick from
+)
+RETURNS TIMESTAMPTZ
+LANGUAGE plpgsql AS $$
+BEGIN
+    -- Parse cron_spec into (minute, hour, dom, month, dow)
+    -- Handle special keywords: @yearly, @annually, @monthly, @weekly, @daily, @hourly, @reboot
+    -- Find the next datetime >= from_time matching the cron constraints
+    -- Return it in UTC
+END;
+$$;
 ```
+
+**Implementation approach:**
+1. Handle special keywords (`@hourly` → `0 * * * *`, etc.)
+2. Parse 5-field cron notation into arrays: `(minute[], hour[], dom[], month[], dow[])`
+3. Iterate forward from `from_time` checking constraints:
+   - Month in `month[]`, Day-of-month in `dom[]`, Day-of-week in `dow[]` (with special handling for `dow` flexibility)
+   - When a day matches, find the earliest hour in `hour[]`
+   - When an hour matches, find the earliest minute in `minute[]`
+4. Return the first matching datetime
+
+**Worker usage:**
+```go
+nextRunAt, err := w.db.QueryRow(ctx, `
+    SELECT cb_next_cron_tick($1, $2)
+`, schedule.CronSpec, schedule.NextRunAt).Scan(&nextRunAt)
+```
+
+**Supported cron specs:**
+- Standard: `0 9 * * *` (9 AM every day)
+- Ranges: `0-30 * * * *` (every hour at :00 and :30)
+- Steps: `*/15 * * * *` (every 15 minutes)
+- Lists: `0,30 9,17 * * *` (9 AM and 5 PM, on the hour and half-hour)
+- Keywords: `@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly`
+- Special: `H` (hash) not supported initially, use `*/n` instead
 
 ### Idempotency Key Strategy
 
@@ -306,6 +341,8 @@ Option 2 Advantage:
 
 ### Phase 2: Implementation (6-8 weeks estimated)
 - [ ] Add `cb_schedules` table via migration
+- [ ] Implement `cb_next_cron_tick()` PL/pgSQL function (cron parsing in database)
+- [ ] Add comprehensive tests for cron edge cases (month boundaries, leap years, etc.)
 - [ ] Implement `claimAndEnqueueSchedules()` worker method
 - [ ] Add config option: `UseDBDrivenScheduling: bool`
 - [ ] Test with both Option 1 and Option 2 enabled simultaneously
@@ -384,23 +421,42 @@ err := client.SetScheduleEnabled(ctx, "email_digest_hourly", false)
 ### Unit Tests
 
 ```go
+func TestCronNextTickFunction(t *testing.T) {
+    // Test cron spec parsing via SQL
+    testCases := []struct{
+        spec string
+        from time.Time
+        expected time.Time
+    }{
+        {"@hourly", time.Date(2026, 2, 12, 14, 30, 0, 0, time.UTC), 
+         time.Date(2026, 2, 12, 15, 0, 0, 0, time.UTC)},
+        {"0 9 * * *", time.Date(2026, 2, 12, 8, 0, 0, 0, time.UTC),
+         time.Date(2026, 2, 12, 9, 0, 0, 0, time.UTC)},
+        {"*/15 * * * *", time.Date(2026, 2, 12, 14, 27, 0, 0, time.UTC),
+         time.Date(2026, 2, 12, 14, 30, 0, 0, time.UTC)},
+        // Month boundaries, leap years, DST transitions, etc.
+    }
+    for _, tc := range testCases {
+        var result time.Time
+        err := db.QueryRow(ctx, `SELECT cb_next_cron_tick($1, $2)`, 
+            tc.spec, tc.from).Scan(&result)
+        assert.NoError(t, err)
+        assert.Equal(t, tc.expected, result)
+    }
+}
+
+### Integration Tests
+
+```go
 func TestScheduleClaimAtomicity(t *testing.T) {
     // Simulate 10 workers claiming the same due schedule
     // Verify: exactly 1 succeeds, 9 get empty result set
     // Verify: row lock held during transaction
 }
 
-func TestNextRunAtCalculation(t *testing.T) {
-    // Test cron spec parsing
-    // "@hourly" → next 00:00 UTC
-    // "@daily" → next midnight UTC
-    // "0 9 * * *" → next 9 AM UTC
-    // Edge cases: leap seconds, DST (if any), month boundaries
-}
-
 func TestScheduleMigrationBackfill(t *testing.T) {
-    // insert known in-memory schedules into cb_schedules
-    // Verify: next_run_at matches cron library calculation
+    // Insert known schedules into cb_schedules
+    // Verify: cb_next_cron_tick() returns expected next_run_at
 }
 
 func TestIdempotencyKeyConsistency(t *testing.T) {
@@ -408,37 +464,6 @@ func TestIdempotencyKeyConsistency(t *testing.T) {
     // Verify: all generate same idempotency key
     // Verify: only one run enqueued despite multiple claims
 }
-```
-
-### Integration Tests
-
-```go
-func TestEndToEndScheduleExecution(t *testing.T) {
-    // 1. Create schedule in DB
-    // 2. Wait for next_run_at to arrive
-    // 3. Start worker
-    // 4. Verify run was enqueued (exactly once)
-    // 5. Verify worker executed it
-    // 6. Verify next_run_at was updated
-}
-
-func TestMultiWorkerScheduleClaiming(t *testing.T) {
-    // Start 5 workers
-    // Create schedule with next_run_at = now
-    // All 5 try to claim simultaneously
-    // Verify: 1 succeeds, others get SKIP LOCKED empty result
-    // Verify: count of enqueued runs = 1
-}
-
-func TestPauseResumeSchedule(t *testing.T) {
-    // Create schedule
-    // Pause it: enabled = false
-    // Wait for next_run_at
-    // Verify: worker skips it, no run enqueued
-    // Resume it: enabled = true, update next_run_at = now
-    // Verify: next claim loop picks it up and enqueues
-}
-```
 
 ### Load Tests
 
@@ -453,7 +478,78 @@ func BenchmarkScheduleClaiming(b *testing.B) {
 
 ---
 
-## 9. Backwards Compatibility
+## 9. PL/pgSQL Cron Implementation
+
+### Design Rationale
+
+Implementing cron parsing in PostgreSQL (not as an extension, just PL/pgSQL) aligns with Catbird's core principle: **no PostgreSQL extensions**. Benefits:
+
+- **Language-agnostic workers**: Python, Node, Ruby, Java, etc. can all schedule via the same API
+- **No version skew**: All workers use identical cron logic from the database
+- **Auditability**: Cron logic is queryable SQL, not compiled binary code
+- **Maintainability**: Single source of truth for scheduling behavior
+
+### Migration Function
+
+```sql
+CREATE OR REPLACE FUNCTION cb_next_cron_tick(
+    cron_spec TEXT,
+    from_time TIMESTAMPTZ
+)
+RETURNS TIMESTAMPTZ
+LANGUAGE plpgsql
+IMMUTABLE STRICT
+AS $$
+DECLARE
+    v_minute INT[];
+    v_hour INT[];
+    v_dom INT[];
+    v_month INT[];
+    v_dow INT[];
+    v_next TIMESTAMPTZ;
+BEGIN
+    -- Normalize cron_spec: handle @yearly, @monthly, @weekly, @daily, @hourly
+    -- Parse 5-field cron notation into arrays
+    -- Iterate from from_time, checking constraints until match found
+    -- Return matching time in UTC
+    
+    -- Implementation sketch:
+    CASE cron_spec
+        WHEN '@yearly' THEN RETURN make_timestamptz(EXTRACT(YEAR FROM from_time)::INT + 1, 1, 1, 0, 0, 0, 'UTC');
+        WHEN '@annually' THEN RETURN make_timestamptz(EXTRACT(YEAR FROM from_time)::INT + 1, 1, 1, 0, 0, 0, 'UTC');
+        WHEN '@monthly' THEN RETURN make_timestamptz(EXTRACT(YEAR FROM from_time)::INT, (EXTRACT(MONTH FROM from_time)::INT % 12) + 1, 1, 0, 0, 0, 'UTC');
+        WHEN '@weekly' THEN RETURN from_time + INTERVAL '1 week' - (EXTRACT(DOW FROM from_time)::INT) * INTERVAL '1 day';
+        WHEN '@daily' THEN RETURN (from_time + INTERVAL '1 day')::DATE::TIMESTAMPTZ AT TIME ZONE 'UTC';
+        WHEN '@hourly' THEN RETURN date_trunc('hour', from_time) + INTERVAL '1 hour';
+        -- Parse @reboot as immediate/now
+        WHEN '@reboot' THEN RETURN now() AT TIME ZONE 'UTC';
+        ELSE
+            -- Parse standard 5-field cron: minute hour dom month dow
+            -- For now, basic implementation
+            RAISE EXCEPTION 'Cron spec not yet supported: %', cron_spec;
+    END CASE;
+END;
+$$;
+```
+
+### Supported Cron Specs (Phase 2)
+
+**Initial release:**
+- ✅ Special keywords: `@yearly`, `@annually`, `@monthly`, `@weekly`, `@daily`, `@hourly`, `@reboot`
+
+**Phase 2B (optional):**
+- `0 9 * * *` (fixed times)
+- `*/15 * * * *` (intervals)
+- Ranges: `0-30`, `9,17`
+- Lists: `0,15,30,45`
+
+**Not supported:**
+- `H` (hash) - use `*/n` instead
+- Timezone-aware specs - all times must be UTC
+
+---
+
+## 10. Backwards Compatibility
 
 ### Coexistence Period
 
@@ -506,7 +602,7 @@ if useDBDrivenScheduling {
 
 ---
 
-## 10. Future Enhancements (Beyond Scope)
+## 11. Future Enhancements (Beyond Scope)
 
 ### 10.1 Schedule Templates
 
@@ -567,11 +663,16 @@ CREATE TABLE cb_schedule_metrics (
 
 ---
 
-## 11. Deployment Checklist
+## 12. Deployment Checklist
 
-- [ ] Schema migration created and tested
-- [ ] Worker code with `claimAndEnqueueSchedules()` implemented
-- [ ] Config option `UseDBDrivenScheduling` added
+- [ ] Create migration for `cb_schedules` table
+- [ ] Create migration for `cb_next_cron_tick()` PL/pgSQL function with comprehensive tests
+- [ ] Test cron function against edge cases (month boundaries, leap years, DST if applicable)
+- [ ] Implement `claimAndEnqueueSchedules()` worker method
+- [ ] Add config option: `UseDBDrivenScheduling: bool`
+- [ ] Document cron spec support (which formats are supported in Phase 2)
+- [ ] Test with both Option 1 and Option 2 enabled simultaneously
+- [ ] Add metrics: schedule claim latency, next_run_at accuracy, etc.
 - [ ] Comprehensive unit + integration tests added
 - [ ] Documentation updated (this file + code comments)
 - [ ] Monitoring/observability built (metrics, logging)
@@ -582,7 +683,7 @@ CREATE TABLE cb_schedule_metrics (
 
 ---
 
-## 12. Performance Considerations
+## 13. Performance Considerations
 
 ### Latency
 
