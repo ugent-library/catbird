@@ -11,6 +11,7 @@ A PostgreSQL-powered message queue and task execution engine. Catbird brings rel
 
 ## Why Catbird?
 
+- **Transactional operations**: All Catbird operations are transactional by design. Enqueue a message, update application state, and commit atomically—if the transaction rolls back, the message never existed. This eliminates the dual-write problem that plagues external message queues.
 - **Exactly-once execution within a timeframe**: PostgreSQL ensures each message is processed exactly once per visibility window, preventing duplicates even with multiple workers. If a worker crashes, the message becomes visible again after the configured timeout and can be retried.
 - **Database as coordinator**: PostgreSQL manages message distribution, deduplication, and state. Scale workers horizontally; the database handles the rest.
 - **Type-safe tasks**: Generic Go handlers with automatic JSON marshaling for inputs and outputs.
@@ -869,17 +870,68 @@ FROM cb_f_order_processing
 WHERE id = $1;
 ```
 
-## Dashboard Preview
+## Dashboard
 
-<p align="center">
-  <img src="screenshots/dashboard-queues.png" alt="Queues Management" width="800" />
-</p>
+The dashboard provides a web UI for monitoring and managing queues, tasks, flows, and workers. Monitor execution status in real-time, trigger new runs, and inspect results.
+
 <p align="center">
   <img src="screenshots/dashboard-flows.png" alt="Flow Visualization" width="800" />
 </p>
-<p align="center">
-  <img src="screenshots/dashboard-workers.png" alt="Workers Overview" width="800" />
-</p>
+
+### Running the Dashboard Standalone
+
+The easiest way to run the dashboard is using the `cb` CLI tool:
+
+```bash
+# Install the CLI
+go install github.com/ugent-library/catbird/cmd/cb@latest
+
+# Set your database connection string
+export CB_CONN="postgres://user:pass@localhost:5432/mydb?sslmode=disable"
+
+# Start the dashboard (default port 8080)
+cb dashboard
+
+# Or specify a custom port
+cb dashboard --port 3000
+```
+
+The dashboard will be available at `http://localhost:8080` (or your specified port).
+
+### Embedding the Dashboard in Your Application
+
+The dashboard is a standard `http.Handler` and can be embedded in any Go web application:
+
+```go
+import (
+    "log/slog"
+    "net/http"
+    
+    "github.com/ugent-library/catbird"
+    "github.com/ugent-library/catbird/dashboard"
+)
+
+func main() {
+    // Create a Catbird client
+    client := catbird.New(conn)
+    
+    // Create the dashboard
+    dash := dashboard.New(dashboard.Config{
+        Client:     client,
+        Log:        slog.Default(), // Optional: provide custom logger
+        PathPrefix: "",              // Optional: mount at a subpath (e.g., "/admin")
+    })
+    
+    // Option 1: Use the dashboard as your main handler
+    http.ListenAndServe(":8080", dash.Handler())
+    
+    // Option 2: Mount at a specific path
+    mux := http.NewServeMux()
+    mux.Handle("/admin/catbird/", http.StripPrefix("/admin/catbird", dash.Handler()))
+    mux.HandleFunc("/api/health", healthHandler)
+    http.ListenAndServe(":8080", mux)
+}
+```
 
 ## Documentation
 

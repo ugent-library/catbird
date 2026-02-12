@@ -31,9 +31,21 @@ type App struct {
 	workers *template.Template
 }
 
+// Config configures the dashboard web application.
 type Config struct {
-	Client     *catbird.Client
-	Log        *slog.Logger
+	// Client is a Catbird client connected to your database. Required.
+	Client *catbird.Client
+
+	// Log is a custom logger for dashboard operations. Optional.
+	// If nil, uses slog.Default().
+	Log *slog.Logger
+
+	// PathPrefix is the URL prefix for constructing internal links.
+	// This should match your routing setup. Optional.
+	//
+	// When mounting at root or using http.StripPrefix, leave empty.
+	// Example: if you mount at "/admin/catbird/" using http.StripPrefix,
+	// set PathPrefix to "" (the prefix is already stripped).
 	PathPrefix string
 }
 
