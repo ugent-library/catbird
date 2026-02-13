@@ -5,7 +5,10 @@
 --   cb_create_task(): Uses pg_advisory_xact_lock, safe for concurrent creation (first-wins)
 --   cb_create_flow(): Uses pg_advisory_xact_lock, safe for concurrent creation (first-wins)
 -- Hot path functions (millions of executions, no advisory locks):
---   cb_run_task(): Uses ON CONFLICT with dedup-id for idempotent task enqueueing - SAFE
+--   cb_run_task(): Uses atomic CTE + UNION ALL pattern with ON CONFLICT DO UPDATE WHERE FALSE - SAFE
+--     Critical: MUST use UNION ALL fallback, not bare RETURNING (returns NULL on conflict without it)
+--   cb_run_flow(): Uses atomic CTE + UNION ALL pattern with ON CONFLICT DO UPDATE WHERE FALSE - SAFE
+--     Critical: MUST use UNION ALL fallback, not bare RETURNING (returns NULL on conflict without it)
 --   cb_read_tasks(): Uses FOR UPDATE SKIP LOCKED for lock-free row polling - SAFE
 --   cb_read_poll_tasks(): Uses FOR UPDATE SKIP LOCKED in polling loop - SAFE
 --   cb_hide_tasks(): Direct UPDATE indexed by deliver_at, no locks - SAFE
@@ -13,6 +16,7 @@
 --   cb_activate_steps(): Lock-free condition evaluation + FOR UPDATE SKIP LOCKED - SAFE
 --   cb_update_step_output(): Atomic UPDATE with WHERE constraints - SAFE
 -- All operations maintain task/flow state invariants and step ordering
+-- Deduplication pattern reference: https://stackoverflow.com/a/35953488
 
 -- +goose up
 

@@ -7,13 +7,15 @@
 --   cb_delete_queue(): Uses pg_advisory_xact_lock, safe for concurrent deletion
 --   cb_bind(): Uses ON CONFLICT DO NOTHING, idempotent and safe
 -- Hot path functions (millions of executions, no advisory locks):
---   cb_send(): Uses ON CONFLICT (deduplication), atomic dedup-id handling - SAFE
+--   cb_send(): Uses atomic CTE + UNION ALL pattern with ON CONFLICT DO UPDATE WHERE FALSE - SAFE
+--     Critical: MUST use UNION ALL fallback, not bare RETURNING (returns NULL on conflict without it)
 --   cb_read(): Uses FOR UPDATE SKIP LOCKED for row-level concurrency - SAFE
 --   cb_read_poll(): Uses FOR UPDATE SKIP LOCKED in polling loop - SAFE
 --   cb_dispatch(): Iterates bindings, uses ON CONFLICT per queue - SAFE
 --   cb_hide(): Uses UPDATE with indexed deliver_at, no locks - SAFE
 --   cb_delete(): Direct DELETE operation, no locks - SAFE
 -- All operations maintain message ordering and deduplication invariants
+-- Deduplication pattern reference: https://stackoverflow.com/a/35953488
 
 -- +goose up
 
