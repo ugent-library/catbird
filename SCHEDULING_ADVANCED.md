@@ -4,8 +4,12 @@
 
 This document outlines the **strongest-guarantee scheduling solution** for Catbird, designed for future implementation after Option 1 (UTC-normalized idempotency keys) proves stable in production.
 
-**Current Status (Option 1):** ✅ Production-ready, all tests passing
+**Current Status (Option 1):** ✅ Production-ready, all tests passing  
 **Future Status (This Document):** 📋 Design phase, ready for implementation roadmap
+
+**Key Design Choice:** Option 2 requires cron parsing in the database. Two approaches:
+- **Option 9A (Recommended):** Custom PL/pgSQL implementation - self-contained, no extensions required
+- **Option 9B (Alternative):** Use pg_cron extension - battle-tested but requires extension installation
 
 ---
 
@@ -283,6 +287,7 @@ Since `next_run_at` is persisted in the database (not recalculated by each worke
 | **Recovery from Crash** | ⚠️ Depends on NTP state | ✅ DB has all state |
 | **Scaling** | ✅ O(1) per worker | ✅ O(1) per worker (DB handles distribution) |
 | **Operational Complexity** | ✅ Simpler (fewer moving parts) | ⚠️ One more table to manage |
+| **Cron Implementation** | ✅ Uses robfig/cron (proven library) | ⚠️ Choice: Custom PL/pgSQL or pg_cron extension |
 
 ### vs. Leader Election
 
@@ -340,8 +345,9 @@ Option 2 Advantage:
 - [ ] Document backwards compatibility
 
 ### Phase 2: Implementation (6-8 weeks estimated)
+- [ ] **Design decision**: Choose between custom PL/pgSQL cron (9A) or pg_cron extension (9B)
 - [ ] Add `cb_schedules` table via migration
-- [ ] Implement `cb_next_cron_tick()` PL/pgSQL function (cron parsing in database)
+- [ ] Implement `cb_next_cron_tick()` function (PL/pgSQL if 9A, pg_cron wrapper if 9B)
 - [ ] Add comprehensive tests for cron edge cases (month boundaries, leap years, etc.)
 - [ ] Implement `claimAndEnqueueSchedules()` worker method
 - [ ] Add config option: `UseDBDrivenScheduling: bool`
@@ -478,18 +484,66 @@ func BenchmarkScheduleClaiming(b *testing.B) {
 
 ---
 
-## 9. PL/pgSQL Cron Implementation
+## 9. Cron Implementation Strategy
 
-### Design Rationale
+### Design Decision: Custom PL/pgSQL vs. pg_cron Extension
 
-Implementing cron parsing in PostgreSQL (not as an extension, just PL/pgSQL) aligns with Catbird's core principle: **no PostgreSQL extensions**. Benefits:
+Two approaches for implementing cron parsing in the database:
 
-- **Language-agnostic workers**: Python, Node, Ruby, Java, etc. can all schedule via the same API
-- **No version skew**: All workers use identical cron logic from the database
-- **Auditability**: Cron logic is queryable SQL, not compiled binary code
-- **Maintainability**: Single source of truth for scheduling behavior
+#### Option 9A: Custom PL/pgSQL Implementation (Self-Contained)
 
-### Migration Function
+**Aligns with Catbird's core principle: no PostgreSQL extensions**
+
+**Benefits:**
+- ✅ **Language-agnostic workers**: Python, Node, Ruby, Java, etc. can all schedule via the same API
+- ✅ **No version skew**: All workers use identical cron logic from the database
+- ✅ **No extension dependency**: Works on any PostgreSQL instance (RDS, managed services, locked-down environments)
+- ✅ **Auditability**: Cron logic is queryable SQL, not compiled binary code
+- ✅ **Full control**: Can customize behavior, add features, fix bugs independently
+- ✅ **Maintainability**: Single source of truth for scheduling behavior
+
+**Drawbacks:**
+- ⚠️ **Implementation complexity**: PL/pgSQL cron parsing is verbose (100-200 lines)
+- ⚠️ **Edge cases**: Must handle leap years, month boundaries, DST, etc. manually
+- ⚠️ **Performance**: Iterative datetime generation slower than optimized C extension
+- ⚠️ **Testing burden**: Must validate against all cron spec edge cases
+
+#### Option 9B: Use pg_cron Extension
+
+**Leverage battle-tested, widely-deployed PostgreSQL extension**
+
+**Benefits:**
+- ✅ **Battle-tested**: Used in production by thousands of deployments
+- ✅ **Fast**: Written in C, highly optimized cron parsing
+- ✅ **Complete**: Handles all cron specs, edge cases already solved
+- ✅ **Less code**: No need to implement/maintain cron logic
+- ✅ **Community support**: Active maintenance, bug fixes, security patches
+- ✅ **Native integration**: Built for PostgreSQL scheduling use cases
+
+**Drawbacks:**
+- ❌ **Requires extension installation**: Violates Catbird's "no extensions" principle
+- ❌ **Deployment friction**: Not available on all managed PostgreSQL services (requires superuser)
+- ❌ **Version dependency**: Must ensure pg_cron version compatibility
+- ❌ **Less control**: Can't customize behavior without forking extension
+
+### Recommendation
+
+**Phase 2 starts with Option 9A (Custom PL/pgSQL)** to maintain Catbird's zero-extension philosophy. This keeps deployment simple and maximizes compatibility.
+
+**Phase 3 (optional)** could add **Option 9B (pg_cron) as an opt-in alternative** for deployments that:
+- Already use pg_cron for other purposes
+- Need maximum performance (100k+ schedules)
+- Prioritize battle-tested code over self-containment
+
+Both options can coexist via a configuration flag:
+```go
+worker := NewWorker(ctx,
+    WithDBDrivenSchedule("task", "@hourly"),
+    WithCronImplementation(CronImplementationPgCron), // vs CronImplementationPLpgSQL
+)
+```
+
+### Option 9A Implementation: Custom PL/pgSQL Function
 
 ```sql
 CREATE OR REPLACE FUNCTION cb_next_cron_tick(
@@ -531,6 +585,40 @@ BEGIN
 END;
 $$;
 ```
+
+### Option 9B Implementation: Using pg_cron Extension
+
+```sql
+-- Install pg_cron extension (requires superuser)
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+-- Wrapper function that delegates to pg_cron's internal parser
+CREATE OR REPLACE FUNCTION cb_next_cron_tick(
+    cron_spec TEXT,
+    from_time TIMESTAMPTZ
+)
+RETURNS TIMESTAMPTZ
+LANGUAGE plpgsql
+IMMUTABLE STRICT
+AS $$
+BEGIN
+    -- Use pg_cron's cron parsing logic
+    -- Note: pg_cron doesn't expose a direct "next tick" function,
+    -- so we'd need to schedule a dummy job and query its next run time,
+    -- or extract the parsing logic from pg_cron source.
+    -- 
+    -- Alternative: Use pg_cron's job scheduler directly in cb_schedules
+    -- and let pg_cron handle the firing (different architecture)
+    RAISE EXCEPTION 'pg_cron integration not yet implemented';
+END;
+$$;
+```
+
+**Note**: pg_cron doesn't expose a "calculate next tick" API directly. You'd either:
+1. Extract/port pg_cron's C parsing logic to PL/pgSQL (defeats the purpose)
+2. Use pg_cron's job scheduler directly and change the architecture (schedules live in `cron.job` table, not `cb_schedules`)
+
+For Catbird's use case, **Option 9A (custom PL/pgSQL) is cleaner** even if pg_cron is available.
 
 ### Supported Cron Specs (Phase 2)
 
@@ -665,8 +753,10 @@ CREATE TABLE cb_schedule_metrics (
 
 ## 12. Deployment Checklist
 
+- [ ] **Decide on cron implementation**: Custom PL/pgSQL (9A) or pg_cron extension (9B)
 - [ ] Create migration for `cb_schedules` table
-- [ ] Create migration for `cb_next_cron_tick()` PL/pgSQL function with comprehensive tests
+- [ ] Create migration for `cb_next_cron_tick()` function (implementation depends on choice)
+- [ ] If using pg_cron (9B): document extension installation requirements
 - [ ] Test cron function against edge cases (month boundaries, leap years, DST if applicable)
 - [ ] Implement `claimAndEnqueueSchedules()` worker method
 - [ ] Add config option: `UseDBDrivenScheduling: bool`
@@ -735,9 +825,20 @@ Option 2 provides the **strongest durability and operational guarantees**:
 
 DB-driven scheduling is the strongest-guarantee approach for Catbird's distributed scheduling. While Option 1 (UTC + IdempotencyKey) is suitable for immediate deployment and covers most real-world scenarios, DB-driven scheduling should be pursued as a future enhancement for applications requiring absolute immunity to clock skew and centralized schedule management.
 
+### Implementation Path
+
+**Phase 1 (Current):** ✅ Option 1 deployed and proven stable
+
+**Phase 2 (Future):** Implement DB-driven scheduling with choice of cron parser:
+- **Recommended**: Custom PL/pgSQL (Option 9A) - maintains Catbird's zero-extension philosophy
+- **Alternative**: pg_cron extension (Option 9B) - if deployment environment already uses extensions
+
+**Phase 3 (Optional):** Support both cron implementations as configuration option
+
 The phased approach allows us to:
 1. Ship Option 1 today (done ✅)
-2. Introduce DB-driven scheduling as opt-in
-3. Eventually unify on DB-driven as the default
+2. Introduce DB-driven scheduling as opt-in with self-contained cron parsing
+3. Optionally add pg_cron support for deployments that prefer it
+4. Eventually unify on DB-driven as the default
 
-This aligns with Catbird's design principle: **PostgreSQL as the single source of truth for all coordination.**
+This aligns with Catbird's design principle: **PostgreSQL as the single source of truth for all coordination**, with flexibility in how that coordination is implemented.
