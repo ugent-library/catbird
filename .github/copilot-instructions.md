@@ -259,3 +259,26 @@ docker compose logs -f postgres
 7. **Conditional execution**: Use `WithCondition("expression")` as a HandlerOpt for both tasks and flow steps. Tasks use `input.field` syntax (e.g., `WithCondition("input.is_premium")`), flow steps use `step_name.field` syntax (e.g., `WithCondition("validate.score gte 50")`)
 8. **Optional dependencies**: Use `Optional[T]` + `OptionalDependency()` pair when depending on conditional steps. Validation at flow construction time enforces type safety.
 9. **SQL parameter/column conflicts**: Use `#variable_conflict use_column` directive in PL/pgSQL when parameter names match column names (prevents "column ambiguous" errors)
+10. **Atomic deduplication with UNION ALL**: For `RunTask()` and `RunFlow()` deduplication (concurrency_key / idempotency_key), use the atomic ON CONFLICT DO UPDATE pattern with UNION ALL fallback. **DO NOT remove the UNION ALL or simplify to plain `RETURNING id`**. The pattern is:
+```sql
+WITH ins AS (
+    INSERT INTO table_name (key_col, data_col)
+    VALUES ($1, $2)
+    ON CONFLICT (key_col) WHERE condition
+    DO UPDATE SET col = EXCLUDED.col WHERE FALSE
+    RETURNING id
+)
+SELECT id FROM ins
+UNION ALL
+SELECT id FROM table_name
+WHERE key_col = $1 AND condition
+LIMIT 1
+```
+**Why this pattern is essential**:
+- `WHERE FALSE` prevents the update from executing (no state mutation on conflict), but still locks the row atomically
+- The UNION ALL fallback returns the conflicting row's ID if INSERT fails, handling the conflict case
+- Together they guarantee exactly one row ID is returned atomically—no race window between INSERT and SELECT
+- Simplifying to bare `DO UPDATE ... WHERE FALSE RETURNING id` causes NULL returns on conflict (RETURNING doesn't fire in DO UPDATE branch)
+- Plain `DO UPDATE SET col = col RETURNING id` has ambiguous column references under `#variable_conflict use_column` directive
+**Used in**: `cb_run_task()`, `cb_run_flow()`, `cb_send()` for both concurrency_key and idempotency_key variants
+**Reference**: https://stackoverflow.com/a/35953488
