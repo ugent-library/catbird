@@ -355,14 +355,25 @@ DECLARE
     _q_table text := cb_table_name(cb_send.queue, 'q');
     _id bigint;
 BEGIN
+    -- ON CONFLICT DO UPDATE with WHERE FALSE: atomic insert + return row ID (new or conflicting).
+    -- Use UNION ALL to handle both INSERT success and conflict cases atomically.
+    -- Pattern from: https://stackoverflow.com/a/35953488
     EXECUTE format(
         $QUERY$
-        INSERT INTO %I (topic, payload, idempotency_key, deliver_at)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (idempotency_key) DO NOTHING
-        RETURNING id;
+        WITH ins AS (
+            INSERT INTO %I (topic, payload, idempotency_key, deliver_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
+            DO UPDATE SET deliver_at = EXCLUDED.deliver_at WHERE FALSE
+            RETURNING id
+        )
+        SELECT id FROM ins
+        UNION ALL
+        SELECT id FROM %I
+        WHERE idempotency_key = $3 AND idempotency_key IS NOT NULL
+        LIMIT 1
         $QUERY$,
-        _q_table
+        _q_table, _q_table
     )
     USING cb_send.topic,
           cb_send.payload,

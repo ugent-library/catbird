@@ -532,61 +532,52 @@ BEGIN
         RAISE EXCEPTION 'cb: cannot specify both concurrency_key and idempotency_key';
     END IF;
 
-    -- See https://dba.stackexchange.com/questions/212580/concurrent-transactions-result-in-race-condition-with-unique-constraint-on-inser/213625#213625
+    -- ON CONFLICT DO UPDATE with WHERE FALSE: atomic insert + return conflicting row ID.
+    -- WHERE FALSE prevents the update from executing, but RETURNING still returns the conflict row.
+    -- Use UNION ALL to handle both INSERT success and conflict cases atomically.
+    -- Pattern from: https://stackoverflow.com/a/35953488
     IF cb_run_task.concurrency_key IS NOT NULL THEN
         -- Concurrency control: dedupe only queued/started
         EXECUTE format(
             $QUERY$
-            INSERT INTO %I (input, concurrency_key)
-            VALUES ($1, $2)
-            ON CONFLICT (concurrency_key) WHERE concurrency_key IS NOT NULL AND status IN ('queued', 'started') DO NOTHING
-            RETURNING id
+            WITH ins AS (
+                INSERT INTO %I (input, concurrency_key)
+                VALUES ($1, $2)
+                ON CONFLICT (concurrency_key) WHERE concurrency_key IS NOT NULL AND status IN ('queued', 'started')
+                DO UPDATE SET status = EXCLUDED.status WHERE FALSE
+                RETURNING id
+            )
+            SELECT id FROM ins
+            UNION ALL
+            SELECT id FROM %I
+            WHERE concurrency_key = $2 AND concurrency_key IS NOT NULL AND status IN ('queued', 'started')
+            LIMIT 1
             $QUERY$,
-            _t_table
+            _t_table, _t_table
         )
         USING cb_run_task.input, cb_run_task.concurrency_key
         INTO _id;
-        
-        -- If duplicate (no row inserted), get the existing row's ID
-        IF _id IS NULL THEN
-            EXECUTE format(
-                $QUERY$
-                SELECT id FROM %I
-                WHERE concurrency_key = $1 AND status IN ('queued', 'started')
-                LIMIT 1
-                $QUERY$,
-                _t_table
-            )
-            USING cb_run_task.concurrency_key
-            INTO _id;
-        END IF;
     ELSIF cb_run_task.idempotency_key IS NOT NULL THEN
         -- Idempotency: dedupe queued/started/completed
         EXECUTE format(
             $QUERY$
-            INSERT INTO %I (input, idempotency_key)
-            VALUES ($1, $2)
-            ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('queued', 'started', 'completed') DO NOTHING
-            RETURNING id
+            WITH ins AS (
+                INSERT INTO %I (input, idempotency_key)
+                VALUES ($1, $2)
+                ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('queued', 'started', 'completed')
+                DO UPDATE SET status = EXCLUDED.status WHERE FALSE
+                RETURNING id
+            )
+            SELECT id FROM ins
+            UNION ALL
+            SELECT id FROM %I
+            WHERE idempotency_key = $2 AND idempotency_key IS NOT NULL AND status IN ('queued', 'started', 'completed')
+            LIMIT 1
             $QUERY$,
-            _t_table
+            _t_table, _t_table
         )
         USING cb_run_task.input, cb_run_task.idempotency_key
         INTO _id;
-        
-        -- If duplicate (no row inserted), get the existing row's ID
-        IF _id IS NULL THEN
-            EXECUTE format(
-                $QUERY$
-                SELECT id FROM %I
-                WHERE idempotency_key = $1 AND status IN ('queued', 'started', 'completed')
-                LIMIT 1
-                $QUERY$,
-                _t_table
-            )
-            USING cb_run_task.idempotency_key
-            INTO _id;
-        END IF;
     ELSE
         -- No deduplication
         EXECUTE format(
@@ -1022,60 +1013,51 @@ BEGIN
     WHERE s.flow_name = cb_run_flow.name;
 
     -- Create flow run or get existing run with same key
+    -- ON CONFLICT DO UPDATE with WHERE FALSE: atomic insert + return conflicting row ID.
+    -- Use UNION ALL to handle both INSERT success and conflict cases atomically.
+    -- Pattern from: https://stackoverflow.com/a/35953488
     IF cb_run_flow.concurrency_key IS NOT NULL THEN
         -- Concurrency control: dedupe only started
         EXECUTE format(
             $QUERY$
-            INSERT INTO %I (concurrency_key, input, remaining_steps, status)
-            VALUES ($1, $2, $3, 'started')
-            ON CONFLICT (concurrency_key) WHERE concurrency_key IS NOT NULL AND status = 'started' DO NOTHING
-            RETURNING id
+            WITH ins AS (
+                INSERT INTO %I (concurrency_key, input, remaining_steps, status)
+                VALUES ($1, $2, $3, 'started')
+                ON CONFLICT (concurrency_key) WHERE concurrency_key IS NOT NULL AND status = 'started'
+                DO UPDATE SET status = EXCLUDED.status WHERE FALSE
+                RETURNING id
+            )
+            SELECT id FROM ins
+            UNION ALL
+            SELECT id FROM %I
+            WHERE concurrency_key = $1 AND concurrency_key IS NOT NULL AND status = 'started'
+            LIMIT 1
             $QUERY$,
-            _f_table
+            _f_table, _f_table
         )
         USING cb_run_flow.concurrency_key, cb_run_flow.input, _remaining_steps
         INTO _id;
-        
-        -- If duplicate (no row inserted), get the existing row's ID
-        IF _id IS NULL THEN
-            EXECUTE format(
-                $QUERY$
-                SELECT id FROM %I
-                WHERE concurrency_key = $1 AND status = 'started'
-                LIMIT 1
-                $QUERY$,
-                _f_table
-            )
-            USING cb_run_flow.concurrency_key
-            INTO _id;
-        END IF;
     ELSIF cb_run_flow.idempotency_key IS NOT NULL THEN
         -- Idempotency: dedupe started/completed
         EXECUTE format(
             $QUERY$
-            INSERT INTO %I (idempotency_key, input, remaining_steps, status)
-            VALUES ($1, $2, $3, 'started')
-            ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('started', 'completed') DO NOTHING
-            RETURNING id
+            WITH ins AS (
+                INSERT INTO %I (idempotency_key, input, remaining_steps, status)
+                VALUES ($1, $2, $3, 'started')
+                ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('started', 'completed')
+                DO UPDATE SET status = EXCLUDED.status WHERE FALSE
+                RETURNING id
+            )
+            SELECT id FROM ins
+            UNION ALL
+            SELECT id FROM %I
+            WHERE idempotency_key = $1 AND idempotency_key IS NOT NULL AND status IN ('started', 'completed')
+            LIMIT 1
             $QUERY$,
-            _f_table
+            _f_table, _f_table
         )
         USING cb_run_flow.idempotency_key, cb_run_flow.input, _remaining_steps
         INTO _id;
-        
-        -- If duplicate (no row inserted), get the existing row's ID
-        IF _id IS NULL THEN
-            EXECUTE format(
-                $QUERY$
-                SELECT id FROM %I
-                WHERE idempotency_key = $1 AND status IN ('started', 'completed')
-                LIMIT 1
-                $QUERY$,
-                _f_table
-            )
-            USING cb_run_flow.idempotency_key
-            INTO _id;
-        END IF;
     ELSE
         -- No deduplication
         EXECUTE format(
@@ -1281,7 +1263,7 @@ BEGIN
       _s_table
     )
     USING _step_to_process.id;
-    
+
     _steps_processed_this_iteration := _steps_processed_this_iteration + 1;
     END LOOP;
     
