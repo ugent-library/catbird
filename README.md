@@ -724,7 +724,7 @@ task := catbird.NewTask("age_restricted",
   SELECT id, status, skipped_at FROM cb_t_<task_name> WHERE id = $1;
   
   -- For flow steps
-  SELECT name, status, skipped_at FROM cb_step_runs WHERE flow_run_id = $1 ORDER BY started_at;
+  SELECT name, status, skipped_at FROM cb_s_<flow_name> WHERE flow_run_id = $1 ORDER BY started_at;
   ```
 - `status = 'skipped'` means the condition was false (or field missing)
 - `status = 'failed'` means the execution returned an error
