@@ -241,8 +241,6 @@ catbird.NewTask("name").
 
 ### 4. Signal Support
 
-### 4. Signal Support
-
 Signals are handled via separate builder variants:
 
 ```go
