@@ -1021,4 +1021,4 @@ NewStep("x").DependsOn[ValidationResult]("v").WithHandler(
 )  // ❌ Compile error!
 ```
 
-Compared to the reflection builder in BUILDER_API_DESIGN.md, this trades off implementation complexity and binary size for zero runtime reflection overhead and compile-time type safety.
+Compared to the reflection builder in REFLECTION_API_DESIGN.md, this trades off implementation complexity and binary size for zero runtime reflection overhead and compile-time type safety.
