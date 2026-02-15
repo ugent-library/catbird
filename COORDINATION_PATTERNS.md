@@ -117,17 +117,17 @@ Patterns vary in how much coordination lives in PostgreSQL vs the worker/client.
 - Client: Just call `RunFlow()`
 
 **Characteristics**:
-- ✅ Automatically detected by `DependsOn[[]ItemType]()`
-- ✅ Index-based ordering
-- ✅ Independent retry per item
-- ✅ Simple aggregation
-- ✅ Crash-safe (all state in tables)
-- ✅ Horizontal scaling trivial
+- ✓ Automatically detected via reflection from dependency types
+- ✓ Index-based ordering
+- ✓ Independent retry per item
+- ✓ Simple aggregation
+- ✓ Crash-safe (all state in tables)
+- ✓ Horizontal scaling trivial
 
 **Example**:
 ```go
 NewStep("process-orders").
-    DependsOn[[]Order]("fetch-orders").
+    DependsOn(catbird.Dep[[]Order]("fetch-orders")).
     WithHandler(func(ctx context.Context, order Order) (OrderResult, error) {
         return processOrder(ctx, order)
     }, WithConcurrency(10))
@@ -162,7 +162,7 @@ NewStep("process-orders").
 *Cursor-based pagination:*
 ```go
 NewGeneratorStep("index-records").
-    DependsOn[Config]("config-step").
+    DependsOn(catbird.Dep[Config]("config-step")).
     WithGenerator(
         // Generator: yields items via channel
         func(ctx context.Context, config Config, yield chan<- Record) error {
@@ -220,7 +220,7 @@ NewGeneratorStep("index-records").
 **Example**:
 ```go
 NewStep("crawl-site").
-    DependsOn[URL]("start-url").
+    "DependsOn(catbird.Dep[URL]("start-url").
     WithTaskPool("crawl-ops").
     WithHandler(
         func(ctx context.Context, stepCtx StepContext, baseURL URL, pageURL URL) (CrawlResult, error) {
@@ -268,7 +268,7 @@ NewStep("crawl-site").
 **Example**:
 ```go
 NewProducerStep("listen-changes").
-    DependsOn[IndexID]("create-index").
+    "DependsOn(catbird.Dep[IndexID]("create-index").
     WithTaskPool("index-ops").
     WithDrainTimeout(5*time.Minute).
     WithIdleTimeout(30*time.Second).
@@ -321,7 +321,7 @@ flow := NewFlow("reindex",
     
     // Phase 2a: Reindex (spawner 1)
     NewStep("reindex-pages").
-        DependsOn[IndexID]("create-index").
+        "DependsOn(catbird.Dep[IndexID]("create-index").
         WithTaskPool("index-ops").
         WithHandler(func(ctx context.Context, stepCtx StepContext, indexID IndexID) (Summary, error) {
             // ... page through DB, spawn tasks ...
@@ -331,7 +331,7 @@ flow := NewFlow("reindex",
     
     // Phase 2b: Listen (spawner 2 - producer)
     NewProducerStep("listen-changes").
-        DependsOn[IndexID]("create-index").
+        "DependsOn(catbird.Dep[IndexID]("create-index").
         WithTaskPool("index-ops").  // SAME POOL!
         WithDrainTimeout(5*time.Minute).
         WithHandler(func(ctx context.Context, stepCtx StepContext, indexID IndexID) (Summary, error) {
@@ -342,8 +342,8 @@ flow := NewFlow("reindex",
     
     // Phase 3: Convergence (waiter)
     NewStep("switch-index").
-        DependsOn[Summary]("reindex-pages").
-        DependsOn[Summary]("listen-changes").
+        "DependsOn(catbird.Dep[Summary]("reindex-pages").
+        "DependsOn(catbird.Dep[Summary]("listen-changes").
         WithTaskPool("index-ops").
         WithHandler(func(ctx context.Context, stepCtx StepContext, r1 Summary, r2 Summary) error {
             // Both spawners done, pool in DRAINING phase
@@ -434,8 +434,8 @@ type StepContext interface {
 The framework automatically detects array types:
 ```go
 DependsOn[[]Order]("fetch")  // → MapStep
-DependsOn[OrderList]("fetch") // If OrderList == []Order → MapStep
-DependsOn[Order]("fetch")     // Regular (not map)
+"DependsOn(catbird.Dep[OrderList]("fetch") // If OrderList == []Order → MapStep
+"DependsOn(catbird.Dep[Order]("fetch")     // Regular (not map)
 ```
 
 ### Task Spawning

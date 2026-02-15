@@ -1,6 +1,6 @@
 # Map Steps Design Document
 
-> **Updated**: Map steps now use the **typed builder pattern** from [GENERIC_API_DESIGN.md](GENERIC_API_DESIGN.md) with strong compile-time type checking. Dependencies are function parameters; array detection is automatic based on return types.
+> **Updated**: Map steps use the **reflection-based builder pattern** from [REFLECTION_API_DESIGN.md](REFLECTION_API_DESIGN.md). Dependencies are validated at build time; array detection is automatic based on return types.
 
 ## Overview
 
@@ -796,12 +796,12 @@ $$;
 
 ## Go API
 
-### Design Pattern: Typed Builders with Generics
+### Design Pattern: Reflection-Based Builders
 
-Map steps use the same **typed builder pattern** as all flow steps (from [GENERIC_API_DESIGN.md](GENERIC_API_DESIGN.md)), with array support:
+Map steps use the same **reflection-based builder pattern** as all flow steps (from [REFLECTION_API_DESIGN.md](REFLECTION_API_DESIGN.md)), with array support:
 
 ```go
-// All flow steps use typed builders: NewStep, NewStep with dependencies, etc.
+// All flow steps use reflection-based builders: NewStep, DependsOn, WithHandler, etc.
 // Map steps extend this with array processing
 
 // Simple map step (no dependencies - operate on flow input array)
@@ -817,8 +817,9 @@ mapStep1 := catbird.NewStep("process-items").
     )
 
 // Map step with dependency (operate on dependency output array)
+// Note: Dep[T] captures type for validation, DependsOn uses reflection
 mapStep2 := catbird.NewStep("transform").
-    DependsOn[[]Record]("fetch-records"). // Depends on step that returns array
+    DependsOn(catbird.Dep[[]Record]("fetch-records")). // Depends on step that returns array
     WithHandler(
         func(
             ctx context.Context,
@@ -833,9 +834,8 @@ mapStep2 := catbird.NewStep("transform").
 
 // Map step with signal and condition
 mapStep3 := catbird.NewStep("validate-with-approval").
-    DependsOn[[]FormSubmission]("collect-submissions").
-    WithSignal[ApprovalSig]().
-    WithCondition("input.requires_review").
+    DependsOn(catbird.Dep[[]FormSubmission]("collect-submissions")).
+    RequiresSignal().
     WithHandler(
         func(
             ctx context.Context,
@@ -844,23 +844,24 @@ mapStep3 := catbird.NewStep("validate-with-approval").
         ) (ValidationResult, error) {
             return validateSubmission(ctx, submission, approval)
         },
+        catbird.WithCondition("input.requires_review"),
     )
 ```
 
 ### Array Detection
 
-The framework automatically detects array types:
+The framework automatically detects array types using reflection:
 
 ```go
-// If DependsOn return type is []T, the step becomes a map step
+// If Dep[T] specifies array type []T, the step becomes a map step
 step := NewStep("process").
-    DependsOn[[]Order]("fetch-orders").  // Array type → map step
+    DependsOn(catbird.Dep[[]Order]("fetch-orders")).  // Array type → map step
     WithHandler(func(ctx context.Context, order Order) (Result, error) { ... })
 
-// Input array can be explicit in step definition
-step := NewStep("process-items").
-    WithArrayInput[Item]().  // Process input array
-    WithHandler(func(ctx context.Context, item Item) (Result, error) { ... })
+// Handler signature analysis (via reflection) detects array processing:
+// - Dependency returns []Order
+// - Handler accepts single Order → map step detected
+// - Runtime wrapper spawns tasks for each element
 
 // Framework handles:
 // - Spawning individual tasks for each array element
@@ -1193,9 +1194,9 @@ flow := catbird.NewFlow("file-processor",
             return req.Files, nil
         }),
     
-    // Step 2: Map over files (automatically detected by []File return type)
+    // Step 2: Map over files (automatically detected via reflection)
     NewStep("process-file").
-        DependsOn[[]File]("upload").
+        DependsOn(catbird.Dep[[]File]("upload")).
         WithHandler(
             func(ctx context.Context, file File) (FileResult, error) {
                 // Process each file independently
@@ -1218,7 +1219,7 @@ flow := catbird.NewFlow("file-processor",
     
     // Step 3: Aggregate results
     NewStep("summary").
-        DependsOn[[]FileResult]("process-file").
+        DependsOn(catbird.Dep[[]FileResult]("process-file")).
         WithHandler(
             func(ctx context.Context, results []FileResult) (Summary, error) {
                 var totalSize int
@@ -1256,9 +1257,9 @@ flow := catbird.NewFlow("email-campaign",
             return db.GetActiveSubscribers(ctx, campaignID)
         }),
     
-    // Map step with circuit breaker (automatically detected by []Email return type)
+    // Map step with circuit breaker (array detected via reflection)
     NewStep("send-email").
-        DependsOn[[]Subscriber]("get-subscribers").
+        DependsOn(catbird.Dep[[]Subscriber]("get-subscribers")).
         WithHandler(
             func(ctx context.Context, sub Subscriber) (EmailResult, error) {
                 // Circuit breaker: fail fast if email service is down
@@ -1271,7 +1272,7 @@ flow := catbird.NewFlow("email-campaign",
         ),
     
     NewStep("report").
-        DependsOn[[]EmailResult]("send-email").
+        DependsOn(catbird.Dep[[]EmailResult]("send-email")).
         WithHandler(
             func(ctx context.Context, results []EmailResult) (Report, error) {
                 sent, failed := 0, 0

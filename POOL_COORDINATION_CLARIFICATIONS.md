@@ -1,5 +1,7 @@
 # Clarifications: Pool Arguments, Step I/O, and Temporal Coordination
 
+> **Note**: This document explores design patterns conceptually. Code examples use pseudo-generic method syntax (e.g., `DependsOn[T]()`) for clarity. The actual implementation uses the reflection-based API from [REFLECTION_API_DESIGN.md](REFLECTION_API_DESIGN.md) where types are captured via `Dep[T]()` and validated at build time using cached reflection.
+
 > **Updated**: This document uses **strong typing patterns** from [TYPED_COORDINATION.md](TYPED_COORDINATION.md). Dependencies are injected as function parameters; side effects and pool operations go through `StepContext`.
 
 ## Issue 1: How Pool Argument Coexists with Step Input/Output
@@ -58,7 +60,7 @@ type StepContext interface {
 // Step handler signature: dependencies as parameters, context as explicit param
 func(ctx context.Context, stepCtx StepContext, cfg IndexConfig) (Output, error)
 
-// Usage with typed builder:
+// Usage with reflection-based builder:
 StepWithDependency("listen-changes", Dependency("create-index"),
     func(ctx context.Context, stepCtx StepContext, cfg IndexConfig) (SummaryOutput, error) {
         // cfg is dependency - injected directly with type safety
@@ -216,7 +218,7 @@ flow := catbird.NewFlow("reindex",
     
     // Branch 1: Reindex existing records
     NewStep("reindex-pages").
-        DependsOn[IndexID]("create-index").
+        DependsOn(catbird.Dep[IndexID]("create-index")).
         WithTaskPool("index-ops").
         WithHandler(
             func(ctx context.Context, stepCtx StepContext, cfg IndexConfig, indexID IndexID) (Summary, error) {
@@ -244,7 +246,7 @@ flow := catbird.NewFlow("reindex",
     
     // Branch 2: Listen for changes (producer step)
     NewProducerStep("listen-changes").
-        DependsOn[IndexID]("create-index").
+        DependsOn(catbird.Dep[IndexID]("create-index")).
         WithTaskPool("index-ops").
         WithHandler(
             func(ctx context.Context, stepCtx StepContext, cfg IndexConfig, indexID IndexID) (Summary, error) {
@@ -267,8 +269,8 @@ flow := catbird.NewFlow("reindex",
     
     // Phase 3: Convergence
     NewStep("switch-index").
-        DependsOn[Summary]("reindex-pages").
-        DependsOn[Summary]("listen-changes").
+        DependsOn(catbird.Dep[Summary]("reindex-pages")).
+        DependsOn(catbird.Dep[Summary]("listen-changes")).
         WithTaskPool("index-ops").
         WithHandler(
             func(ctx context.Context, stepCtx StepContext, cfg IndexConfig, reindexResult Summary, listenResult Summary) error {
@@ -364,7 +366,7 @@ func (b *ProducerStepBuilder[Out]) WithHandler[D1 any](
 
 ```go
 listenStep := NewProducerStep[Summary]("listen-changes").
-    DependsOn[IndexID]("create-index").
+    DependsOn(catbird.Dep[IndexID]("create-index")).
     WithTaskPool("index-ops").
     WithDrainTimeout(5*time.Minute).
     WithIdleTimeout(30*time.Second).
@@ -986,7 +988,7 @@ flow := catbird.NewFlow("reindex",
     // Reads existing records from primary DB using pagination
     // Spawns indexed tasks for each record
     catbird.NewGeneratorStep("reindex-records").
-        catbird.DependsOn[IndexID]("create-index").
+        catbird."DependsOn(catbird.Dep[IndexID]("create-index").
         catbird.WithTaskPool("index-ops").
         catbird.WithGenerator(
             // GENERATOR: Stream through records (millions)
@@ -1046,7 +1048,7 @@ flow := catbird.NewFlow("reindex",
     // Spawns tasks for each arriving change
     // Must exit **gracefully** when reindex is done, even if changes keep arriving
     catbird.NewProducerStep("listen-changes").
-        catbird.DependsOn[IndexID]("create-index").
+        catbird."DependsOn(catbird.Dep[IndexID]("create-index").
         catbird.WithTaskPool("index-ops").  // SAME POOL as reindex
         catbird.WithDrainTimeout(5 * time.Minute).  // Max time to wait for tasks
         catbird.WithHandler(
@@ -1108,8 +1110,8 @@ flow := catbird.NewFlow("reindex",
     // Both spawners have finished. Pool is in DRAINING phase.
     // Wait for ALL tasks from both sources to complete.
     catbird.NewStep("switch-index").
-        catbird.DependsOn[IndexResult]("reindex-records").  // awaits reindex completion
-        catbird.DependsOn[Summary]("listen-changes").  // awaits listener completion
+        catbird."DependsOn(catbird.Dep[IndexResult]("reindex-records").  // awaits reindex completion
+        catbird."DependsOn(catbird.Dep[Summary]("listen-changes").  // awaits listener completion
         catbird.WithTaskPool("index-ops").
         catbird.WithHandler(
             func(ctx context.Context, stepCtx catbird.StepContext) error {

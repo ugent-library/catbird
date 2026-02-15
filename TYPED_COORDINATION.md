@@ -1,23 +1,38 @@
-# Strong Typing for Coordination: Typed Builders + StepContext
+# Strong Typing for Coordination: Reflection API + StepContext
 
-Building on [GENERIC_API_DESIGN.md](GENERIC_API_DESIGN.md), this document applies typed builder patterns to dynamic task spawning, producer steps, and task pools for full compile-time type safety.
+> **Status**: Conceptual exploration of advanced coordination patterns
+> 
+> **Implementation**: This document explores coordination patterns that extend [REFLECTION_API_DESIGN.md](REFLECTION_API_DESIGN.md). All type validation uses cached reflection at build time. Handler signatures are validated when calling `.WithHandler()`.
+
+Building on [REFLECTION_API_DESIGN.md](REFLECTION_API_DESIGN.md), this document explores how to extend the reflection-based builder pattern for dynamic task spawning, producer steps, and task pools.
 
 ## Core Insight: Dependencies as Function Parameters
 
-From GENERIC_API_DESIGN, dependencies are part of the **function signature**, not accessed dynamically:
+Dependencies are validated through the **function signature** using reflection at build time:
 
 ```go
-// StepBuilder2[ValidationResult, FraudCheckResult]
-func(ctx context.Context, in Input, v ValidationResult, f FraudCheckResult) (Output, error)
+// Example: Handler with two dependencies
+// When you call .WithHandler(), reflection validates:
+// - First param is context.Context
+// - Second param matches step input type
+// - Third param matches first dependency type (ValidationResult)
+// - Fourth param matches second dependency type (FraudCheckResult)
+// - Returns (Output, error)
+func(ctx context.Context, in Input, v ValidationResult, f FraudCheckResult) (Output, error) {
+    return processWithDependencies(v, f), nil
+}
 ```
 
-We extend this: **StepContext is an additional typed parameter** that carries side-effect APIs:
+We extend this: **StepContext is an additional parameter** for side effects:
 
 ```go
-// StepBuilder2 WITH side effects
-func(ctx context.Context, stepCtx StepContext, in Input, v ValidationResult, f FraudCheckResult) (Output, error) {
-    // Dependencies are type-safe (in signature)
-    // Side effects via context
+// Handler with StepContext for side effects (task spawning, pool operations)
+// Reflection validates this signature at build time when .WithHandler() is called
+func(ctx context.Context, stepCtx StepContext, in Input, v ValidationResult) (Output, error) {
+    // Dependencies are type-safe (validated via reflection)
+    // Side effects via stepCtx methods
+    taskID, _ := stepCtx.SpawnTask(ctx, ProcessTask{Data: v.Data})
+    return Output{TaskID: taskID}, nil
 }
 ```
 
@@ -26,8 +41,8 @@ func(ctx context.Context, stepCtx StepContext, in Input, v ValidationResult, f F
 ### Design Principle
 
 `StepContext` is NOT for accessing dependencies (those are parameters). Instead:
-- Dependencies: injected as **function parameters** (compile-time typed)
-- Side effects: accessed via **StepContext methods** (typed at step level)
+- Dependencies: injected as **function parameters** (validated via reflection at build time)
+- Side effects: accessed via **StepContext methods** (runtime interface)
 
 ### Basic API
 
@@ -96,55 +111,85 @@ func (sc *stepContextImpl) WaitTaskPool(ctx context.Context) error {
 }
 ```
 
-## Typed Builders: StepContextAware
+## Reflection-Based Builders: StepContext Support
 
-Extend the typed builder pattern to support pool attachment:
+The reflection-based builder pattern supports pool attachment and StepContext:
 
-### StepBuilder Extensions
+### Step Builder with Pool Support
 
 ```go
-// Add pool support to all builders
-type StepBuilder0 struct {
-    name         string
-    taskPoolName string  // NEW
+// Step builder accumulates metadata including pool configuration
+type Step struct {
+    Name         string
+    dependencies []*StepDependency
+    taskPoolName string  // Optional: attached pool
+    handler      *stepHandler
 }
 
-func (s *StepBuilder0) WithTaskPool(poolName string) *StepBuilder0 {
+func NewStep(name string) *Step {
+    return &Step{Name: name}
+}
+
+func (s *Step) DependsOn(deps ...*StepDependency) *Step {
+    s.dependencies = append(s.dependencies, deps...)
+    return s
+}
+
+func (s *Step) WithTaskPool(poolName string) *Step {
     s.taskPoolName = poolName
     return s
 }
 
-type StepBuilder1[D1 any] struct {
-    name         string
-    dep1Name     string
-    taskPoolName string  // NEW
-}
-
-func (s *StepBuilder1[D1]) WithTaskPool(poolName string) *StepBuilder1[D1] {
-    s.taskPoolName = poolName
-    return s
-}
-
-// ... same for StepBuilder2[D1, D2], etc.
-
-// When building handler, pass pool info
-func (s *StepBuilder1[D1]) WithHandler[In, Out any](
-    fn func(context.Context, StepContext, In, D1) (Out, error),
-    opts ...HandlerOpt,
-) *Step {
-    dep1Name := s.dep1Name
-    poolName := s.taskPoolName  // May be ""
+// WithHandler uses reflection to validate handler signature
+// If step has taskPoolName, validates that second param is StepContext
+func (s *Step) WithHandler(fn any, opts ...HandlerOpt) *Step {
+    // Reflection validates:
+    // 1. First param: context.Context
+    // 2. If s.taskPoolName != "": second param must be StepContext
+    // 3. Next param: input type
+    // 4. Following params: dependency types (validated against s.dependencies)
+    // 5. Last param if signal: signal type
+    // 6. Returns: (output, error)
     
-    wrapper := func(ctx context.Context, msg stepMessage, stepCtx StepContext) ([]byte, error) {
-        var input In
-        var dep1 D1
-        
-        json.Unmarshal(msg.Input, &input)
-        json.Unmarshal(msg.Dependencies[dep1Name], &dep1)
-        
-        output, err := fn(ctx, stepCtx, input, dep1)
-        if err != nil {
-            return nil, err
+    wrapper, err := makeStepWrapperWithContext(fn, s)
+    if err != nil {
+        panic(fmt.Errorf("invalid handler for step %s: %w", s.Name, err))
+    }
+    
+    s.handler = &stepHandler{fn: wrapper}
+    return s
+}
+```
+
+### Usage Example
+
+```go
+// Step WITHOUT pool (no StepContext parameter)
+normalStep := catbird.NewStep("process").
+    DependsOn(catbird.Dep[ValidationResult]("validate")).
+    WithHandler(
+        func(ctx context.Context, in Request, v ValidationResult) (Response, error) {
+            return process(v), nil
+        },
+    )
+
+// Step WITH pool (requires StepContext parameter)
+poolStep := catbird.NewStep("index-pages").
+    DependsOn(catbird.Dep[IndexID]("create-index")).
+    WithTaskPool("index-ops").
+    WithHandler(
+        // Reflection validates: has StepContext param because step has pool
+        func(ctx context.Context, stepCtx StepContext, cfg Config, indexID IndexID) (Summary, error) {
+            pages := fetchPages(cfg)
+            for _, page := range pages {
+                stepCtx.SpawnTask(ctx, IndexTask{PageID: page.ID, IndexID: indexID})
+            }
+            stepCtx.PoolStartDrain(ctx)
+            stepCtx.WaitTaskPool(ctx)
+            return Summary{Indexed: len(pages)}, nil
+        },
+    )
+```
         }
         
         return json.Marshal(output)
@@ -159,7 +204,7 @@ func (s *StepBuilder1[D1]) WithHandler[In, Out any](
 }
 ```
 
-## Usage: Reindexing Flow with Strong Types
+## Usage: Reindexing Flow with Reflection API
 
 ```go
 // Phase 1: Setup
@@ -172,21 +217,21 @@ createIndexStep := catbird.NewStep("create-index").
 
 // Phase 2a: Reindex existing records (spawns tasks)
 reindexStep := catbird.NewStep("reindex-pages").
-    DependsOn[IndexID]("create-index").
+    DependsOn(catbird.Dep[IndexID]("create-index")).
     WithTaskPool("index-ops").  // ← Connect to pool
     WithHandler(
         func(
             ctx context.Context,
-            stepCtx StepContext,  // ← Type parameter for context
+            stepCtx StepContext,  // ← Reflection validates this is present when pool attached
             config IndexConfig,
-            indexID IndexID,      // ← Type parameter for dependency
+            indexID IndexID,      // ← Dependency type validated via reflection
         ) (Summary, error) {
             cursor := ""
             for {
                 records, next := db.QueryPage(ctx, cursor, 1000)
                 
                 for _, record := range records {
-                    // Spawn to typed context
+                    // Spawn to pool
                     if _, err := stepCtx.SpawnTask(ctx, IndexOp{
                         Type:    "insert",
                         IndexID: indexID,
@@ -214,7 +259,7 @@ reindexStep := catbird.NewStep("reindex-pages").
 
 // Phase 2b: Listen for changes (producer step)
 listenStep := catbird.NewProducerStep("listen-changes").
-    DependsOn[IndexID]("create-index").
+    DependsOn(catbird.Dep[IndexID]("create-index")).
     WithTaskPool("index-ops").  // ← Same pool!
     WithHandler(
         func(
@@ -244,8 +289,8 @@ listenStep := catbird.NewProducerStep("listen-changes").
 
 // Phase 3: Convergence (wait for all tasks)
 switchStep := catbird.NewStep("switch-index").
-    DependsOn[Summary]("reindex-pages").
-    DependsOn[bool]("listen-changes").  // Now DependsOn the Producer step too!
+    DependsOn(catbird.Dep[Summary]("reindex-pages")).
+    DependsOn(catbird.Dep[bool]("listen-changes")).  // Now DependsOn the Producer step too!
     WithTaskPool("index-ops").
     WithHandler(
         func(
@@ -281,123 +326,118 @@ flow := catbird.NewFlow("reindex-with-changes").
     AddStep(switchStep)
 ```
 
-## ProducerStep: Typed Builder Variant
+## ProducerStep: Conceptual Extension (Not Yet Implemented)
 
-ProducerStep is a builder variant that includes drain configuration:
+> **Note**: This section describes a potential extension to the reflection-based API for specialized producer scenarios. The base reflection-based builder already handles most producer patterns via regular steps with `WithTaskPool()` and drain configuration. This shows how specialized producer steps could be added if needed.
+
+ProducerStep would be a specialized builder that auto-drains on completion:
 
 ```go
-type ProducerStepBuilder[D1 any] struct {
+// Conceptual design - not yet implemented
+type ProducerStep struct {
     name          string
-    dep1Name      string
+    dependencies  []*StepDependency
     taskPoolName  string
     drainTimeout  time.Duration
     idleTimeout   time.Duration
+    handler       *stepHandler
 }
 
-func (s *StepBuilder1[D1]) AsProducer() *ProducerStepBuilder[D1] {
-    return &ProducerStepBuilder[D1]{
-        name:         s.name,
-        dep1Name:     s.dep1Name,
-        taskPoolName: s.taskPoolName,
+func NewProducerStep(name string) *ProducerStep {
+    return &ProducerStep{
+        name:         name,
         drainTimeout: 5 * time.Minute,  // Default
         idleTimeout:  30 * time.Second, // Default
     }
 }
 
-func (p *ProducerStepBuilder[D1]) WithDrainTimeout(d time.Duration) *ProducerStepBuilder[D1] {
+func (p *ProducerStep) DependsOn(deps ...*StepDependency) *ProducerStep {
+    p.dependencies = append(p.dependencies, deps...)
+    return p
+}
+
+func (p *ProducerStep) WithTaskPool(poolName string) *ProducerStep {
+    p.taskPoolName = poolName
+    return p
+}
+
+func (p *ProducerStep) WithDrainTimeout(d time.Duration) *ProducerStep {
     p.drainTimeout = d
     return p
 }
 
-func (p *ProducerStepBuilder[D1]) WithIdleTimeout(d time.Duration) *ProducerStepBuilder[D1] {
+func (p *ProducerStep) WithIdleTimeout(d time.Duration) *ProducerStep {
     p.idleTimeout = d
     return p
 }
 
-func (p *ProducerStepBuilder[D1]) WithHandler[In any](
-    fn func(context.Context, StepContext, In, D1) error,  // Returns error, not output
-    opts ...HandlerOpt,
-) *ProducerStep {
-    // Creates a ProducerStep that auto-drains on exit
-    // ...
-}
-```
-
-Alternative API (simpler):
-
-```go
-// Use NewProducerStep instead of converting
-func NewProducerStep(name string) *ProducerStepBuilder0 { ... }
-
-type ProducerStepBuilder0 struct {
-    name         string
-    drainTimeout time.Duration
-    idleTimeout  time.Duration
-}
-
-func (p *ProducerStepBuilder0) DependsOn[D1 any](name string) *ProducerStepBuilder1[D1] {
-    return &ProducerStepBuilder1[D1]{
-        name:         p.name,
-        dep1Name:     name,
-        drainTimeout: p.drainTimeout,
-        idleTimeout:  p.idleTimeout,
+// WithHandler uses reflection to validate signature
+// Producer handlers return error instead of (output, error)
+func (p *ProducerStep) WithHandler(fn any, opts ...HandlerOpt) *ProducerStep {
+    // Reflection validates producer signature:
+    // func(ctx, stepCtx, input, ...deps) error  // No output
+    wrapper, err := makeProducerWrapper(fn, p)
+    if err != nil {
+        panic(err)
     }
+    p.handler = &stepHandler{fn: wrapper}
+    return p
 }
 
 // Usage:
 listenStep := catbird.NewProducerStep("listen").
     WithDrainTimeout(5*time.Minute).
-    DependsOn[IndexID]("create-index").
+    DependsOn(catbird.Dep[IndexID]("create-index")).
     WithTaskPool("index-ops").
     WithHandler(
         func(ctx context.Context, stepCtx StepContext, config IndexConfig, indexID IndexID) error {
-            // ...
+            // Producer logic - auto-drains on exit
         },
     )
 ```
 
-## GeneratorStep: Typed Builder with Channel
+## GeneratorStep: Conceptual Extension (Not Yet Implemented)
 
-GeneratorStep yields items via typed channel:
+> **Note**: This section describes a potential extension for channel-based item generation. The base reflection API already supports generator patterns via regular steps that spawn tasks in loops. This shows how a specialized generator abstraction could simplify common patterns.
+
+GeneratorStep would abstract channel-based task generation:
 
 ```go
-type GeneratorStepBuilder0 struct {
-    name string
-    taskPoolName string
-}
-
-func (g *GeneratorStepBuilder0) DependsOn[D1 any](name string) *GeneratorStepBuilder1[D1] {
-    return &GeneratorStepBuilder1[D1]{
-        name:     g.name,
-        dep1Name: name,
-    }
-}
-
-type GeneratorStepBuilder1[D1 any] struct {
+// Conceptual design - not yet implemented
+type GeneratorStep struct {
     name         string
-    dep1Name     string
+    dependencies []*StepDependency
     taskPoolName string
+    generator    any  // Generator function
+    taskHandler  any  // Task handler function
 }
 
-func (g *GeneratorStepBuilder1[D1]) WithTaskPool(poolName string) *GeneratorStepBuilder1[D1] {
+func NewGeneratorStep(name string) *GeneratorStep {
+    return &GeneratorStep{name: name}
+}
+
+func (g *GeneratorStep) DependsOn(deps ...*StepDependency) *GeneratorStep {
+    g.dependencies = append(g.dependencies, deps...)
+    return g
+}
+
+func (g *GeneratorStep) WithTaskPool(poolName string) *GeneratorStep {
     g.taskPoolName = poolName
     return g
 }
 
-// WithGenerator specifies the generator function and task handler
-func (g *GeneratorStepBuilder1[D1]) WithGenerator[In, Item, Result any](
-    generatorFn func(context.Context, In, D1, chan<- Item) error,  // Generator yields items
-    taskHandlerFn func(context.Context, Item) (Result, error),     // Process each item
-    opts ...HandlerOpt,
-) *Step {
-    // Creates tasks as items are yielded
-    // Results aggregated into []Result
+// WithGenerator uses reflection to validate both functions:
+// generatorFn: func(ctx, input, ...deps, chan<- Item) error
+// taskHandlerFn: func(ctx, Item) (Result, error)
+func (g *GeneratorStep) WithGenerator(generatorFn any, taskHandlerFn any, opts ...HandlerOpt) *GeneratorStep {
+    // Reflection validates signatures and creates wrapper
     // ...
+    return g
 }
 
 // Usage:
 indexStep := catbird.NewGeneratorStep("index-records").
-    DependsOn[IndexID]("create-index").
+    DependsOn(catbird.Dep[IndexID]("create-index")).
     WithTaskPool("index-ops").
     WithGenerator(
         // Generator function: yields items
@@ -446,18 +486,18 @@ func createTypedPool[Item any](poolName string, handler func(context.Context, It
 // Usage stays untyped (inherent limitation of task pools)
 pool := catbird.CreateTaskPool("index-ops", indexOpHandler)
 
-// But steps are strongly typed:
+// But steps use reflection for type validation:
 step := catbird.NewStep("spawn-tasks").
-    WithTaskPool("index-ops").  // Pool name is string (untyped at compile time)
+    WithTaskPool("index-ops").  // Pool name is string (validated at runtime)
     WithHandler(
         func(ctx context.Context, stepCtx StepContext, config Config) error {
-            // stepCtx.SpawnTask enforces types at runtime
+            // stepCtx.SpawnTask validates types at runtime
             stepCtx.SpawnTask(ctx, IndexOp{...})
         },
     )
 ```
 
-## Complete Flow Example: Compile-Time Safety
+## Complete Flow Example: Reflection-Based API
 
 ```go
 package main
@@ -491,46 +531,38 @@ type Summary struct {
     RecordsSpawned int
 }
 
-// Flow definition with STRONG TYPES at compile time
+// Flow definition with reflection-based API
 func buildReindexFlow() *catbird.Flow {
     // Phase 1: Setup
     createStep := catbird.NewStep("create-index").
         WithHandler(
             func(ctx context.Context, cfg IndexConfig) (IndexID, error) {
-                // ✅ Compile time: cfg type is IndexConfig
-                // ✅ Compile time: return type must be IndexID
+                // Reflection validates: ctx, cfg, returns (IndexID, error)
                 log.Printf("Creating index: %s", cfg.Name)
                 return IndexID("v2"), nil
             },
         )
 
     // Phase 2a: Reindex
-    // ✅ Type safety enforced by builder!
     reindexStep := catbird.NewStep("reindex").
-        DependsOn[IndexID]("create-index").             // ← Builder now is StepBuilder1[IndexID]
+        DependsOn(catbird.Dep[IndexID]("create-index")).  // Reflection validates dependency type
         WithTaskPool("index-ops").
         WithHandler(
-            // ✅ If you write this wrong:
-            // func(..., id string) // ❌ Compile error! Expected IndexID, got string
-            // ✅ If dependency is missing:
-            // func(ctx context.Context, cfg IndexConfig) // ❌ Compile error! Missing IndexID parameter
-            // ✅ Only valid signature:
             func(
                 ctx context.Context,
                 stepCtx catbird.StepContext,
                 cfg IndexConfig,
-                indexID IndexID,  // ← Type parameter enforced by builder type
+                indexID IndexID,  // Reflection validates against Dep[IndexID]
             ) (Summary, error) {
                 log.Printf("Reindexing to: %s", indexID)
                 
-                // ✅ Compile time: stepCtx has SpawnTask method
+                // Runtime: stepCtx has SpawnTask method
                 _, err := stepCtx.SpawnTask(ctx, IndexOp{
                     Type:    "insert",
                     IndexID: indexID,
                     Record:  Record{ID: "1"},
                 })
                 
-                // ✅ Compile time: PoolStartDrain exists
                 _ = stepCtx.PoolStartDrain(ctx)
                 
                 return Summary{RecordsSpawned: 1}, nil
@@ -540,7 +572,7 @@ func buildReindexFlow() *catbird.Flow {
     // Phase 2b: Listen
     listenStep := catbird.NewProducerStep("listen").
         WithDrainTimeout(5*time.Minute).
-        DependsOn[IndexID]("create-index").
+        DependsOn(catbird.Dep[IndexID]("create-index")).
         WithTaskPool("index-ops").
         WithHandler(
             func(
@@ -556,10 +588,10 @@ func buildReindexFlow() *catbird.Flow {
         )
 
     // Phase 3: Convergence
-    // ✅ Now depends on BOTH spawning steps, each with proper output type
+    // Depends on BOTH spawning steps
     switchStep := catbird.NewStep("switch").
-        DependsOn[Summary]("reindex").               // ← Summary output type
-        DependsOn[error]("listen").                  // ← Wait, what type does ProducerStep return?
+        "DependsOn(catbird.Dep[Summary]("reindex").               // ← Summary output type
+        "DependsOn(catbird.Dep[error]("listen").                  // ← Wait, what type does ProducerStep return?
         WithTaskPool("index-ops").
         WithHandler(
             func(
@@ -602,8 +634,8 @@ func(ctx context.Context, stepCtx StepContext, in Input, dep1 D1) error
 But DependsOn requires a type for the step's output:
 
 ```go
-DependsOn[Summary]("reindex")      // ✅ Reindex outputs Summary
-DependsOn[???]("listen")            // ❌ Listen outputs error? Unit? bool?
+DependsOn(catbird.Dep[Summary]("reindex"))      // ✅ Reindex outputs Summary
+DependsOn(catbird.Dep[???]("listen"))            // ❌ Listen outputs error? Unit? bool?
 ```
 
 ### Solution Options
@@ -614,7 +646,7 @@ DependsOn[???]("listen")            // ❌ Listen outputs error? Unit? bool?
 type Unit struct{}
 
 listenStep := catbird.NewProducerStep("listen").
-    DependsOn[IndexID]("create-index").
+    DependsOn(catbird.Dep[IndexID]("create-index")).
     WithHandler(
         func(ctx context.Context, stepCtx StepContext, cfg IndexConfig, indexID IndexID) (Unit, error) {
             // ...
@@ -624,8 +656,8 @@ listenStep := catbird.NewProducerStep("listen").
 
 // Then:
 switchStep := catbird.NewStep("switch").
-    DependsOn[Summary]("reindex").
-    DependsOn[Unit]("listen").       // ← Explicit but verbose
+    DependsOn(catbird.Dep[Summary]("reindex")).
+    DependsOn(catbird.Dep[Unit]("listen")).       // ← Explicit but verbose
     WithHandler(
         func(ctx context.Context, stepCtx StepContext, cfg IndexConfig, s Summary, _ Unit) error {
             // Ignore the Unit
@@ -646,7 +678,7 @@ Producer steps run concurrently, but you don't depend on their output. Convergen
 // 5. switch only DependsOn steps that feed data to it
 
 switchStep := catbird.NewStep("switch").
-    DependsOn[Summary]("reindex").  // Get data from reindex
+    DependsOn(catbird.Dep[Summary]("reindex")).  // Get data from reindex
     WithTaskPool("index-ops").
     WithHandler(
         func(ctx context.Context, stepCtx StepContext, cfg IndexConfig, s Summary) error {
@@ -671,7 +703,7 @@ This requires new flow definition semantics - we need to mark steps that should 
 
 ```go
 switchStep := catbird.NewStep("switch").
-    DependsOn[Summary]("reindex").
+    DependsOn(catbird.Dep[Summary]("reindex")).
     WithTaskPool("index-ops").
     WaitForProducers("listen-changes").  // Wait for this producer to complete
     WithHandler(
@@ -691,11 +723,11 @@ Producer steps should be defined separately from regular data-flow dependencies:
 
 ```go
 // CURRENT (wrong semantics)
-switchStep := DependsOn[Summary]("reindex").
-    DependsOn[Unit]("listen")  // Looks like listen produces Summary
+switchStep := DependsOn(catbird.Dep[Summary]("reindex")).
+    DependsOn(catbird.Dep[Unit]("listen"))  // Looks like listen produces Summary
 
 // BETTER (clear semantics)
-switchStep := DependsOn[Summary]("reindex").
+switchStep := DependsOn(catbird.Dep[Summary]("reindex")).
     WaitForPool("index-ops")   // Wait for pool to drain (includes all producers)
 
 // Or even:
@@ -705,33 +737,33 @@ pool := TaskPool("index-ops",
 )
 ```
 
-But this is beyond the scope of GENERIC_API_DESIGN patterns.
+But this is beyond the scope of reflection-based API patterns.
 
-## Summary: Strong Typing Benefits
+## Summary: Reflection-Based Type Safety
 
-With typed builders + StepContext:
+With reflection-based builders + StepContext:
 
-✅ **Compile-time type safety**
+✅ **Runtime type validation at build time**
 ```go
-// Handler signature MUST match dependency types
-NewStep("x").DependsOn[ValidationResult]("v").WithHandler(
+// Handler signature validated via reflection against dependency types
+NewStep("x").DependsOn(catbird.Dep[ValidationResult]("v")).WithHandler(
     func(ctx context.Context, stepCtx StepContext, in Request, v ValidationResult) error {
-        // ✅ v is known to be ValidationResult (compile-time guarantee)
-        // ❌ This won't compile: func(..., v FraudResult)
+        // ✅ v is validated to be ValidationResult at build time via reflection
+        // ❌ Wrong signature detected: func(..., v FraudResult) → panic at build time
     },
 )
 ```
 
-✅ **Zero reflection**
+✅ **Minimal reflection overhead**
 ```go
-// Types known at compile time, direct function calls
-// No reflection.Value.Call() overhead
+// Type validation at build time (once)
+// Runtime uses cached reflect.Value wrappers (~1μs overhead vs 1-5ms I/O)
 ```
 
 ✅ **IDE support**
 ```go
-// Full autocomplete, jump-to-definition, inline docs
-// All dependency types visible in signature
+// Full autocomplete, jump-to-definition for API
+// Handler function types checked normally (just as any function literal)
 ```
 
 ✅ **Side effects explicit**
@@ -740,27 +772,25 @@ NewStep("x").DependsOn[ValidationResult]("v").WithHandler(
 // pool.SpawnTask() vs dependency parameters vs signal
 ```
 
-✅ **No package prefix repetition**
+✅ **Clean fluent API**
 ```go
-// Methods instead of functions
-step.WithTaskPool("pool").WithHandler(fn)
-// vs
-catbird.NewStep(...,
-    catbird.WithTaskPool(...),
-    catbird.WithHandler(...),
-)
+// Fluent methods without function explosion
+step.DependsOn(...).WithTaskPool("pool").WithHandler(fn)
+// vs current 8 function variants:
+// InitialStep, StepWithDependency, StepWith2Dependencies, etc.
 ```
 
 ## Open Design Question: Producer Step Output
 
 **Remaining ambiguity**: What type do ProducerSteps contribute to the type system?
 
-- ✅ Regular steps: `StepBuilder1[D1]` → output type is part of signature
+- ✅ Regular steps: Reflection validates output type against dependencies
 - ❌ Producer steps: Return `error` only → what output type?
 
 Recommend:
 1. Producer steps return `(Unit, error)` for consistency, or
-2. Producer steps are not dependencies (don't use `Depends On`), or
+2. Producer steps are not dependencies (don't use DependsOn), or
 3. Separate `WithProducerPool()` semantic that doesn't create dependencies
 
-This needs further design but doesn't block the strong typing approach.
+This needs further design but doesn't block the reflection-based approach.
+

@@ -1,8 +1,10 @@
 # Catbird API Redesign: Builder Methods + Cached Reflection
 
 **Date:** February 2026  
-**Status:** Design Proposal  
+**Status:** Approved Design  
 **Goal:** Eliminate step function explosion while maintaining performance and usability
+
+**Decision:** Reflection API selected over generic methods (impossible in Go) and hybrid approaches (doesn't solve function explosion).
 
 ## Problem Statement
 
@@ -106,55 +108,85 @@ func (w *Worker) executeTask(task *Task, msg taskMessage) error {
 }
 ```
 
-### 4. Cached Reflection for Zero Runtime Cost
+### 4. Cached Reflection for Minimal Runtime Cost
+
+**Key Strategy:** Reflection used ONCE at construction time, cached for all runtime executions.
 
 Handler wrappers are created **once** during construction:
 
 ```go
 func (t *Task) WithHandler(fn any, opts ...HandlerOpt) *Task {
-    // Reflection used ONCE here (build time)
+    // PHASE 1: Reflection used ONCE here (build/construction time)
+    // - Validate signature
+    // - Extract type information
+    // - Build optimized wrapper
     wrapper, err := makeTaskWrapper(fn, t.Name)
     if err != nil {
-        panic(err)
+        panic(err) // Fail fast at build time
     }
     
-    // Store cached wrapper - no reflection at runtime
+    // PHASE 2: Store cached wrapper - zero reflection at runtime
     t.handler = &taskHandler{fn: wrapper}
     return t
 }
 
-// makeTaskWrapper uses reflection once to extract types
+// makeTaskWrapper uses reflection once to extract types and create cached wrapper
 func makeTaskWrapper(fn any, name string) (func(context.Context, taskMessage) ([]byte, error), error) {
     fnType := reflect.TypeOf(fn)
     fnVal := reflect.ValueOf(fn)
     
-    // Extract types once (build time)
+    // Validate signature at build time
+    if fnType.Kind() != reflect.Func {
+        return nil, fmt.Errorf("handler must be a function")
+    }
+    if fnType.NumIn() != 2 || fnType.In(0) != reflect.TypeOf((*context.Context)(nil)).Elem() {
+        return nil, fmt.Errorf("handler must have signature (context.Context, In) (Out, error)")
+    }
+    if fnType.NumOut() != 2 || !fnType.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+        return nil, fmt.Errorf("handler must return (Out, error)")
+    }
+    
+    // Extract types once (build time) - CACHED
     inputType := fnType.In(1)
     
-    // Return wrapper that uses cached type info
+    // Return wrapper with all type info cached in closure
     return func(ctx context.Context, msg taskMessage) ([]byte, error) {
-        // Runtime: just JSON unmarshal + direct call
-        inputVal := reflect.New(inputType).Interface()
-        json.Unmarshal(msg.Input, inputVal)
+        // RUNTIME PATH - minimal overhead:
+        // 1. Allocate input value using cached type
+        inputVal := reflect.New(inputType)
         
+        // 2. Unmarshal JSON (unavoidable cost)
+        if err := json.Unmarshal(msg.Input, inputVal.Interface()); err != nil {
+            return nil, fmt.Errorf("unmarshal input: %w", err)
+        }
+        
+        // 3. Call handler via cached reflect.Value (~0.5-1μs overhead)
         results := fnVal.Call([]reflect.Value{
             reflect.ValueOf(ctx),
-            reflect.ValueOf(inputVal).Elem(),
+            inputVal.Elem(),
         })
         
+        // 4. Check error
         if !results[1].IsNil() {
             return nil, results[1].Interface().(error)
         }
+        
+        // 5. Marshal output (unavoidable cost)
         return json.Marshal(results[0].Interface())
     }, nil
 }
 ```
 
-**Performance:**
-- Build time: ~10-50μs per handler (reflection + validation)
-- Runtime: ~0.5-1μs for `reflect.Value.Call()` overhead
-- Context: PostgreSQL I/O dominates at ~1-5ms
-- Overhead: ~0.02-0.1% of total latency (acceptable)
+**Performance Characteristics:**
+
+| Phase | Cost | When | Notes |
+|-------|------|------|-------|
+| **Build time** (once) | ~10-50μs | `WithHandler()` call | Reflection introspection + validation |
+| **Runtime** (per execution) | ~0.5-1μs | Handler execution | `reflect.Value.Call()` overhead only |
+| **Context** | ~1-5ms | Handler execution | PostgreSQL I/O (dominates) |
+| **Overhead** | 0.02-0.1% | Per execution | Negligible vs total latency |
+
+**Optimization:** All reflection introspection happens once. Runtime only pays for `reflect.Value.Call()`, which is ~50-100x faster than re-introspecting types.
 
 ## Type Structure
 
@@ -358,28 +390,45 @@ flow.AddStep(finalizeStep)
 ### Task Handler Wrapper
 ```go
 // makeTaskWrapper creates cached wrapper for task handlers
+// Reflection used ONCE during this call, all type info cached in returned closure
 func makeTaskWrapper(fn any, taskName string) (func(context.Context, taskMessage) ([]byte, error), error) {
     fnType := reflect.TypeOf(fn)
     
     // Validate signature: (context.Context, In) -> (Out, error)
-    if fnType.NumIn() != 2 || fnType.NumOut() != 2 {
-        return nil, fmt.Errorf("invalid signature")
+    if fnType.Kind() != reflect.Func {
+        return nil, fmt.Errorf("task %s: handler must be a function, got %T", taskName, fn)
+    }
+    if fnType.NumIn() != 2 {
+        return nil, fmt.Errorf("task %s: handler must have 2 inputs (context.Context, In), got %d", taskName, fnType.NumIn())
+    }
+    if fnType.NumOut() != 2 {
+        return nil, fmt.Errorf("task %s: handler must have 2 outputs (Out, error), got %d", taskName, fnType.NumOut())
+    }
+    if fnType.In(0) != reflect.TypeOf((*context.Context)(nil)).Elem() {
+        return nil, fmt.Errorf("task %s: first parameter must be context.Context, got %v", taskName, fnType.In(0))
+    }
+    errorType := reflect.TypeOf((*error)(nil)).Elem()
+    if !fnType.Out(1).Implements(errorType) {
+        return nil, fmt.Errorf("task %s: second return value must be error, got %v", taskName, fnType.Out(1))
     }
     
-    // Extract type info once
+    // CACHE: Extract type info once - stored in closure
     inputType := fnType.In(1)
     fnVal := reflect.ValueOf(fn)
     
-    // Return cached wrapper
+    // Return wrapper that uses cached fnVal and inputType
     return func(ctx context.Context, msg taskMessage) ([]byte, error) {
-        inputVal := reflect.New(inputType).Interface()
-        if err := json.Unmarshal(msg.Input, inputVal); err != nil {
-            return nil, err
+        // Allocate input using cached type
+        inputVal := reflect.New(inputType)
+        
+        if err := json.Unmarshal(msg.Input, inputVal.Interface()); err != nil {
+            return nil, fmt.Errorf("unmarshal input for task %s: %w", taskName, err)
         }
         
+        // Call using cached fnVal (minimal overhead)
         results := fnVal.Call([]reflect.Value{
             reflect.ValueOf(ctx),
-            reflect.ValueOf(inputVal).Elem(),
+            inputVal.Elem(),
         })
         
         if !results[1].IsNil() {
@@ -394,10 +443,15 @@ func makeTaskWrapper(fn any, taskName string) (func(context.Context, taskMessage
 ### Step Handler Wrapper
 ```go
 // makeStepWrapper creates cached wrapper for step handlers
+// Reflection used ONCE during this call, all type info cached in returned closure
 func makeStepWrapper(fn any, step *Step) (func(context.Context, stepMessage) ([]byte, error), error) {
     fnType := reflect.TypeOf(fn)
     
-    // Expected: context.Context, In, [SigIn if hasSignal], [Dep1, Dep2, ...]
+    if fnType.Kind() != reflect.Func {
+        return nil, fmt.Errorf("step %s: handler must be a function, got %T", step.Name, fn)
+    }
+    
+    // Expected signature: (context.Context, In, [SigIn if hasSignal], [Dep1, Dep2, ...])
     expectedInputs := 2
     if step.hasSignal {
         expectedInputs++
@@ -405,25 +459,44 @@ func makeStepWrapper(fn any, step *Step) (func(context.Context, stepMessage) ([]
     expectedInputs += len(step.dependencies)
     
     if fnType.NumIn() != expectedInputs {
-        return nil, fmt.Errorf("expected %d inputs, got %d", expectedInputs, fnType.NumIn())
+        return nil, fmt.Errorf("step %s: expected %d inputs, got %d", step.Name, expectedInputs, fnType.NumIn())
     }
     
-    // Validate Optional[T] for optional dependencies
+    // Validate context.Context is first parameter
+    if fnType.In(0) != reflect.TypeOf((*context.Context)(nil)).Elem() {
+        return nil, fmt.Errorf("step %s: first parameter must be context.Context, got %v", step.Name, fnType.In(0))
+    }
+    
+    // Validate error return
+    errorType := reflect.TypeOf((*error)(nil)).Elem()
+    if fnType.NumOut() != 2 || !fnType.Out(1).Implements(errorType) {
+        return nil, fmt.Errorf("step %s: must return (Out, error)", step.Name)
+    }
+    
+    // Determine parameter indices
     depStartIdx := 2
     if step.hasSignal {
         depStartIdx = 3
     }
     
+    // Validate Optional[T] for optional dependencies
     for i, dep := range step.dependencies {
         paramType := fnType.In(depStartIdx + i)
-        isOptional := paramType.Name() == "Optional"
+        // Check if type name contains "Optional" (simplified check)
+        isOptional := paramType.Kind() == reflect.Struct && paramType.NumField() >= 2 &&
+            paramType.Field(0).Name == "IsSet" && paramType.Field(1).Name == "Value"
         
         if dep.Optional && !isOptional {
-            return nil, fmt.Errorf("dependency %s is optional but parameter is not Optional[T]", dep.Name)
+            return nil, fmt.Errorf("step %s: dependency %s is optional but parameter %d is not Optional[T]", 
+                step.Name, dep.Name, depStartIdx+i)
+        }
+        if !dep.Optional && isOptional {
+            return nil, fmt.Errorf("step %s: dependency %s is required but parameter %d is Optional[T]", 
+                step.Name, dep.Name, depStartIdx+i)
         }
     }
     
-    // Extract type info once
+    // CACHE: Extract all type info once - stored in closure
     inputType := fnType.In(1)
     var signalType reflect.Type
     if step.hasSignal {
@@ -436,45 +509,58 @@ func makeStepWrapper(fn any, step *Step) (func(context.Context, stepMessage) ([]
     }
     
     fnVal := reflect.ValueOf(fn)
+    deps := step.dependencies // Cache dependencies slice
+    hasSignal := step.hasSignal
     
-    // Return cached wrapper
+    // Return wrapper with all type info cached
     return func(ctx context.Context, msg stepMessage) ([]byte, error) {
         args := []reflect.Value{reflect.ValueOf(ctx)}
         
-        // Unmarshal input
-        inputVal := reflect.New(inputType).Interface()
-        json.Unmarshal(msg.Input, inputVal)
-        args = append(args, reflect.ValueOf(inputVal).Elem())
+        // Unmarshal input using cached type
+        inputVal := reflect.New(inputType)
+        if err := json.Unmarshal(msg.Input, inputVal.Interface()); err != nil {
+            return nil, fmt.Errorf("unmarshal input: %w", err)
+        }
+        args = append(args, inputVal.Elem())
         
-        // Unmarshal signal if present
-        if step.hasSignal {
-            signalVal := reflect.New(signalType).Interface()
-            json.Unmarshal(msg.SignalInput, signalVal)
-            args = append(args, reflect.ValueOf(signalVal).Elem())
+        // Unmarshal signal if present (uses cached signalType)
+        if hasSignal {
+            signalVal := reflect.New(signalType)
+            if err := json.Unmarshal(msg.SignalInput, signalVal.Interface()); err != nil {
+                return nil, fmt.Errorf("unmarshal signal: %w", err)
+            }
+            args = append(args, signalVal.Elem())
         }
         
-        // Unmarshal dependencies
-        for i, dep := range step.dependencies {
+        // Unmarshal dependencies using cached depTypes
+        for i, dep := range deps {
             if dep.Optional {
-                // Handle Optional[T]
+                // Handle Optional[T] - construct directly
                 optVal := reflect.New(depTypes[i]).Elem()
                 if depOutput, exists := msg.StepOutputs[dep.Name]; exists && len(depOutput) > 0 {
+                    // Set IsSet = true
                     optVal.FieldByName("IsSet").SetBool(true)
+                    // Unmarshal into Value field
                     valueField := optVal.FieldByName("Value")
-                    valuePtr := reflect.New(valueField.Type()).Interface()
-                    json.Unmarshal(depOutput, valuePtr)
-                    valueField.Set(reflect.ValueOf(valuePtr).Elem())
+                    valuePtr := reflect.New(valueField.Type())
+                    if err := json.Unmarshal(depOutput, valuePtr.Interface()); err != nil {
+                        return nil, fmt.Errorf("unmarshal optional dependency %s: %w", dep.Name, err)
+                    }
+                    valueField.Set(valuePtr.Elem())
                 }
+                // If not exists, optVal stays as Optional{IsSet: false}
                 args = append(args, optVal)
             } else {
                 // Handle required dependency
-                depVal := reflect.New(depTypes[i]).Interface()
-                json.Unmarshal(msg.StepOutputs[dep.Name], depVal)
-                args = append(args, reflect.ValueOf(depVal).Elem())
+                depVal := reflect.New(depTypes[i])
+                if err := json.Unmarshal(msg.StepOutputs[dep.Name], depVal.Interface()); err != nil {
+                    return nil, fmt.Errorf("unmarshal dependency %s: %w", dep.Name, err)
+                }
+                args = append(args, depVal.Elem())
             }
         }
         
-        // Call handler
+        // Call handler using cached fnVal
         results := fnVal.Call(args)
         
         if !results[1].IsNil() {

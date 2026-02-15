@@ -1,6 +1,8 @@
 # Dynamic Task Spawning: Streaming and Unbounded Arrays
 
-> **Updated**: This document now uses **strong typing patterns** from [TYPED_COORDINATION.md](TYPED_COORDINATION.md) for all approaches. Dependencies are injected as typed function parameters via generics; pool operations use `StepContext` interface.
+> **Note**: This document explores dynamic task patterns conceptually. Code examples may show pseudo-generic syntax for clarity. See [REFLECTION_API_DESIGN.md](REFLECTION_API_DESIGN.md) for the actual implementation approach using cached reflection for type validation.
+
+> **Updated**: This document now uses **strong typing patterns** from [TYPED_COORDINATION.md](TYPED_COORDINATION.md) for all approaches. Dependencies are validated at build time via reflection; pool operations use `StepContext` interface.
 
 ## Problem Statement
 
@@ -454,7 +456,7 @@ type StepContext interface {
 
 // Dynamic spawning step: uses typed dependency + StepContext
 reindexStep := catbird.NewStep("reindex").
-    DependsOn[IndexID]("create-index").
+    "DependsOn(catbird.Dep[IndexID]("create-index").
     WithTaskPool("index-ops").
     WithHandler(
         func(
@@ -874,7 +876,7 @@ flow := catbird.NewFlow("reindex",
     
     // Phase 2a: Reindex existing records (type-safe dependency + pool)
     NewStep("reindex-existing").
-        DependsOn[IndexID]("create-index").
+        "DependsOn(catbird.Dep[IndexID]("create-index").
         WithTaskPool("index-ops").  // Pool name
         WithHandler(
             func(
@@ -923,7 +925,7 @@ flow := catbird.NewFlow("reindex",
     
     // Phase 2b: Listen for changes (producer step, same pool)
     NewProducerStep("listen-changes").
-        DependsOn[IndexID]("create-index").
+        "DependsOn(catbird.Dep[IndexID]("create-index").
         WithTaskPool("index-ops").  // SAME pool!
         WithDrainTimeout(5*time.Minute).
         WithIdleTimeout(30*time.Second).
@@ -956,8 +958,8 @@ flow := catbird.NewFlow("reindex",
     
     // Phase 3: Converge - wait for both branches + all tasks
     NewStep("switch-index").
-        DependsOn[Summary]("reindex-existing").
-        DependsOn[Summary]("listen-changes").
+        "DependsOn(catbird.Dep[Summary]("reindex-existing").
+        "DependsOn(catbird.Dep[Summary]("listen-changes").
         WithTaskPool("index-ops").
         WithHandler(
             func(
