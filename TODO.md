@@ -2,7 +2,18 @@
 
 ## API Improvements
 
-- [ ] Implement reflection-based builder API (see REFLECTION_API_DESIGN.md)
+Choose one API approach and implement:
+
+- [ ] **Option A**: Typed Generics API (see TYPED_GENERICS_API_DESIGN.md)
+  - Zero reflection overhead, full compile-time type safety
+  - Moderate function explosion (3-4 step constructor variants)
+  - Familiar Go generics patterns
+  - Recommended approach
+  
+- [ ] **Option B**: Reflection-based builder API (see REFLECTION_API_DESIGN.md)
+  - Minimal overhead (~1μs), runtime type validation
+  - No function explosion (single builder)
+  - Fluent API with cached reflection
 
 ## Features
 

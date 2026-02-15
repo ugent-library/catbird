@@ -1,8 +1,10 @@
 # Catbird API Redesign: Builder Methods + Cached Reflection
 
 **Date:** February 2026  
-**Status:** Approved Design  
+**Status:** Alternative Design (see also TYPED_GENERICS_API_DESIGN.md)  
 **Goal:** Eliminate step function explosion while maintaining performance and usability
+
+**Note:** A typed generics approach (TYPED_GENERICS_API_DESIGN.md) may be preferable as it provides full compile-time type safety with zero reflection overhead. This design remains valid but has ~1μs runtime overhead from reflection.
 
 **Decision:** Reflection API selected over generic methods (impossible in Go) and hybrid approaches (doesn't solve function explosion).
 
