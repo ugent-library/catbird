@@ -406,3 +406,105 @@ func TestInterfaceComposition(t *testing.T) {
 		t.Errorf("task names incorrect: %v", names)
 	}
 }
+
+// Test 16: Handler bundling pattern
+// Validates that bundling function + options is ergonomic and composable
+func TestHandlerBundlingPattern(t *testing.T) {
+	// Simulated handler options
+	type handlerOpts struct {
+		concurrency int
+		retries     int
+	}
+
+	// HandlerConfig bundles function + options
+	type HandlerConfig[In, Out any] struct {
+		fn   func(context.Context, In) (Out, error)
+		opts handlerOpts
+	}
+
+	// Handler constructor with production defaults
+	Handler := func(fn func(context.Context, string) (int, error), opts ...func(*handlerOpts)) HandlerConfig[string, int] {
+		h := HandlerConfig[string, int]{
+			fn: fn,
+			opts: handlerOpts{
+				concurrency: 1,
+				retries:     3, // Production default
+			},
+		}
+		for _, opt := range opts {
+			opt(&h.opts)
+		}
+		return h
+	}
+
+	// Option constructors
+	WithConcurrency := func(n int) func(*handlerOpts) {
+		return func(h *handlerOpts) { h.concurrency = n }
+	}
+	WithRetries := func(n int) func(*handlerOpts) {
+		return func(h *handlerOpts) { h.retries = n }
+	}
+
+	// Test 1: Minimal usage (gets production defaults)
+	minimalHandler := Handler(func(ctx context.Context, s string) (int, error) {
+		return len(s), nil
+	})
+
+	if minimalHandler.opts.concurrency != 1 {
+		t.Errorf("expected default concurrency 1, got %d", minimalHandler.opts.concurrency)
+	}
+	if minimalHandler.opts.retries != 3 {
+		t.Errorf("expected default retries 3, got %d", minimalHandler.opts.retries)
+	}
+
+	// Test 2: With options (overrides defaults)
+	configuredHandler := Handler(
+		func(ctx context.Context, s string) (int, error) {
+			return len(s) * 2, nil
+		},
+		WithConcurrency(10),
+		WithRetries(5),
+	)
+
+	if configuredHandler.opts.concurrency != 10 {
+		t.Errorf("expected concurrency 10, got %d", configuredHandler.opts.concurrency)
+	}
+	if configuredHandler.opts.retries != 5 {
+		t.Errorf("expected retries 5, got %d", configuredHandler.opts.retries)
+	}
+
+	// Test 3: Reusability - define once, use multiple times
+	reusableHandler := Handler(
+		func(ctx context.Context, s string) (int, error) {
+			return len(s), nil
+		},
+		WithConcurrency(10),
+		WithRetries(5),
+	)
+
+	// Simulate using same handler config for multiple tasks
+	task1 := struct {
+		name    string
+		handler HandlerConfig[string, int]
+	}{name: "task1", handler: reusableHandler}
+
+	task2 := struct {
+		name    string
+		handler HandlerConfig[string, int]
+	}{name: "task2", handler: reusableHandler}
+
+	// Both tasks share same configuration
+	if task1.handler.opts.concurrency != task2.handler.opts.concurrency {
+		t.Error("expected same concurrency for reused handler")
+	}
+
+	// Test 4: Handler execution works correctly
+	ctx := context.Background()
+	result, err := configuredHandler.fn(ctx, "test")
+	if err != nil {
+		t.Errorf("handler execution failed: %v", err)
+	}
+	if result != 8 { // len("test") * 2
+		t.Errorf("expected result 8, got %d", result)
+	}
+}

@@ -3,7 +3,7 @@
 **Status**: ✅ **Verified Implementable** (all patterns validated with working prototypes)  
 **Created**: 2026-02-15  
 **Last Updated**: 2026-02-15  
-**Test Results**: 15/15 passing (see `prototype_test.go` and `prototype_flow_test.go`)
+**Test Results**: 16/16 passing (see `prototype_test.go` and `prototype_flow_test.go`)
 
 ## Overview
 
@@ -13,7 +13,7 @@ This design uses **generic types** (not generic methods) to provide compile-time
 
 ## Design Validation
 
-**Status**: ✅ **All Tests Passing** (15/15)
+**Status**: ✅ **All Tests Passing** (16/16)
 
 All core patterns have been validated with working prototypes in Go 1.26.0. The design has been refined based on implementation insights:
 
@@ -22,6 +22,7 @@ All core patterns have been validated with working prototypes in Go 1.26.0. The 
 2. **Minimal public API**: Only `Name()` is public; worker methods (`handle()`, `dependencies()`, `handlerOpts()`) are unexported
 3. **Consistent naming**: Handler terminology (`handle()`, `handlerOpts`) replaces mixed execute/handler naming
 4. **Zero overhead**: Identical reflection profile to current implementation (standard library JSON only)
+5. **Handler bundling**: `Handler()` function bundles execution function with options for cleaner, more composable code
 
 ### Validation Summary
 
@@ -37,13 +38,14 @@ All core patterns have been validated with working prototypes in Go 1.26.0. The 
 | **Conditional convergence** | TestConditionalDependencyPattern | ✅ Pass | Optional[T] properly handles both set/unset cases |
 | **Type parameter propagation** | TestTypeParameterPropagation | ✅ Pass | Constructors correctly propagate type params |
 | **Interface composition** | TestInterfaceComposition | ✅ Pass | Typed tasks implement non-generic Task interface |
+| **Handler bundling pattern** | TestHandlerBundlingPattern | ✅ Pass | Function + options bundling is ergonomic and composable |
 | **Build-time validation (valid)** | TestFlowBuildTimeTypeValidation_Valid | ✅ Pass | Correctly accepts flows with matching types |
 | **Build-time validation (invalid)** | TestFlowBuildTimeTypeValidation_Invalid | ✅ Pass | Correctly rejects flows with type mismatches |
 | **Optional dependency handling** | TestFlowBuildTimeTypeValidation_OptionalDependency | ✅ Pass | Optional[T] types detectable via reflection |
 | **Constructor patterns** | TestFlowConstructorPatterns | ✅ Pass | Step0/Step1/Step2 constructors work with type inference |
 | **MapStep array detection** | TestMapStepArrayDetection | ✅ Pass | Build-time validation catches non-array deps |
 
-**All 15 tests pass**: The design is fully implementable in Go 1.26.0.
+**All 16 tests pass**: The design is fully implementable in Go 1.26.0.
 
 ### Key Findings
 
@@ -81,7 +83,7 @@ The prototype demonstrates:
 Current API has four issues:
 1. ✅ **Function explosion**: 8 step constructor variants → 1 generic constructor
 2. ✅ **Handler always required**: Definition-only constructors exist
-3. ✅ **Options mixed**: Separated via `TaskOpt` and `HandlerOpt` types with explicit `WithHandlerOptions()` wrapper
+3. ✅ **Options mixed**: Separated via `TaskOpt` and `HandlerOpt` types with `Handler()` bundling pattern
 4. ✅ **Not extensible**: Interface-based design allows custom implementations
 
 ## Tasks API
@@ -216,30 +218,26 @@ func (t *TypedTask[In, Out]) Run(ctx context.Context, client *Client, input In) 
 // NewTask creates a task with handler (full definition)
 func NewTask[In, Out any](
     name string,
-    handler func(context.Context, In) (Out, error),
-    opts ...HandlerOpt,
+    handler HandlerConfig[In, Out],
+    opts ...TaskOpt,
 ) *TypedTask[In, Out] {
-    // Initialize with defaults
-    h := handlerOpts{
-        concurrency: 1,
-        batchSize:   10,
-    }
-    
-    // Apply options
-    for _, opt := range opts {
-        opt(&h)
-    }
-    
-    // Validate
-    if err := h.validate(); err != nil {
+    // Validate handler options (already validated in Handler())
+    if err := handler.opts.validate(); err != nil {
         panic(fmt.Errorf("invalid handler options for task %s: %v", name, err))
     }
     
-    return &TypedTask[In, Out]{
+    task := &TypedTask[In, Out]{
         name:        name,
-        handler:     handler,
-        handlerOpts: h,
+        handler:     handler.fn,
+        handlerOpts: handler.opts,
     }
+    
+    // Apply task-level options (future: priority, tags, etc.)
+    for _, opt := range opts {
+        opt(task)
+    }
+    
+    return task
 }
 
 // DefineTask creates a task without handler (definition-only)
@@ -257,58 +255,97 @@ func DefineTask[In, Out any](
 }
 ```
 
-### Options
+### Handler Configuration Pattern
+
+The `Handler()` function bundles a handler function with its execution options, improving code organization and composability:
 
 ```go
-// TaskOpt is a task-level option (metadata, scheduling, etc.)
-type TaskOpt interface {
-    applyTask(t *taskConfig)
+// HandlerConfig bundles a function with its execution configuration
+type HandlerConfig[In, Out any] struct {
+    fn   func(context.Context, In) (Out, error)
+    opts handlerOpts
+}
+
+// Handler creates a bundled handler configuration
+// In production, robust configuration is the norm, so bundling function + options is natural
+func Handler[In, Out any](
+    fn func(context.Context, In) (Out, error),
+    opts ...HandlerOpt,
+) HandlerConfig[In, Out] {
+    h := HandlerConfig[In, Out]{
+        fn: fn,
+        opts: handlerOpts{
+            concurrency: 1,
+            batchSize:   10,
+            maxRetries:  3,                        // Production-ready default
+            minDelay:    100 * time.Millisecond,   // Production-ready default
+            maxDelay:    30 * time.Second,         // Production-ready default
+        },
+    }
+    for _, opt := range opts {
+        opt(&h.opts)
+    }
+    if err := h.opts.validate(); err != nil {
+        panic(fmt.Errorf("invalid handler options: %v", err))
+    }
+    return h
 }
 
 // HandlerOpt is a handler execution option (concurrency, retries, etc.)
-type HandlerOpt interface {
-    applyHandler(h *handlerConfig)
-}
-
-// WithHandlerOptions wraps handler options to distinguish them from task options
-// This maintains clear separation between task-level and handler-level concerns
-//
-// Note: Slightly verbose but prioritizes clarity. Alternative patterns considered:
-//   - Builder: WithHandlerOptions().Concurrency(2).Timeout(200)
-//   - Struct: WithHandlerOpts(catbird.HandlerOpts{Concurrency: 2})
-// Current pattern chosen for consistency with idiomatic Go functional options
-func WithHandlerOptions(opts ...HandlerOpt) TaskOpt {
-    return handlerOptsWrapper{opts: opts}
-}
-
-// Task options (metadata, orchestration)
-func WithSchedule(cron string) TaskOpt { ... }
-func WithDeduplication(strategy DeduplicationStrategy) TaskOpt { ... }
+type HandlerOpt func(*handlerOpts)
 
 // Handler options (execution behavior)
 func WithConcurrency(n int) HandlerOpt { ... }
-func WithMaxRetries(n int) HandlerOpt { ... }
+func WithRetries(n int) HandlerOpt { ... }             // Replaces WithMaxRetries
 func WithBackoff(min, max time.Duration) HandlerOpt { ... }
 func WithCircuitBreaker(failures int, timeout time.Duration) HandlerOpt { ... }
 func WithCondition(expr string) HandlerOpt { ... }
+func WithTimeout(d time.Duration) HandlerOpt { ... }
+
+// Task options (metadata, orchestration - future)
+type TaskOpt func(*taskOpts)
+func WithSchedule(cron string) TaskOpt { ... }
+func WithPriority(n int) TaskOpt { ... }
 ```
+
+**Benefits:**
+- ✅ **Logical grouping**: Function and its resilience config stay together
+- ✅ **Production defaults**: Retries + backoff enabled by default
+- ✅ **Composable**: Can define handlers once and reuse
+- ✅ **Clear scope**: Options obviously apply to this specific handler
+- ✅ **Future-proof**: Easy to add task/step-level options as separate parameters
 
 ### Usage Example
 
 ```go
-// Full task definition with handler
+// Production task with robust configuration (typical use case)
 processTask := catbird.NewTask("process-order",
-    func(ctx context.Context, order Order) (Receipt, error) {
-        // Process order
-        return Receipt{OrderID: order.ID}, nil
-    },
-    catbird.WithHandlerOptions(
+    catbird.Handler(
+        func(ctx context.Context, order Order) (Receipt, error) {
+            // Process order
+            return Receipt{OrderID: order.ID}, nil
+        },
         catbird.WithConcurrency(10),
-        catbird.WithMaxRetries(3),
-        catbird.WithBackoff(1*time.Second, 30*time.Second),
+        catbird.WithRetries(5),                    // Override default 3
+        catbird.WithBackoff(1*time.Second, 60*time.Second),
+        catbird.WithCircuitBreaker(10, 60*time.Second),
     ),
-    catbird.WithSchedule("@hourly"),
 )
+
+// Minimal task (gets production-ready defaults: retries + backoff)
+simpleTask := catbird.NewTask("simple",
+    catbird.Handler(simpleFunc),
+)
+
+// Reusable handler configuration
+robustHandler := catbird.Handler(
+    processFunc,
+    catbird.WithConcurrency(10),
+    catbird.WithRetries(5),
+    catbird.WithBackoff(1*time.Second, 30*time.Second),
+)
+task1 := catbird.NewTask("task1", robustHandler)
+task2 := catbird.NewTask("task2", robustHandler)
 
 // Definition-only (handler registered in different worker/language)
 // Use case: client triggers tasks, separate workers (possibly other machines/languages) execute them
@@ -800,48 +837,29 @@ Implementation mapping to internal typedStepN variants (private types):
 // No dependencies → typedStep0 (private)
 func InitialStep[In, Out any](
     name string,
-    handler func(context.Context, In) (Out, error),
-    opts ...HandlerOpt,
+    handler HandlerConfig[In, Out],
 ) Step {  // Returns interface, hides concrete type
-    // Initialize with defaults
-    h := handlerOpts{
-        concurrency: 1,
-        batchSize:   10,
-    }
-    
-    // Apply options
-    for _, opt := range opts {
-        opt(&h)
-    }
-    
-    // Validate
-    if err := h.validate(); err != nil {
+    // Validate (already done in Handler())
+    if err := handler.opts.validate(); err != nil {
         panic(fmt.Errorf("invalid handler options for step %s: %v", name, err))
     }
     
     return &typedStep0[In, Out]{
         name:        name,
-        handler:     handler,
-        handlerOpts: h,
+        handler:     handler.fn,
+        handlerOpts: handler.opts,
     }
 }
 
 // 1 dependency → typedStep1 (private)
 func StepWithDependency[In, D1, Out any](
     name string,
-    dep1 string,
-    handler func(context.Context, In, D1) (Out, error),
-    opts ...HandlerOpt,
+    dep1 *StepDependency,
+    handler HandlerConfig[In, Out],
 ) Step {
-    // Initialize with defaults
-    h := handlerOpts{
-        concurrency: 1,
-        batchSize:   10,
-    }
-    
-    // Apply options
-    for _, opt := range opts {
-        opt(&h)
+    // Validate (already done in Handler())
+    if err := handler.opts.validate(); err != nil {
+        panic(fmt.Errorf("invalid handler options for step %s: %v", name, err))
     }
     
     // Validate
@@ -2047,9 +2065,14 @@ The typed generics API enforces a **single final step constraint** with build-ti
 **Simple flow** (single terminal step):
 ```go
 flow := NewFlow[OrderInput, Receipt]("process-order").
-    AddStep(InitialStep("validate", validateFn)).
-    AddStep(StepWithDependency("process", Dependency("validate"), processFn)).
-    AddStep(StepWithDependency("finalize", Dependency("process"), finalizeFn)).
+    AddStep(InitialStep("validate",
+        Handler(validateFn, WithConcurrency(5)))).
+    AddStep(StepWithDependency("process",
+        Dependency("validate"),
+        Handler(processFn, WithRetries(3)))).
+    AddStep(StepWithDependency("finalize",
+        Dependency("process"),
+        Handler(finalizeFn))).
     Build()
 
 // finalize is the only terminal step → automatically the output step
@@ -2059,27 +2082,30 @@ receipt, _ := flow.Run(ctx, client, order).WaitForOutput(ctx)
 **Conditional branching** (requires reconvergence):
 ```go
 flow := NewFlow[Input, Output]("process").
-    AddStep(InitialStep("validate", validateFn)).
+    AddStep(InitialStep("validate",
+        Handler(validateFn, WithConcurrency(10)))).
     // Conditional branches
-    AddStep(StepWithDependency("premium", 
-        Dependency("validate"), 
-        premiumFn, 
-        WithCondition("input.is_premium"))).
-    AddStep(StepWithDependency("standard", 
-        Dependency("validate"), 
-        standardFn, 
-        WithCondition("not input.is_premium"))).
+    AddStep(StepWithDependency("premium",
+        Dependency("validate"),
+        Handler(premiumFn,
+            WithConcurrency(5),
+            WithCondition("input.is_premium")))).
+    AddStep(StepWithDependency("standard",
+        Dependency("validate"),
+        Handler(standardFn,
+            WithCondition("not input.is_premium")))).
     // REQUIRED: Unconditional convergence step
     AddStep(StepWithTwoDependencies("finalize",
-        OptionalDependency("premium"), 
+        OptionalDependency("premium"),
         OptionalDependency("standard"),
-        func(ctx context.Context, in Input, premium Optional[PremiumResult], standard Optional[StandardResult]) (Output, error) {
-            if premium.IsSet {
-                return Output{Type: "premium", Result: premium.Value}, nil
-            }
-            return Output{Type: "standard", Result: standard.Value}, nil
-        },
-    )).
+        Handler(
+            func(ctx context.Context, in Input, premium Optional[PremiumResult], standard Optional[StandardResult]) (Output, error) {
+                if premium.IsSet {
+                    return Output{Type: "premium", Result: premium.Value}, nil
+                }
+                return Output{Type: "standard", Result: standard.Value}, nil
+            },
+        ))).
     Build()
 
 // finalize always executes (no condition) → guaranteed output available
@@ -2089,10 +2115,10 @@ output, _ := flow.Run(ctx, client, input).WaitForOutput(ctx)
 **Build-time error** (multiple terminal steps without convergence):
 ```go
 flow := NewFlow[Request, ApprovalDecision]("approval").
-    AddStep(InitialStep("validate", validateFn)).
-    AddStep(StepWithDependency("approve", Dependency("validate"), approveFn)).
-    AddStep(StepWithDependency("notify-approver", Dependency("approve"), notifyFn)).
-    AddStep(StepWithDependency("notify-requester", Dependency("approve"), notifyFn)).
+    AddStep(InitialStep("validate", Handler(validateFn))).
+    AddStep(StepWithDependency("approve", Dependency("validate"), Handler(approveFn))).
+    AddStep(StepWithDependency("notify-approver", Dependency("approve"), Handler(notifyFn))).
+    AddStep(StepWithDependency("notify-requester", Dependency("approve"), Handler(notifyFn))).
     Build()
 // ERROR at build time: "flow must have exactly one final step, found 2: [notify-approver, notify-requester]"
 ```
