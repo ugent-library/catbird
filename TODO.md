@@ -3,10 +3,6 @@
 ## API Improvements
 
 - [ ] Implement reflection-based builder API (see REFLECTION_API_DESIGN.md)
-      - Use cached reflection (~1μs overhead) for flexible, extensible step dependencies
-      - Eliminate current 8-function explosion problem
-      - Enable optional handler, separated metadata/handler options
-      - Build-time validation with clear error messages
 
 ## Features
 
