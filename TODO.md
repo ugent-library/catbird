@@ -17,6 +17,8 @@ Choose one API approach and implement:
 
 ### Naming & API Cleanup
 
+- [ ] prefix all options: NewHander(..., WithHandlerConcurrency), NewStep(..., WithStepDescription()) or use setter methods
+
 - [ ] **Use standard "visibility timeout" terminology for queue operations**
   - Current: `hideFor` parameter is non-standard and unclear
   - Proposed: Rename to `visibility` or `visibilityTimeout` (industry standard)
