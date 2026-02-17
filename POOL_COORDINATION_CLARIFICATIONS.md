@@ -1,6 +1,6 @@
 # Clarifications: Pool Arguments, Step I/O, and Temporal Coordination
 
-> **Note**: This document explores design patterns conceptually. Code examples use pseudo-generic method syntax (e.g., `DependsOn[T]()`) for clarity. The actual implementation uses the reflection-based API from [REFLECTION_API_DESIGN.md](REFLECTION_API_DESIGN.md) where types are captured via `Dep[T]()` and validated at build time using cached reflection.
+> **Note**: This document explores design patterns conceptually. Code examples use pseudo-generic method syntax (e.g., `DependsOn[T]()`) for clarity.
 
 > **Updated**: This document uses **strong typing patterns** from [TYPED_COORDINATION.md](TYPED_COORDINATION.md). Dependencies are injected as function parameters; side effects and pool operations go through `StepContext`.
 
