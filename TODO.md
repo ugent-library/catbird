@@ -17,7 +17,11 @@ Choose one API approach and implement:
 
 ### Naming & API Cleanup
 
-- [ ] prefix all options: NewHander(..., WithHandlerConcurrency), NewStep(..., WithStepDescription()) or use setter methods
+- [ ] prefix all options: NewHander(..., WithHandlerConcurrency), NewStep(..., WithStepDescription())
+
+- [ ] review sql function return values
+
+- [ ] use WithSignalAndDependency, not the other way around
 
 - [ ] **Use standard "visibility timeout" terminology for queue operations**
   - Current: `hideFor` parameter is non-standard and unclear
@@ -46,10 +50,11 @@ Choose one API approach and implement:
 - [ ] Task coördination and dynamic tasks (see COORDINATION_PATTERNS.md)
 - [ ] Task cancellation and early exit
 - [ ] Wait for output long polling
-- [ ] Description and other meta fields (part of reflection API)
+- [ ] Description and other meta fields 
 - [ ] Metrics
 - [ ] Schemas for task/flow input/output? (see https://opensource.googleblog.com/2026/01/a-json-schema-package-for-go.html)
 - [ ] OnFail handlers
+- [ ] Unlogged tasks and flows
 
 ## Project Management
 
