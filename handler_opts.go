@@ -8,7 +8,7 @@ import (
 type handlerOpts struct {
 	concurrency    int
 	batchSize      int
-	maxDuration    time.Duration
+	timeout        time.Duration
 	maxRetries     int
 	minDelay       time.Duration
 	maxDelay       time.Duration
@@ -24,8 +24,8 @@ func (h *handlerOpts) validate() error {
 	if h.batchSize <= 0 {
 		return fmt.Errorf("batch size must be greater than zero")
 	}
-	if h.maxDuration < 0 {
-		return fmt.Errorf("max duration cannot be negative")
+	if h.timeout < 0 {
+		return fmt.Errorf("timeout cannot be negative")
 	}
 	if h.minDelay < 0 {
 		return fmt.Errorf("backoff minimum delay cannot be negative")
@@ -60,10 +60,10 @@ func WithConcurrency(n int) HandlerOpt {
 	}
 }
 
-// WithMaxDuration sets the maximum duration for handler execution
-func WithMaxDuration(d time.Duration) HandlerOpt {
+// WithTimeout sets the maximum duration for handler execution
+func WithTimeout(d time.Duration) HandlerOpt {
 	return func(h *handlerOpts) {
-		h.maxDuration = d
+		h.timeout = d
 	}
 }
 

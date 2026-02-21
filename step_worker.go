@@ -201,9 +201,9 @@ func (w *stepWorker) handle(ctx context.Context, msg stepMessage) {
 
 	// Execute with timeout if configured
 	fnCtx := ctx
-	if h.maxDuration > 0 {
+	if h.timeout > 0 {
 		var cancel context.CancelFunc
-		fnCtx, cancel = context.WithTimeout(ctx, h.maxDuration)
+		fnCtx, cancel = context.WithTimeout(ctx, h.timeout)
 		defer cancel()
 	}
 
