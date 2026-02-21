@@ -81,7 +81,7 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 	idempotencyKey := fmt.Sprintf("schedule:%d", scheduledTime.Unix())
 
 	// First "worker" enqueues
-	h1, err := client.RunTaskWithOpts(t.Context(), "dedup_test_task", "test", RunOpts{
+	h1, err := client.RunTask(t.Context(), "dedup_test_task", "test", &RunOpts{
 		IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {
@@ -89,7 +89,7 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 	}
 
 	// Second "worker" tries to enqueue same run (should be deduplicated)
-	h2, err := client.RunTaskWithOpts(t.Context(), "dedup_test_task", "test", RunOpts{
+	h2, err := client.RunTask(t.Context(), "dedup_test_task", "test", &RunOpts{
 		IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {
@@ -138,7 +138,7 @@ func TestSchedulerIdempotencyPersists(t *testing.T) {
 
 	// Enqueue first run with idempotency key
 	idempotencyKey := "schedule:1707759600"
-	h1, err := client.RunTaskWithOpts(t.Context(), "persisted_dedup_task", 21, RunOpts{
+	h1, err := client.RunTask(t.Context(), "persisted_dedup_task", 21, &RunOpts{
 		IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {
@@ -233,14 +233,14 @@ func TestSchedulerFlowIdempotency(t *testing.T) {
 	// Enqueue two flows with same idempotency key
 	idempotencyKey := "schedule:1707759600"
 
-	h1, err := client.RunFlowWithOpts(t.Context(), "scheduled_flow", "test1", RunOpts{
+	h1, err := client.RunFlow(t.Context(), "scheduled_flow", "test1", &RunOpts{
 		IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	h2, err := client.RunFlowWithOpts(t.Context(), "scheduled_flow", "test2", RunOpts{
+	h2, err := client.RunFlow(t.Context(), "scheduled_flow", "test2", &RunOpts{
 		IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {

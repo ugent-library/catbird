@@ -258,7 +258,7 @@ func TestFlowCondition(t *testing.T) {
 
 		startTestWorker(t, worker)
 
-		handle, err := client.RunFlow(t.Context(), flowName, 95)
+		handle, err := client.RunFlow(t.Context(), flowName, 95, nil)
 		if err != nil {
 			t.Fatalf("RunFlow failed: %v", err)
 		}
@@ -310,7 +310,7 @@ func TestFlowCondition(t *testing.T) {
 		}
 		startTestWorker(t, worker)
 
-		handle, err := client.RunFlow(t.Context(), flowName, 75)
+		handle, err := client.RunFlow(t.Context(), flowName, 75, nil)
 		if err != nil {
 			t.Fatalf("RunFlow failed: %v", err)
 		}
@@ -352,7 +352,7 @@ func TestFlowCondition(t *testing.T) {
 		}
 		startTestWorker(t, worker)
 
-		handle, err := client.RunFlow(t.Context(), flowName, 95)
+		handle, err := client.RunFlow(t.Context(), flowName, 95, nil)
 		if err != nil {
 			t.Fatalf("RunFlow failed: %v", err)
 		}
@@ -405,7 +405,7 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 		}
 		startTestWorker(t, worker)
 
-		handle, err := client.RunFlow(t.Context(), flowName, map[string]interface{}{"other": "data"})
+		handle, err := client.RunFlow(t.Context(), flowName, map[string]interface{}{"other": "data"}, nil)
 		if err != nil {
 			t.Fatalf("RunFlow failed: %v", err)
 		}
@@ -445,7 +445,7 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 		}
 		startTestWorker(t, worker)
 
-		handle, err := client.RunFlow(t.Context(), flowName, map[string]interface{}{"field": nil})
+		handle, err := client.RunFlow(t.Context(), flowName, map[string]interface{}{"field": nil}, nil)
 		if err != nil {
 			t.Fatalf("RunFlow failed: %v", err)
 		}
@@ -494,7 +494,7 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 					"age": 15,
 				},
 			},
-		})
+		}, nil)
 		if err != nil {
 			t.Fatalf("RunFlow failed: %v", err)
 		}
@@ -553,7 +553,7 @@ func TestFlowOptionalDependency(t *testing.T) {
 	startTestWorker(t, worker)
 
 	// Step2 skipped
-	handle, err := client.RunFlow(t.Context(), flowName, 40)
+	handle, err := client.RunFlow(t.Context(), flowName, 40, nil)
 	if err != nil {
 		t.Fatalf("RunFlow failed: %v", err)
 	}
@@ -576,7 +576,7 @@ func TestFlowOptionalDependency(t *testing.T) {
 	}
 
 	// Step2 executed
-	handle, err = client.RunFlow(t.Context(), flowName, 60)
+	handle, err = client.RunFlow(t.Context(), flowName, 60, nil)
 	if err != nil {
 		t.Fatalf("RunFlow failed: %v", err)
 	}

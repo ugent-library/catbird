@@ -115,7 +115,7 @@ NewFlow("workflow",
     InitialStep("step1", func(ctx context.Context, in string) (string, error) {
         return in + " processed by step 1", nil
     }),
-    StepWithDependencyAndSignal("approve",  // Waits for signal
+    StepWithSignalAndDependency("approve",  // Waits for signal
         Dependency("step1"),
         func(ctx context.Context, in string, approval ApprovalInput, step1Out string) (string, error) {
             return step1Out + " approved by " + approval.ApproverID, nil

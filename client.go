@@ -18,14 +18,8 @@ func New(conn Conn) *Client {
 }
 
 // CreateQueue creates a new queue with the given name.
-func (c *Client) CreateQueue(ctx context.Context, name string) error {
-	return CreateQueue(ctx, c.Conn, name)
-}
-
-// CreateQueueWithOpts creates a queue with the specified options including
-// topics, deletion time, and unlogged mode.
-func (c *Client) CreateQueueWithOpts(ctx context.Context, name string, opts QueueOpts) error {
-	return CreateQueueWithOpts(ctx, c.Conn, name, opts)
+func (c *Client) CreateQueue(ctx context.Context, name string, opts *QueueOpts) error {
+	return CreateQueue(ctx, c.Conn, name, opts)
 }
 
 // GetQueue retrieves queue metadata by name.
@@ -46,14 +40,8 @@ func (c *Client) DeleteQueue(ctx context.Context, name string) (bool, error) {
 
 // Send enqueues a message to the specified queue.
 // The payload is marshaled to JSON.
-func (c *Client) Send(ctx context.Context, queue string, payload any) error {
-	return Send(ctx, c.Conn, queue, payload)
-}
-
-// SendWithOpts enqueues a message with options for topic, deduplication ID,
-// and delivery time.
-func (c *Client) SendWithOpts(ctx context.Context, queue string, payload any, opts SendOpts) error {
-	return SendWithOpts(ctx, c.Conn, queue, payload, opts)
+func (c *Client) Send(ctx context.Context, queue string, payload any, opts *SendOpts) error {
+	return Send(ctx, c.Conn, queue, payload, opts)
 }
 
 // Bind subscribes a queue to a topic pattern.
@@ -69,14 +57,8 @@ func (c *Client) Unbind(ctx context.Context, queue string, pattern string) error
 }
 
 // Dispatch sends a message to all queues subscribed to the specified topic.
-func (c *Client) Dispatch(ctx context.Context, topic string, payload any) error {
-	return Dispatch(ctx, c.Conn, topic, payload)
-}
-
-// DispatchWithOpts sends a message to topic-subscribed queues with options
-// for deduplication ID and delivery time.
-func (c *Client) DispatchWithOpts(ctx context.Context, topic string, payload any, opts DispatchOpts) error {
-	return DispatchWithOpts(ctx, c.Conn, topic, payload, opts)
+func (c *Client) Dispatch(ctx context.Context, topic string, payload any, opts *DispatchOpts) error {
+	return Dispatch(ctx, c.Conn, topic, payload, opts)
 }
 
 // Read reads up to quantity messages from the queue, hiding them from other
@@ -131,13 +113,8 @@ func (c *Client) ListTasks(ctx context.Context) ([]*TaskInfo, error) {
 
 // RunTask enqueues a task execution and returns a handle for monitoring
 // progress and retrieving output.
-func (c *Client) RunTask(ctx context.Context, name string, input any, opts ...RunOpts) (*RunHandle, error) {
-	return RunTask(ctx, c.Conn, name, input, opts...)
-}
-
-// RunTaskWithOpts enqueues a task with options for concurrency/idempotency control.
-func (c *Client) RunTaskWithOpts(ctx context.Context, name string, input any, opts RunOpts) (*RunHandle, error) {
-	return RunTaskWithOpts(ctx, c.Conn, name, input, opts)
+func (c *Client) RunTask(ctx context.Context, name string, input any, opts *RunOpts) (*RunHandle, error) {
+	return RunTask(ctx, c.Conn, name, input, opts)
 }
 
 // GetTaskRun retrieves a specific task run result by ID.
@@ -166,13 +143,8 @@ func (c *Client) ListFlows(ctx context.Context) ([]*FlowInfo, error) {
 }
 
 // RunFlow enqueues a flow execution and returns a handle for monitoring.
-func (c *Client) RunFlow(ctx context.Context, name string, input any, opts ...RunOpts) (*RunHandle, error) {
-	return RunFlow(ctx, c.Conn, name, input, opts...)
-}
-
-// RunFlowWithOpts enqueues a flow with options for concurrency/idempotency control.
-func (c *Client) RunFlowWithOpts(ctx context.Context, name string, input any, opts RunFlowOpts) (*RunHandle, error) {
-	return RunFlowWithOpts(ctx, c.Conn, name, input, opts)
+func (c *Client) RunFlow(ctx context.Context, name string, input any, opts *RunFlowOpts) (*RunHandle, error) {
+	return RunFlow(ctx, c.Conn, name, input, opts)
 }
 
 // GetFlowRun retrieves a specific flow run result by ID.

@@ -40,7 +40,7 @@ func TestFlowCreate(t *testing.T) {
 		Step1 string `json:"step1"`
 	}
 
-	h, err := client.RunFlow(t.Context(), "test_flow", "input")
+	h, err := client.RunFlow(t.Context(), "test_flow", "input", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestFlowSingleStep(t *testing.T) {
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunFlow(t.Context(), "single_step_flow", "input")
+	h, err := client.RunFlow(t.Context(), "single_step_flow", "input", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestFlowWithDependencies(t *testing.T) {
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunFlow(t.Context(), "dependency_flow", "input")
+	h, err := client.RunFlow(t.Context(), "dependency_flow", "input", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestFlowListFlows(t *testing.T) {
 		Step1 string `json:"step1"`
 	}
 
-	h1, err := client.RunFlow(t.Context(), "list_flow_1", "input_1")
+	h1, err := client.RunFlow(t.Context(), "list_flow_1", "input_1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestFlowListFlows(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	h2, err := client.RunFlow(t.Context(), "list_flow_2", "input_2")
+	h2, err := client.RunFlow(t.Context(), "list_flow_2", "input_2", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +329,7 @@ func TestFlowComplexDependencies(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Run the flow
-	h, err := client.RunFlow(t.Context(), "complex_flow", "input")
+	h, err := client.RunFlow(t.Context(), "complex_flow", "input", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +390,7 @@ func TestFlowStepPanicRecovery(t *testing.T) {
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	if _, err := client.RunFlow(t.Context(), "panic_flow", "test input"); err != nil {
+	if _, err := client.RunFlow(t.Context(), "panic_flow", "test input", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -447,7 +447,7 @@ func TestStepCircuitBreaker(t *testing.T) {
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunFlow(t.Context(), "circuit_flow", "input")
+	h, err := client.RunFlow(t.Context(), "circuit_flow", "input", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -498,7 +498,7 @@ func TestFlowWithSignal(t *testing.T) {
 		InitialStep("submit", func(ctx context.Context, doc string) (string, error) {
 			return "submitted: " + doc, nil
 		}),
-		StepWithDependencyAndSignal("approve",
+		StepWithSignalAndDependency("approve",
 			Dependency("submit"),
 			func(ctx context.Context, doc string, approval ApprovalInput, submitResult string) (string, error) {
 				if !approval.Approved {
@@ -523,7 +523,7 @@ func TestFlowWithSignal(t *testing.T) {
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunFlow(t.Context(), "signal_approval_flow", "my_document")
+	h, err := client.RunFlow(t.Context(), "signal_approval_flow", "my_document", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -593,7 +593,7 @@ func TestFlowWithInitialSignal(t *testing.T) {
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunFlow(t.Context(), "signal_trigger_flow", "workflow_data")
+	h, err := client.RunFlow(t.Context(), "signal_trigger_flow", "workflow_data", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -645,7 +645,7 @@ func TestFlowSignalAlreadyDelivered(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunFlow(t.Context(), "signal_duplicate_flow", "input")
+	h, err := client.RunFlow(t.Context(), "signal_duplicate_flow", "input", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -245,10 +245,10 @@ func InitialStepWithSignal[In, SigIn, Out any](name string, fn func(context.Cont
 	}
 }
 
-// StepWithDependencyAndSignal creates a flow step with one dependency that requires a signal
+// StepWithSignalAndDependency creates a flow step with one dependency that requires a signal
 // The handler receives the flow input, signal input, and the output of the dependency step
 // Step waits for both dependency completion AND signal delivery before executing
-func StepWithDependencyAndSignal[In, SigIn, Dep1Out, Out any](name string, dep1 *StepDependency, fn func(context.Context, In, SigIn, Dep1Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+func StepWithSignalAndDependency[In, SigIn, Dep1Out, Out any](name string, dep1 *StepDependency, fn func(context.Context, In, SigIn, Dep1Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	var dep1Out Dep1Out
 	if err := validateDependencyOutputs([]*StepDependency{dep1}, []any{&dep1Out}); err != nil {
 		panic(err)
@@ -284,10 +284,10 @@ func StepWithDependencyAndSignal[In, SigIn, Dep1Out, Out any](name string, dep1 
 	}
 }
 
-// StepWithTwoDependenciesAndSignal creates a flow step with two dependencies that requires a signal
+// StepWithSignalAndTwoDependencies creates a flow step with two dependencies that requires a signal
 // The handler receives the flow input, signal input, and the outputs of both dependency steps
 // Step waits for both dependencies to complete AND signal delivery before executing
-func StepWithTwoDependenciesAndSignal[In, SigIn, Dep1Out, Dep2Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, fn func(context.Context, In, SigIn, Dep1Out, Dep2Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+func StepWithSignalAndTwoDependencies[In, SigIn, Dep1Out, Dep2Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, fn func(context.Context, In, SigIn, Dep1Out, Dep2Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	var dep1Out Dep1Out
 	var dep2Out Dep2Out
 	if err := validateDependencyOutputs([]*StepDependency{dep1, dep2}, []any{&dep1Out, &dep2Out}); err != nil {
@@ -325,10 +325,10 @@ func StepWithTwoDependenciesAndSignal[In, SigIn, Dep1Out, Dep2Out, Out any](name
 	}
 }
 
-// StepWithThreeDependenciesAndSignal creates a flow step with three dependencies that requires a signal
+// StepWithSignalAndThreeDependencies creates a flow step with three dependencies that requires a signal
 // The handler receives the flow input, signal input, and the outputs of all three dependency steps
 // Step waits for all dependencies to complete AND signal delivery before executing
-func StepWithThreeDependenciesAndSignal[In, SigIn, Dep1Out, Dep2Out, Dep3Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, fn func(context.Context, In, SigIn, Dep1Out, Dep2Out, Dep3Out) (Out, error), opts ...HandlerOpt) FlowOpt {
+func StepWithSignalAndThreeDependencies[In, SigIn, Dep1Out, Dep2Out, Dep3Out, Out any](name string, dep1 *StepDependency, dep2 *StepDependency, dep3 *StepDependency, fn func(context.Context, In, SigIn, Dep1Out, Dep2Out, Dep3Out) (Out, error), opts ...HandlerOpt) FlowOpt {
 	var dep1Out Dep1Out
 	var dep2Out Dep2Out
 	var dep3Out Dep3Out
@@ -501,16 +501,11 @@ func ListFlows(ctx context.Context, conn Conn) ([]*FlowInfo, error) {
 type RunFlowOpts = RunOpts
 
 // RunFlow enqueues a flow execution and returns a handle for monitoring.
-func RunFlow(ctx context.Context, conn Conn, name string, input any, opts ...RunOpts) (*RunHandle, error) {
-	var o RunOpts
-	if len(opts) > 0 {
-		o = opts[0]
+func RunFlow(ctx context.Context, conn Conn, name string, input any, opts *RunFlowOpts) (*RunHandle, error) {
+	if opts == nil {
+		opts = &RunFlowOpts{}
 	}
-	return RunFlowWithOpts(ctx, conn, name, input, o)
-}
 
-// RunFlowWithOpts enqueues a flow with options for concurrency/idempotency control.
-func RunFlowWithOpts(ctx context.Context, conn Conn, name string, input any, opts RunFlowOpts) (*RunHandle, error) {
 	b, err := json.Marshal(input)
 	if err != nil {
 		return nil, err
@@ -613,7 +608,7 @@ func GetFlowRunSteps(ctx context.Context, conn Conn, flowName string, flowRunID 
 }
 
 // SignalFlow delivers a signal to a waiting step in a flow run.
-// The step must have been defined with a signal variant (e.g., InitialStepWithSignal, StepWithDependencyAndSignal).
+// The step must have been defined with a signal variant (e.g., InitialStepWithSignal, StepWithSignalAndDependency).
 // Signals enable human-in-the-loop workflows where a step waits for external input before executing.
 // Returns an error if the signal was already delivered or the step doesn't require a signal.
 func SignalFlow(ctx context.Context, conn Conn, flowName string, flowRunID int64, stepName string, input any) error {

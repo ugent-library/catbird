@@ -9,7 +9,7 @@ import (
 func TestQueueCreate(t *testing.T) {
 	client := getTestClient(t)
 
-	err := client.CreateQueue(t.Context(), "simple_queue")
+	err := client.CreateQueue(t.Context(), "simple_queue", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +27,7 @@ func TestQueueSendAndRead(t *testing.T) {
 	client := getTestClient(t)
 
 	queueName := "send_read_queue"
-	err := client.CreateQueue(t.Context(), queueName)
+	err := client.CreateQueue(t.Context(), queueName, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestQueueSendAndRead(t *testing.T) {
 	}
 
 	payload := TestPayload{Message: "hello", Count: 42}
-	err = client.Send(t.Context(), queueName, payload)
+	err = client.Send(t.Context(), queueName, payload, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestQueueDispatch(t *testing.T) {
 	client := getTestClient(t)
 
 	queueName := "dispatch_queue"
-	err := client.CreateQueue(t.Context(), queueName)
+	err := client.CreateQueue(t.Context(), queueName, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestQueueDispatch(t *testing.T) {
 	}
 
 	event := Event{EventType: "test_event", Data: "test_data"}
-	err = client.Dispatch(t.Context(), "event_topic", event)
+	err = client.Dispatch(t.Context(), "event_topic", event, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,12 +101,12 @@ func TestQueueDelete(t *testing.T) {
 	client := getTestClient(t)
 
 	queueName := "delete_queue"
-	err := client.CreateQueue(t.Context(), queueName)
+	err := client.CreateQueue(t.Context(), queueName, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = client.Send(t.Context(), queueName, "test")
+	err = client.Send(t.Context(), queueName, "test", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,12 +140,12 @@ func TestQueueHide(t *testing.T) {
 	client := getTestClient(t)
 
 	queueName := "hide_queue"
-	err := client.CreateQueue(t.Context(), queueName)
+	err := client.CreateQueue(t.Context(), queueName, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = client.Send(t.Context(), queueName, "test message")
+	err = client.Send(t.Context(), queueName, "test message", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,12 +180,12 @@ func TestQueueHideExpiry(t *testing.T) {
 	client := getTestClient(t)
 
 	queueName := "hide_expiry_queue"
-	err := client.CreateQueue(t.Context(), queueName)
+	err := client.CreateQueue(t.Context(), queueName, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = client.Send(t.Context(), queueName, "test message")
+	err = client.Send(t.Context(), queueName, "test message", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,11 +235,11 @@ func TestQueueListQueues(t *testing.T) {
 	q1 := "list_queue_1"
 	q2 := "list_queue_2"
 
-	err := client.CreateQueue(t.Context(), q1)
+	err := client.CreateQueue(t.Context(), q1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = client.CreateQueue(t.Context(), q2)
+	err = client.CreateQueue(t.Context(), q2, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

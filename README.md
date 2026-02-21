@@ -34,10 +34,10 @@ ctx := context.Background()
 client := catbird.New(conn)
 
 // Create a queue
-err := client.CreateQueue(ctx, "my-queue")
+err := client.CreateQueue(ctx, "my-queue", nil)
 
 // Create a queue that expires after 1 hour and is unlogged for better performance
-err = client.CreateQueueWithOpts(ctx, "temp-queue", catbird.QueueOpts{
+err = client.CreateQueue(ctx, "temp-queue", &catbird.QueueOpts{
     ExpiresAt: time.Now().Add(1 * time.Hour),
     Unlogged:  true, // Faster but not crash-safe; useful for transient work
 })
@@ -46,21 +46,21 @@ err = client.CreateQueueWithOpts(ctx, "temp-queue", catbird.QueueOpts{
 err = client.Send(ctx, "my-queue", map[string]any{
     "user_id": 123,
     "action":  "process",
-})
+}, nil)
 
 // Send a message with delayed delivery (available in 5 minutes)
-err = client.SendWithOpts(ctx, "my-queue", map[string]any{
+err = client.Send(ctx, "my-queue", map[string]any{
     "type":    "reminder",
     "user_id": 456,
-}, catbird.SendOpts{
+}, &catbird.SendOpts{
     DeliverAt: time.Now().Add(5 * time.Minute),
 })
 
 // Send a message with idempotency key to prevent duplicates
-err = client.SendWithOpts(ctx, "my-queue", map[string]any{
+err = client.Send(ctx, "my-queue", map[string]any{
     "order_id": 789,
     "action":   "process",
-}, catbird.SendOpts{
+}, &catbird.SendOpts{
     IdempotencyKey: "order-789-process",
 })
 
@@ -89,12 +89,12 @@ Catbird supports two deduplication strategies for tasks and flows, allowing you 
 
 ```go
 // Task: Prevent concurrent executions
-handle, err := client.RunTaskWithOpts(ctx, "process-user", userID, catbird.RunOpts{
+handle, err := client.RunTask(ctx, "process-user", userID, &catbird.RunOpts{
     ConcurrencyKey: fmt.Sprintf("user-%d", userID),
 })
 
 // Flow: Prevent concurrent workflow runs
-handle, err := client.RunFlowWithOpts(ctx, "order-processing", order, catbird.RunFlowOpts{
+handle, err := client.RunFlow(ctx, "order-processing", order, &catbird.RunFlowOpts{
     ConcurrencyKey: fmt.Sprintf("order-%s", order.ID),
 })
 
@@ -124,12 +124,12 @@ worker, err := client.NewWorker(ctx,
 
 ```go
 // Task: Ensure payment is processed exactly once
-handle, err := client.RunTaskWithOpts(ctx, "charge-payment", payment, catbird.RunOpts{
+handle, err := client.RunTask(ctx, "charge-payment", payment, &catbird.RunOpts{
     IdempotencyKey: fmt.Sprintf("payment-%s", payment.ID),
 })
 
 // Flow: Ensure order is processed exactly once
-handle, err := client.RunFlowWithOpts(ctx, "fulfill-order", order, catbird.RunFlowOpts{
+handle, err := client.RunFlow(ctx, "fulfill-order", order, &catbird.RunFlowOpts{
     IdempotencyKey: fmt.Sprintf("order-%s-fulfillment", order.ID),
 })
 ```
@@ -155,11 +155,11 @@ handle, err := client.RunFlowWithOpts(ctx, "fulfill-order", order, catbird.RunFl
 - **Return value on duplicate**: When a duplicate is detected, `RunTask()`/`RunFlow()` return a handle with the **existing run's ID**, not an error. This allows you to wait on the existing execution:
   ```go
   // First call creates run with ID 123
-  h1, _ := client.RunTaskWithOpts(ctx, "task", input, RunOpts{IdempotencyKey: "key-1"})
+    h1, _ := client.RunTask(ctx, "task", input, &RunOpts{IdempotencyKey: "key-1"})
   // h1.ID = 123
   
   // Duplicate call returns handle to same run
-  h2, _ := client.RunTaskWithOpts(ctx, "task", input, RunOpts{IdempotencyKey: "key-1"})
+    h2, _ := client.RunTask(ctx, "task", input, &RunOpts{IdempotencyKey: "key-1"})
   // h2.ID = 123 (same as h1)
   
   // Both handles can wait for the same result
@@ -175,8 +175,8 @@ handle, err := client.RunFlowWithOpts(ctx, "fulfill-order", order, catbird.RunFl
 
 ```go
 // Create queues
-err := client.CreateQueue(ctx, "user-events")
-err = client.CreateQueue(ctx, "audit-log")
+err := client.CreateQueue(ctx, "user-events", nil)
+err = client.CreateQueue(ctx, "audit-log", nil)
 
 // Bind queues to topic patterns
 // Exact match
@@ -194,7 +194,7 @@ err = client.Bind(ctx, "audit-log", "events.*")
 err = client.Dispatch(ctx, "events.user.created", map[string]any{
     "user_id": 123,
     "email":   "user@example.com",
-})
+}, nil)
 // Message is delivered to both "user-events" (exact) and "audit-log" (wildcard)
 
 // Unbind a pattern
@@ -236,7 +236,7 @@ go worker.Start(ctx)
 handle, err := client.RunTask(ctx, "send-email", EmailRequest{
     To:      "user@example.com",
     Subject: "Hello",
-})
+}, nil)
 
 // Get result
 var result EmailResponse
@@ -303,7 +303,7 @@ worker, err = client.NewWorker(ctx,
 go worker.Start(ctx)
 
 // Run the flow
-handle, err := client.RunFlow(ctx, "order-processing", myOrder)
+handle, err := client.RunFlow(ctx, "order-processing", myOrder, nil)
 
 // Get combined results from all steps
 var results map[string]any
@@ -327,7 +327,7 @@ flow := catbird.NewFlow("document_approval",
         // Submit document for review
         return doc.ID, nil
     }),
-    catbird.StepWithDependencyAndSignal("approve",
+    catbird.StepWithSignalAndDependency("approve",
         catbird.Dependency("submit"),
         func(ctx context.Context, doc Document, approval ApprovalInput, docID string) (string, error) {
             if !approval.Approved {
@@ -348,7 +348,7 @@ worker, err := client.NewWorker(ctx, catbird.WithFlow(flow))
 go worker.Start(ctx)
 
 // Run the flow
-handle, err := client.RunFlow(ctx, "document_approval", myDocument)
+handle, err := client.RunFlow(ctx, "document_approval", myDocument, nil)
 
 // Later, when approval is received (e.g., from a webhook or UI):
 err = client.SignalFlow(ctx, "document_approval", handle.ID, "approve", ApprovalInput{
@@ -365,9 +365,9 @@ err = handle.WaitForOutput(ctx, &results)
 
 Signal variants available:
 - `InitialStepWithSignal` - first step requires signal
-- `StepWithDependencyAndSignal` - step with 1 dependency + signal
-- `StepWithTwoDependenciesAndSignal` - step with 2 dependencies + signal
-- `StepWithThreeDependenciesAndSignal` - step with 3 dependencies + signal
+- `StepWithSignalAndDependency` - step with 1 dependency + signal
+- `StepWithSignalAndTwoDependencies` - step with 2 dependencies + signal
+- `StepWithSignalAndThreeDependencies` - step with 3 dependencies + signal
 
 A step with both dependencies and a signal waits for **both** conditions: all dependencies must complete **and** the signal must be delivered before the step executes.
 
@@ -486,7 +486,7 @@ premiumTask := catbird.NewTask("premium_processing",
 )
 
 // Run task - may be skipped based on input
-client.RunTask(ctx, "premium_processing", ProcessRequest{UserID: 123, IsPremium: false})
+client.RunTask(ctx, "premium_processing", ProcessRequest{UserID: 123, IsPremium: false}, nil)
 // This task run will be skipped (is_premium = false)
 ```
 

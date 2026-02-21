@@ -123,7 +123,7 @@ func (s *Scheduler) Start(ctx context.Context) error {
 				return
 			}
 
-			_, err = RunTaskWithOpts(ctx, s.conn, ts.name, inputJSON, RunOpts{
+			_, err = RunTask(ctx, s.conn, ts.name, inputJSON, &RunOpts{
 				// Generate stable idempotency key from scheduled time (UTC seconds)
 				// Format: "schedule:<unix_seconds>" ensures consistent dedup across workers
 				IdempotencyKey: fmt.Sprintf("schedule:%d", scheduledTime.Unix()),
@@ -158,7 +158,7 @@ func (s *Scheduler) Start(ctx context.Context) error {
 				return
 			}
 
-			_, err = RunFlowWithOpts(ctx, s.conn, fs.name, inputJSON, RunOpts{
+			_, err = RunFlow(ctx, s.conn, fs.name, inputJSON, &RunOpts{
 				// Generate stable idempotency key from scheduled time (UTC seconds)
 				// Format: "schedule:<unix_seconds>" ensures consistent dedup across workers
 				IdempotencyKey: fmt.Sprintf("schedule:%d", scheduledTime.Unix()),

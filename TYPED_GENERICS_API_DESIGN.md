@@ -2014,7 +2014,7 @@ flow := catbird.NewFlow[Request, ApprovalOutput]("approval-flow").
     ).
     AddStep(
         // Step waits for signal before executing
-        StepWithDependencyAndSignal("approve",
+        StepWithSignalAndDependency("approve",
             "validate",
             func(ctx context.Context, stepCtx StepContext, req Request, 
                 approval ApprovalInput, validation ValidationResult) (ApprovalOutput, error) {

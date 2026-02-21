@@ -21,24 +21,12 @@ Choose one API approach and implement:
 
 - [ ] review sql function return values
 
-- [ ] use WithSignalAndDependency, not the other way around
-
 - [ ] **Use standard "visibility timeout" terminology for queue operations**
   - Current: `hideFor` parameter is non-standard and unclear
   - Proposed: Rename to `visibility` or `visibilityTimeout` (industry standard)
   - Affects: `Read()`, `ReadPoll()`, `Hide()`, `HideMany()` methods
   - Reference: AWS SQS, Azure Service Bus, Google Cloud Tasks all use "visibility timeout"
   - Benefit: Self-documenting, searchable, familiar to developers
-
-- [ ] **Eliminate ...WithOpts method duplication**
-  - Current: Duplicate methods like `Send()` + `SendWithOpts()`, `RunTask()` + `RunTaskWithOpts()`
-  - Proposed: Single method with optional `*ConfigStruct` parameter (nil for defaults)
-  - Pattern: `Send(ctx, queue, payload, *SendConfig)` where `nil` uses defaults
-  - Benefits: One method per operation, idiomatic Go, easier to extend
-  - Examples:
-    - `CreateQueue(ctx, name, *QueueConfig)` instead of `CreateQueue()` + `CreateQueueWithOpts()`
-    - `Send(ctx, queue, payload, *SendConfig)` instead of `Send()` + `SendWithOpts()`
-    - `RunTask(ctx, name, input, *RunConfig)` instead of variadic + `RunTaskWithOpts()`
 
 ## Features
 

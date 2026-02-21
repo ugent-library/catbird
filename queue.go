@@ -31,14 +31,14 @@ type QueueOpts struct {
 	Unlogged  bool
 }
 
-// CreateQueue creates a new queue with the given name.
-func CreateQueue(ctx context.Context, conn Conn, name string) error {
-	return CreateQueueWithOpts(ctx, conn, name, QueueOpts{})
-}
-
-// CreateQueueWithOpts creates a queue with the specified options.
+// CreateQueue creates a queue with the specified options.
+// Pass nil opts to use defaults.
 // Use Bind() separately to create topic bindings.
-func CreateQueueWithOpts(ctx context.Context, conn Conn, name string, opts QueueOpts) error {
+func CreateQueue(ctx context.Context, conn Conn, name string, opts *QueueOpts) error {
+	if opts == nil {
+		opts = &QueueOpts{}
+	}
+
 	q := `SELECT cb_create_queue(name => $1, expires_at => $2, unlogged => $3);`
 	_, err := conn.Exec(ctx, q, name, ptrOrNil(opts.ExpiresAt), opts.Unlogged)
 	return err
@@ -76,14 +76,13 @@ type SendOpts struct {
 }
 
 // Send enqueues a message to the specified queue.
+// Pass nil opts to use defaults.
 // The payload is marshaled to JSON.
-func Send(ctx context.Context, conn Conn, queue string, payload any) error {
-	return SendWithOpts(ctx, conn, queue, payload, SendOpts{})
-}
+func Send(ctx context.Context, conn Conn, queue string, payload any, opts *SendOpts) error {
+	if opts == nil {
+		opts = &SendOpts{}
+	}
 
-// SendWithOpts enqueues a message with options for topic, idempotency key,
-// and delivery time.
-func SendWithOpts(ctx context.Context, conn Conn, queue string, payload any, opts SendOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -115,14 +114,13 @@ type DispatchOpts struct {
 	DeliverAt      *time.Time
 }
 
-// Dispatch sends a message to all queues subscribed to the specified topic.
-func Dispatch(ctx context.Context, conn Conn, topic string, payload any) error {
-	return DispatchWithOpts(ctx, conn, topic, payload, DispatchOpts{})
-}
+// Dispatch sends a message to topic-subscribed queues with options.
+// Pass nil opts to use defaults.
+func Dispatch(ctx context.Context, conn Conn, topic string, payload any, opts *DispatchOpts) error {
+	if opts == nil {
+		opts = &DispatchOpts{}
+	}
 
-// DispatchWithOpts sends a message to topic-subscribed queues with options
-// for idempotency key and delivery time.
-func DispatchWithOpts(ctx context.Context, conn Conn, topic string, payload any, opts DispatchOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return err

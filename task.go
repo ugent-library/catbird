@@ -103,16 +103,11 @@ type RunOpts struct {
 
 // RunTask enqueues a task execution and returns a handle for monitoring
 // progress and retrieving output.
-func RunTask(ctx context.Context, conn Conn, name string, input any, opts ...RunOpts) (*RunHandle, error) {
-	var o RunOpts
-	if len(opts) > 0 {
-		o = opts[0]
+func RunTask(ctx context.Context, conn Conn, name string, input any, opts *RunOpts) (*RunHandle, error) {
+	if opts == nil {
+		opts = &RunOpts{}
 	}
-	return RunTaskWithOpts(ctx, conn, name, input, o)
-}
 
-// RunTaskWithOpts enqueues a task with options for concurrency/idempotency control.
-func RunTaskWithOpts(ctx context.Context, conn Conn, name string, input any, opts RunOpts) (*RunHandle, error) {
 	b, err := json.Marshal(input)
 	if err != nil {
 		return nil, err

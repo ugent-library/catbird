@@ -54,7 +54,7 @@ func TestTaskRunAndWait(t *testing.T) {
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunTask(t.Context(), "math_task", TaskInput{Value: 21})
+	h, err := client.RunTask(t.Context(), "math_task", TaskInput{Value: 21}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestTaskPanicRecovery(t *testing.T) {
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	if _, err := client.RunTask(t.Context(), "panic_task", "test input"); err != nil {
+	if _, err := client.RunTask(t.Context(), "panic_task", "test input", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -149,7 +149,7 @@ func TestTaskCircuitBreaker(t *testing.T) {
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunTask(t.Context(), "circuit_task", "input")
+	h, err := client.RunTask(t.Context(), "circuit_task", "input", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

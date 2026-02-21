@@ -219,7 +219,7 @@ func (a *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		opts.Topic = topic
 	}
 
-	err := a.client.SendWithOpts(r.Context(), queue, json.RawMessage(payload), opts)
+	err := a.client.Send(r.Context(), queue, json.RawMessage(payload), &opts)
 	if err != nil {
 		a.queues.ExecuteTemplate(w, "send_message_error", struct {
 			Error string
@@ -258,7 +258,7 @@ func (a *App) handleCreateQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := a.client.CreateQueue(r.Context(), name)
+	err := a.client.CreateQueue(r.Context(), name, nil)
 	if err != nil {
 		a.queues.ExecuteTemplate(w, "create_queue_error", struct {
 			Error string
@@ -452,7 +452,7 @@ func (a *App) handleStartTaskRun(w http.ResponseWriter, r *http.Request) {
 		input = "{}"
 	}
 
-	_, err := a.client.RunTask(r.Context(), taskName, json.RawMessage(input))
+	_, err := a.client.RunTask(r.Context(), taskName, json.RawMessage(input), nil)
 	if err != nil {
 		a.task.ExecuteTemplate(w, "start_task_run_error", struct {
 			Error string
@@ -541,7 +541,7 @@ func (a *App) handleStartFlowRun(w http.ResponseWriter, r *http.Request) {
 		input = "{}"
 	}
 
-	_, err := a.client.RunFlow(r.Context(), flowName, json.RawMessage(input))
+	_, err := a.client.RunFlow(r.Context(), flowName, json.RawMessage(input), nil)
 	if err != nil {
 		a.flow.ExecuteTemplate(w, "start_flow_run_error", struct {
 			Error string

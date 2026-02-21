@@ -212,7 +212,7 @@ func TestTaskRetriesIntegration(t *testing.T) {
 	// give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunTask(t.Context(), "retry_task", "input")
+	h, err := client.RunTask(t.Context(), "retry_task", "input", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
