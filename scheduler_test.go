@@ -15,7 +15,7 @@ func TestSchedulerIdempotencyKeyGeneration(t *testing.T) {
 
 	task := NewTask("scheduled_task", func(ctx context.Context, in string) (string, error) {
 		return in + " processed", nil
-	})
+	}, nil)
 
 	worker, err := client.NewWorker(t.Context(),
 		WithTask(task),
@@ -62,7 +62,7 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 		executionCount++
 		countMutex.Unlock()
 		return in, nil
-	})
+	}, nil)
 
 	// Create and run worker to execute task (must create task before running)
 	worker, err := client.NewWorker(t.Context(),
@@ -124,7 +124,7 @@ func TestSchedulerIdempotencyPersists(t *testing.T) {
 
 	task := NewTask("persisted_dedup_task", func(ctx context.Context, in int) (int, error) {
 		return in * 2, nil
-	})
+	}, nil)
 
 	worker, err := client.NewWorker(t.Context(),
 		WithTask(task),
@@ -214,11 +214,10 @@ func TestSchedulerUTCNormalization(t *testing.T) {
 func TestSchedulerFlowIdempotency(t *testing.T) {
 	client := getTestClient(t)
 
-	flow := NewFlow("scheduled_flow",
-		InitialStep("step1", func(ctx context.Context, in string) (int, error) {
+	flow := NewFlow[string, int]("scheduled_flow").
+		AddStep(NewStep("step1", func(ctx context.Context, in string) (int, error) {
 			return 42, nil
-		}),
-	)
+		}, nil))
 
 	worker, err := client.NewWorker(t.Context(),
 		WithFlow(flow),
@@ -253,7 +252,7 @@ func TestSchedulerFlowIdempotency(t *testing.T) {
 	}
 
 	// Wait for completion
-	var output map[string]interface{}
+	var output int
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	if err := h1.WaitForOutput(ctx, &output); err != nil {

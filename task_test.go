@@ -15,7 +15,7 @@ func TestTaskCreate(t *testing.T) {
 
 	task := NewTask("test_task", func(ctx context.Context, in string) (string, error) {
 		return in + " processed", nil
-	})
+	}, nil)
 
 	err := client.CreateTask(t.Context(), task)
 	if err != nil {
@@ -40,7 +40,7 @@ func TestTaskRunAndWait(t *testing.T) {
 
 	task := NewTask("math_task", func(ctx context.Context, in TaskInput) (int, error) {
 		return in.Value * 2, nil
-	})
+	}, nil)
 
 	worker, err := client.NewWorker(t.Context(),
 		WithTask(task),
@@ -76,7 +76,7 @@ func TestTaskPanicRecovery(t *testing.T) {
 
 	task := NewTask("panic_task", func(ctx context.Context, in string) (string, error) {
 		panic("intentional panic in task")
-	})
+	}, nil)
 
 	worker, err := client.NewWorker(t.Context(),
 		WithTask(task),
@@ -137,7 +137,12 @@ func TestTaskCircuitBreaker(t *testing.T) {
 			return "", fmt.Errorf("intentional failure")
 		}
 		return "ok", nil
-	}, WithMaxRetries(2), WithBackoff(minBackoff, maxBackoff), WithCircuitBreaker(1, openTimeout))
+	}, &TaskOpts{
+		MaxRetries:     2,
+		MinDelay:       minBackoff,
+		MaxDelay:       maxBackoff,
+		CircuitBreaker: NewCircuitBreaker(1, openTimeout),
+	})
 
 	worker, err := client.NewWorker(t.Context(), WithTask(task))
 	if err != nil {

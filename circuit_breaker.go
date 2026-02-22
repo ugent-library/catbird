@@ -14,7 +14,7 @@ const (
 	circuitHalfOpen
 )
 
-type circuitBreaker struct {
+type CircuitBreaker struct {
 	mu               sync.Mutex
 	state            circuitState
 	failures         int
@@ -24,15 +24,15 @@ type circuitBreaker struct {
 	halfOpenInFlight bool
 }
 
-func newCircuitBreaker(failureThreshold int, openTimeout time.Duration) *circuitBreaker {
-	return &circuitBreaker{
+func NewCircuitBreaker(failureThreshold int, openTimeout time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
 		state:            circuitClosed,
 		failureThreshold: failureThreshold,
 		openTimeout:      openTimeout,
 	}
 }
 
-func (c *circuitBreaker) validate() error {
+func (c *CircuitBreaker) validate() error {
 	if c.failureThreshold <= 0 {
 		return fmt.Errorf("circuit breaker failure threshold must be greater than zero")
 	}
@@ -42,7 +42,7 @@ func (c *circuitBreaker) validate() error {
 	return nil
 }
 
-func (c *circuitBreaker) allow(now time.Time) (bool, time.Duration) {
+func (c *CircuitBreaker) allow(now time.Time) (bool, time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -74,7 +74,7 @@ func (c *circuitBreaker) allow(now time.Time) (bool, time.Duration) {
 	return true, 0
 }
 
-func (c *circuitBreaker) recordSuccess() {
+func (c *CircuitBreaker) recordSuccess() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -88,7 +88,7 @@ func (c *circuitBreaker) recordSuccess() {
 	}
 }
 
-func (c *circuitBreaker) recordFailure(now time.Time) {
+func (c *CircuitBreaker) recordFailure(now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

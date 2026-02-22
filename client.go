@@ -97,7 +97,7 @@ func (c *Client) DeleteMany(ctx context.Context, queue string, ids []int64) erro
 }
 
 // CreateTask creates a new task definition.
-func (c *Client) CreateTask(ctx context.Context, task *Task) error {
+func (c *Client) CreateTask(ctx context.Context, task Task) error {
 	return CreateTask(ctx, c.Conn, task)
 }
 
@@ -128,7 +128,7 @@ func (c *Client) ListTaskRuns(ctx context.Context, name string) ([]*RunInfo, err
 }
 
 // CreateFlow creates a new flow definition.
-func (c *Client) CreateFlow(ctx context.Context, flow *Flow) error {
+func (c *Client) CreateFlow(ctx context.Context, flow Flow) error {
 	return CreateFlow(ctx, c.Conn, flow)
 }
 
@@ -163,7 +163,7 @@ func (c *Client) GetFlowRunSteps(ctx context.Context, flowName string, flowRunID
 }
 
 // SignalFlow delivers a signal to a waiting step in a flow run.
-// The step must have been defined with a signal variant (e.g., InitialStepWithSignal).
+// The step must have been defined with a signal variant (e.g., NewStepWithSignal).
 // Returns an error if the signal was already delivered or the step doesn't require a signal.
 func (c *Client) SignalFlow(ctx context.Context, flowName string, flowRunID int64, stepName string, input any) error {
 	return SignalFlow(ctx, c.Conn, flowName, flowRunID, stepName, input)

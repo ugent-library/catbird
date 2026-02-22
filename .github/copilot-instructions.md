@@ -32,7 +32,7 @@ Catbird is a PostgreSQL-based message queue with task and workflow execution eng
 
 All schema is version-controlled in `migrations/` (goose-managed):
 - **Queues** (v1): `cb_queues` table (name PK, expires_at) + `cb_bindings` table (queue_name FK, pattern, pattern_type, prefix, regex) + message functions; custom types `cb_message` (7 fields including id, topic, payload). Bindings use exact match fast path (indexed) or wildcard (prefix filter + regex).
-- **Tasks/Flows** (v2): Task definitions, runs, flows; custom types `cb_task_message`, `cb_step_message`; `optional` column on `cb_step_dependencies`; `cb_create_flow()` handles optional dependencies; `cb_start_steps()` uses LOOP for cascading dependency resolution
+- **Tasks/Flows** (v2): Task definitions, runs, flows; custom types `cb_task_message`, `cb_step_message`; `cb_create_flow()` handles step dependencies; `cb_start_steps()` uses LOOP for cascading dependency resolution
 - **GC** (v3): Garbage collection routines (`cb_gc()` deletes queues with `expires_at <= now()` and removes workers with stale heartbeats > 5 minutes old)
 - **Conditions** (v4): Conditional branching support with `cb_parse_condition()`, `cb_evaluate_condition()`/`cb_evaluate_condition_expr()`, and condition columns on `cb_step_dependencies`
 - **Conditions Integration** (v5): Modified `cb_create_flow()` to handle ConditionalDependency JSON and populate condition columns
@@ -60,26 +60,35 @@ tableName := fmt.Sprintf("cb_q_%s", strings.ToLower(queueName)) // Queues
 **Task handlers use generic codegen**:
 ```go
 // Handler fn: (context.Context, InputType) -> (OutputType, error)
-task := catbird.NewTask("my_task", func(ctx context.Context, input MyInput) (MyOutput, error) {
+task := catbird.NewTask("my_task",
+  catbird.Handler(func(ctx context.Context, input MyInput) (MyOutput, error) {
     return MyOutput{}, nil
-}, catbird.WithConcurrency(5), catbird.WithMaxRetries(3), catbird.WithCircuitBreaker(5, 30*time.Second))
+  },
+    catbird.WithConcurrency(5),
+    catbird.WithMaxRetries(3),
+    catbird.WithCircuitBreaker(5, 30*time.Second),
+  ),
+)
 ```
 - Input/output marshaled as JSON automatically
-- Options are applied via `HandlerOpt` interface (see `concurrencyOpt`, `retriesOpt`, etc. pattern)
+- Execution options are applied via `HandlerOpt` (concurrency, retries, backoff, circuit breaker)
+- Task/step metadata like conditions are applied via `TaskOpt`/`StepOpt`
 - Payloads are `json.RawMessage`; handlers receive `[]byte`
 
-**Flows**: Multi-step DAGs with dependencies. Steps execute when their dependencies complete (simple DAG semantics). Flow output is the combined JSON object of all step outputs; step names are unique within a flow and form the output keys.
+**Flows**: Multi-step DAGs with dependencies. Steps execute when their dependencies complete (simple DAG semantics).
 
-**Conditional Execution**: Both tasks and flow steps support conditional execution via `WithCondition(expression)`. When a condition evaluates to false or a referenced field is missing, the task/step is skipped (status='skipped') instead of executed.
+**CRITICAL - Flow Output Design**: Flow output is **the unwrapped output value of the final step** (the step with no dependents after completion). This is NOT an aggregated object. The flow's remaining_steps counter reaches 0 when the last step completes; that step's output becomes the flow's output. The output type matches the generic parameter `Out` from `NewFlow[In, Out]`. When the flow completes in `cb_complete_step()`, it directly selects that step's output and stores it as the flow's output.
+
+**Conditional Execution**: Both tasks and flow steps support conditional execution via `WithCondition(expression)` (a task/step option). When a condition evaluates to false or a referenced field is missing, the task/step is skipped (status='skipped') instead of executed.
 Use `not <expr>` to negate any condition expression (e.g., `not input.is_premium`).
 
 **Task conditions** reference input fields with `input.*` prefix:
 ```go
 task := catbird.NewTask("premium_processing",
-    func(ctx context.Context, req ProcessRequest) (string, error) {
-        return "processed", nil
-    },
-    catbird.WithCondition("input.is_premium"),  // Skipped if is_premium = false
+  catbird.Handler(func(ctx context.Context, req ProcessRequest) (string, error) {
+    return "processed", nil
+  }),
+  catbird.WithCondition("input.is_premium"),  // Skipped if is_premium = false
 )
 // Other examples: "input.amount gte 1000", "input.env eq \"production\""
 ```
@@ -87,23 +96,23 @@ task := catbird.NewTask("premium_processing",
 **Flow step conditions** reference step outputs with `step_name.*` prefix and can also reference signal input via `signal.*` when present:
 ```go
 NewFlow("risk-check",
-    InitialStep("validate", func(ctx context.Context, amount int) (int, error) {
-        return amount, nil
+  InitialStep("validate", Handler(func(ctx context.Context, amount int) (int, error) {
+    return amount, nil
+  })),
+  StepWithDependency("fraud-check",  // Conditional step
+    Dependency("validate"),
+    Handler(func(ctx context.Context, in int, amount int) (int, error) {
+      return amount * 2, nil  // expensive fraud check
     }),
-    StepWithDependency("fraud-check",  // Conditional step
-        Dependency("validate"),
-        func(ctx context.Context, in int, amount int) (int, error) {
-            return amount * 2, nil  // expensive fraud check
-        },
-        WithCondition("validate gt 1000")),
-    StepWithDependency("finalize",
-        OptionalDependency("fraud-check"),  // Required for conditional deps
-        func(ctx context.Context, in int, fraudResult Optional[int]) (int, error) {
-            if fraudResult.IsSet {
-                return fraudResult.Value, nil  // used fraud check result
-            }
-            return in, nil  // fraud check was skipped
-        }),
+    WithCondition("validate gt 1000")),
+  StepWithDependency("finalize",
+    OptionalDependency("fraud-check"),  // Required for conditional deps
+    Handler(func(ctx context.Context, in int, fraudResult Optional[int]) (int, error) {
+      if fraudResult.IsSet {
+        return fraudResult.Value, nil  // used fraud check result
+      }
+      return in, nil  // fraud check was skipped
+    })),
 )
 // Flow input: 500 → fraud-check skipped → finalize gets Optional[int]{IsSet: false}
 // Flow input: 2000 → fraud-check runs → finalize gets Optional[int]{IsSet: true, Value: 4000}
@@ -125,7 +134,7 @@ NewFlow("workflow",
 ```
 
 **Key Flow Patterns**:
-- **Conditions work for both tasks and steps**: Use `WithCondition("expression")` as a HandlerOpt. Tasks use `input.field` to reference input; steps use `step_name.field` to reference outputs; steps with signals can use `signal.field` to reference signal input.
+- **Conditions work for both tasks and steps**: Use `WithCondition("expression")` as a task/step option. Tasks use `input.field` to reference input; steps use `step_name.field` to reference outputs; steps with signals can use `signal.field` to reference signal input.
 - **Dependency tracking**: `dependency_count` includes all deps (required + optional); `remaining_dependencies` decrements for both completed and skipped steps
 - **Optional outputs**: When a conditional step is skipped, dependent steps receive `Optional[T]{IsSet: false}`. When executed, `Optional[T]{IsSet: true, Value: result}`
 - **Cascading resolution**: `cb_start_steps()` loops until no more steps unblock; handles chains like step2 skips → step3 unblocks → step4 unblocks
@@ -202,29 +211,59 @@ psql -U postgres -h localhost -d cb_tst
 docker compose logs -f postgres
 ```
 
+**Test Database Setup (sync.Once Pattern)**:
+- The test harness uses `sync.Once` to initialize the database exactly once per test suite run
+- In `catbird_test.go`, `testOnce.Do()` calls `getTestClient()` which:
+  1. Opens connection to `cb_tst` database
+  2. Runs `MigrateDownTo(0)` to clean state (may fail on first run)
+  3. Runs `MigrateUpTo(SchemaVersion)` to apply all migrations
+  4. Creates connection pool and test client
+- **Key consequence**: Dynamic tables (e.g., `cb_f_myflow`, `cb_s_myflow`) and data persist across all tests in the suite
+- **Data isolation impact**: If a test uses a hardcoded deduplication key (e.g., `IdempotencyKey: "order-123"`), subsequent test runs will retrieve the OLD flow run (with potentially outdated data formats)
+- **Solutions**:
+  - Use unique identifiers per test run: `fmt.Sprintf("key-%d", time.Now().UnixNano())`
+  - Or reset specific tables/flows in test setup if needed
+  - Or use `docker compose down -v && docker compose up -d` to wipe database between manual test iterations
+
 **Troubleshooting**:
 - "Connection refused" → Ensure `docker compose up -d` is running
 - "Database doesn't exist" → Run `./scripts/test.sh` once to initialize
-- "Stale data" → Database is automatically reset before each test run
-- "Need clean slate" → `docker compose down -v && docker compose up -d`
+- "Schema mismatch / old data format" → Database was not fully dropped between runs; use `docker compose down -v` and re-run
+- "Test retrieves wrong data" → Check deduplication keys; if hardcoded, old rows from previous runs may be returned
+- "Need clean slate" → `docker compose down -v && docker compose up -d` (removes volume)
 
 **Add migrations**: 
 1. Create new `.sql` file in `migrations/`, use goose syntax (`+goose up`/`+goose down`)
 2. Update `SchemaVersion` constant in `migrate.go` to match the new migration version number
 3. Migrations are embedded via `//go:embed migrations/*.sql` and use `goose.WithDisableVersioning(true)`
 
+**CRITICAL: Migration Versioning System**:
+- Catbird uses goose with `DisableVersioning(true)` - there is **NO goose version table** in the database
+- Goose tracks which migrations have run by executing them in order; state is NOT persisted
+- This means:
+  - Migrations run exactly once when first applied during test initialization
+  - In test harness, `testOnce.Do()` in `catbird_test.go` ensures migrations run only on first test in suite
+  - **OLD DATABASE STATE PERSISTS BETWEEN TEST RUNS** - If you change a migration, old data in dynamic tables (e.g., `cb_f_myflow`, `cb_s_myflow`) remains until explicitly dropped
+  - Problem: Test may retrieve old rows from previous runs with outdated schemas/formats
+  - Solution: Either (a) Use unique test identifiers to avoid hitting old data, or (b) Drop tables explicitly in `-- +goose down` sections
+
 **Goose SQL Syntax Rules**:
 - Each migration file must start with `-- +goose up` and end with `-- +goose down`
-- **CRITICAL UP/DOWN Structure**: Goose only executes the section it needs:
+- **CRITICAL UP/DOWN Structure**: Goose selectively executes sections:
   - When applying migrations (rolling forward): only `-- +goose up` section is executed
   - When rolling back: only `-- +goose down` section is executed
-  - When using `psql -f` to manually run a migration file, BOTH sections execute! This is a testing antipattern.
+  - When using `psql -f` to manually run a migration file, **BOTH sections execute sequentially**! This is a debugging antipattern.
   - **Always use the migration API** (`MigrateUpTo`, `MigrateDownTo`) for testing, never manual `psql` execution
+- **The `-- +goose down` section MUST clean up what the `up` section created**, including:
+  - All tables created in `up` (use `DROP TABLE IF EXISTS` statements)
+  - All custom types created in `up` (use `DROP TYPE IF EXISTS` statements)
+  - All functions created in `up` (DROP FUNCTION statements are usually in `down`)
+  - Without proper cleanup, old tables persist when goose can't roll back partially-applied migrations
 - Use `-- +goose statementbegin` / `-- +goose statementend` to wrap multi-line SQL statements (especially PL/pgSQL functions)
 - **For PL/pgSQL functions with `LANGUAGE ... AS $$` syntax**:
   - DO NOT use `$$ LANGUAGE plpgsql;` at the end (creates duplicate LANGUAGE clause)
   - Use `$$;` to terminate (language already specified in CREATE statement)
-  - Example:
+  - Correct example:
   ```sql
   -- +goose statementbegin
   CREATE OR REPLACE FUNCTION my_func() RETURNS void
@@ -235,18 +274,18 @@ docker compose logs -f postgres
   $$;  -- <- Just $$; (no LANGUAGE here, already in CREATE)
   -- +goose statementend
   ```
-- Without statementbegin/statementend, goose treats each line separately, causing syntax errors on multi-line statements
+  - Without statementbegin/statementend, goose treats each line separately, causing syntax errors on multi-line statements
 
 ## Critical Files
 
-- [catbird.go](/catbird.go): Message, Task, Flow, Step, Options definitions
-- [optional.go](/optional.go): Optional[T] generic type for conditional dependency outputs
-- [flow.go](/flow.go): Flow DSL, step constructors, dependency validation
-- [worker.go](/worker.go): Worker struct, task/flow execution, polling logic
-- [scheduler.go](/scheduler.go): Cron-based scheduling for tasks and flows
-- [client.go](/client.go): Public API (delegation layer)
-- [dashboard/handler.go](/dashboard/handler.go): HTTP routes & templating
-- [migrations/](/migrations/): Database schema (versioned)
+- [catbird.go](../catbird.go): Message, Task, Flow, Step, Options definitions
+- [optional.go](../optional.go): Optional[T] generic type for conditional dependency outputs
+- [flow.go](../flow.go): Flow DSL, step constructors, dependency validation
+- [worker.go](../worker.go): Worker struct, task/flow execution, polling logic
+- [scheduler.go](../scheduler.go): Cron-based scheduling for tasks and flows
+- [client.go](../client.go): Public API (delegation layer)
+- [dashboard/handler.go](../dashboard/handler.go): HTTP routes & templating
+- [migrations/](../migrations/): Database schema (versioned)
 
 ## Common Patterns to Replicate
 
@@ -256,7 +295,7 @@ docker compose logs -f postgres
 4. **Retries**: Built-in with configurable exponential backoff with full jitter (see `WithBackoff(min, max)`)
 5. **Circuit breaker**: Optional per-handler protection for external dependencies (see `WithCircuitBreaker(failures, openTimeout)`)
 6. **Concurrency**: Default 1 per handler; tweak with `WithConcurrency(n)`
-7. **Conditional execution**: Use `WithCondition("expression")` as a HandlerOpt for both tasks and flow steps. Tasks use `input.field` syntax (e.g., `WithCondition("input.is_premium")`), flow steps use `step_name.field` syntax (e.g., `WithCondition("validate.score gte 50")`)
+7. **Conditional execution**: Use `WithCondition("expression")` as a task/step option for both tasks and flow steps. Tasks use `input.field` syntax (e.g., `WithCondition("input.is_premium")`), flow steps use `step_name.field` syntax (e.g., `WithCondition("validate.score gte 50")`)
 8. **Optional dependencies**: Use `Optional[T]` + `OptionalDependency()` pair when depending on conditional steps. Validation at flow construction time enforces type safety.
 9. **SQL parameter/column conflicts**: Use `#variable_conflict use_column` directive in PL/pgSQL when parameter names match column names (prevents "column ambiguous" errors)
 10. **Atomic deduplication with UNION ALL**: For `RunTask()` and `RunFlow()` deduplication (concurrency_key / idempotency_key), use the atomic ON CONFLICT DO UPDATE pattern with UNION ALL fallback. **DO NOT remove the UNION ALL or simplify to plain `RETURNING id`**. The pattern is:

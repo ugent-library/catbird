@@ -89,7 +89,7 @@ StepWithDependency("listen-changes", Dependency("create-index"),
 2. **Pool access is explicit**: `stepCtx.SpawnTask()` makes it clear this is framework-provided
 3. **Dependencies are typed**: Injected as function parameters with full type safety - no `GetDependency()` calls needed
 4. **Compile-time checking**: Wrong dependency type = compile error (caught before runtime)
-5. **Works with all features**: Conditions, retries, and other HandlerOpts all supported
+5. **Works with all features**: Conditions (task/step opts), retries, and other handler opts are supported
 
 **Implementation:**
 

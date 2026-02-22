@@ -45,8 +45,8 @@ type Worker struct {
 	id              string
 	conn            Conn
 	logger          *slog.Logger
-	tasks           []*Task
-	flows           []*Flow
+	tasks           []Task
+	flows           []Flow
 	scheduler       *Scheduler
 	shutdownTimeout time.Duration
 }
@@ -55,14 +55,14 @@ type Worker struct {
 type WorkerOpt func(*Worker)
 
 // WithTask registers a task with the worker
-func WithTask(t *Task) WorkerOpt {
+func WithTask(t Task) WorkerOpt {
 	return func(w *Worker) {
 		w.tasks = append(w.tasks, t)
 	}
 }
 
 // WithFlow registers a flow with the worker
-func WithFlow(f *Flow) WorkerOpt {
+func WithFlow(f Flow) WorkerOpt {
 	return func(w *Worker) {
 		w.flows = append(w.flows, f)
 	}
@@ -124,7 +124,7 @@ func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, erro
 	// Register built-in garbage collection task (automatic, runs every 5 minutes)
 	gcTask := NewTask("gc", func(ctx context.Context, in struct{}) (struct{}, error) {
 		return struct{}{}, GC(ctx, w.conn)
-	})
+	}, nil)
 	w.tasks = append(w.tasks, gcTask)
 	if w.scheduler == nil {
 		w.scheduler = NewScheduler(w.conn, w.logger)
@@ -192,8 +192,8 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	// Start task workers
 	for _, t := range w.tasks {
-		if t.handler != nil {
-			taskHandlers = append(taskHandlers, &TaskHandlerInfo{TaskName: t.Name})
+		if t.handlerOpts() != nil {
+			taskHandlers = append(taskHandlers, &TaskHandlerInfo{TaskName: t.Name()})
 			worker := newTaskWorker(w.conn, w.logger, t)
 			worker.start(ctx, handlerCtx, &wg)
 		}
@@ -201,10 +201,10 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	// Start step workers
 	for _, f := range w.flows {
-		for _, s := range f.Steps {
-			if s.handler != nil {
-				stepHandlers = append(stepHandlers, &StepHandlerInfo{FlowName: f.Name, StepName: s.Name})
-				worker := newStepWorker(w.conn, w.logger, f.Name, s)
+		for _, s := range f.Steps() {
+			if s.handlerOpts() != nil {
+				stepHandlers = append(stepHandlers, &StepHandlerInfo{FlowName: f.Name(), StepName: s.Name()})
+				worker := newStepWorker(w.conn, w.logger, f.Name(), s)
 				worker.start(ctx, handlerCtx, &wg)
 			}
 		}

@@ -33,7 +33,7 @@ func TestTaskConcurrencyKey(t *testing.T) {
 	task := NewTask("concurrent_task", func(ctx context.Context, in int) (int, error) {
 		time.Sleep(200 * time.Millisecond) // Simulate work
 		return in * 2, nil
-	})
+	}, nil)
 
 	worker, err := client.NewWorker(t.Context(), WithTask(task))
 	if err != nil {
@@ -107,7 +107,7 @@ func TestTaskIdempotencyKey(t *testing.T) {
 	task := NewTask("idempotent_task", func(ctx context.Context, in int) (int, error) {
 		time.Sleep(100 * time.Millisecond) // Simulate work
 		return in * 3, nil
-	})
+	}, nil)
 
 	worker, err := client.NewWorker(t.Context(), WithTask(task))
 	if err != nil {
@@ -197,7 +197,7 @@ func TestTaskDeduplicationRetryOnFailure(t *testing.T) {
 			return "", fmt.Errorf("task failed")
 		}
 		return "success", nil
-	})
+	}, nil)
 
 	worker, err := client.NewWorker(t.Context(), WithTask(task))
 	if err != nil {
@@ -266,16 +266,11 @@ func TestFlowConcurrencyKey(t *testing.T) {
 	input1 := "input"
 	input2 := "input2"
 
-	type FlowOutput struct {
-		Step1 string `json:"step1"`
-	}
-
-	flow := NewFlow(flowName,
-		InitialStep("step1", func(ctx context.Context, in string) (string, error) {
+	flow := NewFlow[string, map[string]any](flowName).
+		AddStep(NewStep("step1", func(ctx context.Context, in string) (string, error) {
 			time.Sleep(200 * time.Millisecond) // Simulate work
 			return in + " processed", nil
-		}),
-	)
+		}, nil))
 
 	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
 	if err != nil {
@@ -306,14 +301,14 @@ func TestFlowConcurrencyKey(t *testing.T) {
 	}
 
 	// Wait for completion
-	var out1 FlowOutput
+	var out1 string
 	ctx1, cancel1 := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel1()
 	if err := h1.WaitForOutput(ctx1, &out1); err != nil {
 		t.Fatalf("first run failed: %v", err)
 	}
-	if out1.Step1 != input1+" processed" {
-		t.Fatalf("unexpected output: %s", out1.Step1)
+	if out1 != input1+" processed" {
+		t.Fatalf("unexpected output: %s", out1)
 	}
 
 	// Run 3: After completion, same ConcurrencyKey should create new run
@@ -332,16 +327,11 @@ func TestFlowConcurrencyKey(t *testing.T) {
 func TestFlowIdempotencyKey(t *testing.T) {
 	client := getTestClient(t)
 
-	type FlowOutput struct {
-		Step1 int `json:"step1"`
-	}
-
-	flow := NewFlow("idempotent_flow",
-		InitialStep("step1", func(ctx context.Context, in int) (int, error) {
+	flow := NewFlow[int, int]("idempotent_flow").
+		AddStep(NewStep("step1", func(ctx context.Context, in int) (int, error) {
 			time.Sleep(100 * time.Millisecond)
 			return in * 5, nil
-		}),
-	)
+		}, nil))
 
 	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
 	if err != nil {
@@ -350,9 +340,13 @@ func TestFlowIdempotencyKey(t *testing.T) {
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
+	// Use unique idempotency keys per test run to avoid conflicts with old data
+	uniqueKey1 := fmt.Sprintf("order-999-%d", time.Now().UnixNano())
+	uniqueKey2 := fmt.Sprintf("order-888-%d", time.Now().UnixNano())
+
 	// Run 1: First execution
 	h1, err := client.RunFlow(t.Context(), "idempotent_flow", 10, &RunFlowOpts{
-		IdempotencyKey: "order-999",
+		IdempotencyKey: uniqueKey1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -363,7 +357,7 @@ func TestFlowIdempotencyKey(t *testing.T) {
 
 	// Run 2: Duplicate (should return existing ID)
 	h2, err := client.RunFlow(t.Context(), "idempotent_flow", 20, &RunFlowOpts{
-		IdempotencyKey: "order-999",
+		IdempotencyKey: uniqueKey1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -373,19 +367,19 @@ func TestFlowIdempotencyKey(t *testing.T) {
 	}
 
 	// Wait for completion
-	var out1 FlowOutput
+	var out1 int
 	ctx1, cancel1 := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel1()
 	if err := h1.WaitForOutput(ctx1, &out1); err != nil {
 		t.Fatalf("first run failed: %v", err)
 	}
-	if out1.Step1 != 50 {
-		t.Fatalf("expected 50, got %d", out1.Step1)
+	if out1 != 50 {
+		t.Fatalf("expected 50, got %d", out1)
 	}
 
 	// Run 3: After completion, still return existing ID (exactly-once)
 	h3, err := client.RunFlow(t.Context(), "idempotent_flow", 30, &RunFlowOpts{
-		IdempotencyKey: "order-999",
+		IdempotencyKey: uniqueKey1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -396,7 +390,7 @@ func TestFlowIdempotencyKey(t *testing.T) {
 
 	// Run 4: Different IdempotencyKey should create new run
 	h4, err := client.RunFlow(t.Context(), "idempotent_flow", 40, &RunFlowOpts{
-		IdempotencyKey: "order-888",
+		IdempotencyKey: uniqueKey2,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -413,7 +407,7 @@ func TestTaskBothKeysRejected(t *testing.T) {
 
 	task := NewTask("both_keys_task", func(ctx context.Context, in string) (string, error) {
 		return in, nil
-	})
+	}, nil)
 
 	worker, err := client.NewWorker(t.Context(), WithTask(task))
 	if err != nil {
@@ -436,11 +430,10 @@ func TestTaskBothKeysRejected(t *testing.T) {
 func TestFlowBothKeysRejected(t *testing.T) {
 	client := getTestClient(t)
 
-	flow := NewFlow("both_keys_flow",
-		InitialStep("step1", func(ctx context.Context, in string) (string, error) {
+	flow := NewFlow[string, map[string]any]("both_keys_flow").
+		AddStep(NewStep("step1", func(ctx context.Context, in string) (string, error) {
 			return in, nil
-		}),
-	)
+		}, nil))
 
 	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
 	if err != nil {

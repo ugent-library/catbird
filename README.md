@@ -211,21 +211,28 @@ Wildcard rules:
 
 ```go
 // Define the task
-task := catbird.NewTask("send-email", func(ctx context.Context, input EmailRequest) (EmailResponse, error) {
-    // Send email logic here
-    return EmailResponse{SentAt: time.Now()}, nil
-},
-    catbird.WithConcurrency(5), // Allow up to 5 concurrent executions
-    catbird.WithMaxRetries(3), // Retry 3 times
-    catbird.WithBackoff(500*time.Millisecond, 10*time.Second), // Exponential backoff between 500ms and 10s
-    catbird.WithCircuitBreaker(5, 30*time.Second), // Open after 5 consecutive failures
+task := catbird.NewTask("send-email",
+    func(ctx context.Context, input EmailRequest) (EmailResponse, error) {
+        // Send email logic here
+        return EmailResponse{SentAt: time.Now()}, nil
+    },
+    &catbird.TaskOpts{
+        Concurrency:    5, // Allow up to 5 concurrent executions
+        MaxRetries:     3, // Retry 3 times
+        MinDelay:       500*time.Millisecond,
+        MaxDelay:       10*time.Second, // Exponential backoff between 500ms and 10s
+        CircuitBreaker: catbird.NewCircuitBreaker(5, 30*time.Second), // Open after 5 consecutive failures
+    },
 )
 
 // Define a task with a condition (skipped when condition is false)
-conditionalTask := catbird.NewTask("premium-processing", func(ctx context.Context, input ProcessRequest) (string, error) {
-    return "processed", nil
-},
-    catbird.WithCondition("input.is_premium"), // Skipped if is_premium = false
+conditionalTask := catbird.NewTask("premium-processing",
+    func(ctx context.Context, input ProcessRequest) (string, error) {
+        return "processed", nil
+    },
+    &catbird.TaskOpts{
+        Condition: "input.is_premium", // Skipped if is_premium = false
+    },
 )
 
 // Start a worker that handles the tasks
@@ -250,44 +257,196 @@ worker, err = client.NewWorker(ctx,
 go worker.Start(ctx)
 ```
 
+## Flow Semantics
+
+A **flow** (also called a workflow) is a **directed acyclic graph (DAG)** of steps that execute in dependency order. Understanding flow execution is critical for building reliable workflows.
+
+### Core Concepts
+
+**What is a flow?**
+- A multi-step unit of work where each step is a function that accepts inputs and produces outputs
+- Steps can depend on other steps, creating execution constraints
+- A flow has an input (provided at run-time) that all steps can access
+- **A flow has exactly ONE output: the unwrapped output of the final step** (the step with no dependents)
+
+**How does execution work?**
+1. **Initialization**: When `RunFlow()` is called, all steps are created with status `created`
+2. **Dependency resolution**: Steps with no dependencies immediately start (status transitions to `started` then `completed`)
+3. **Cascading activation**: As each step completes, steps that depend on it are checked:
+   - If all dependencies are satisfied → step transitions to `started`
+   - If any dependency was skipped → the step checks if it uses `Optional[T]` for a conditional dependency
+4. **Flow completion**: When the final step completes, the flow is marked `completed` with the final step's output
+5. **Output retrieval**: `WaitForOutput()` retrieves the unwrapped output of the final step
+
+**Key invariant**: Catbird ensures there is always **exactly one final step** (a step with no dependents). This is validated at flow construction time.
+
+**Parallel execution**: Steps with independent dependencies can execute in parallel. Workers poll for ready steps and execute them concurrently.
+
+**Skipped steps**: When a step has a condition that evaluates to false, it transitions directly to `skipped` status. Dependent steps must use `Optional[T]` parameter types to handle skipped dependencies.
+
+### Example: Linear Chain
+
+```
+Input: 100
+        ↓
+ ┌──────────────┐
+ │ step1(100)   │  Returns 100 * 2 = 200
+ └──────────────┘
+        ↓
+ ┌──────────────┐
+ │ step2(200)   │  Returns 200 + 50 = 250
+ └──────────────┘
+        ↓
+ ┌──────────────┐
+ │ step3(250)   │  Returns 250 (FINAL STEP OUTPUT)
+ └──────────────┘
+        ↓
+  Output: 250
+```
+
+Each step receives the flow's input PLUS outputs from its dependencies.
+
+### Example: Parallel Steps
+
+```
+Input: [user1, user2, user3]
+            ↓
+    ┌──────────────┐
+    │  validate    │
+    └──────────────┘
+     ↓            ↓
+  charge      inventory    ← These run in PARALLEL (both depend only on validate)
+     ↓            ↓
+    ┌──────────────┐
+    │    ship      │  (Waits for BOTH charge AND inventory)
+    └──────────────┘
+            ↓
+  Output: ship's result
+```
+
+**Execution timeline**:
+1. `validate` runs immediately
+2. When `validate` completes, both `charge` and `inventory` start immediately (in parallel)
+3. When BOTH complete, `ship` starts
+4. When `ship` completes, flow is done
+
+### Example: Conditional Steps with Reconvergence
+
+```
+Input: amount=50
+
+        ↓
+    ┌───────────────┐
+    │  assess_risk  │  Returns RiskScore: 20
+    └───────────────┘
+        ↓
+    [Condition: score > 30?]
+        ↓                ↓
+       NO                YES
+        ↓                ↓
+    (skipped)        ┌─────────┐
+        ↓            │ audit   │
+        ↓            └─────────┘
+        ↓                ↓
+    ┌─────────────────────────┐
+    │  finalize (Optional!)    │  Uses Optional[T] to handle both cases
+    └─────────────────────────┘
+            ↓
+  Output: finalize's result
+```
+
+**Execution**:
+- `assess_risk` runs and returns `RiskScore: 20`
+- The `audit` step condition `assess_risk.score > 30?` evaluates to false
+- `audit` transitions to `skipped`
+- `finalize` uses `Optional[AuditLog]` parameter so it receives `Optional[T]{IsSet: false}`
+- The handler checks `if !audit.IsSet { /* handle skipped case */ }`
+
+**Critical requirement**: When a step depends on a conditional step, use `Optional[T]` parameter type:
+```go
+NewStep1Dep("finalize",
+    "audit",
+    func(ctx context.Context, in Order, audit catbird.Optional[AuditLog]) (Result, error) {
+        if audit.IsSet {
+            return audit.Value, nil
+        }
+        return DefaultResult, nil
+    }, nil)
+```
+
+The `Optional[T]` parameter type automatically signals to the flow that this is an optional dependency. Without `Optional[T]`, flow construction will panic: "step depends on conditional step but does not use Optional[T]".
+
 ### Workflow (Multi-Step Flow)
 
-Flow structure:
-```
-     validate
-     /      \
-  charge   check
-     \      /
-       ship
-```
-
 ```go
+type Order struct {
+    ID     string  `json:"id"`
+    Amount int     `json:"amount"`
+}
+
+type ValidationResult struct {
+    Valid  bool   `json:"valid"`
+    Reason string `json:"reason"`
+}
+
+type ChargeResult struct {
+    TransactionID string `json:"transaction_id"`
+    Amount        int    `json:"amount"`
+}
+
+type InventoryCheck struct {
+    InStock bool `json:"in_stock"`
+    Qty     int  `json:"qty"`
+}
+
+type ShipmentResult struct {
+    TrackingNumber string `json:"tracking_number"`
+    EstimatedDays int    `json:"estimated_days"`
+}
+
 // Define the flow with steps and dependencies
-flow := catbird.NewFlow("order-processing",
-    catbird.InitialStep("validate", func(ctx context.Context, order Order) (bool, error) {
+flow := catbird.NewFlow[Order, ShipmentResult]("order-processing").
+    AddStep(catbird.NewStep("validate", func(ctx context.Context, order Order) (ValidationResult, error) {
         // Validate order
-        return true, nil
-    }),
-    catbird.StepWithDependency("charge",
-        catbird.Dependency("validate"),
-        func(ctx context.Context, order Order, validated bool) (int, error) {
-            // Charge payment and return amount
-            return 9999, nil
-        }),
-    catbird.StepWithDependency("check",
-        catbird.Dependency("validate"),
-        func(ctx context.Context, order Order, validated bool) (bool, error) {
-            // Inventory check
-            return true, nil
-        }),
-    catbird.StepWithTwoDependencies("ship",
-        catbird.Dependency("charge"),
-        catbird.Dependency("check"),
-        func(ctx context.Context, order Order, chargeAmount int, inStock bool) (string, error) {
-            // Ship order only if charged and in stock
-            return "TRK123", nil
-        }),
-)
+        if order.Amount <= 0 {
+            return ValidationResult{Valid: false, Reason: "Invalid amount"}, nil
+        }
+        return ValidationResult{Valid: true}, nil
+    }, nil)).
+    AddStep(catbird.NewStep1Dep("charge",
+        "validate",
+        func(ctx context.Context, order Order, validated ValidationResult) (ChargeResult, error) {
+            // Charge payment and return transaction ID
+            if !validated.Valid {
+                return ChargeResult{}, fmt.Errorf("cannot charge invalid order")
+            }
+            return ChargeResult{
+                TransactionID: "txn-" + order.ID,
+                Amount:        order.Amount,
+            }, nil
+        }, nil)).
+    AddStep(catbird.NewStep1Dep("check-inventory",
+        "validate",
+        func(ctx context.Context, order Order, validated ValidationResult) (InventoryCheck, error) {
+            // Check inventory (independent of charge, runs in parallel)
+            return InventoryCheck{
+                InStock: true,
+                Qty:     order.Amount,
+            }, nil
+        }, nil)).
+    AddStep(catbird.NewStep2Deps("ship",
+        "charge",
+        "check-inventory",
+        func(ctx context.Context, order Order, chargeResult ChargeResult, inventory InventoryCheck) (ShipmentResult, error) {
+            // Ship order only if both charge and inventory check passed
+            if !inventory.InStock {
+                return ShipmentResult{}, fmt.Errorf("out of stock")
+            }
+            return ShipmentResult{
+                TrackingNumber: "TRK-" + chargeResult.TransactionID,
+                EstimatedDays:  3,
+            }, nil
+        }, nil))
 
 // Start a worker that handles the flow
 worker, err := client.NewWorker(ctx,
@@ -295,20 +454,28 @@ worker, err := client.NewWorker(ctx,
 )
 go worker.Start(ctx)
 
+// Run the flow
+handle, err := client.RunFlow(ctx, "order-processing", Order{
+    ID:     "order-123",
+    Amount: 9999,
+}, nil)
+
+// Get the final step's output (ShipmentResult)
+var result ShipmentResult
+err = handle.WaitForOutput(ctx, &result)
+if err != nil {
+    // Handle error
+}
+
+// result.TrackingNumber contains the shipment tracking number
+fmt.Println("Shipped with tracking:", result.TrackingNumber)
+
 // Schedule a flow to run periodically (using cron syntax)
 worker, err = client.NewWorker(ctx,
     catbird.WithFlow(flow),
-    catbird.WithScheduledFlow("order-processing", "0 2 * * *", nil), // Run daily at 2 AM
+    catbird.WithScheduledFlow("order-processing", "0 2 * * *"), // Run daily at 2 AM
 )
 go worker.Start(ctx)
-
-// Run the flow
-handle, err := client.RunFlow(ctx, "order-processing", myOrder, nil)
-
-// Get combined results from all steps
-var results map[string]any
-err = handle.WaitForOutput(ctx, &results)
-// results contains output from all steps: validate, charge, check, ship
 ```
 
 ### Workflow with Signals (Human-in-the-Loop)
@@ -316,58 +483,87 @@ err = handle.WaitForOutput(ctx, &results)
 Signals enable workflows that wait for external input before proceeding, such as approval workflows or webhooks.
 
 ```go
+type Document struct {
+    ID      string `json:"id"`
+    Content string `json:"content"`
+}
+
 type ApprovalInput struct {
     ApproverID string `json:"approver_id"`
     Approved   bool   `json:"approved"`
+    Notes      string `json:"notes"`
+}
+
+type ApprovalResult struct {
+    Status     string `json:"status"`
+    ApprovedBy string `json:"approved_by"`
+    Timestamp  string `json:"timestamp"`
+}
+
+type PublishResult struct {
+    PublishedAt string `json:"published_at"`
+    URL         string `json:"url"`
 }
 
 // Define a flow with an approval step that requires a signal
-flow := catbird.NewFlow("document_approval",
-    catbird.InitialStep("submit", func(ctx context.Context, doc Document) (string, error) {
+flow := catbird.NewFlow[Document, PublishResult]("document_approval").
+    AddStep(catbird.NewStep("submit", func(ctx context.Context, doc Document) (string, error) {
         // Submit document for review
         return doc.ID, nil
-    }),
-    catbird.StepWithSignalAndDependency("approve",
-        catbird.Dependency("submit"),
-        func(ctx context.Context, doc Document, approval ApprovalInput, docID string) (string, error) {
+    }, nil)).
+    AddStep(catbird.NewStepSignal1Dep("approve",
+        "submit",
+        func(ctx context.Context, doc Document, approval ApprovalInput, docID string) (ApprovalResult, error) {
             if !approval.Approved {
-                return "", fmt.Errorf("approval denied by %s", approval.ApproverID)
+                return ApprovalResult{}, fmt.Errorf("approval denied by %s: %s", approval.ApproverID, approval.Notes)
             }
-            return fmt.Sprintf("Approved by %s: %s", approval.ApproverID, docID), nil
-        }),
-    catbird.StepWithDependency("publish",
-        catbird.Dependency("approve"),
-        func(ctx context.Context, doc Document, status string) (string, error) {
+            return ApprovalResult{
+                Status:     "approved",
+                ApprovedBy: approval.ApproverID,
+                Timestamp:  time.Now().Format(time.RFC3339),
+            }, nil
+        }, nil)).
+    AddStep(catbird.NewStep1Dep("publish",
+        "approve",
+        func(ctx context.Context, doc Document, approval ApprovalResult) (PublishResult, error) {
             // Publish the approved document
-            return "Published: " + status, nil
-        }),
-)
+            return PublishResult{
+                PublishedAt: time.Now().Format(time.RFC3339),
+                URL:         "https://example.com/docs/" + approval.ApprovedBy,
+            }, nil
+        }, nil))
 
 // Start worker
 worker, err := client.NewWorker(ctx, catbird.WithFlow(flow))
 go worker.Start(ctx)
 
-// Run the flow
-handle, err := client.RunFlow(ctx, "document_approval", myDocument, nil)
+// Run the flow - it will wait at the "approve" step until a signal is sent
+handle, err := client.RunFlow(ctx, "document_approval", Document{
+    ID:      "doc-123",
+    Content: "Important document",
+}, nil)
 
-// Later, when approval is received (e.g., from a webhook or UI):
+// Later, when approval is received (e.g., from a webhook, HTTP endpoint, or UI):
 err = client.SignalFlow(ctx, "document_approval", handle.ID, "approve", ApprovalInput{
-    ApproverID: "user123",
+    ApproverID: "user-456",
     Approved:   true,
+    Notes:      "LGTM",
 })
 
-// Wait for completion
-var results map[string]any
-err = handle.WaitForOutput(ctx, &results)
-// results["approve"] contains "Approved by user123: doc-id"
-// results["publish"] contains "Published: Approved by user123: doc-id"
+// Wait for flow completion
+var result PublishResult
+err = handle.WaitForOutput(ctx, &result)
+if err != nil {
+    log.Fatal(err)
+}
+// result.PublishedAt and result.URL are now populated
 ```
 
 Signal variants available:
-- `InitialStepWithSignal` - first step requires signal
-- `StepWithSignalAndDependency` - step with 1 dependency + signal
-- `StepWithSignalAndTwoDependencies` - step with 2 dependencies + signal
-- `StepWithSignalAndThreeDependencies` - step with 3 dependencies + signal
+- `NewStepSignal` - step with no dependencies + signal
+- `NewStepSignal1Dep` - step with 1 dependency + signal
+- `NewStepSignal2Deps` - step with 2 dependencies + signal
+- `NewStepSignal3Deps` - step with 3 dependencies + signal
 
 A step with both dependencies and a signal waits for **both** conditions: all dependencies must complete **and** the signal must be delivered before the step executes.
 
@@ -378,7 +574,7 @@ Both tasks and flow steps support conditional execution via `WithCondition(expre
 ### Basic Concepts
 
 **How conditions work**:
-- `WithCondition(expression)` - A handler option (works for both tasks and flow steps) that makes execution conditional
+- `WithCondition(expression)` - A task/step option (works for both tasks and flow steps) that makes execution conditional
 - If the condition evaluates to true, the handler executes normally
 - If the condition evaluates to false or a referenced field is missing, the task/step is marked as `skipped`
 - Skipped tasks/steps do not execute their handler function
@@ -388,9 +584,9 @@ Both tasks and flow steps support conditional execution via `WithCondition(expre
 - **Flow steps**: Use `step_name.field_name` to reference outputs from previous steps in the flow
 
 **Flow-specific considerations**:
-- **Key rule**: If a step can be skipped, downstream steps must use `OptionalDependency(name)` and accept `Optional[T]` parameters to handle missing outputs
+- **Key rule**: If a step can be skipped, downstream steps must accept `Optional[T]` parameters to handle missing outputs
 - **Optional outputs**: When a conditional step is skipped, dependent steps receive `Optional[T]{IsSet: false}`
-- **Reconvergence**: Multiple conditional branches can merge back together using `OptionalDependency` and `Optional[T]` checks
+- **Reconvergence**: Multiple conditional branches can merge back together using `Optional[T]` parameter types
 
 ### Condition Expression Syntax
 
@@ -482,7 +678,9 @@ premiumTask := catbird.NewTask("premium_processing",
     func(ctx context.Context, req ProcessRequest) (string, error) {
         return fmt.Sprintf("Processed premium user %d", req.UserID), nil
     },
-    catbird.WithCondition("input.is_premium"), // Skipped if is_premium = false
+    &catbird.TaskOpts{
+        Condition: "input.is_premium", // Skipped if is_premium = false
+    },
 )
 
 // Run task - may be skipped based on input
@@ -491,11 +689,11 @@ client.RunTask(ctx, "premium_processing", ProcessRequest{UserID: 123, IsPremium:
 ```
 
 **Task condition patterns**:
-- Feature flags: `WithCondition("input.feature_enabled")`
-- Environment checks: `WithCondition("input.env eq \"production\"")`
-- Priority filtering: `WithCondition("input.priority eq \"high\"")`
-- Value thresholds: `WithCondition("input.amount gte 100")`
-- User segments: `WithCondition("input.user_tier in [\"premium\", \"enterprise\"]")`
+- Feature flags: `TaskOpts{Condition: "input.feature_enabled"}`
+- Environment checks: `TaskOpts{Condition: "input.env eq \"production\""}`
+- Priority filtering: `TaskOpts{Condition: "input.priority eq \"high\""}`
+- Value thresholds: `TaskOpts{Condition: "input.amount gte 100"}`
+- User segments: `TaskOpts{Condition: "input.user_tier in [\"premium\", \"enterprise\"]"}`
 
 ### Flows with Conditions
 
@@ -516,17 +714,21 @@ type AuditLog struct {
     Message   string    `json:"message"`
 }
 
+type ProcessResult struct {
+    Status string `json:"status"`
+}
+
 // Define a flow that only audits high-risk transactions
-flow := catbird.NewFlow("checkout",
-    catbird.InitialStep("assess_risk", func(ctx context.Context, order Order) (RiskAssessment, error) {
+flow := catbird.NewFlow[Order, ProcessResult]("checkout").
+    AddStep(catbird.NewStep("assess_risk", func(ctx context.Context, order Order) (RiskAssessment, error) {
         score := calculateRiskScore(order)
         return RiskAssessment{
             RiskScore: score,
             RiskLevel: levelFromScore(score),
         }, nil
-    }),
-    catbird.StepWithDependency("audit",
-        catbird.Dependency("assess_risk"),
+    }, nil)).
+    AddStep(catbird.NewStep1Dep("audit",
+        "assess_risk",
         func(ctx context.Context, order Order, risk RiskAssessment) (AuditLog, error) {
             // Only audit high-risk transactions
             return AuditLog{
@@ -534,95 +736,165 @@ flow := catbird.NewFlow("checkout",
                 Message:   fmt.Sprintf("High-risk order %s with score %d", order.ID, risk.RiskScore),
             }, nil
         },
-        catbird.WithCondition("assess_risk.risk_score gte 30")),  // Skip if risk_score < 30
-    catbird.StepWithDependency("process",
-        catbird.Dependency("assess_risk"),  // Safe: depends on unconditional pre-branch step
-        func(ctx context.Context, order Order, risk RiskAssessment) (string, error) {
+        &catbird.StepOpts{Condition: "assess_risk.risk_score gte 30"})).  // Skip if risk_score < 30
+    AddStep(catbird.NewStep1Dep("process",
+        "assess_risk",  // Safe: depends on unconditional pre-branch step
+        func(ctx context.Context, order Order, risk RiskAssessment) (ProcessResult, error) {
             // Process order regardless of audit execution
-            return "ORDER_PROCESSED", nil
-        }),
-)
+            return ProcessResult{Status: "ORDER_PROCESSED"}, nil
+        }, nil))
+
+// When assess_risk returns risk_score: 20:
+// - audit step is skipped (condition evaluates to false)
+// - process step executes normally (depends on unconditional assess_risk, not on audit)
+// - flow output = process step output
 ```
 
-When `assess_risk` completes with `risk_score: 20`, the `audit` step is skipped. The `process` step executes normally because it depends on the unconditional `assess_risk` step, not the conditional `audit` step.
+When `assess_risk` completes with `risk_score: 20`, the `audit` step is skipped. The `process` step executes normally because it depends on the unconditional `assess_risk` step, not on the conditional `audit` step.
 
 #### Pattern 2: Divergent Branching
 
-Different conditions lead to different execution paths. Each branch handles a specific scenario:
+Different conditions lead to different execution paths. Since Catbird requires exactly one final step, divergent branches must reconverge using `Optional[T]` parameters:
 
 ```go
+type Request struct {
+    ID     string `json:"id"`
+    Amount int    `json:"amount"`
+}
+
 type RiskAssessment struct {
     RiskScore int    `json:"risk_score"`
     Category  string `json:"category"`
 }
 
-// Define a flow with divergent branches (no reconvergence)
-flow := catbird.NewFlow("approval_workflow",
-    catbird.InitialStep("assess", func(ctx context.Context, request Request) (RiskAssessment, error) {
+type ApprovalResult struct {
+    Status string `json:"status"`
+    Notes  string `json:"notes"`
+}
+
+// Define a flow with divergent branches that reconverge
+flow := catbird.NewFlow[Request, ApprovalResult]("approval_workflow").
+    AddStep(catbird.NewStep("assess", func(ctx context.Context, request Request) (RiskAssessment, error) {
         score := calculateRisk(request)
         return RiskAssessment{
             RiskScore: score,
             Category:  categorize(score),
         }, nil
-    }),
+    }, nil)).
     // Low-risk: auto-approve (executes when category is "low")
-    catbird.StepWithDependency("auto_approve",
-        catbird.Dependency("assess"),
-        func(ctx context.Context, req Request, assessment RiskAssessment) (string, error) {
-            return fmt.Sprintf("AUTO-APPROVED: %s", req.ID), nil
+    AddStep(catbird.NewStep1Dep("auto_approve",
+        "assess",
+        func(ctx context.Context, req Request, assessment RiskAssessment) (ApprovalResult, error) {
+            return ApprovalResult{Status: "APPROVED", Notes: "Auto-approved"}, nil
         },
-        catbird.WithCondition("assess.category eq \"low\"")),
+        &catbird.StepOpts{Condition: "assess.category eq \"low\""})).
     // Medium-risk: manager approval (executes when category is "medium")
-    catbird.StepWithDependency("manager_review",
-        catbird.Dependency("assess"),
-        func(ctx context.Context, req Request, assessment RiskAssessment) (string, error) {
-            return fmt.Sprintf("MANAGER-REVIEW: %s", req.ID), nil
+    AddStep(catbird.NewStep1Dep("manager_review",
+        "assess",
+        func(ctx context.Context, req Request, assessment RiskAssessment) (ApprovalResult, error) {
+            return ApprovalResult{Status: "PENDING", Notes: "Awaiting manager review"}, nil
         },
-        catbird.WithCondition("assess.category eq \"medium\"")),
+        &catbird.StepOpts{Condition: "assess.category eq \"medium\""})).
     // High-risk: executive approval (executes when category is "high")
-    catbird.StepWithDependency("executive_review",
-        catbird.Dependency("assess"),
-        func(ctx context.Context, req Request, assessment RiskAssessment) (string, error) {
-            return fmt.Sprintf("EXECUTIVE-REVIEW: %s", req.ID), nil
+    AddStep(catbird.NewStep1Dep("executive_review",
+        "assess",
+        func(ctx context.Context, req Request, assessment RiskAssessment) (ApprovalResult, error) {
+            return ApprovalResult{Status: "PENDING", Notes: "Awaiting executive review"}, nil
         },
-        catbird.WithCondition("assess.category eq \"high\"")),
-)
+        &catbird.StepOpts{Condition: "assess.category eq \"high\""})).
+    // Reconvergence step: REQUIRED to have exactly one final step
+    AddStep(catbird.NewStep3Deps("finalize",
+        "auto_approve",
+        "manager_review",
+        "executive_review",
+        func(ctx context.Context, req Request, 
+            autoApprove catbird.Optional[ApprovalResult],
+            managerReview catbird.Optional[ApprovalResult],
+            executiveReview catbird.Optional[ApprovalResult]) (ApprovalResult, error) {
+            // Exactly one branch executed - return whichever is set
+            if autoApprove.IsSet {
+                return autoApprove.Value, nil
+            }
+            if managerReview.IsSet {
+                return managerReview.Value, nil
+            }
+            if executiveReview.IsSet {
+                return executiveReview.Value, nil
+            }
+            return ApprovalResult{}, fmt.Errorf("no approval branch executed")
+        }, nil))
+
+// Based on the risk category, exactly one approval path executes:
+// - Category "low": auto_approve runs → finalize receives Optional{IsSet: true} for auto_approve
+// - Category "medium": manager_review runs → finalize receives Optional{IsSet: true} for manager_review
+// - Category "high": executive_review runs → finalize receives Optional{IsSet: true} for executive_review
+// The finalize step is the single final step (required by validation)
 ```
 
-Based on the risk category, exactly one approval path executes:
-- Category "low": `auto_approve` runs, others skip
-- Category "medium": `manager_review` runs, others skip
-- Category "high": `executive_review` runs, others skip
-
-This is divergent branching—no reconvergence needed.
+**Why reconvergence is required**: Catbird validates at construction time that flows have exactly one final step (a step with no dependents). Even though only one branch executes at runtime, all three conditional branches are visible as final steps at construction time, violating this rule. The `finalize` step solves this by depending on all branches.
 
 #### Pattern 3: Reconvergent Branching (Using Optional)
 
-When conditional branches need to merge back together, use `OptionalDependency` and `Optional[T]`:
+When conditional branches need to merge back together, use `Optional[T]` parameter types:
 
 ```go
-flow := catbird.NewFlow("payment_processing",
-    catbird.InitialStep("validate", func(ctx context.Context, order Order) (ValidationResult, error) {
-        return ValidationResult{Amount: order.Amount, Valid: true}, nil
-    }),
-    catbird.StepWithDependency("charge",
-        catbird.Dependency("validate"),
+type Order struct {
+    ID     string `json:"id"`
+    Amount int    `json:"amount"`
+}
+
+type ValidationResult struct {
+    Valid bool `json:"valid"`
+}
+
+type ChargeResult struct {
+    TransactionID string `json:"transaction_id"`
+}
+
+type FinalResult struct {
+    Status string `json:"status"`
+    TxnID  string `json:"txn_id"`
+}
+
+flow := catbird.NewFlow[Order, FinalResult]("payment_processing").
+    AddStep(catbird.NewStep("validate", func(ctx context.Context, order Order) (ValidationResult, error) {
+        return ValidationResult{Valid: order.Amount > 0}, nil
+    }, nil)).
+    AddStep(catbird.NewStep1Dep("charge",
+        "validate",
         func(ctx context.Context, order Order, validation ValidationResult) (ChargeResult, error) {
-            return ChargeResult{Amount: 100, ID: "txn-123"}, nil
+            return ChargeResult{TransactionID: "txn-123"}, nil
         },
-        catbird.WithCondition("validate.amount gt 0")),  // Skip for zero-amount orders
-    catbird.StepWithDependency("finalize",
-        catbird.OptionalDependency("charge"),  // Required because charge is conditional
-        func(ctx context.Context, order Order, charge catbird.Optional[ChargeResult]) (Result, error) {
+        &catbird.StepOpts{Condition: "validate.valid"})).  // Skip for invalid orders
+    AddStep(catbird.NewStep1Dep("finalize",
+        "charge",
+        func(ctx context.Context, order Order, charge catbird.Optional[ChargeResult]) (FinalResult, error) {
             if charge.IsSet {
-                return Result{Status: "charged", TxnID: charge.Value.ID}, nil
+                return FinalResult{Status: "charged", TxnID: charge.Value.TransactionID}, nil
             }
-            return Result{Status: "free_order"}, nil
-        }),
-)
+            return FinalResult{Status: "free_order", TxnID: ""}, nil
+        }, nil))
+
+// When order.amount <= 0:
+// - validate returns Valid: false
+// - charge condition evaluates to false → charge is skipped
+// - finalize receives Optional[ChargeResult]{IsSet: false}
+// - finalize returns FinalResult{Status: "free_order"}
+
+// When order.amount > 0:
+// - validate returns Valid: true
+// - charge condition evaluates to true → charge executes
+// - finalize receives Optional[ChargeResult]{IsSet: true, Value: ...}
+// - finalize returns FinalResult{Status: "charged", TxnID: ...}
 ```
 
 The `finalize` step executes whether or not `charge` runs, checking `charge.IsSet` to handle both cases.
+
+**Important**: This pattern requires:
+1. Parameter type must be `Optional[ChargeResult]` (not just `ChargeResult`)
+2. Handler must check `charge.IsSet` before using `charge.Value`
+
+The `Optional[T]` parameter type automatically signals to the flow that this is an optional dependency. Failure to use `Optional[T]` when depending on a conditional step will cause a panic during flow construction: "step depends on conditional step but does not use Optional[T]".
 
 ### Design Philosophy
 
@@ -633,17 +905,17 @@ main_path → [Condition] → optional_logging
        next_step  ✓ next_step depends on main_path, not optional step
 ```
 
-✅ **Divergent branching** - Different conditions lead to different endpoints
-```
-assess → [Condition score < 50] → auto_approve
-    → [Condition 50 ≤ score < 80] → manager_review
-    → [Condition score ≥ 80] → executive_review
-```
-
-✅ **Reconvergent branching (explicit)** - Merge paths using OptionalDependency
+✅ **Divergent branching** - Different conditions lead to different paths, must reconverge
 ```
 assess → [Condition score < 50] → auto_approve ┐
-                                ├─► reconcile (OptionalDependency on both)
+    → [Condition 50 ≤ score < 80] → manager_review ├─► finalize (reconvergence step, Optional[T] for all)
+    → [Condition score ≥ 80] → executive_review   ┘
+```
+
+✅ **Reconvergent branching (explicit)** - Merge paths using Optional[T] parameters
+```
+assess → [Condition score < 50] → auto_approve ┐
+                                ├─► reconcile (Optional[T] parameters for both)
 assess → [Condition score ≥ 50] → manager_review ┘
 ```
 
@@ -675,16 +947,16 @@ type CheckResult struct {
 }
 
 // Flow example
-flow := catbird.NewFlow("order_processing",
-    catbird.InitialStep("check_stock", func(ctx context.Context, order Order) (CheckResult, error) {
+flow := catbird.DefineFlow("order_processing",
+    catbird.NewStep("check_stock", func(ctx context.Context, order Order) (CheckResult, error) {
         return CheckResult{Inventory: struct{...}{InStock: true, Qty: 10}}, nil
-    }),
-    catbird.StepWithDependency("ship",
-        catbird.Dependency("check_stock"),
+    }, nil),
+    catbird.NewStep1Dep("ship",
+        "check_stock",
         func(ctx context.Context, order Order, check CheckResult) (string, error) {
             return "SHIPPED", nil
         },
-        catbird.WithCondition("check_stock.inventory.qty gte 5")),
+        &catbird.StepOpts{Condition: "check_stock.inventory.qty gte 5"}),
 )
 
 // Task example with nested input
@@ -700,7 +972,9 @@ task := catbird.NewTask("age_restricted",
     func(ctx context.Context, input TaskInput) (string, error) {
         return "processed", nil
     },
-    catbird.WithCondition("input.user.profile.age gte 18"),
+    &catbird.TaskOpts{
+        Condition: "input.user.profile.age gte 18",
+    },
 )
 ```
 
@@ -733,34 +1007,34 @@ task := catbird.NewTask("age_restricted",
 - No. Flow step conditions reference step outputs, not flow input. 
 - If you need to branch on flow input, use an initial step that processes the input and returns a value to check:
   ```go
-  InitialStep("check_input", func(ctx context.Context, input MyInput) (MyOutput, error) {
+  NewStep("check_input", func(ctx context.Context, input MyInput) (MyOutput, error) {
       return MyOutput{ShouldProcess: input.Flag}, nil
-  }),
-    StepWithDependency("next",
-      Dependency("check_input"),
+  }, nil),
+    NewStep1Dep("next",
+      "check_input",
       func(ctx context.Context, input MyInput, check MyOutput) (Result, error) {
           return Result{}, nil
       },
-      WithCondition("check_input.should_process")),
+      &catbird.StepOpts{Condition: "check_input.should_process"}),
   ```
 
 **Q: Can I skip a flow step in the critical path and have downstream steps handle both cases?**
-- Yes, but make the dependency explicit with `OptionalDependency` and accept `Optional[T]` in the handler:
+- Yes, but use `Optional[T]` in the handler parameter for the conditional dependency:
   ```go
-    StepWithDependency("charge",
-      Dependency("validate"),
+    NewStep1Dep("charge",
+      "validate",
       func(ctx context.Context, in Input, validation ValidationResult) (ChargeResult, error) {
           return ChargeResult{Amount: 100, ID: "txn-123"}, nil
       },
-      WithCondition("validation.amount gt 0")),
-    StepWithDependency("next",
-      OptionalDependency("charge"),
+      &catbird.StepOpts{Condition: "validation.amount gt 0"}),
+    NewStep1Dep("next",
+      "charge",
       func(ctx context.Context, in Input, charge Optional[ChargeResult]) (Result, error) {
           if charge.IsSet {
               return Result{Status: "charged", TxnID: charge.Value.ID}, nil
           }
           return Result{Status: "skipped_payment"}, nil
-      },
+      }, nil),
   )
   ```
 

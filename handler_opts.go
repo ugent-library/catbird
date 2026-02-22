@@ -12,8 +12,7 @@ type handlerOpts struct {
 	maxRetries     int
 	minDelay       time.Duration
 	maxDelay       time.Duration
-	circuitBreaker *circuitBreaker
-	condition      string
+	circuitBreaker *CircuitBreaker
 }
 
 // validate checks handler options for consistency.
@@ -48,62 +47,4 @@ func (h *handlerOpts) validate() error {
 		}
 	}
 	return nil
-}
-
-// HandlerOpt is an option for configuring task and flow step handlers
-type HandlerOpt func(*handlerOpts)
-
-// WithConcurrency sets the number of concurrent handler executions
-func WithConcurrency(n int) HandlerOpt {
-	return func(h *handlerOpts) {
-		h.concurrency = n
-	}
-}
-
-// WithTimeout sets the maximum duration for handler execution
-func WithTimeout(d time.Duration) HandlerOpt {
-	return func(h *handlerOpts) {
-		h.timeout = d
-	}
-}
-
-// WithBatchSize sets the number of messages to read per batch
-func WithBatchSize(n int) HandlerOpt {
-	return func(h *handlerOpts) {
-		h.batchSize = n
-	}
-}
-
-// WithMaxRetries sets the number of retry attempts for failed handlers
-func WithMaxRetries(n int) HandlerOpt {
-	return func(h *handlerOpts) {
-		h.maxRetries = n
-	}
-}
-
-// WithBackoff sets the delay between retries, exponentially backing off from minDelay to maxDelay
-func WithBackoff(minDelay, maxDelay time.Duration) HandlerOpt {
-	return func(h *handlerOpts) {
-		h.minDelay = minDelay
-		h.maxDelay = maxDelay
-	}
-}
-
-// WithCircuitBreaker configures a circuit breaker for handler execution.
-// failureThreshold is the number of consecutive failures before opening.
-// openTimeout controls how long the circuit stays open before trying again.
-func WithCircuitBreaker(failureThreshold int, openTimeout time.Duration) HandlerOpt {
-	return func(h *handlerOpts) {
-		h.circuitBreaker = newCircuitBreaker(failureThreshold, openTimeout)
-	}
-}
-
-// WithCondition sets a condition that must be satisfied for the handler to execute.
-// If the condition evaluates to false, the task/step is skipped.
-// Condition syntax: "input.field op value" or "dep_name.field op value"
-// Example: WithCondition("input.priority eq high"), WithCondition("validate.score gte 80")
-func WithCondition(expr string) HandlerOpt {
-	return func(h *handlerOpts) {
-		h.condition = expr
-	}
 }

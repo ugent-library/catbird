@@ -76,7 +76,6 @@ CREATE TABLE IF NOT EXISTS cb_step_dependencies (
     step_name text NOT NULL,
     dependency_name text NOT NULL,
     idx int NOT NULL DEFAULT 0,
-    optional boolean NOT NULL DEFAULT false,
     PRIMARY KEY (flow_name, step_name, idx),
     UNIQUE (flow_name, step_name, dependency_name),
     FOREIGN KEY (flow_name, step_name) REFERENCES cb_steps (flow_name, name),
@@ -835,7 +834,6 @@ DECLARE
     _f_table text;
     _s_table text;
     _condition jsonb;
-    _optional boolean;
 BEGIN
     IF cb_create_flow.name IS NULL OR cb_create_flow.name = '' THEN
     RAISE EXCEPTION 'cb: flow name must not be empty';
@@ -905,10 +903,9 @@ BEGIN
     FOR _dep IN SELECT jsonb_array_elements(coalesce(_step->'depends_on', '[]'::jsonb))
     LOOP
       _dep_name := _dep->>'name';
-      _optional := coalesce((_dep->>'optional')::boolean, false);
       
-      INSERT INTO cb_step_dependencies (flow_name, step_name, dependency_name, idx, optional)
-      VALUES (cb_create_flow.name, _step_name, _dep_name, _dep_idx, _optional);
+      INSERT INTO cb_step_dependencies (flow_name, step_name, dependency_name, idx)
+      VALUES (cb_create_flow.name, _step_name, _dep_name, _dep_idx);
       _dep_idx := _dep_idx + 1;
     END LOOP;
 
@@ -1215,38 +1212,15 @@ BEGIN
         USING cb_start_steps.flow_run_id, cb_start_steps.flow_name, _step_to_process.step_name;
 
         -- Decrement remaining_steps in flow run for skipped step
-        -- And check if flow should be completed
         EXECUTE format(
           $QUERY$
           UPDATE %I
           SET remaining_steps = remaining_steps - 1
           WHERE id = $1 AND status = 'started'
-          RETURNING remaining_steps
           $QUERY$,
           _f_table
         )
-        USING cb_start_steps.flow_run_id
-        INTO _remaining;
-        
-        -- If all steps done (remaining_steps = 0), mark flow as completed
-        IF _remaining IS NOT NULL AND _remaining = 0 THEN
-          EXECUTE format(
-            $QUERY$
-            UPDATE %I
-            SET status = 'completed',
-                completed_at = now(),
-                output = (
-                  SELECT jsonb_object_agg(step_name, output)
-                  FROM %I
-                  WHERE flow_run_id = $1 AND status = 'completed'
-                )
-            WHERE id = $1
-              AND status = 'started'
-            $QUERY$,
-            _f_table, _s_table
-          )
-          USING cb_start_steps.flow_run_id;
-        END IF;
+        USING cb_start_steps.flow_run_id;
         
         _steps_processed_this_iteration := _steps_processed_this_iteration + 1;
         
@@ -1491,22 +1465,23 @@ BEGIN
 
     -- Maybe complete flow run - only if remaining_steps reached 0
     IF _remaining = 0 THEN
+    -- Get the final step output and set it directly
     EXECUTE format(
       $QUERY$
-      UPDATE %I
+      UPDATE %I flow_table
       SET status = 'completed',
           completed_at = now(),
           output = (
-            SELECT jsonb_object_agg(step_name, output)
-            FROM %I
-            WHERE flow_run_id = $1 AND status = 'completed'
+            SELECT step_table.output
+            FROM %I step_table
+            WHERE step_table.flow_run_id = %L AND step_table.status IN ('completed', 'skipped')
+            ORDER BY step_table.id DESC
+            LIMIT 1
           )
-      WHERE id = $1
-        AND status = 'started'
+      WHERE flow_table.id = %L AND flow_table.status = 'started'
       $QUERY$,
-      _f_table, _s_table
-    )
-    USING _flow_run_id;
+      _f_table, _s_table, _flow_run_id, _flow_run_id
+    );
     END IF;
 
     -- Start steps with no dependencies
@@ -1837,3 +1812,15 @@ DROP FUNCTION IF EXISTS cb_evaluate_condition(jsonb, jsonb);
 DROP FUNCTION IF EXISTS cb_get_jsonb_field(jsonb, text);
 DROP FUNCTION IF EXISTS cb_parse_condition_value(text, text);
 DROP FUNCTION IF EXISTS cb_parse_condition(text);
+
+DROP TABLE IF EXISTS cb_step_handlers;
+DROP TABLE IF EXISTS cb_task_handlers;
+DROP TABLE IF EXISTS cb_step_dependencies;
+DROP TABLE IF EXISTS cb_steps;
+DROP TABLE IF EXISTS cb_step_messages;
+DROP TABLE IF EXISTS cb_flows;
+DROP TABLE IF EXISTS cb_tasks;
+DROP TABLE IF EXISTS cb_workers;
+
+DROP TYPE IF EXISTS cb_step_message;
+DROP TYPE IF EXISTS cb_task_message;

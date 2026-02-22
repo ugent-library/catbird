@@ -16,14 +16,14 @@ import (
 type taskWorker struct {
 	conn   Conn
 	logger *slog.Logger
-	task   *Task
+	task   Task
 
 	// In-flight message tracking (replaces messageHider)
 	inFlight   map[int64]struct{}
 	inFlightMu sync.Mutex
 }
 
-func newTaskWorker(conn Conn, logger *slog.Logger, task *Task) *taskWorker {
+func newTaskWorker(conn Conn, logger *slog.Logger, task Task) *taskWorker {
 	return &taskWorker{
 		conn:     conn,
 		logger:   logger,
@@ -69,7 +69,7 @@ func (w *taskWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 					return
 				}
 
-				w.logger.ErrorContext(shutdownCtx, "worker: cannot read task messages", "task", w.task.Name, "error", err)
+				w.logger.ErrorContext(shutdownCtx, "worker: cannot read task messages", "task", w.task.Name(), "error", err)
 
 				delay := backoffWithFullJitter(retryAttempt, 250*time.Millisecond, 5*time.Second)
 				retryAttempt++
@@ -103,7 +103,8 @@ func (w *taskWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 	})
 
 	// Start consumers
-	for i := 0; i < w.task.handler.concurrency; i++ {
+	h := w.task.handlerOpts()
+	for i := 0; i < h.concurrency; i++ {
 		wg.Go(func() {
 			for msg := range messages {
 				w.handle(handlerCtx, msg)
@@ -144,19 +145,19 @@ func (w *taskWorker) hideInFlight(ctx context.Context) {
 	}
 
 	q := `SELECT * FROM cb_hide_tasks(name => $1, ids => $2, hide_for => $3);`
-	_, err := execWithRetry(ctx, w.conn, q, w.task.Name, ids, (10 * time.Minute).Milliseconds())
+	_, err := execWithRetry(ctx, w.conn, q, w.task.Name(), ids, (10 * time.Minute).Milliseconds())
 
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		w.logger.ErrorContext(ctx, "worker: cannot hide in-flight tasks", "task", w.task.Name, "error", err)
+		w.logger.ErrorContext(ctx, "worker: cannot hide in-flight tasks", "task", w.task.Name(), "error", err)
 	}
 }
 
 func (w *taskWorker) readMessages(ctx context.Context) ([]taskMessage, error) {
-	h := w.task.handler
+	h := w.task.handlerOpts()
 
 	q := `SELECT id, deliveries, input FROM cb_read_tasks(name => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
 
-	rows, err := queryWithRetry(ctx, w.conn, q, w.task.Name, h.batchSize, (10 * time.Minute).Milliseconds(), (10 * time.Second).Milliseconds(), (100 * time.Millisecond).Milliseconds())
+	rows, err := queryWithRetry(ctx, w.conn, q, w.task.Name(), h.batchSize, (10 * time.Minute).Milliseconds(), (10 * time.Second).Milliseconds(), (100 * time.Millisecond).Milliseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -167,7 +168,7 @@ func (w *taskWorker) readMessages(ctx context.Context) ([]taskMessage, error) {
 func (w *taskWorker) handle(ctx context.Context, msg taskMessage) {
 	defer w.removeInFlight(msg.ID)
 
-	h := w.task.handler
+	h := w.task.handlerOpts()
 
 	if h.circuitBreaker != nil {
 		allowed, delay := h.circuitBreaker.allow(time.Now())
@@ -175,21 +176,21 @@ func (w *taskWorker) handle(ctx context.Context, msg taskMessage) {
 			if delay <= 0 {
 				delay = time.Second
 			}
-			w.logger.WarnContext(ctx, "worker: circuit breaker open", "task", w.task.Name, "retry_in", delay)
+			w.logger.WarnContext(ctx, "worker: circuit breaker open", "task", w.task.Name(), "retry_in", delay)
 			delayMs := delay.Milliseconds()
 			if delayMs <= 0 {
 				delayMs = 1
 			}
 			q := `SELECT * FROM cb_hide_tasks(name => $1, ids => $2, hide_for => $3);`
-			if _, err := execWithRetry(ctx, w.conn, q, w.task.Name, []int64{msg.ID}, delayMs); err != nil {
-				w.logger.ErrorContext(ctx, "worker: cannot delay task due to open circuit", "task", w.task.Name, "error", err)
+			if _, err := execWithRetry(ctx, w.conn, q, w.task.Name(), []int64{msg.ID}, delayMs); err != nil {
+				w.logger.ErrorContext(ctx, "worker: cannot delay task due to open circuit", "task", w.task.Name(), "error", err)
 			}
 			return
 		}
 	}
 
 	w.logger.DebugContext(ctx, "worker: handleTask",
-		"task", w.task.Name,
+		"task", w.task.Name(),
 		"id", msg.ID,
 		"deliveries", msg.Deliveries,
 		"input", string(msg.Input),
@@ -203,7 +204,7 @@ func (w *taskWorker) handle(ctx context.Context, msg taskMessage) {
 		defer cancel()
 	}
 
-	var out json.RawMessage
+	var out []byte
 	var err error
 
 	func() {
@@ -212,7 +213,13 @@ func (w *taskWorker) handle(ctx context.Context, msg taskMessage) {
 				err = fmt.Errorf("task handler panic: %v", r)
 			}
 		}()
-		out, err = h.fn(fnCtx, msg)
+		// Call the interface method to execute the handler
+		inputJSON, marshalErr := json.Marshal(msg.Input)
+		if marshalErr != nil {
+			err = fmt.Errorf("marshal input: %w", marshalErr)
+			return
+		}
+		out, err = w.task.handle(fnCtx, inputJSON)
 	}()
 
 	// Handle result
@@ -220,18 +227,18 @@ func (w *taskWorker) handle(ctx context.Context, msg taskMessage) {
 		if h.circuitBreaker != nil {
 			h.circuitBreaker.recordFailure(time.Now())
 		}
-		w.logger.ErrorContext(ctx, "worker: failed", "task", w.task.Name, "error", err)
+		w.logger.ErrorContext(ctx, "worker: failed", "task", w.task.Name(), "error", err)
 
 		if msg.Deliveries > h.maxRetries {
 			q := `SELECT * FROM cb_fail_task(name => $1, id => $2, error_message => $3);`
-			if _, err := execWithRetry(ctx, w.conn, q, w.task.Name, msg.ID, err.Error()); err != nil {
-				w.logger.ErrorContext(ctx, "worker: cannot mark task as failed", "task", w.task.Name, "error", err)
+			if _, err := execWithRetry(ctx, w.conn, q, w.task.Name(), msg.ID, err.Error()); err != nil {
+				w.logger.ErrorContext(ctx, "worker: cannot mark task as failed", "task", w.task.Name(), "error", err)
 			}
 		} else {
 			delay := backoffWithFullJitter(msg.Deliveries-1, h.minDelay, h.maxDelay)
 			q := `SELECT * FROM cb_hide_tasks(name => $1, ids => $2, hide_for => $3);`
-			if _, err := execWithRetry(ctx, w.conn, q, w.task.Name, []int64{msg.ID}, delay.Milliseconds()); err != nil {
-				w.logger.ErrorContext(ctx, "worker: cannot delay next task run", "task", w.task.Name, "error", err)
+			if _, err := execWithRetry(ctx, w.conn, q, w.task.Name(), []int64{msg.ID}, delay.Milliseconds()); err != nil {
+				w.logger.ErrorContext(ctx, "worker: cannot delay next task run", "task", w.task.Name(), "error", err)
 			}
 		}
 	} else {
@@ -239,8 +246,8 @@ func (w *taskWorker) handle(ctx context.Context, msg taskMessage) {
 			h.circuitBreaker.recordSuccess()
 		}
 		q := `SELECT * FROM cb_complete_task(name => $1, id => $2, output => $3);`
-		if _, err := execWithRetry(ctx, w.conn, q, w.task.Name, msg.ID, out); err != nil {
-			w.logger.ErrorContext(ctx, "worker: cannot mark task as completed", "task", w.task.Name, "error", err)
+		if _, err := execWithRetry(ctx, w.conn, q, w.task.Name(), msg.ID, out); err != nil {
+			w.logger.ErrorContext(ctx, "worker: cannot mark task as completed", "task", w.task.Name(), "error", err)
 		}
 	}
 }

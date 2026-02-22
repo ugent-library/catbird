@@ -343,7 +343,9 @@ $$;
 --   idempotency_key: Optional unique ID for idempotency (prevents duplicate messages)
 --   deliver_at: Optional timestamp when message should become deliverable (default: now)
 -- Returns: bigint - the message ID
-CREATE OR REPLACE FUNCTION cb_send(
+DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, timestamptz);
+DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, text, timestamptz);
+CREATE FUNCTION cb_send(
     queue text,
     payload jsonb,
     topic text = null,
