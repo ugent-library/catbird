@@ -18,7 +18,7 @@ A PostgreSQL-powered message queue and task execution engine. Catbird brings rel
 - **Flexible workflows**: Multi-step DAGs with dependency tracking and cascading data between steps.
 - **Built-in persistence**: All state (queues, tasks, flows, runs) lives in PostgreSQL for auditability and recovery.
 - **Worker management**: Simple worker lifecycle with graceful shutdown, configurable concurrency, and built-in retries.
-- **Resiliency features**: Handler retries with backoff, optional circuit breaker protection, and PostgreSQL retry logic for transient errors.
+- **Resiliency features**: Handler retries with backoff, optional circuit breaker protection, and bounded PostgreSQL retries with full-jitter backoff in worker database paths.
 - **Dashboard**: Web UI to trigger task/flow runs, monitor progress in real-time, and view results.
 
 <p align="center">
@@ -569,19 +569,19 @@ A step with both dependencies and a signal waits for **both** conditions: all de
 
 ## Conditional Execution
 
-Both tasks and flow steps support conditional execution via `WithCondition(expression)`. When a condition evaluates to false (or a referenced field is missing), the task/step is skipped instead of executed. This enables patterns like environment-specific processing, risk-based branching, and optional side effects.
+Both tasks and flow steps support conditional execution via the `Condition` field on `TaskOpts` and `StepOpts`. When a condition evaluates to false (or a referenced field is missing), the task/step is skipped instead of executed. This enables patterns like environment-specific processing, risk-based branching, and optional side effects.
 
 ### Basic Concepts
 
 **How conditions work**:
-- `WithCondition(expression)` - A task/step option (works for both tasks and flow steps) that makes execution conditional
+- Set `Condition: "<expression>"` on `TaskOpts` (tasks) or `StepOpts` (flow steps)
 - If the condition evaluates to true, the handler executes normally
 - If the condition evaluates to false or a referenced field is missing, the task/step is marked as `skipped`
 - Skipped tasks/steps do not execute their handler function
 
 **What conditions can reference**:
 - **Tasks**: Use `input.field_name` to reference fields from the task input
-- **Flow steps**: Use `step_name.field_name` to reference outputs from previous steps in the flow
+- **Flow steps**: Can reference `input.field_name` (flow input), `step_name.field_name` (prior step outputs), and `signal.field_name` (signal input for signal-enabled steps)
 
 **Flow-specific considerations**:
 - **Key rule**: If a step can be skipped, downstream steps must accept `Optional[T]` parameters to handle missing outputs
@@ -594,7 +594,7 @@ Condition expressions follow the format: `[prefix].[field] [operator] [value]`
 
 The **prefix** differs based on context:
 - **Tasks**: Use `input` to reference fields from the task input (e.g., `input.priority`, `input.amount`)
-- **Flow steps**: Use the step name to reference that step's output (e.g., `validate.score`, `assess_risk.category`)
+- **Flow steps**: Use `input` for flow input (e.g., `input.priority`, `input.amount`) or a step name for step outputs (e.g., `validate.score`, `assess_risk.category`)
 - **Flow steps with signals**: Use `signal` to reference the signal input when present (e.g., `signal.approver_id`)
 
 Supported operators:
@@ -612,22 +612,22 @@ Supported operators:
 **For scalar inputs/outputs** (simple values like `bool`, `int`, or `string`):
 ```go
 // Task input or step output is a boolean
-WithCondition("input.is_premium")  // task: executes if input.is_premium is true
-WithCondition("not input.is_premium")  // task: executes if input.is_premium is false
-WithCondition("validate")          // flow: executes if validate step output is true
+// TaskOpts{Condition: "input.is_premium"}      // task: executes if input.is_premium is true
+// TaskOpts{Condition: "not input.is_premium"}  // task: executes if input.is_premium is false
+// StepOpts{Condition: "validate"}              // flow: executes if validate step output is true
 
 // Task input or step output is a number
-WithCondition("input.count ne 0")  // task: executes if input.count != 0
-WithCondition("score gt 50")       // flow: executes if score step output > 50
+// TaskOpts{Condition: "input.count ne 0"}  // task: executes if input.count != 0
+// StepOpts{Condition: "score gt 50"}       // flow: executes if score step output > 50
 ```
 
 **For struct inputs/outputs** (objects with multiple fields):
 ```go
 // Task input has fields
-WithCondition("input.risk_score gte 30")  // access field from task input struct
+// TaskOpts{Condition: "input.risk_score gte 30"}  // access field from task input struct
 
 // Flow step output has fields
-WithCondition("assess_risk.risk_score gte 30")  // access field from step output struct
+// StepOpts{Condition: "assess_risk.risk_score gte 30"}  // access field from step output struct
 ```
 
 ### Path Syntax
@@ -982,12 +982,12 @@ task := catbird.NewTask("age_restricted",
 
 **Q: My condition never evaluates to true. Why?**
 - **Tasks**: Check that you're using `input.field_name` prefix and the field name matches JSON struct tags
-- **Flows**: Check that the step name matches exactly (case-sensitive) and field names match JSON struct tags
+- **Flows**: Check that your prefix is valid for the context (`input.*`, `step_name.*`, or `signal.*`) and that field names match JSON struct tags
 - Confirm the operator is supported (eq, ne, gt, gte, lt, lte, in, exists, contains)
 - For nested fields, use dot notation (e.g., `input.user.profile.age` or `step_name.user.profile.age`)
 
 **Q: Can I use multiple conditions or AND/OR logic?**
-- No. Only one `WithCondition()` call per task/step is supported. If you call it multiple times, only the **last one takes effect**.
+- No. Each task/step has a single `Condition` field, so only one condition expression can be configured per task/step.
 - AND/OR logic is not currently supported in condition expressions.
 - **Workaround**: Have the task input or upstream step compute a categorical field (e.g., "low", "medium", "high") and use that in conditions instead of trying to express ranges.
 
@@ -1004,19 +1004,9 @@ task := catbird.NewTask("age_restricted",
 - `status = 'failed'` means the execution returned an error
 
 **Q: Can I use flow input fields in step conditions?**
-- No. Flow step conditions reference step outputs, not flow input. 
-- If you need to branch on flow input, use an initial step that processes the input and returns a value to check:
-  ```go
-  NewStep("check_input", func(ctx context.Context, input MyInput) (MyOutput, error) {
-      return MyOutput{ShouldProcess: input.Flag}, nil
-  }, nil),
-    NewStep1Dep("next",
-      "check_input",
-      func(ctx context.Context, input MyInput, check MyOutput) (Result, error) {
-          return Result{}, nil
-      },
-      &catbird.StepOpts{Condition: "check_input.should_process"}),
-  ```
+- Yes. Use the `input.` prefix directly in the step condition.
+- Example: `&catbird.StepOpts{Condition: "input.amount gt 1000"}`
+- Step conditions can also reference prior step outputs (`step_name.field`) and signal input (`signal.field`) when present.
 
 **Q: Can I skip a flow step in the critical path and have downstream steps handle both cases?**
 - Yes, but use `Optional[T]` in the handler parameter for the conditional dependency:
@@ -1026,7 +1016,7 @@ task := catbird.NewTask("age_restricted",
       func(ctx context.Context, in Input, validation ValidationResult) (ChargeResult, error) {
           return ChargeResult{Amount: 100, ID: "txn-123"}, nil
       },
-      &catbird.StepOpts{Condition: "validation.amount gt 0"}),
+    &catbird.StepOpts{Condition: "validate.amount gt 0"}),
     NewStep1Dep("next",
       "charge",
       func(ctx context.Context, in Input, charge Optional[ChargeResult]) (Result, error) {
@@ -1040,7 +1030,7 @@ task := catbird.NewTask("age_restricted",
 
 ## Resiliency
 
-Catbird includes multiple resiliency layers for transient failures. Handlers can retry with [WithMaxRetries](https://pkg.go.dev/github.com/ugent-library/catbird#WithMaxRetries) and exponential jittered backoff via [WithBackoff](https://pkg.go.dev/github.com/ugent-library/catbird#WithBackoff), and you can wrap external calls with a circuit breaker using [WithCircuitBreaker](https://pkg.go.dev/github.com/ugent-library/catbird#WithCircuitBreaker) to avoid cascading outages. On the infrastructure side, PostgreSQL operations are issued with retry logic for transient errors to keep workers making progress even if the database briefly hiccups.
+Catbird includes multiple resiliency layers for runtime failures. Handler-level retries are configured with `TaskOpts` (`MaxRetries`, `MinDelay`, `MaxDelay`), and external calls can be protected with `TaskOpts.CircuitBreaker` (typically created via `NewCircuitBreaker(...)`) to avoid cascading outages. In worker database paths, PostgreSQL reads/writes are retried with bounded attempts and full-jitter backoff; retries stop immediately on context cancellation or deadline expiry.
 
 ## Naming Rules
 
