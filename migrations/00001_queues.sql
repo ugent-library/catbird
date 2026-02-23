@@ -11,7 +11,7 @@
 --     Critical: MUST use UNION ALL fallback, not bare RETURNING (returns NULL on conflict without it)
 --   cb_read(): Uses FOR UPDATE SKIP LOCKED for row-level concurrency - SAFE
 --   cb_read_poll(): Uses FOR UPDATE SKIP LOCKED in polling loop - SAFE
---   cb_dispatch(): Iterates bindings, uses ON CONFLICT per queue - SAFE
+--   cb_publish(): Iterates bindings, uses ON CONFLICT per queue - SAFE
 --   cb_hide(): Uses UPDATE with indexed deliver_at, no locks - SAFE
 --   cb_delete(): Direct DELETE operation, no locks - SAFE
 -- All operations maintain message ordering and deduplication invariants
@@ -179,7 +179,7 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- cb_dispatch: Send a message to all queues subscribed to a topic
+-- cb_publish: Send a message to all queues subscribed to a topic
 -- Routes messages based on bindings with support for exact and wildcard patterns
 -- Parameters:
 --   topic: Topic string to route to subscribed queues
@@ -187,7 +187,7 @@ $$;
 --   idempotency_key: Optional unique ID for idempotency (prevents duplicate messages)
 --   deliver_at: Optional timestamp when message should become deliverable (default: now)
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_dispatch(
+CREATE OR REPLACE FUNCTION cb_publish(
     topic text,
     payload jsonb,
     idempotency_key text = null,
@@ -196,7 +196,7 @@ CREATE OR REPLACE FUNCTION cb_dispatch(
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-    _deliver_at timestamptz = coalesce(cb_dispatch.deliver_at, now());
+    _deliver_at timestamptz = coalesce(cb_publish.deliver_at, now());
     _rec record;
     _q_table text;
 BEGIN
@@ -206,12 +206,12 @@ BEGIN
         FROM cb_bindings
         WHERE (
             -- Exact match (fastest path)
-            (pattern_type = 'exact' AND pattern = cb_dispatch.topic)
+            (pattern_type = 'exact' AND pattern = cb_publish.topic)
             OR
             -- Wildcard match with prefix filter + regex
             (pattern_type = 'wildcard'
-             AND (prefix = '' OR cb_dispatch.topic LIKE prefix || '%')
-             AND cb_dispatch.topic ~ regex)
+             AND (prefix = '' OR cb_publish.topic LIKE prefix || '%')
+             AND cb_publish.topic ~ regex)
         )
     LOOP
         _q_table := cb_table_name(_rec.name, 'q');
@@ -224,9 +224,9 @@ BEGIN
                 $QUERY$,
                 _q_table
             )
-            USING cb_dispatch.topic,
-                  cb_dispatch.payload,
-                  cb_dispatch.idempotency_key,
+            USING cb_publish.topic,
+                cb_publish.payload,
+                cb_publish.idempotency_key,
                   _deliver_at;
         EXCEPTION WHEN undefined_table THEN
             -- Queue was deleted between SELECT and INSERT, skip it
@@ -666,10 +666,10 @@ DROP FUNCTION IF EXISTS cb_bind(text, text);
 DROP FUNCTION IF EXISTS cb_create_queue(text, timestamptz, boolean);
 DROP FUNCTION IF EXISTS cb_create_queue(text, text[], timestamptz, boolean);
 DROP FUNCTION IF EXISTS cb_delete_queue(text);
-DROP FUNCTION IF EXISTS cb_dispatch(text, jsonb, text, timestamptz);
+DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, timestamptz);
 DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, timestamptz);
 DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, text, timestamptz);
-DROP FUNCTION IF EXISTS cb_dispatch(text, jsonb, text, text, timestamptz);
+DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, text, timestamptz);
 DROP FUNCTION IF EXISTS cb_read(text, int, int);
 DROP FUNCTION IF EXISTS cb_read_poll(text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_hide(text, bigint, integer);

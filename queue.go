@@ -3,6 +3,7 @@ package catbird
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -31,17 +32,36 @@ type QueueOpts struct {
 	Unlogged  bool
 }
 
-// CreateQueue creates a queue with the specified options.
-// Pass nil opts to use defaults.
+type Queue struct {
+	name string
+	opts *QueueOpts
+}
+
+// NewQueue creates a queue definition with optional options.
+func NewQueue(name string, opts *QueueOpts) *Queue {
+	return &Queue{name: name, opts: opts}
+}
+
+// CreateQueue creates one or more queue definitions.
 // Use Bind() separately to create topic bindings.
-func CreateQueue(ctx context.Context, conn Conn, name string, opts *QueueOpts) error {
-	if opts == nil {
-		opts = &QueueOpts{}
+func CreateQueue(ctx context.Context, conn Conn, queues ...*Queue) error {
+	q := `SELECT cb_create_queue(name => $1, expires_at => $2, unlogged => $3);`
+	for _, queue := range queues {
+		if queue == nil {
+			return fmt.Errorf("queue definition cannot be nil")
+		}
+
+		opts := queue.opts
+		if opts == nil {
+			opts = &QueueOpts{}
+		}
+
+		if _, err := conn.Exec(ctx, q, queue.name, ptrOrNil(opts.ExpiresAt), opts.Unlogged); err != nil {
+			return err
+		}
 	}
 
-	q := `SELECT cb_create_queue(name => $1, expires_at => $2, unlogged => $3);`
-	_, err := conn.Exec(ctx, q, name, ptrOrNil(opts.ExpiresAt), opts.Unlogged)
-	return err
+	return nil
 }
 
 // GetQueue retrieves queue metadata by name.
@@ -109,16 +129,16 @@ func Unbind(ctx context.Context, conn Conn, queue string, pattern string) error 
 	return err
 }
 
-type DispatchOpts struct {
+type PublishOpts struct {
 	IdempotencyKey string
 	DeliverAt      *time.Time
 }
 
-// Dispatch sends a message to topic-subscribed queues with options.
+// Publish sends a message to topic-subscribed queues with options.
 // Pass nil opts to use defaults.
-func Dispatch(ctx context.Context, conn Conn, topic string, payload any, opts *DispatchOpts) error {
+func Publish(ctx context.Context, conn Conn, topic string, payload any, opts *PublishOpts) error {
 	if opts == nil {
-		opts = &DispatchOpts{}
+		opts = &PublishOpts{}
 	}
 
 	b, err := json.Marshal(payload)
@@ -126,7 +146,7 @@ func Dispatch(ctx context.Context, conn Conn, topic string, payload any, opts *D
 		return err
 	}
 
-	q := `SELECT cb_dispatch(topic => $1, payload => $2, idempotency_key => $3, deliver_at => $4);`
+	q := `SELECT cb_publish(topic => $1, payload => $2, idempotency_key => $3, deliver_at => $4);`
 	_, err = conn.Exec(ctx, q, topic, b, ptrOrNil(opts.IdempotencyKey), ptrOrNil(opts.DeliverAt))
 	return err
 }
@@ -203,15 +223,15 @@ func EnqueueSend(batch *pgx.Batch, queue string, payload any, opts SendOpts) err
 	return nil
 }
 
-// EnqueueDispatch adds a Dispatch operation to a batch for efficient bulk message dispatching.
-func EnqueueDispatch(batch *pgx.Batch, topic string, payload any, opts DispatchOpts) error {
+// EnqueuePublish adds a Publish operation to a batch for efficient bulk message publishing.
+func EnqueuePublish(batch *pgx.Batch, topic string, payload any, opts PublishOpts) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 
 	batch.Queue(
-		`SELECT cb_dispatch(topic => $1, payload => $2, idempotency_key => $3, deliver_at => $4);`,
+		`SELECT cb_publish(topic => $1, payload => $2, idempotency_key => $3, deliver_at => $4);`,
 		topic, b, ptrOrNil(opts.IdempotencyKey), ptrOrNil(opts.DeliverAt),
 	)
 

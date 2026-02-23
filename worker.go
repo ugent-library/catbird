@@ -163,17 +163,13 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 
 	// Create tasks in database
-	for _, t := range w.tasks {
-		if err := CreateTask(ctx, w.conn, t); err != nil {
-			return err
-		}
+	if err := CreateTask(ctx, w.conn, w.tasks...); err != nil {
+		return err
 	}
 
 	// Create flows in database
-	for _, f := range w.flows {
-		if err := CreateFlow(ctx, w.conn, f); err != nil {
-			return err
-		}
+	if err := CreateFlow(ctx, w.conn, w.flows...); err != nil {
+		return err
 	}
 
 	var wg sync.WaitGroup

@@ -17,9 +17,9 @@ func New(conn Conn) *Client {
 	return &Client{Conn: conn}
 }
 
-// CreateQueue creates a new queue with the given name.
-func (c *Client) CreateQueue(ctx context.Context, name string, opts *QueueOpts) error {
-	return CreateQueue(ctx, c.Conn, name, opts)
+// CreateQueue creates one or more queue definitions.
+func (c *Client) CreateQueue(ctx context.Context, queues ...*Queue) error {
+	return CreateQueue(ctx, c.Conn, queues...)
 }
 
 // GetQueue retrieves queue metadata by name.
@@ -56,9 +56,9 @@ func (c *Client) Unbind(ctx context.Context, queue string, pattern string) error
 	return Unbind(ctx, c.Conn, queue, pattern)
 }
 
-// Dispatch sends a message to all queues subscribed to the specified topic.
-func (c *Client) Dispatch(ctx context.Context, topic string, payload any, opts *DispatchOpts) error {
-	return Dispatch(ctx, c.Conn, topic, payload, opts)
+// Publish sends a message to all queues subscribed to the specified topic.
+func (c *Client) Publish(ctx context.Context, topic string, payload any, opts *PublishOpts) error {
+	return Publish(ctx, c.Conn, topic, payload, opts)
 }
 
 // Read reads up to quantity messages from the queue, hiding them from other
@@ -96,9 +96,9 @@ func (c *Client) DeleteMany(ctx context.Context, queue string, ids []int64) erro
 	return DeleteMany(ctx, c.Conn, queue, ids)
 }
 
-// CreateTask creates a new task definition.
-func (c *Client) CreateTask(ctx context.Context, task *Task) error {
-	return CreateTask(ctx, c.Conn, task)
+// CreateTask creates one or more task definitions.
+func (c *Client) CreateTask(ctx context.Context, tasks ...*Task) error {
+	return CreateTask(ctx, c.Conn, tasks...)
 }
 
 // GetTask retrieves task metadata by name.
@@ -127,9 +127,9 @@ func (c *Client) ListTaskRuns(ctx context.Context, name string) ([]*RunInfo, err
 	return ListTaskRuns(ctx, c.Conn, name)
 }
 
-// CreateFlow creates a new flow definition.
-func (c *Client) CreateFlow(ctx context.Context, flow *Flow) error {
-	return CreateFlow(ctx, c.Conn, flow)
+// CreateFlow creates one or more flow definitions.
+func (c *Client) CreateFlow(ctx context.Context, flows ...*Flow) error {
+	return CreateFlow(ctx, c.Conn, flows...)
 }
 
 // GetFlow retrieves flow metadata by name.

@@ -29,7 +29,7 @@ client := catbird.New(conn)
 ctx := context.Background()
 
 // Queue: create, send, read, delete
-err := client.CreateQueue(ctx, "my-queue", nil)
+err := client.CreateQueue(ctx, catbird.NewQueue("my-queue", nil))
 err = client.Send(ctx, "my-queue", map[string]any{"user_id": 123}, &catbird.SendOpts{
     IdempotencyKey: "user-123",
 })
@@ -67,6 +67,15 @@ err = taskHandle.WaitForOutput(ctx, &taskOut)
 flowHandle, err := client.RunFlow(ctx, "double-add", 10, nil)
 var flowOut int
 err = flowHandle.WaitForOutput(ctx, &flowOut)
+
+// Ensure definitions exist before usage; this is not necessary if you
+// just want to run a worker, definitions will be created for you on
+// Start
+err := client.CreateTask(ctx, taskA, taskB)
+err := client.CreateFlow(ctx, flowA, flowB)
+
+// Direct package-level usage (no Client), for example in a transaction:
+taskHandle, err := catbird.RunTask(ctx, tx, "send-email", "hello", nil)
 ```
 
 # Deduplication Strategies
@@ -114,14 +123,14 @@ _, err = client.RunTask(ctx, "charge-payment", payment, &catbird.RunOpts{
 # Topic-Based Routing
 
 ```go
-err := client.CreateQueue(ctx, "user-events", nil)
-err = client.CreateQueue(ctx, "audit-log", nil)
+err := client.CreateQueue(ctx, catbird.NewQueue("user-events", nil))
+err = client.CreateQueue(ctx, catbird.NewQueue("audit-log", nil))
 
 err = client.Bind(ctx, "user-events", "events.user.created")
 err = client.Bind(ctx, "user-events", "events.?.updated")
 err = client.Bind(ctx, "audit-log", "events.*")
 
-err = client.Dispatch(ctx, "events.user.created", map[string]any{
+err = client.Publish(ctx, "events.user.created", map[string]any{
     "user_id": 123,
     "email":   "user@example.com",
 }, nil)
@@ -354,8 +363,8 @@ SELECT cb_create_queue(name => 'my_queue', expires_at => null, unlogged => false
 SELECT cb_send(queue => 'my_queue', payload => '{"user_id": 123, "action": "process"}'::jsonb, 
                topic => null, idempotency_key => null, deliver_at => null);
 
--- Dispatch to topic-bound queues
-SELECT cb_dispatch(topic => 'events.user.created', payload => '{"user_id": 456}'::jsonb,
+-- Publish to topic-bound queues
+SELECT cb_publish(topic => 'events.user.created', payload => '{"user_id": 456}'::jsonb,
                    idempotency_key => 'user-456-created', deliver_at => null);
 
 -- Read messages (with 30 second visibility timeout)

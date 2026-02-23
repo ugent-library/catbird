@@ -123,20 +123,23 @@ type TaskInfo struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// CreateTask creates a new task definition.
-func CreateTask(ctx context.Context, conn Conn, task *Task) error {
+// CreateTask creates one or more task definitions.
+func CreateTask(ctx context.Context, conn Conn, tasks ...*Task) error {
 	q := `SELECT * FROM cb_create_task(name => $1);`
-	_, err := conn.Exec(ctx, q, task.name)
-	if err != nil {
-		return err
-	}
-
-	if strings.TrimSpace(task.condition) != "" {
-		condQuery := `UPDATE cb_tasks SET condition = cb_parse_condition($1) WHERE name = $2;`
-		if _, err := conn.Exec(ctx, condQuery, task.condition, task.name); err != nil {
+	for _, task := range tasks {
+		_, err := conn.Exec(ctx, q, task.name)
+		if err != nil {
 			return err
 		}
+
+		if strings.TrimSpace(task.condition) != "" {
+			condQuery := `UPDATE cb_tasks SET condition = cb_parse_condition($1) WHERE name = $2;`
+			if _, err := conn.Exec(ctx, condQuery, task.condition, task.name); err != nil {
+				return err
+			}
+		}
 	}
+
 	return nil
 }
 

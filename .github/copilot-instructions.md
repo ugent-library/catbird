@@ -12,7 +12,7 @@ Catbird is a PostgreSQL-based message queue with task and workflow execution eng
 
 **SQL Performance Patterns**:
 - **Setup functions** (e.g., `cb_create_flow`, `Bind`): Safe to use advisory locks and joins. These are called once during initialization, not in hot paths.
-- **Hot path runtime functions** (e.g., `Read()`, `Dispatch()`, message polling): Avoid expensive operations:
+- **Hot path runtime functions** (e.g., `Read()`, `Publish()`, message polling): Avoid expensive operations:
   - **No joins**: Filter by indexed keys only (e.g., `cb_queue.name`, `cb_queue.expires_at`)
   - **No advisory locks**: Use lock-free techniques instead (`SKIP LOCKED` for row-level concurrency, CTEs with `FOR UPDATE`, or atomic compare-and-swap logic)
   - **No N+1 queries**: Bulk operations with `RETURNING` clauses
@@ -25,7 +25,7 @@ Catbird is a PostgreSQL-based message queue with task and workflow execution eng
 4. **Dashboard** (`dashboard/`): Web UI for starting task/flow runs, monitoring progress in real-time, and viewing results; served via CLI `cb dashboard`
 
 **Two Independent Systems**:
-1. **Generic Message Queues**: `Send()`, `Dispatch()`, `Read()` operations similar to pgmq/SQS. Messages stored in queue tables; independent from tasks/flows. **Topic routing** via explicit bindings with wildcard support (`?` for single token, `*` for multi-token tail). Bindings stored in `cb_bindings` table with pattern type (exact/wildcard), prefix extraction for indexed filtering, and precompiled regexes.
+1. **Generic Message Queues**: `Send()`, `Publish()`, `Read()` operations similar to pgmq/SQS. Messages stored in queue tables; independent from tasks/flows. **Topic routing** via explicit bindings with wildcard support (`?` for single token, `*` for multi-token tail). Bindings stored in `cb_bindings` table with pattern type (exact/wildcard), prefix extraction for indexed filtering, and precompiled regexes.
 2. **Task & Flow Execution**: Task/flow definitions describe shape; `RunTask()` or `RunFlow()` create entries in task_run/step_run tables (which act as queues themselves). Worker reads from these tables and executes handlers. State tracked via constants (created, started, completed, failed).
 
 ## Database Schema
@@ -38,7 +38,7 @@ All schema is version-controlled in `migrations/` (goose-managed):
 - **Conditions Integration** (v5): Modified `cb_create_flow()` to handle ConditionalDependency JSON and populate condition columns
 - **Conditions Validation** (v6): Added `cb_check_reconvergence()` for validating flow structure and enforcing no-reconvergence rule
 
-Key: Migrations use goose with `DisableVersioning` + embedded FS. Current schema version = 6.
+Key: Migrations use goose with `DisableVersioning` + embedded FS. Current schema version = 3.
 
 **Table Name Construction**:
 All runtime tables (messages, task runs, flow runs, step runs) are created dynamically using the `cb_table_name(name, prefix)` function:

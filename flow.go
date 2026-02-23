@@ -314,52 +314,56 @@ func validateFlowDependencies(flow *Flow) error {
 	return nil
 }
 
-// CreateFlow creates a new flow definition.
-func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
-	if err := validateFlowDependencies(flow); err != nil {
-		return err
-	}
-
-	// Need to marshal the steps with their public fields for JSON
-	// Convert to a serializable structure
-	type stepDependency struct {
-		Name string `json:"name"`
-	}
-	type serializableStep struct {
-		Name      string            `json:"name"`
-		Condition string            `json:"condition,omitempty"`
-		Signal    bool              `json:"signal"`
-		DependsOn []*stepDependency `json:"depends_on,omitempty"`
-	}
-
-	steps := flow.steps
-	serSteps := make([]serializableStep, len(steps))
-	for i, s := range steps {
-		// Convert dependency names to stepDependency objects
-		depNames := s.dependencies
-		deps := make([]*stepDependency, len(depNames))
-		for j, depName := range depNames {
-			deps[j] = &stepDependency{Name: depName}
-		}
-
-		serStep := serializableStep{
-			Name:      s.name,
-			Signal:    s.signal,
-			DependsOn: deps,
-		}
-		serStep.Condition = s.condition
-		serSteps[i] = serStep
-	}
-
-	b, err := json.Marshal(serSteps)
-	if err != nil {
-		return err
-	}
+// CreateFlow creates one or more flow definitions.
+func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 	q := `SELECT * FROM cb_create_flow(name => $1, steps => $2);`
-	_, err = conn.Exec(ctx, q, flow.name, b)
-	if err != nil {
-		return err
+	for _, flow := range flows {
+		if err := validateFlowDependencies(flow); err != nil {
+			return err
+		}
+
+		// Need to marshal the steps with their public fields for JSON
+		// Convert to a serializable structure
+		type stepDependency struct {
+			Name string `json:"name"`
+		}
+		type serializableStep struct {
+			Name      string            `json:"name"`
+			Condition string            `json:"condition,omitempty"`
+			Signal    bool              `json:"signal"`
+			DependsOn []*stepDependency `json:"depends_on,omitempty"`
+		}
+
+		steps := flow.steps
+		serSteps := make([]serializableStep, len(steps))
+		for i, s := range steps {
+			// Convert dependency names to stepDependency objects
+			depNames := s.dependencies
+			deps := make([]*stepDependency, len(depNames))
+			for j, depName := range depNames {
+				deps[j] = &stepDependency{Name: depName}
+			}
+
+			serStep := serializableStep{
+				Name:      s.name,
+				Signal:    s.signal,
+				DependsOn: deps,
+			}
+			serStep.Condition = s.condition
+			serSteps[i] = serStep
+		}
+
+		b, err := json.Marshal(serSteps)
+		if err != nil {
+			return err
+		}
+
+		_, err = conn.Exec(ctx, q, flow.name, b)
+		if err != nil {
+			return err
+		}
 	}
+
 	return nil
 }
 
