@@ -4,16 +4,7 @@
 
 ### Naming & API Cleanup
 
-- [ ] prefix all options? NewHander(..., WithHandlerConcurrency), NewStep(..., WithStepDescription())
-
-- [ ] review sql function return values
-
-- [ ] **Use standard "visibility timeout" terminology for queue operations**
-  - Current: `hideFor` parameter is non-standard and unclear
-  - Proposed: Rename to `visibility` or `visibilityTimeout` (industry standard)
-  - Affects: `Read()`, `ReadPoll()`, `Hide()`, `HideMany()` methods
-  - Reference: AWS SQS, Azure Service Bus, Google Cloud Tasks all use "visibility timeout"
-  - Benefit: Self-documenting, searchable, familiar to developers
+- [ ] Review sql function return values
 
 ## Features
 
