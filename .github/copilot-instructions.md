@@ -311,7 +311,7 @@ docker compose logs -f postgres
 
 1. **Errors**: Use `ErrTaskFailed`, `ErrFlowFailed` package-level errors
 2. **Context propagation**: All DB ops accept `context.Context` first param
-3. **JSON payloads**: Custom types → JSON via generics; validation happens in handler
+3. **JSON payloads**: Custom types → JSON via handler reflection; validation happens in handler
 4. **Retries**: Built-in with configurable exponential backoff with full jitter (see `WithBackoff(min, max)`)
 5. **Circuit breaker**: Optional per-handler protection for external dependencies (see `WithCircuitBreaker(failures, openTimeout)`)
 6. **Concurrency**: Default 1 per handler; tweak with `WithConcurrency(n)`
