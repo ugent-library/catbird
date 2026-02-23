@@ -35,7 +35,7 @@ func TestTaskConcurrencyKey(t *testing.T) {
 		return in * 2, nil
 	}, nil)
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
+	worker := client.NewWorker(t.Context(), nil).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -106,7 +106,7 @@ func TestTaskIdempotencyKey(t *testing.T) {
 		return in * 3, nil
 	}, nil)
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
+	worker := client.NewWorker(t.Context(), nil).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -193,7 +193,7 @@ func TestTaskDeduplicationRetryOnFailure(t *testing.T) {
 		return "success", nil
 	}, nil)
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
+	worker := client.NewWorker(t.Context(), nil).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -263,7 +263,7 @@ func TestFlowConcurrencyKey(t *testing.T) {
 			return in + " processed", nil
 		}, nil))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -321,7 +321,7 @@ func TestFlowIdempotencyKey(t *testing.T) {
 			return in * 5, nil
 		}, nil))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -395,7 +395,7 @@ func TestTaskBothKeysRejected(t *testing.T) {
 		return in, nil
 	}, nil)
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
+	worker := client.NewWorker(t.Context(), nil).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -419,7 +419,7 @@ func TestFlowBothKeysRejected(t *testing.T) {
 			return in, nil
 		}, nil))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 

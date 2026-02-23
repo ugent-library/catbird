@@ -210,7 +210,7 @@ func TestTaskRetriesIntegration(t *testing.T) {
 		Backoff:     NewFullJitterBackoff(minDelay, maxDelay),
 	})
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
+	worker := client.NewWorker(t.Context(), nil).AddTask(task)
 
 	startTestWorker(t, worker)
 

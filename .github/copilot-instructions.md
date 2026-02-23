@@ -20,8 +20,8 @@ Catbird is a PostgreSQL-based message queue with task and workflow execution eng
 
 **Main Components**:
 1. **Client** (`client.go`): Facade delegating to standalone functions; call `catbird.New(conn)` to create
-2. **Worker** (`worker.go`): Runs tasks and flows; initialized with `catbird.NewWorker(ctx, conn, opts...)`. Multiple workers can run concurrently; DB ensures each message is processed exactly once.
-3. **Scheduler** (`scheduler.go`): Manages cron-based task and flow scheduling using robfig/cron; created internally by worker when registering tasks/flows with `Schedule` field in `TaskOpts`/`FlowOpts`. Can also be used standalone.
+2. **Worker** (`worker.go`): Runs tasks and flows; initialized with `catbird.NewWorker(conn, opts)` or `client.NewWorker(ctx, opts)`. Multiple workers can run concurrently; DB ensures each message is processed exactly once.
+3. **Scheduler** (`scheduler.go`): Manages cron-based task and flow scheduling using robfig/cron; created internally by worker when registering tasks/flows with `Schedule` method. Can also be used standalone.
 4. **Dashboard** (`dashboard/`): Web UI for starting task/flow runs, monitoring progress in real-time, and viewing results; served via CLI `cb dashboard`
 
 **Two Independent Systems**:
@@ -67,10 +67,7 @@ task := catbird.NewTask("my_task").
     Concurrency: 5,
     MaxRetries:  3,
     Backoff:     catbird.NewFullJitterBackoff(500*time.Millisecond, 10*time.Second),
-    CircuitBreaker: &catbird.CircuitBreaker{
-      FailureThreshold: 5,
-      OpenTimeout:      30 * time.Second,
-    },
+    CircuitBreaker: catbird.NewCircuitBreaker(5, 30*time.Second),
   })
 ```
 
@@ -144,7 +141,7 @@ NewFlow("workflow").
     }, nil)).
   AddStep(NewStep("approve").
     DependsOn("step1").
-    Signal(catbird.NewSignal[ApprovalInput](nil)). // Wait for signal
+    Signal(true). // Wait for signal
     Handler(func(ctx context.Context, in string, approval ApprovalInput, step1Out string) (string, error) {
       return step1Out + " approved by " + approval.ApproverID, nil
     }, nil))
@@ -161,12 +158,12 @@ NewFlow("workflow").
 
 ## Key Conventions
 
-- **Worker lifecycle**: `client.NewWorker(ctx, opts)` followed by `.AddTask(..., taskOpts)` and `.AddFlow(..., flowOpts)` builder methods, then `worker.Start(ctx)` (graceful shutdown with configurable timeout)
+- **Worker lifecycle**: `client.NewWorker(ctx, opts)` followed by `.AddTask(task)` and `.AddFlow(flow)` builder methods (schedule set via `task.Schedule(cron, inputFunc)` or `flow.Schedule(cron, inputFunc)`), then `worker.Start(ctx)` (graceful shutdown with configurable timeout)
 - **HandlerOpts validation**: Worker validates all task and flow step HandlerOpts at initialization time. Invalid configs (negative concurrency/batch size, invalid backoff, invalid circuit breaker) are caught immediately with descriptive errors before reaching database operations. This ensures type safety at construction time.
 - **Options pattern**: HandlerOpts uses a public struct with public fields (Concurrency, BatchSize, Timeout, MaxRetries, Backoff, CircuitBreaker). WorkerOpts uses a config struct (Logger, ShutdownTimeout).
 - **Conn interface**: Abstracts pgx; accepts `*pgxpool.Pool`, `*pgx.Conn` or `pgx.Tx`
 - **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `WorkerOpts.Logger` field
-- **Scheduled tasks/flows**: Use robfig/cron syntax via optional `TaskOpts{Schedule: "@hourly"}` or `FlowOpts{Schedule: "@hourly"}` parameters to `AddTask()`/`AddFlow()`. Optional `ScheduleInput` field allows dynamic input generation at execution time
+- **Scheduled tasks/flows**: Use robfig/cron syntax via `.Schedule("@hourly", nil)` builder method on task/flow before adding to worker. Optional second parameter allows dynamic input generation at execution time. Example: `task := NewTask("t").Schedule("@hourly", func(ctx context.Context) (any, error) { return InputType{...}, nil })` then `worker.AddTask(task)`.
 - **Automatic garbage collection**: All workers automatically run GC every 5 minutes (cleans up expired queues and stale worker heartbeats); no configuration needed
 - **Deduplication strategies**: Two strategies available:
   - **ConcurrencyKey**: Prevents concurrent/overlapping runs (deduplicates `queued`/`started` status). After completion or failure, same key can be used again.
@@ -312,10 +309,10 @@ docker compose logs -f postgres
 1. **Errors**: Use `ErrTaskFailed`, `ErrFlowFailed` package-level errors
 2. **Context propagation**: All DB ops accept `context.Context` first param
 3. **JSON payloads**: Custom types → JSON via handler reflection; validation happens in handler
-4. **Retries**: Built-in with configurable exponential backoff with full jitter (see `WithBackoff(min, max)`)
-5. **Circuit breaker**: Optional per-handler protection for external dependencies (see `WithCircuitBreaker(failures, openTimeout)`)
-6. **Concurrency**: Default 1 per handler; tweak with `WithConcurrency(n)`
-7. **Conditional execution**: Use `WithCondition("expression")` as a task/step option for both tasks and flow steps. Tasks use `input.field` syntax (e.g., `WithCondition("input.is_premium")`), flow steps use `step_name.field` syntax (e.g., `WithCondition("validate.score gte 50")`)
+4. **Retries**: Built-in with configurable exponential backoff with full jitter (see `NewFullJitterBackoff(min, max)`)
+5. **Circuit breaker**: Optional per-handler protection for external dependencies (see `NewCircuitBreaker(failures, openTimeout)`)
+6. **Concurrency**: Default 1 per handler; set `HandlerOpts.Concurrency`
+7. **Conditional execution**: Use `.Condition("expression")` on tasks/steps. Tasks use `input.field` syntax (e.g., `"input.is_premium"`), flow steps use `step_name.field` syntax (e.g., `"validate.score gte 50"`)
 8. **Optional dependencies**: Use `Optional[T]` + `OptionalDependency()` pair when depending on conditional steps. Validation at flow construction time enforces type safety.
 9. **SQL parameter/column conflicts**: Use `#variable_conflict use_column` directive in PL/pgSQL when parameter names match column names (prevents "column ambiguous" errors)
 10. **Atomic deduplication with UNION ALL**: For `RunTask()` and `RunFlow()` deduplication (concurrency_key / idempotency_key), use the atomic ON CONFLICT DO UPDATE pattern with UNION ALL fallback. **DO NOT remove the UNION ALL or simplify to plain `RETURNING id`**. The pattern is:

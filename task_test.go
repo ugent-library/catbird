@@ -42,7 +42,7 @@ func TestTaskRunAndWait(t *testing.T) {
 		return in.Value * 2, nil
 	}, nil)
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
+	worker := client.NewWorker(t.Context(), nil).AddTask(task)
 
 	startTestWorker(t, worker)
 
@@ -73,7 +73,7 @@ func TestTaskPanicRecovery(t *testing.T) {
 		panic("intentional panic in task")
 	}, nil)
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
+	worker := client.NewWorker(t.Context(), nil).AddTask(task)
 
 	startTestWorker(t, worker)
 
@@ -135,7 +135,7 @@ func TestTaskCircuitBreaker(t *testing.T) {
 		CircuitBreaker: NewCircuitBreaker(1, openTimeout),
 	})
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
+	worker := client.NewWorker(t.Context(), nil).AddTask(task)
 
 	startTestWorker(t, worker)
 

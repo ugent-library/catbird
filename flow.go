@@ -12,12 +12,20 @@ import (
 )
 
 type Flow struct {
-	name  string
-	steps []Step
+	name          string
+	schedule      string
+	scheduleInput func(context.Context) (any, error)
+	steps         []Step
 }
 
 func NewFlow(name string) *Flow {
 	return &Flow{name: name}
+}
+
+func (f *Flow) Schedule(schedule string, inputFunc func(context.Context) (any, error)) *Flow {
+	f.schedule = schedule
+	f.scheduleInput = inputFunc
+	return f
 }
 
 func (f *Flow) AddStep(step *Step) *Flow {

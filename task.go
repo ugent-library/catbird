@@ -15,10 +15,12 @@ import (
 // Use NewTask().Handler(fn, opts) for tasks with handlers.
 // Use NewTask() for definition-only tasks.
 type Task struct {
-	name        string
-	condition   string
-	handler     func(context.Context, json.RawMessage) (json.RawMessage, error)
-	handlerOpts *HandlerOpts
+	name          string
+	condition     string
+	schedule      string
+	scheduleInput func(context.Context) (any, error)
+	handler       func(context.Context, json.RawMessage) (json.RawMessage, error)
+	handlerOpts   *HandlerOpts
 }
 
 // NewTask creates a new task definition with the given name.
@@ -30,6 +32,12 @@ func NewTask(name string) *Task {
 // Condition sets the condition expression for the task.
 func (t *Task) Condition(condition string) *Task {
 	t.condition = condition
+	return t
+}
+
+func (t *Task) Schedule(schedule string, inputFunc func(context.Context) (any, error)) *Task {
+	t.schedule = schedule
+	t.scheduleInput = inputFunc
 	return t
 }
 

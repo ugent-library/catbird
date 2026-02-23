@@ -24,7 +24,7 @@ func TestFlowCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
@@ -55,7 +55,7 @@ func TestFlowSingleStep(t *testing.T) {
 			return in + " processed by step 1", nil
 		}, nil))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
@@ -100,7 +100,7 @@ func TestFlowWithDependencies(t *testing.T) {
 				return step2Out + " and by step 3", nil
 			}, nil))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
@@ -155,8 +155,8 @@ func TestFlowListFlows(t *testing.T) {
 
 	// Start worker to execute flows
 	worker := client.NewWorker(t.Context(), nil).
-		AddFlow(flow1, nil).
-		AddFlow(flow2, nil)
+		AddFlow(flow1).
+		AddFlow(flow2)
 
 	startTestWorker(t, worker)
 
@@ -270,7 +270,7 @@ func TestFlowComplexDependencies(t *testing.T) {
 
 	// Start worker to execute flow
 	worker := client.NewWorker(t.Context(), &WorkerOpts{Logger: logger}).
-		AddFlow(flow, nil)
+		AddFlow(flow)
 
 	startTestWorker(t, worker)
 
@@ -309,7 +309,7 @@ func TestFlowStepPanicRecovery(t *testing.T) {
 				panic("intentional panic in flow step")
 			}, nil))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
@@ -341,6 +341,7 @@ func TestFlowStepPanicRecovery(t *testing.T) {
 
 func TestStepCircuitBreaker(t *testing.T) {
 	client := getTestClient(t)
+	flowName := testFlowName(t, "circuit_flow")
 
 	openTimeout := 300 * time.Millisecond
 	minBackoff := 10 * time.Millisecond
@@ -350,7 +351,7 @@ func TestStepCircuitBreaker(t *testing.T) {
 	var mu sync.Mutex
 	var times []time.Time
 
-	flow := NewFlow("circuit_flow").
+	flow := NewFlow(flowName).
 		AddStep(NewStep("step1").Handler(
 			func(ctx context.Context, in string) (string, error) {
 				n := atomic.AddInt32(&calls, 1)
@@ -367,14 +368,14 @@ func TestStepCircuitBreaker(t *testing.T) {
 				CircuitBreaker: &CircuitBreaker{failureThreshold: 1, openTimeout: openTimeout},
 			}))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunFlow(t.Context(), "circuit_flow", "input", nil)
+	h, err := client.RunFlow(t.Context(), flowName, "input", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +436,7 @@ func TestFlowWithSignal(t *testing.T) {
 				return "published: " + approveResult, nil
 			}, nil))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
@@ -493,7 +494,7 @@ func TestFlowWithInitialSignal(t *testing.T) {
 				return startResult + " - processed", nil
 			}, nil))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
@@ -555,7 +556,7 @@ func TestFlowSignalAlreadyDelivered(t *testing.T) {
 				return approveResult + " - completed", nil
 			}, nil))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
 
 	startTestWorker(t, worker)
 

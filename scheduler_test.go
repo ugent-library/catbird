@@ -13,12 +13,14 @@ import (
 func TestSchedulerIdempotencyKeyGeneration(t *testing.T) {
 	client := getTestClient(t)
 
-	task := NewTask("scheduled_task").Handler(func(ctx context.Context, in string) (string, error) {
-		return in + " processed", nil
-	}, nil)
+	task := NewTask("scheduled_task").
+		Schedule("@hourly", nil).
+		Handler(func(ctx context.Context, in string) (string, error) {
+			return in + " processed", nil
+		}, nil)
 
 	worker := client.NewWorker(t.Context(), nil).
-		AddTask(task, &TaskOpts{Schedule: "@hourly"})
+		AddTask(task)
 
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
@@ -59,7 +61,7 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 	}, nil)
 
 	// Create and run worker to execute task (must create task before running)
-	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
+	worker := client.NewWorker(t.Context(), nil).AddTask(task)
 
 	startTestWorker(t, worker)
 	time.Sleep(200 * time.Millisecond)
@@ -115,7 +117,7 @@ func TestSchedulerIdempotencyPersists(t *testing.T) {
 		return in * 2, nil
 	}, nil)
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
+	worker := client.NewWorker(t.Context(), nil).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -201,7 +203,7 @@ func TestSchedulerFlowIdempotency(t *testing.T) {
 			return 42, nil
 		}, nil))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
 
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)

@@ -57,18 +57,6 @@ type WorkerOpts struct {
 	ShutdownTimeout time.Duration
 }
 
-// TaskOpts is a configuration struct for registering tasks with optional scheduling.
-type TaskOpts struct {
-	Schedule      string                             // Cron syntax (e.g., "@hourly")
-	ScheduleInput func(context.Context) (any, error) // Optional input generator for scheduled runs
-}
-
-// FlowOpts is a configuration struct for registering flows with optional scheduling.
-type FlowOpts struct {
-	Schedule      string                             // Cron syntax (e.g., "@hourly")
-	ScheduleInput func(context.Context) (any, error) // Optional input generator for scheduled runs
-}
-
 // NewWorker creates a new worker with the given connection and configuration.
 // Use builder methods (AddTask, AddFlow, etc.) to configure the worker.
 // Call Start(ctx) to begin processing tasks and flows.
@@ -95,31 +83,31 @@ func NewWorker(conn Conn, opts *WorkerOpts) *Worker {
 	}
 }
 
-// AddTask registers a task with the worker. opts can be nil for default behavior.
-// If opts.Schedule is set, the task will be executed according to the cron schedule.
-func (w *Worker) AddTask(t *Task, opts *TaskOpts) *Worker {
+// AddTask registers a task with the worker.
+// If the task has a Schedule set via .Schedule(), it will be executed according to the cron schedule.
+func (w *Worker) AddTask(t *Task) *Worker {
 	w.tasks = append(w.tasks, t)
 
-	if opts != nil && opts.Schedule != "" {
+	if t.schedule != "" {
 		if w.scheduler == nil {
 			w.scheduler = NewScheduler(w.conn, w.logger)
 		}
-		w.scheduler.AddTask(t.name, opts.Schedule, opts.ScheduleInput)
+		w.scheduler.AddTask(t.name, t.schedule, t.scheduleInput)
 	}
 
 	return w
 }
 
-// AddFlow registers a flow with the worker. opts can be nil for default behavior.
-// If opts.Schedule is set, the flow will be executed according to the cron schedule.
-func (w *Worker) AddFlow(f *Flow, opts *FlowOpts) *Worker {
+// AddFlow registers a flow with the worker.
+// If the flow has a Schedule set via .Schedule(), it will be executed according to the cron schedule.
+func (w *Worker) AddFlow(f *Flow) *Worker {
 	w.flows = append(w.flows, f)
 
-	if opts != nil && opts.Schedule != "" {
+	if f.schedule != "" {
 		if w.scheduler == nil {
 			w.scheduler = NewScheduler(w.conn, w.logger)
 		}
-		w.scheduler.AddFlow(f.name, opts.Schedule, opts.ScheduleInput)
+		w.scheduler.AddFlow(f.name, f.schedule, f.scheduleInput)
 	}
 
 	return w

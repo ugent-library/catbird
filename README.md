@@ -55,7 +55,9 @@ flow := catbird.NewFlow("double-add").
             return doubled + 1, nil
         }, nil))
 
-worker, err := client.NewWorker(ctx, catbird.WithTask(task), catbird.WithFlow(flow))
+worker, err := client.NewWorker(ctx, nil)
+worker.AddTask(task)
+worker.AddFlow(flow)
 go worker.Start(ctx)
 
 taskHandle, err := client.RunTask(ctx, "send-email", "hello", nil)
@@ -136,6 +138,7 @@ Wildcard rules:
 
 ```go
 task := catbird.NewTask("send-email").
+    Schedule("@hourly", nil).
     Handler(func(ctx context.Context, input EmailRequest) (EmailResponse, error) {
         return EmailResponse{SentAt: time.Now()}, nil
     }, &catbird.HandlerOpts{
@@ -154,9 +157,9 @@ conditionalTask := catbird.NewTask("premium-processing").
 
 // Create worker
 worker, err := client.NewWorker(ctx)
-// Add tasks with options
-worker.AddTask(task, &catbird.TaskOpts{Schedule: "@hourly"})
-worker.AddTask(conditionalTask, nil)
+// Add tasks
+worker.AddTask(task)
+worker.AddTask(conditionalTask)
 go worker.Start(ctx)
 
 // Run the task
@@ -186,6 +189,7 @@ A **flow** is a **directed acyclic graph (DAG)** of steps that execute when thei
 
 ```go
 flow := catbird.NewFlow("order-processing").
+    Schedule("0 2 * * *", nil). // Daily at 2 AM
     AddStep(catbird.NewStep("validate").
         Handler(func(ctx context.Context, order Order) (ValidationResult, error) {
             if order.Amount <= 0 {
@@ -226,8 +230,8 @@ flow := catbird.NewFlow("order-processing").
 
 // Create worker
 worker, err := client.NewWorker(ctx)
-// Add flow with schedule
-worker.AddFlow(flow, &catbird.FlowOpts{Schedule: "0 2 * * *"}) // Daily at 2 AM
+// Add flow
+worker.AddFlow(flow)
 go worker.Start(ctx)
 ```
 
@@ -268,7 +272,7 @@ A step with both dependencies and a signal waits for **both** conditions: all de
 
 # Conditional Execution
 
-Both tasks and flow steps support conditional execution via `Condition` on `TaskOpts` and `StepOpts`. If the condition evaluates to false (or a referenced field is missing), the task/step is marked `skipped` and its handler does not run.
+Both tasks and flow steps support conditional execution via `Condition` on the builder methods. If the condition evaluates to false (or a referenced field is missing), the task/step is marked `skipped` and its handler does not run.
 
 ## Rules at a Glance
 
