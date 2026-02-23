@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS cb_steps (
     name text NOT NULL,
     idx int NOT NULL DEFAULT 0,
     dependency_count int NOT NULL DEFAULT 0,
-    has_signal boolean NOT NULL DEFAULT false,
+    signal boolean NOT NULL DEFAULT false,
     condition jsonb,
     PRIMARY KEY (flow_name, name),
     UNIQUE (flow_name, idx),
@@ -889,13 +889,13 @@ BEGIN
       _condition := cb_parse_condition(_step->>'condition');
     END IF;
 
-    INSERT INTO cb_steps (flow_name, name, idx, dependency_count, has_signal, condition)
+    INSERT INTO cb_steps (flow_name, name, idx, dependency_count, signal, condition)
     VALUES (
       cb_create_flow.name,
       _step_name,
       _idx,
       jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb)),
-      coalesce((_step->>'has_signal')::boolean, false),
+      coalesce((_step->>'signal')::boolean, false),
       _condition
     );
 
@@ -1157,7 +1157,7 @@ BEGIN
       WHERE sr.flow_run_id = $1
         AND sr.status = 'created'
         AND sr.remaining_dependencies = 0
-        AND (NOT (SELECT has_signal FROM cb_steps WHERE flow_name = $3 AND name = sr.step_name) 
+        AND (NOT (SELECT signal FROM cb_steps WHERE flow_name = $3 AND name = sr.step_name) 
              OR sr.signal_input IS NOT NULL)
       FOR UPDATE SKIP LOCKED
       $QUERY$,
@@ -1573,7 +1573,7 @@ BEGIN
       AND sr.signal_input IS NULL
       AND s.flow_name = $4
       AND s.name = sr.step_name
-      AND s.has_signal = true
+      AND s.signal = true
     RETURNING true
     $QUERY$,
     _s_table
@@ -1730,7 +1730,7 @@ CREATE OR REPLACE VIEW cb_flow_info AS
       s.flow_name,
       jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
         'name', s.name,
-        'has_signal', s.has_signal,
+        'signal', s.signal,
         'depends_on', (
           SELECT jsonb_agg(jsonb_build_object('name', s_d.dependency_name))
           FROM cb_step_dependencies AS s_d

@@ -239,25 +239,24 @@ func TestFlowCondition(t *testing.T) {
 		// Flow: step1 -> step2 (conditional, executed if step1 output < 90) -> finalize (unconditional final step)
 		// If input is 95, step1 outputs 95, condition is false, so step2 should be skipped, finalize still runs
 		flowName := testFlowName(t, "condition_test_flow")
-		flow := NewFlow[int, map[string]any](flowName).
-			AddStep(NewStep("step1", func(ctx context.Context, score int) (int, error) {
+		flow := NewFlow(flowName).
+			AddStep(NewStep("step1").Handler(func(ctx context.Context, score int) (int, error) {
 				return score, nil
 			}, nil)).
-			AddStep(NewStep1Dep("step2",
-				"step1",
-				func(ctx context.Context, score int, step1Score int) (string, error) {
+			AddStep(NewStep("step2").
+				DependsOn("step1").
+				Condition("step1 lt 90").
+				Handler(func(ctx context.Context, score int, step1Score int) (string, error) {
 					return "step2_executed", nil
-				},
-				&StepOpts{Condition: "step1 lt 90"})).
-			AddStep(NewStep1Dep("finalize", "step2",
-				func(ctx context.Context, score int, step2Result Optional[string]) (map[string]any, error) {
-					result := make(map[string]any)
-					result["step1"] = score
-					if step2Result.IsSet {
-						result["step2"] = step2Result.Value
-					}
-					return result, nil
-				}, nil))
+				}, nil)).
+			AddStep(NewStep("finalize").DependsOn("step2").Handler(func(ctx context.Context, score int, step2Result Optional[string]) (map[string]any, error) {
+				result := make(map[string]any)
+				result["step1"] = score
+				if step2Result.IsSet {
+					result["step2"] = step2Result.Value
+				}
+				return result, nil
+			}, nil))
 
 		worker, err := client.NewWorker(t.Context(), WithFlow(flow))
 		if err != nil {
@@ -300,25 +299,24 @@ func TestFlowCondition(t *testing.T) {
 
 	t.Run("execute_step_when_condition_true", func(t *testing.T) {
 		flowName := testFlowName(t, "condition_true_flow")
-		flow := NewFlow[int, map[string]any](flowName).
-			AddStep(NewStep("step1", func(ctx context.Context, score int) (int, error) {
+		flow := NewFlow(flowName).
+			AddStep(NewStep("step1").Handler(func(ctx context.Context, score int) (int, error) {
 				return score, nil
 			}, nil)).
-			AddStep(NewStep1Dep("step2",
-				"step1",
-				func(ctx context.Context, score int, step1Score int) (string, error) {
+			AddStep(NewStep("step2").
+				DependsOn("step1").
+				Condition("step1 lt 90").
+				Handler(func(ctx context.Context, score int, step1Score int) (string, error) {
 					return "step2_executed", nil
-				},
-				&StepOpts{Condition: "step1 lt 90"})).
-			AddStep(NewStep1Dep("finalize", "step2",
-				func(ctx context.Context, score int, step2Result Optional[string]) (map[string]any, error) {
-					result := make(map[string]any)
-					result["step1"] = score
-					if step2Result.IsSet {
-						result["step2"] = step2Result.Value
-					}
-					return result, nil
-				}, nil))
+				}, nil)).
+			AddStep(NewStep("finalize").DependsOn("step2").Handler(func(ctx context.Context, score int, step2Result Optional[string]) (map[string]any, error) {
+				result := make(map[string]any)
+				result["step1"] = score
+				if step2Result.IsSet {
+					result["step2"] = step2Result.Value
+				}
+				return result, nil
+			}, nil))
 
 		worker, err := client.NewWorker(t.Context(), WithFlow(flow))
 		if err != nil {
@@ -350,25 +348,24 @@ func TestFlowCondition(t *testing.T) {
 
 	t.Run("skip_with_condition", func(t *testing.T) {
 		flowName := testFlowName(t, "condition_named_flow")
-		flow := NewFlow[int, map[string]any](flowName).
-			AddStep(NewStep("step1", func(ctx context.Context, score int) (int, error) {
+		flow := NewFlow(flowName).
+			AddStep(NewStep("step1").Handler(func(ctx context.Context, score int) (int, error) {
 				return score, nil
 			}, nil)).
-			AddStep(NewStep1Dep("step2",
-				"step1",
-				func(ctx context.Context, score int, step1Score int) (string, error) {
+			AddStep(NewStep("step2").
+				DependsOn("step1").
+				Condition("step1 lt 90").
+				Handler(func(ctx context.Context, score int, step1Score int) (string, error) {
 					return "step2_executed", nil
-				},
-				&StepOpts{Condition: "step1 lt 90"})).
-			AddStep(NewStep1Dep("finalize", "step2",
-				func(ctx context.Context, score int, step2Result Optional[string]) (map[string]any, error) {
-					result := make(map[string]any)
-					result["step1"] = score
-					if step2Result.IsSet {
-						result["step2"] = step2Result.Value
-					}
-					return result, nil
-				}, nil))
+				}, nil)).
+			AddStep(NewStep("finalize").DependsOn("step2").Handler(func(ctx context.Context, score int, step2Result Optional[string]) (map[string]any, error) {
+				result := make(map[string]any)
+				result["step1"] = score
+				if step2Result.IsSet {
+					result["step2"] = step2Result.Value
+				}
+				return result, nil
+			}, nil))
 
 		worker, err := client.NewWorker(t.Context(), WithFlow(flow))
 		if err != nil {
@@ -411,24 +408,23 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 	t.Run("missing_field_condition", func(t *testing.T) {
 		// When field doesn't exist, condition should be false
 		flowName := testFlowName(t, "missing_field_flow")
-		flow := NewFlow[map[string]interface{}, map[string]any](flowName).
-			AddStep(NewStep("step1", func(ctx context.Context, input map[string]interface{}) (map[string]interface{}, error) {
+		flow := NewFlow(flowName).
+			AddStep(NewStep("step1").Handler(func(ctx context.Context, input map[string]interface{}) (map[string]interface{}, error) {
 				return input, nil
 			}, nil)).
-			AddStep(NewStep1Dep("step2",
-				"step1",
-				func(ctx context.Context, input map[string]interface{}, step1Out map[string]interface{}) (string, error) {
+			AddStep(NewStep("step2").
+				DependsOn("step1").
+				Condition("step1.optional_field ne value").
+				Handler(func(ctx context.Context, input map[string]interface{}, step1Out map[string]interface{}) (string, error) {
 					return "executed", nil
-				},
-				&StepOpts{Condition: "step1.optional_field ne value"})).
-			AddStep(NewStep1Dep("finalize", "step2",
-				func(ctx context.Context, input map[string]interface{}, step2Result Optional[string]) (map[string]any, error) {
-					result := make(map[string]any)
-					if step2Result.IsSet {
-						result["step2"] = step2Result.Value
-					}
-					return result, nil
-				}, nil))
+				}, nil)).
+			AddStep(NewStep("finalize").DependsOn("step2").Handler(func(ctx context.Context, input map[string]interface{}, step2Result Optional[string]) (map[string]any, error) {
+				result := make(map[string]any)
+				if step2Result.IsSet {
+					result["step2"] = step2Result.Value
+				}
+				return result, nil
+			}, nil))
 
 		worker, err := client.NewWorker(t.Context(), WithFlow(flow))
 		if err != nil {
@@ -458,24 +454,23 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 
 	t.Run("null_value_handling", func(t *testing.T) {
 		flowName := testFlowName(t, "null_value_flow")
-		flow := NewFlow[map[string]interface{}, map[string]any](flowName).
-			AddStep(NewStep("step1", func(ctx context.Context, input map[string]interface{}) (map[string]interface{}, error) {
+		flow := NewFlow(flowName).
+			AddStep(NewStep("step1").Handler(func(ctx context.Context, input map[string]interface{}) (map[string]interface{}, error) {
 				return input, nil
 			}, nil)).
-			AddStep(NewStep1Dep("step2",
-				"step1",
-				func(ctx context.Context, input map[string]interface{}, step1Out map[string]interface{}) (string, error) {
+			AddStep(NewStep("step2").
+				DependsOn("step1").
+				Condition("step1.field exists").
+				Handler(func(ctx context.Context, input map[string]interface{}, step1Out map[string]interface{}) (string, error) {
 					return "executed", nil
-				},
-				&StepOpts{Condition: "step1.field exists"})).
-			AddStep(NewStep1Dep("finalize", "step2",
-				func(ctx context.Context, input map[string]interface{}, step2Result Optional[string]) (map[string]any, error) {
-					result := make(map[string]any)
-					if step2Result.IsSet {
-						result["step2"] = step2Result.Value
-					}
-					return result, nil
-				}, nil))
+				}, nil)).
+			AddStep(NewStep("finalize").DependsOn("step2").Handler(func(ctx context.Context, input map[string]interface{}, step2Result Optional[string]) (map[string]any, error) {
+				result := make(map[string]any)
+				if step2Result.IsSet {
+					result["step2"] = step2Result.Value
+				}
+				return result, nil
+			}, nil))
 
 		worker, err := client.NewWorker(t.Context(), WithFlow(flow))
 		if err != nil {
@@ -508,24 +503,23 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 
 	t.Run("complex_nested_path", func(t *testing.T) {
 		flowName := testFlowName(t, "nested_path_flow")
-		flow := NewFlow[map[string]interface{}, map[string]any](flowName).
-			AddStep(NewStep("step1", func(ctx context.Context, input map[string]interface{}) (map[string]interface{}, error) {
+		flow := NewFlow(flowName).
+			AddStep(NewStep("step1").Handler(func(ctx context.Context, input map[string]interface{}) (map[string]interface{}, error) {
 				return input, nil
 			}, nil)).
-			AddStep(NewStep1Dep("step2",
-				"step1",
-				func(ctx context.Context, input map[string]interface{}, step1Out map[string]interface{}) (string, error) {
+			AddStep(NewStep("step2").
+				DependsOn("step1").
+				Condition("step1.data.user.age gte 18").
+				Handler(func(ctx context.Context, input map[string]interface{}, step1Out map[string]interface{}) (string, error) {
 					return "executed", nil
-				},
-				&StepOpts{Condition: "step1.data.user.age gte 18"})).
-			AddStep(NewStep1Dep("finalize", "step2",
-				func(ctx context.Context, input map[string]interface{}, step2Result Optional[string]) (map[string]any, error) {
-					result := make(map[string]any)
-					if step2Result.IsSet {
-						result["step2"] = step2Result.Value
-					}
-					return result, nil
-				}, nil))
+				}, nil)).
+			AddStep(NewStep("finalize").DependsOn("step2").Handler(func(ctx context.Context, input map[string]interface{}, step2Result Optional[string]) (map[string]any, error) {
+				result := make(map[string]any)
+				if step2Result.IsSet {
+					result["step2"] = step2Result.Value
+				}
+				return result, nil
+			}, nil))
 
 		worker, err := client.NewWorker(t.Context(), WithFlow(flow))
 		if err != nil {
@@ -571,19 +565,19 @@ func TestFlowOptionalDependency(t *testing.T) {
 	client := getTestClient(t)
 
 	flowName := testFlowName(t, "optional_dep_flow")
-	flow := NewFlow[int, map[string]any](flowName).
-		AddStep(NewStep("step1", func(ctx context.Context, score int) (int, error) {
+	flow := NewFlow(flowName).
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, score int) (int, error) {
 			return score, nil
 		}, nil)).
-		AddStep(NewStep1Dep("step2",
-			"step1",
-			func(ctx context.Context, score int, step1Score int) (int, error) {
+		AddStep(NewStep("step2").
+			DependsOn("step1").
+			Condition("step1 gte 50").
+			Handler(func(ctx context.Context, score int, step1Score int) (int, error) {
 				return step1Score * 2, nil
-			},
-			&StepOpts{Condition: "step1 gte 50"})).
-		AddStep(NewStep1Dep("step3",
-			"step2", // TODO: Support OptionalDependency marker
-			func(ctx context.Context, score int, step2Out Optional[int]) (int, error) {
+			}, nil)).
+		AddStep(NewStep("step3").
+			DependsOn("step2"). // TODO: Support OptionalDependency marker
+			Handler(func(ctx context.Context, score int, step2Out Optional[int]) (int, error) {
 				if step2Out.IsSet {
 					return step2Out.Value, nil
 				}
@@ -637,19 +631,19 @@ func TestFlowConditionalDependencyRequiresOptional(t *testing.T) {
 	client := getTestClient(t)
 
 	flowName := testFlowName(t, "missing_optional_dep")
-	flow := NewFlow[int, map[string]any](flowName).
-		AddStep(NewStep("step1", func(ctx context.Context, score int) (int, error) {
+	flow := NewFlow(flowName).
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, score int) (int, error) {
 			return score, nil
 		}, nil)).
-		AddStep(NewStep1Dep("step2",
-			"step1",
-			func(ctx context.Context, score int, step1Score int) (int, error) {
+		AddStep(NewStep("step2").
+			DependsOn("step1").
+			Condition("step1 gte 50").
+			Handler(func(ctx context.Context, score int, step1Score int) (int, error) {
 				return step1Score * 2, nil
-			},
-			&StepOpts{Condition: "step1 gte 50"})).
-		AddStep(NewStep1Dep("step3",
-			"step2",
-			func(ctx context.Context, score int, step2Out int) (int, error) {
+			}, nil)).
+		AddStep(NewStep("step3").
+			DependsOn("step2").
+			Handler(func(ctx context.Context, score int, step2Out int) (int, error) {
 				return step2Out, nil
 			}, nil))
 

@@ -902,7 +902,7 @@ func (s *Step) MarshalJSON() ([]byte, error) {
         IsMapStep       bool              `json:"is_map,omitempty"`
         ArraySourceStep string            `json:"array_source,omitempty"`
         Condition       string            `json:"condition,omitempty"`
-        HasSignal       bool              `json:"has_signal"`
+        Signal       bool              `json:"signal"`
         DependsOn       []*StepDependency `json:"depends_on,omitempty"`
     }
     
@@ -911,7 +911,7 @@ func (s *Step) MarshalJSON() ([]byte, error) {
         IsMapStep:       s.IsMapStep,
         ArraySourceStep: s.ArraySourceStep,
         Condition:       s.Condition,
-        HasSignal:       s.HasSignal,
+        Signal:       s.Signal,
         DependsOn:       s.DependsOn,
     })
 }

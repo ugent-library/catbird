@@ -17,14 +17,14 @@ type stepWorker struct {
 	conn     Conn
 	logger   *slog.Logger
 	flowName string
-	step     StepInterface
+	step     *Step
 
 	// In-flight message tracking
 	inFlight   map[int64]struct{}
 	inFlightMu sync.Mutex
 }
 
-func newStepWorker(conn Conn, logger *slog.Logger, flowName string, step StepInterface) *stepWorker {
+func newStepWorker(conn Conn, logger *slog.Logger, flowName string, step *Step) *stepWorker {
 	return &stepWorker{
 		conn:     conn,
 		logger:   logger,
@@ -72,7 +72,7 @@ func (w *stepWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 					return
 				}
 
-				w.logger.ErrorContext(shutdownCtx, "worker: cannot read step messages", "flow", w.flowName, "step", w.step.Name(), "error", err)
+				w.logger.ErrorContext(shutdownCtx, "worker: cannot read step messages", "flow", w.flowName, "step", w.step.name, "error", err)
 
 				delay := backoffWithFullJitter(retryAttempt, 250*time.Millisecond, 5*time.Second)
 				retryAttempt++
@@ -106,8 +106,8 @@ func (w *stepWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 	})
 
 	// Start consumers
-	h := w.step.handlerOpts()
-	for i := 0; i < h.concurrency; i++ {
+	h := w.step.handlerOpts
+	for i := 0; i < h.Concurrency; i++ {
 		wg.Go(func() {
 			for msg := range messages {
 				w.handle(handlerCtx, msg)
@@ -148,19 +148,19 @@ func (w *stepWorker) hideInFlight(ctx context.Context) {
 	}
 
 	q := `SELECT * FROM cb_hide_steps(flow_name => $1, step_name => $2, ids => $3, hide_for => $4);`
-	_, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.Name(), w.getInFlight(), (10 * time.Minute).Milliseconds())
+	_, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.name, w.getInFlight(), (10 * time.Minute).Milliseconds())
 
 	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		w.logger.ErrorContext(ctx, "worker: cannot hide in-flight steps", "flow", w.flowName, "step", w.step.Name(), "error", err)
+		w.logger.ErrorContext(ctx, "worker: cannot hide in-flight steps", "flow", w.flowName, "step", w.step.name, "error", err)
 	}
 }
 
 func (w *stepWorker) readMessages(ctx context.Context) ([]stepMessage, error) {
-	h := w.step.handlerOpts()
+	h := w.step.handlerOpts
 
 	q := `SELECT id, deliveries, input, step_outputs, signal_input FROM cb_read_steps(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
 
-	rows, err := queryWithRetry(ctx, w.conn, q, w.flowName, w.step.Name(), h.batchSize, (10 * time.Minute).Milliseconds(), (10 * time.Second).Milliseconds(), (100 * time.Millisecond).Milliseconds())
+	rows, err := queryWithRetry(ctx, w.conn, q, w.flowName, w.step.name, h.BatchSize, (10 * time.Minute).Milliseconds(), (10 * time.Second).Milliseconds(), (100 * time.Millisecond).Milliseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -171,18 +171,18 @@ func (w *stepWorker) readMessages(ctx context.Context) ([]stepMessage, error) {
 func (w *stepWorker) handle(ctx context.Context, msg stepMessage) {
 	defer w.removeInFlight(msg.ID)
 
-	h := w.step.handlerOpts()
+	h := w.step.handlerOpts
 
-	if h.circuitBreaker != nil {
-		allowed, delay := h.circuitBreaker.allow(time.Now())
+	if h.CircuitBreaker != nil {
+		allowed, delay := h.CircuitBreaker.allow(time.Now())
 		if !allowed {
 			if delay <= 0 {
 				delay = time.Second
 			}
-			w.logger.WarnContext(ctx, "worker: circuit breaker open", "flow", w.flowName, "step", w.step.Name(), "retry_in", delay)
+			w.logger.WarnContext(ctx, "worker: circuit breaker open", "flow", w.flowName, "step", w.step.name, "retry_in", delay)
 			q := `SELECT * FROM cb_hide_steps(flow_name => $1, step_name => $2, ids => $3, hide_for => $4);`
-			if _, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.Name(), []int64{msg.ID}, delay.Milliseconds()); err != nil {
-				w.logger.ErrorContext(ctx, "worker: cannot delay step due to open circuit", "flow", w.flowName, "step", w.step.Name(), "error", err)
+			if _, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds()); err != nil {
+				w.logger.ErrorContext(ctx, "worker: cannot delay step due to open circuit", "flow", w.flowName, "step", w.step.name, "error", err)
 			}
 			return
 		}
@@ -192,7 +192,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepMessage) {
 		stepOutputsJSON, _ := json.Marshal(msg.StepOutputs)
 		w.logger.DebugContext(ctx, "worker: handleStep",
 			"flow", w.flowName,
-			"step", w.step.Name(),
+			"step", w.step.name,
 			"id", msg.ID,
 			"deliveries", msg.Deliveries,
 			"input", string(msg.Input),
@@ -202,9 +202,9 @@ func (w *stepWorker) handle(ctx context.Context, msg stepMessage) {
 
 	// Execute with timeout if configured
 	fnCtx := ctx
-	if h.timeout > 0 {
+	if h.Timeout > 0 {
 		var cancel context.CancelFunc
-		fnCtx, cancel = context.WithTimeout(ctx, h.timeout)
+		fnCtx, cancel = context.WithTimeout(ctx, h.Timeout)
 		defer cancel()
 	}
 
@@ -238,35 +238,39 @@ func (w *stepWorker) handle(ctx context.Context, msg stepMessage) {
 			}
 			depsJSON[name] = depJSON
 		}
-		out, err = w.step.handle(fnCtx, inputJSON, depsJSON, signalInputJSON)
+		if w.step.handler == nil {
+			err = fmt.Errorf("step %s has no handler (definition-only)", w.step.name)
+			return
+		}
+		out, err = w.step.handler(fnCtx, inputJSON, depsJSON, signalInputJSON)
 	}()
 
 	// Handle result
 	if err != nil {
-		if h.circuitBreaker != nil {
-			h.circuitBreaker.recordFailure(time.Now())
+		if h.CircuitBreaker != nil {
+			h.CircuitBreaker.recordFailure(time.Now())
 		}
-		w.logger.ErrorContext(ctx, "worker: failed", "flow", w.flowName, "step", w.step.Name(), "error", err)
+		w.logger.ErrorContext(ctx, "worker: failed", "flow", w.flowName, "step", w.step.name, "error", err)
 
-		if msg.Deliveries > h.maxRetries {
+		if msg.Deliveries > h.MaxRetries {
 			q := `SELECT * FROM cb_fail_step(flow_name => $1, step_name => $2, step_id => $3, error_message => $4);`
-			if _, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.Name(), msg.ID, err.Error()); err != nil {
-				w.logger.ErrorContext(ctx, "worker: cannot mark step as failed", "flow", w.flowName, "step", w.step.Name(), "error", err)
+			if _, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.name, msg.ID, err.Error()); err != nil {
+				w.logger.ErrorContext(ctx, "worker: cannot mark step as failed", "flow", w.flowName, "step", w.step.name, "error", err)
 			}
 		} else {
-			delay := backoffWithFullJitter(msg.Deliveries-1, h.minDelay, h.maxDelay)
+			delay := backoffWithFullJitter(msg.Deliveries-1, h.MinDelay, h.MaxDelay)
 			q := `SELECT * FROM cb_hide_steps(flow_name => $1, step_name => $2, ids => $3, hide_for => $4);`
-			if _, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.Name(), []int64{msg.ID}, delay.Milliseconds()); err != nil {
-				w.logger.ErrorContext(ctx, "worker: cannot delay next step run", "flow", w.flowName, "step", w.step.Name(), "error", err)
+			if _, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds()); err != nil {
+				w.logger.ErrorContext(ctx, "worker: cannot delay next step run", "flow", w.flowName, "step", w.step.name, "error", err)
 			}
 		}
 	} else {
-		if h.circuitBreaker != nil {
-			h.circuitBreaker.recordSuccess()
+		if h.CircuitBreaker != nil {
+			h.CircuitBreaker.recordSuccess()
 		}
 		q := `SELECT * FROM cb_complete_step(flow_name => $1, step_name => $2, step_id => $3, output => $4);`
-		if _, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.Name(), msg.ID, out); err != nil {
-			w.logger.ErrorContext(ctx, "worker: cannot mark step as completed", "flow", w.flowName, "step", w.step.Name(), "error", err)
+		if _, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.name, msg.ID, out); err != nil {
+			w.logger.ErrorContext(ctx, "worker: cannot mark step as completed", "flow", w.flowName, "step", w.step.name, "error", err)
 		}
 	}
 }

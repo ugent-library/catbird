@@ -13,7 +13,7 @@ import (
 func TestTaskCreate(t *testing.T) {
 	client := getTestClient(t)
 
-	task := NewTask("test_task", func(ctx context.Context, in string) (string, error) {
+	task := NewTask("test_task").Handler(func(ctx context.Context, in string) (string, error) {
 		return in + " processed", nil
 	}, nil)
 
@@ -38,7 +38,7 @@ func TestTaskRunAndWait(t *testing.T) {
 		Value int `json:"value"`
 	}
 
-	task := NewTask("math_task", func(ctx context.Context, in TaskInput) (int, error) {
+	task := NewTask("math_task").Handler(func(ctx context.Context, in TaskInput) (int, error) {
 		return in.Value * 2, nil
 	}, nil)
 
@@ -74,7 +74,7 @@ func TestTaskRunAndWait(t *testing.T) {
 func TestTaskPanicRecovery(t *testing.T) {
 	client := getTestClient(t)
 
-	task := NewTask("panic_task", func(ctx context.Context, in string) (string, error) {
+	task := NewTask("panic_task").Handler(func(ctx context.Context, in string) (string, error) {
 		panic("intentional panic in task")
 	}, nil)
 
@@ -128,7 +128,7 @@ func TestTaskCircuitBreaker(t *testing.T) {
 	var mu sync.Mutex
 	var times []time.Time
 
-	task := NewTask("circuit_task", func(ctx context.Context, in string) (string, error) {
+	task := NewTask("circuit_task").Handler(func(ctx context.Context, in string) (string, error) {
 		n := atomic.AddInt32(&calls, 1)
 		mu.Lock()
 		times = append(times, time.Now())
@@ -137,7 +137,9 @@ func TestTaskCircuitBreaker(t *testing.T) {
 			return "", fmt.Errorf("intentional failure")
 		}
 		return "ok", nil
-	}, &TaskOpts{
+	}, &HandlerOpts{
+		Concurrency:    1,
+		BatchSize:      10,
 		MaxRetries:     2,
 		MinDelay:       minBackoff,
 		MaxDelay:       maxBackoff,

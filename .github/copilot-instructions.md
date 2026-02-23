@@ -55,95 +55,116 @@ tableName := fmt.Sprintf("cb_s_%s", strings.ToLower(flowName))  // Steps
 tableName := fmt.Sprintf("cb_q_%s", strings.ToLower(queueName)) // Queues
 ```
 
-## Handler Pattern & Generics
+## Handler Pattern & Reflection-Based API
 
-**Task handlers use generic codegen**:
+**Task handlers use reflection and a builder pattern**:
 ```go
 // Handler fn: (context.Context, InputType) -> (OutputType, error)
-task := catbird.NewTask("my_task",
-  catbird.Handler(func(ctx context.Context, input MyInput) (MyOutput, error) {
+task := catbird.NewTask("my_task").
+  Handler(func(ctx context.Context, input MyInput) (MyOutput, error) {
     return MyOutput{}, nil
-  },
-    catbird.WithConcurrency(5),
-    catbird.WithMaxRetries(3),
-    catbird.WithCircuitBreaker(5, 30*time.Second),
-  ),
-)
+  }, &catbird.HandlerOpts{
+    Concurrency: 5,
+    MaxRetries:  3,
+    MinDelay:    500 * time.Millisecond,
+    MaxDelay:    10 * time.Second,
+    CircuitBreaker: &catbird.CircuitBreaker{
+      FailureThreshold: 5,
+      OpenTimeout:      30 * time.Second,
+    },
+  })
 ```
-- Input/output marshaled as JSON automatically
-- Execution options are applied via `HandlerOpt` (concurrency, retries, backoff, circuit breaker)
-- Task/step metadata like conditions are applied via `TaskOpt`/`StepOpt`
-- Payloads are `json.RawMessage`; handlers receive `[]byte`
 
-**Flows**: Multi-step DAGs with dependencies. Steps execute when their dependencies complete (simple DAG semantics).
+**Key characteristics**:
+- **No type parameters**: Input/output types are discovered at runtime via reflection (handlers receive `[]byte` payloads internally)
+- **Builder pattern**: Construction via method chaining: `NewTask(name).Condition(...).Handler(fn, opts)`
+- **Execution options**: Applied via `HandlerOpts` struct with public fields (Concurrency, MaxRetries, MinDelay, MaxDelay, CircuitBreaker, BatchSize, Timeout)
+- **HandlerOpts validation**: Worker validates all task and flow step HandlerOpts at initialization time, catching configuration errors early before database operations
+- **Task/step metadata**: Conditions applied via `.Condition(expr)` method chain
 
-**CRITICAL - Flow Output Design**: Flow output is **the unwrapped output value of the final step** (the step with no dependents after completion). This is NOT an aggregated object. The flow's remaining_steps counter reaches 0 when the last step completes; that step's output becomes the flow's output. The output type matches the generic parameter `Out` from `NewFlow[In, Out]`. When the flow completes in `cb_complete_step()`, it directly selects that step's output and stores it as the flow's output.
+**Flows**: Multi-step DAGs with dependencies using builder pattern:
+```go
+flow := catbird.NewFlow("my_flow").
+  AddStep(catbird.NewStep("step1").
+    Handler(func(ctx context.Context, in string) (string, error) {
+      return in + " modified", nil
+    }, nil)).
+  AddStep(catbird.NewStep("step2").
+    DependsOn("step1").
+    Handler(func(ctx context.Context, in string, step1Out string) (string, error) {
+      return step1Out + " from step2", nil
+    }, nil))
+```
 
-**Conditional Execution**: Both tasks and flow steps support conditional execution via `WithCondition(expression)` (a task/step option). When a condition evaluates to false or a referenced field is missing, the task/step is skipped (status='skipped') instead of executed.
+**CRITICAL - Flow Output Design**: Flow output is **the unwrapped output value of the final step** (the step with no dependents after completion). This is NOT an aggregated object. The flow's remaining_steps counter reaches 0 when the last step completes; that step's output becomes the flow's output. When the flow completes in `cb_complete_step()`, it directly selects that step's output and stores it as the flow's output.
+
+**Conditional Execution**: Both tasks and flow steps support conditional execution via `.Condition(expression)` builder method. When a condition evaluates to false or a referenced field is missing, the task/step is skipped (status='skipped') instead of executed.
 Use `not <expr>` to negate any condition expression (e.g., `not input.is_premium`).
 
 **Task conditions** reference input fields with `input.*` prefix:
 ```go
-task := catbird.NewTask("premium_processing",
-  catbird.Handler(func(ctx context.Context, req ProcessRequest) (string, error) {
+task := catbird.NewTask("premium_processing").
+  Condition("input.is_premium"). // Skipped if is_premium = false
+  Handler(func(ctx context.Context, req ProcessRequest) (string, error) {
     return "processed", nil
-  }),
-  catbird.WithCondition("input.is_premium"),  // Skipped if is_premium = false
-)
+  }, nil)
 // Other examples: "input.amount gte 1000", "input.env eq \"production\""
 ```
 
 **Flow step conditions** reference step outputs with `step_name.*` prefix and can also reference signal input via `signal.*` when present:
 ```go
-NewFlow("risk-check",
-  InitialStep("validate", Handler(func(ctx context.Context, amount int) (int, error) {
-    return amount, nil
-  })),
-  StepWithDependency("fraud-check",  // Conditional step
-    Dependency("validate"),
-    Handler(func(ctx context.Context, in int, amount int) (int, error) {
-      return amount * 2, nil  // expensive fraud check
-    }),
-    WithCondition("validate gt 1000")),
-  StepWithDependency("finalize",
-    OptionalDependency("fraud-check"),  // Required for conditional deps
-    Handler(func(ctx context.Context, in int, fraudResult Optional[int]) (int, error) {
-      if fraudResult.IsSet {
-        return fraudResult.Value, nil  // used fraud check result
+NewFlow("risk-check").
+  AddStep(NewStep("validate").
+    Handler(func(ctx context.Context, amount int) (int, error) {
+      return amount, nil
+    }, nil)).
+  AddStep(NewStep("audit").
+    DependsOn("validate").
+    Condition("validate gt 1000"). // Conditional step
+    Handler(func(ctx context.Context, in int, validateOut int) (int, error) {
+      return validateOut * 2, nil  // expensive check
+    }, nil)).
+  AddStep(NewStep("finalize").
+    DependsOn("audit").
+    Handler(func(ctx context.Context, in int, auditResult catbird.Optional[int]) (int, error) {
+      if auditResult.IsSet {
+        return auditResult.Value, nil  // used audit result
       }
-      return in, nil  // fraud check was skipped
-    })),
-)
-// Flow input: 500 → fraud-check skipped → finalize gets Optional[int]{IsSet: false}
-// Flow input: 2000 → fraud-check runs → finalize gets Optional[int]{IsSet: true, Value: 4000}
+      return in, nil  // audit was skipped
+    }, nil))
+// Flow input: 500 → audit skipped → finalize gets Optional[int]{IsSet: false}
+// Flow input: 2000 → audit runs → finalize gets Optional[int]{IsSet: true, Value: 4000}
 ```
 
-**Signals** enable human-in-the-loop workflows: steps can optionally wait for external input via `Signal()` before executing:
+**Signals** enable human-in-the-loop workflows: steps can optionally wait for external input via `.Signal()` builder method before executing:
 ```go
-NewFlow("workflow",
-    InitialStep("step1", func(ctx context.Context, in string) (string, error) {
-        return in + " processed by step 1", nil
-    }),
-    StepWithSignalAndDependency("approve",  // Waits for signal
-        Dependency("step1"),
-        func(ctx context.Context, in string, approval ApprovalInput, step1Out string) (string, error) {
-            return step1Out + " approved by " + approval.ApproverID, nil
-        }),
-)
+NewFlow("workflow").
+  AddStep(NewStep("step1").
+    Handler(func(ctx context.Context, in string) (string, error) {
+      return in + " processed by step 1", nil
+    }, nil)).
+  AddStep(NewStep("approve").
+    DependsOn("step1").
+    Signal(catbird.NewSignal[ApprovalInput](nil)). // Wait for signal
+    Handler(func(ctx context.Context, in string, approval ApprovalInput, step1Out string) (string, error) {
+      return step1Out + " approved by " + approval.ApproverID, nil
+    }, nil))
 // Signal delivery: client.SignalFlow(ctx, "workflow", flowRunID, "approve", ApprovalInput{...})
 ```
 
 **Key Flow Patterns**:
-- **Conditions work for both tasks and steps**: Use `WithCondition("expression")` as a task/step option. Tasks use `input.field` to reference input; steps use `step_name.field` to reference outputs; steps with signals can use `signal.field` to reference signal input.
+- **Conditions work for both tasks and steps**: Use `.Condition("expression")` builder method. Tasks use `input.field` to reference input; steps use `step_name.field` to reference outputs; steps with signals can use `signal.field` to reference signal input.
 - **Dependency tracking**: `dependency_count` includes all deps (required + optional); `remaining_dependencies` decrements for both completed and skipped steps
 - **Optional outputs**: When a conditional step is skipped, dependent steps receive `Optional[T]{IsSet: false}`. When executed, `Optional[T]{IsSet: true, Value: result}`
 - **Cascading resolution**: `cb_start_steps()` loops until no more steps unblock; handles chains like step2 skips → step3 unblocks → step4 unblocks
-- **Validation**: Flow construction panics if a step depends on a conditional step without using `OptionalDependency()` and `Optional[T]` parameter type
+- **Validation**: Flow construction panics if a step depends on a conditional step without using `.OptionalDependency()` variant and `Optional[T]` parameter type
+- **Builder methods**: All construction through chainable methods: `NewStep(name).DependsOn(...).Condition(...).Signal(...).Handler(fn, opts)`
 
 ## Key Conventions
 
 - **Worker lifecycle**: `client.NewWorker(ctx, opts...)` → `worker.Start(ctx)` → `worker.Wait()` (graceful shutdown with timeout)
-- **Options pattern**: Most configs use closure functional options (HandlerOpt, WorkerOpt, etc.). But performance critical runtime functions use function variants (`...WithOpts`) that take a config struct.
+- **HandlerOpts validation**: Worker validates all task and flow step HandlerOpts at initialization time. Invalid configs (negative concurrency/batch size, invalid backoff, invalid circuit breaker) are caught immediately with descriptive errors before reaching database operations. This ensures type safety at construction time.
+- **Options pattern**: HandlerOpts uses a public struct with public fields (Concurrency, BatchSize, Timeout, MaxRetries, MinDelay, MaxDelay, CircuitBreaker). WorkerOpts and other configs use closure functional options (WithScheduledTask, WithFlow, etc.).
 - **Conn interface**: Abstracts pgx; accepts `*pgxpool.Pool`, `*pgx.Conn` or `pgx.Tx`
 - **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `WithLogger()`
 - **Scheduled tasks/flows**: Use robfig/cron syntax; `WithScheduledTask("name", "@hourly")`
@@ -156,8 +177,8 @@ NewFlow("workflow",
   - **Mutually exclusive**: Cannot specify both keys simultaneously (returns error).
 - **Topic bindings**: Explicit via `Bind(queue, pattern)`; wildcards `?` (single token) and `*` (multi-token tail as `.*`). Foreign key CASCADE deletes bindings when queue is deleted. Pattern validation at bind time; regex precompiled in PostgreSQL.
 - **Task/Flow execution**: `client.RunTask()` or `client.RunFlow()` return handles with `WaitForOutput()` to block until completion. When deduplication detects an existing run, the handle contains the existing run's ID.
-- **Workflow signals**: Steps can require signals (external input) before executing. Use `InitialStepWithSignal`, `StepWith*DependenciesAndSignal` variants. Signal delivered via `client.SignalFlow(ctx, flowName, flowRunID, stepName, input)`. Steps with both dependencies and signals wait for **both** conditions before starting. Enables approval workflows, webhooks, and human-in-the-loop patterns.
-- **Optional dependencies**: When a step depends on a conditional step (one with `WithCondition()`), use `OptionalDependency("stepName")` and declare the parameter as `Optional[T]`. The `Optional[T]` type has `IsSet bool` and `Value T` fields. Flow construction validates this constraint and panics if violated. Enables reconvergence patterns where multiple branches merge back together.
+- **Workflow signals**: Steps can require signals (external input) before executing. Use `.Signal()` builder method. Signal delivered via `client.SignalFlow(ctx, flowName, flowRunID, stepName, input)`. Steps with both dependencies and signals wait for **both** conditions before starting. Enables approval workflows, webhooks, and human-in-the-loop patterns.
+- **Optional dependencies**: When a step depends on a conditional step (one with `.Condition()`), use dependent step parameter as `Optional[T]`. The `Optional[T]` type has `IsSet bool` and `Value T` fields. Flow construction validates this constraint and panics if violated. Enables reconvergence patterns where multiple branches merge back together.
 
 ## Developer Workflows
 

@@ -13,7 +13,7 @@ import (
 func TestSchedulerIdempotencyKeyGeneration(t *testing.T) {
 	client := getTestClient(t)
 
-	task := NewTask("scheduled_task", func(ctx context.Context, in string) (string, error) {
+	task := NewTask("scheduled_task").Handler(func(ctx context.Context, in string) (string, error) {
 		return in + " processed", nil
 	}, nil)
 
@@ -57,7 +57,7 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 	executionCount := 0
 	var countMutex sync.Mutex
 
-	task := NewTask("dedup_test_task", func(ctx context.Context, in string) (string, error) {
+	task := NewTask("dedup_test_task").Handler(func(ctx context.Context, in string) (string, error) {
 		countMutex.Lock()
 		executionCount++
 		countMutex.Unlock()
@@ -122,7 +122,7 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 func TestSchedulerIdempotencyPersists(t *testing.T) {
 	client := getTestClient(t)
 
-	task := NewTask("persisted_dedup_task", func(ctx context.Context, in int) (int, error) {
+	task := NewTask("persisted_dedup_task").Handler(func(ctx context.Context, in int) (int, error) {
 		return in * 2, nil
 	}, nil)
 
@@ -214,8 +214,8 @@ func TestSchedulerUTCNormalization(t *testing.T) {
 func TestSchedulerFlowIdempotency(t *testing.T) {
 	client := getTestClient(t)
 
-	flow := NewFlow[string, int]("scheduled_flow").
-		AddStep(NewStep("step1", func(ctx context.Context, in string) (int, error) {
+	flow := NewFlow("scheduled_flow").
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (int, error) {
 			return 42, nil
 		}, nil))
 

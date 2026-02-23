@@ -14,8 +14,8 @@ import (
 func TestFlowCreate(t *testing.T) {
 	client := getTestClient(t)
 
-	flow := NewFlow[string, map[string]any]("test_flow").
-		AddStep(NewStep("step1", func(ctx context.Context, in string) (string, error) {
+	flow := NewFlow("test_flow").
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			return in + " processed", nil
 		}, nil))
 
@@ -55,8 +55,8 @@ func TestFlowCreate(t *testing.T) {
 func TestFlowSingleStep(t *testing.T) {
 	client := getTestClient(t)
 
-	flow := NewFlow[string, map[string]any]("single_step_flow").
-		AddStep(NewStep("step1", func(ctx context.Context, in string) (string, error) {
+	flow := NewFlow("single_step_flow").
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			return in + " processed by step 1", nil
 		}, nil))
 
@@ -95,18 +95,18 @@ func TestFlowWithDependencies(t *testing.T) {
 	// Flow structure: step1 -> step2 -> step3 (linear chain)
 	// Final step is step3, which returns the full chain
 
-	flow := NewFlow[string, map[string]any]("dependency_flow").
-		AddStep(NewStep("step1", func(ctx context.Context, in string) (string, error) {
+	flow := NewFlow("dependency_flow").
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			return in + " processed by step 1", nil
 		}, nil)).
-		AddStep(NewStep1Dep("step2",
-			"step1",
-			func(ctx context.Context, in string, step1Out string) (string, error) {
+		AddStep(NewStep("step2").
+			DependsOn("step1").
+			Handler(func(ctx context.Context, in string, step1Out string) (string, error) {
 				return step1Out + " and by step 2", nil
 			}, nil)).
-		AddStep(NewStep1Dep("step3",
-			"step2",
-			func(ctx context.Context, in string, step2Out string) (string, error) {
+		AddStep(NewStep("step3").
+			DependsOn("step2").
+			Handler(func(ctx context.Context, in string, step2Out string) (string, error) {
 				return step2Out + " and by step 3", nil
 			}, nil))
 
@@ -144,15 +144,15 @@ func TestFlowListFlows(t *testing.T) {
 	client := getTestClient(t)
 
 	// Create multiple flows
-	flows := make([]Flow, 2)
+	flows := make([]*Flow, 2)
 
-	flow1 := NewFlow[string, map[string]any]("list_flow_1").
-		AddStep(NewStep("step1", func(ctx context.Context, in string) (string, error) {
+	flow1 := NewFlow("list_flow_1").
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			return in, nil
 		}, nil))
 
-	flow2 := NewFlow[string, map[string]any]("list_flow_2").
-		AddStep(NewStep("step1", func(ctx context.Context, in string) (string, error) {
+	flow2 := NewFlow("list_flow_2").
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			return in, nil
 		}, nil))
 
@@ -214,11 +214,11 @@ func TestFlowListFlows(t *testing.T) {
 func TestTaskListTasks(t *testing.T) {
 	client := getTestClient(t)
 
-	task1 := NewTask("list_task_1", func(ctx context.Context, in string) (string, error) {
+	task1 := NewTask("list_task_1").Handler(func(ctx context.Context, in string) (string, error) {
 		return in, nil
 	}, nil)
 
-	task2 := NewTask("list_task_2", func(ctx context.Context, in string) (string, error) {
+	task2 := NewTask("list_task_2").Handler(func(ctx context.Context, in string) (string, error) {
 		return in, nil
 	}, nil)
 
@@ -262,24 +262,23 @@ func TestFlowComplexDependencies(t *testing.T) {
 	//       \     /
 	//        step4
 	// Create a complex flow with multiple dependencies:
-	flow := NewFlow[string, map[string]any]("complex_flow").
-		AddStep(NewStep("step1", func(ctx context.Context, in string) (int, error) {
+	flow := NewFlow("complex_flow").
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (int, error) {
 			return 10, nil
 		}, nil)).
-		AddStep(NewStep1Dep("step2",
-			"step1",
-			func(ctx context.Context, in string, step1Out int) (int, error) {
+		AddStep(NewStep("step2").
+			DependsOn("step1").
+			Handler(func(ctx context.Context, in string, step1Out int) (int, error) {
 				return step1Out * 2, nil // 20
 			}, nil)).
-		AddStep(NewStep1Dep("step3",
-			"step1",
-			func(ctx context.Context, in string, step1Out int) (int, error) {
+		AddStep(NewStep("step3").
+			DependsOn("step1").
+			Handler(func(ctx context.Context, in string, step1Out int) (int, error) {
 				return step1Out * 3, nil // 30
 			}, nil)).
-		AddStep(NewStep2Deps("step4",
-			"step2",
-			"step3",
-			func(ctx context.Context, in string, step2Out, step3Out int) (int, error) {
+		AddStep(NewStep("step4").
+			DependsOn("step2", "step3").
+			Handler(func(ctx context.Context, in string, step2Out, step3Out int) (int, error) {
 				return step2Out + step3Out, nil // 20 + 30 = 50
 			}, nil))
 
@@ -324,13 +323,13 @@ func TestFlowComplexDependencies(t *testing.T) {
 func TestFlowStepPanicRecovery(t *testing.T) {
 	client := getTestClient(t)
 
-	flow := NewFlow[string, map[string]any]("panic_flow").
-		AddStep(NewStep("step1", func(ctx context.Context, in string) (string, error) {
+	flow := NewFlow("panic_flow").
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			return "success", nil
 		}, nil)).
-		AddStep(NewStep1Dep("step2",
-			"step1",
-			func(ctx context.Context, in string, step1Out string) (string, error) {
+		AddStep(NewStep("step2").
+			DependsOn("step1").
+			Handler(func(ctx context.Context, in string, step1Out string) (string, error) {
 				panic("intentional panic in flow step")
 			}, nil))
 
@@ -380,8 +379,8 @@ func TestStepCircuitBreaker(t *testing.T) {
 	var mu sync.Mutex
 	var times []time.Time
 
-	flow := NewFlow[string, map[string]any]("circuit_flow").
-		AddStep(NewStep("step1",
+	flow := NewFlow("circuit_flow").
+		AddStep(NewStep("step1").Handler(
 			func(ctx context.Context, in string) (string, error) {
 				n := atomic.AddInt32(&calls, 1)
 				mu.Lock()
@@ -391,7 +390,7 @@ func TestStepCircuitBreaker(t *testing.T) {
 					return "", fmt.Errorf("intentional failure")
 				}
 				return "ok", nil
-			}, &StepOpts{
+			}, &HandlerOpts{
 				MaxRetries:     2,
 				MinDelay:       minBackoff,
 				MaxDelay:       maxBackoff,
@@ -450,19 +449,22 @@ func TestFlowWithSignal(t *testing.T) {
 	}
 
 	flowName := testFlowName(t, "signal_approval_flow")
-	flow := NewFlow[string, map[string]any](flowName).
-		AddStep(NewStep("submit", func(ctx context.Context, doc string) (string, error) {
+	flow := NewFlow(flowName).
+		AddStep(NewStep("submit").Handler(func(ctx context.Context, doc string) (string, error) {
 			return "submitted: " + doc, nil
 		}, nil)).
-		AddStep(NewStepSignal1Dep("approve", "submit",
-			func(ctx context.Context, doc string, approval ApprovalInput, submitResult string) (string, error) {
+		AddStep(NewStep("approve").
+			DependsOn("submit").
+			Signal(true).
+			Handler(func(ctx context.Context, doc string, approval ApprovalInput, submitResult string) (string, error) {
 				if !approval.Approved {
 					return "", fmt.Errorf("approval denied by %s", approval.ApproverID)
 				}
 				return fmt.Sprintf("approved by %s: %s", approval.ApproverID, submitResult), nil
 			}, nil)).
-		AddStep(NewStep1Dep("publish", "approve",
-			func(ctx context.Context, doc string, approveResult string) (string, error) {
+		AddStep(NewStep("publish").
+			DependsOn("approve").
+			Handler(func(ctx context.Context, doc string, approveResult string) (string, error) {
 				return "published: " + approveResult, nil
 			}, nil))
 
@@ -508,9 +510,138 @@ func TestFlowWithSignal(t *testing.T) {
 }
 
 func TestFlowWithInitialSignal(t *testing.T) {
-	t.Skip("TODO: Implement signal support in typed API")
+	client := getTestClient(t)
+
+	type StartInput struct {
+		InitiatorID string `json:"initiator_id"`
+	}
+
+	flowName := testFlowName(t, "initial_signal_flow")
+	flow := NewFlow(flowName).
+		AddStep(NewStep("start").
+			Signal(true).
+			Handler(func(ctx context.Context, flowInput string, signal StartInput) (string, error) {
+				return fmt.Sprintf("started by %s", signal.InitiatorID), nil
+			}, nil)).
+		AddStep(NewStep("process").
+			DependsOn("start").
+			Handler(func(ctx context.Context, flowInput string, startResult string) (string, error) {
+				return startResult + " - processed", nil
+			}, nil))
+
+	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	startTestWorker(t, worker)
+
+	// Give worker time to start
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, "test_flow", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Deliver signal to initial step immediately
+	err = client.SignalFlow(t.Context(), flowName, h.ID, "start", StartInput{
+		InitiatorID: "user_alpha",
+	})
+	if err != nil {
+		t.Fatalf("signal delivery failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var result string
+	if err := h.WaitForOutput(ctx, &result); err != nil {
+		t.Fatalf("wait for output failed: %v", err)
+	}
+
+	expectedResult := "started by user_alpha - processed"
+	if result != expectedResult {
+		t.Errorf("unexpected result: got %q, want %q", result, expectedResult)
+	}
 }
 
 func TestFlowSignalAlreadyDelivered(t *testing.T) {
-	t.Skip("TODO: Implement signal support in typed API")
+	client := getTestClient(t)
+
+	type ApprovalInput struct {
+		ApproverID string `json:"approver_id"`
+		Response   string `json:"response"`
+	}
+
+	flowName := testFlowName(t, "signal_already_delivered_flow")
+	flow := NewFlow(flowName).
+		AddStep(NewStep("request").Handler(func(ctx context.Context, doc string) (string, error) {
+			return "approval requested for: " + doc, nil
+		}, nil)).
+		AddStep(NewStep("approve").
+			DependsOn("request").
+			Signal(true).
+			Handler(func(ctx context.Context, doc string, approval ApprovalInput, reqResult string) (string, error) {
+				if approval.Response != "approved" {
+					return "", fmt.Errorf("approval denied by %s: %s", approval.ApproverID, approval.Response)
+				}
+				return fmt.Sprintf("approved by %s: %s", approval.ApproverID, reqResult), nil
+			}, nil)).
+		AddStep(NewStep("complete").
+			DependsOn("approve").
+			Handler(func(ctx context.Context, doc string, approveResult string) (string, error) {
+				return approveResult + " - completed", nil
+			}, nil))
+
+	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	startTestWorker(t, worker)
+
+	// Give worker time to start
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, "my_doc", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for step to be ready for signal
+	time.Sleep(200 * time.Millisecond)
+
+	// Deliver approval signal first time
+	err = client.SignalFlow(t.Context(), flowName, h.ID, "approve", ApprovalInput{
+		ApproverID: "reviewer1",
+		Response:   "approved",
+	})
+	if err != nil {
+		t.Fatalf("first signal delivery failed: %v", err)
+	}
+
+	// Try to deliver signal again (should be a no-op or silently ignored)
+	// This tests idempotency of signal delivery
+	err = client.SignalFlow(t.Context(), flowName, h.ID, "approve", ApprovalInput{
+		ApproverID: "reviewer2",
+		Response:   "rejected",
+	})
+	// The second signal delivery might fail or be ignored depending on implementation
+	// For now, we just check the flow completes with the first signal's data
+	_ = err
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var result string
+	if err := h.WaitForOutput(ctx, &result); err != nil {
+		t.Fatalf("wait for output failed: %v", err)
+	}
+
+	// Result should reflect the first signal (reviewer1 approved)
+	expectedResult := "approved by reviewer1: approval requested for: my_doc - completed"
+	if result != expectedResult {
+		t.Errorf("unexpected result: got %q, want %q", result, expectedResult)
+	}
 }

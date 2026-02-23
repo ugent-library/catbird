@@ -133,17 +133,19 @@ func TestHandlerOpts_WithRetriesAndBackoff(t *testing.T) {
 
 	// Just verify that task can be created with these options
 	// Internal fields are not exposed via interface
-	task := NewTask("test", func(_ context.Context, _ any) (any, error) { return nil, nil }, &TaskOpts{
-		MaxRetries: 3,
-		MinDelay:   min,
-		MaxDelay:   max,
+	task := NewTask("test").Handler(func(_ context.Context, _ any) (any, error) { return nil, nil }, &HandlerOpts{
+		Concurrency: 1,
+		BatchSize:   10,
+		MaxRetries:  3,
+		MinDelay:    min,
+		MaxDelay:    max,
 	})
 
 	if task == nil {
 		t.Fatal("expected task to be created")
 	}
 
-	// Options are validated during NewTask - if we got here, they were accepted
+	// Options are validated during New().Handler() - if we got here, they were accepted
 }
 
 func TestBackoffWithFullJitter(t *testing.T) {
@@ -193,7 +195,7 @@ func TestTaskRetriesIntegration(t *testing.T) {
 	const seed int64 = 42
 	rand.Seed(seed)
 
-	task := NewTask("retry_task", func(ctx context.Context, in string) (string, error) {
+	task := NewTask("retry_task").Handler(func(ctx context.Context, in string) (string, error) {
 		n := atomic.AddInt32(&calls, 1)
 		mu.Lock()
 		times = append(times, time.Now())
@@ -202,10 +204,12 @@ func TestTaskRetriesIntegration(t *testing.T) {
 			return "", fmt.Errorf("intentional failure %d", n)
 		}
 		return fmt.Sprintf("success at %d", n), nil
-	}, &TaskOpts{
-		MaxRetries: 3,
-		MinDelay:   minDelay,
-		MaxDelay:   maxDelay,
+	}, &HandlerOpts{
+		Concurrency: 1,
+		BatchSize:   10,
+		MaxRetries:  3,
+		MinDelay:    minDelay,
+		MaxDelay:    maxDelay,
 	})
 
 	worker, err := client.NewWorker(t.Context(), WithTask(task))

@@ -30,7 +30,7 @@ func waitForTaskRunStatus(t *testing.T, client *Client, taskName string, runID i
 func TestTaskConcurrencyKey(t *testing.T) {
 	client := getTestClient(t)
 
-	task := NewTask("concurrent_task", func(ctx context.Context, in int) (int, error) {
+	task := NewTask("concurrent_task").Handler(func(ctx context.Context, in int) (int, error) {
 		time.Sleep(200 * time.Millisecond) // Simulate work
 		return in * 2, nil
 	}, nil)
@@ -104,7 +104,7 @@ func TestTaskConcurrencyKey(t *testing.T) {
 func TestTaskIdempotencyKey(t *testing.T) {
 	client := getTestClient(t)
 
-	task := NewTask("idempotent_task", func(ctx context.Context, in int) (int, error) {
+	task := NewTask("idempotent_task").Handler(func(ctx context.Context, in int) (int, error) {
 		time.Sleep(100 * time.Millisecond) // Simulate work
 		return in * 3, nil
 	}, nil)
@@ -192,7 +192,7 @@ func TestTaskDeduplicationRetryOnFailure(t *testing.T) {
 	}
 
 	taskName := fmt.Sprintf("retry_task_dedupe_%d", time.Now().UnixNano())
-	task := NewTask(taskName, func(ctx context.Context, in RetryInput) (string, error) {
+	task := NewTask(taskName).Handler(func(ctx context.Context, in RetryInput) (string, error) {
 		if in.Fail {
 			return "", fmt.Errorf("task failed")
 		}
@@ -266,8 +266,8 @@ func TestFlowConcurrencyKey(t *testing.T) {
 	input1 := "input"
 	input2 := "input2"
 
-	flow := NewFlow[string, map[string]any](flowName).
-		AddStep(NewStep("step1", func(ctx context.Context, in string) (string, error) {
+	flow := NewFlow(flowName).
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			time.Sleep(200 * time.Millisecond) // Simulate work
 			return in + " processed", nil
 		}, nil))
@@ -327,8 +327,8 @@ func TestFlowConcurrencyKey(t *testing.T) {
 func TestFlowIdempotencyKey(t *testing.T) {
 	client := getTestClient(t)
 
-	flow := NewFlow[int, int]("idempotent_flow").
-		AddStep(NewStep("step1", func(ctx context.Context, in int) (int, error) {
+	flow := NewFlow("idempotent_flow").
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in int) (int, error) {
 			time.Sleep(100 * time.Millisecond)
 			return in * 5, nil
 		}, nil))
@@ -405,7 +405,7 @@ func TestFlowIdempotencyKey(t *testing.T) {
 func TestTaskBothKeysRejected(t *testing.T) {
 	client := getTestClient(t)
 
-	task := NewTask("both_keys_task", func(ctx context.Context, in string) (string, error) {
+	task := NewTask("both_keys_task").Handler(func(ctx context.Context, in string) (string, error) {
 		return in, nil
 	}, nil)
 
@@ -430,8 +430,8 @@ func TestTaskBothKeysRejected(t *testing.T) {
 func TestFlowBothKeysRejected(t *testing.T) {
 	client := getTestClient(t)
 
-	flow := NewFlow[string, map[string]any]("both_keys_flow").
-		AddStep(NewStep("step1", func(ctx context.Context, in string) (string, error) {
+	flow := NewFlow("both_keys_flow").
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			return in, nil
 		}, nil))
 
