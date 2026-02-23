@@ -39,7 +39,6 @@ func (c *Client) DeleteQueue(ctx context.Context, name string) (bool, error) {
 }
 
 // Send enqueues a message to the specified queue.
-// The payload is marshaled to JSON.
 func (c *Client) Send(ctx context.Context, queue string, payload any, opts *SendOpts) error {
 	return Send(ctx, c.Conn, queue, payload, opts)
 }

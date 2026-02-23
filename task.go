@@ -167,23 +167,36 @@ type RunOpts struct {
 // RunTask enqueues a task execution and returns a handle for monitoring
 // progress and retrieving output.
 func RunTask(ctx context.Context, conn Conn, name string, input any, opts *RunOpts) (*RunHandle, error) {
+	q, args, err := RunTaskQuery(name, input, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	var id int64
+	err = conn.QueryRow(ctx, q, args...).Scan(&id)
+	if err != nil {
+		return nil, err
+	}
+
+	return &RunHandle{conn: conn, getFn: GetTaskRun, Name: name, ID: id}, nil
+}
+
+// RunTaskQuery builds the SQL query and args for a RunTask operation.
+// Pass nil opts to use defaults.
+func RunTaskQuery(name string, input any, opts *RunOpts) (string, []any, error) {
 	if opts == nil {
 		opts = &RunOpts{}
 	}
 
 	b, err := json.Marshal(input)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
 	q := `SELECT * FROM cb_run_task(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4);`
-	var id int64
-	err = conn.QueryRow(ctx, q, name, b, ptrOrNil(opts.ConcurrencyKey), ptrOrNil(opts.IdempotencyKey)).Scan(&id)
-	if err != nil {
-		return nil, err
-	}
+	args := []any{name, b, ptrOrNil(opts.ConcurrencyKey), ptrOrNil(opts.IdempotencyKey)}
 
-	return &RunHandle{conn: conn, getFn: GetTaskRun, Name: name, ID: id}, nil
+	return q, args, nil
 }
 
 // GetTaskRun retrieves a specific task run result by ID.

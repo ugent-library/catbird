@@ -6,6 +6,130 @@ import (
 	"time"
 )
 
+func TestSendQuery(t *testing.T) {
+	type payload struct {
+		Value string `json:"value"`
+	}
+
+	deliverAt := time.Unix(1700000000, 0).UTC()
+	query, args, err := SendQuery(
+		"test_queue",
+		payload{Value: "hello"},
+		&SendOpts{
+			Topic:          "topic.a",
+			IdempotencyKey: "idem-1",
+			DeliverAt:      deliverAt,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedQuery := `SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, deliver_at => $5);`
+	if query != expectedQuery {
+		t.Fatalf("unexpected query: %s", query)
+	}
+
+	if len(args) != 5 {
+		t.Fatalf("expected 5 args, got %d", len(args))
+	}
+
+	if gotQueue, ok := args[0].(string); !ok || gotQueue != "test_queue" {
+		t.Fatalf("unexpected queue arg: %#v", args[0])
+	}
+
+	if gotPayload, ok := args[1].([]byte); !ok || string(gotPayload) != `{"value":"hello"}` {
+		t.Fatalf("unexpected payload arg: %#v", args[1])
+	}
+
+	if gotTopic, ok := args[2].(*string); !ok || gotTopic == nil || *gotTopic != "topic.a" {
+		t.Fatalf("unexpected topic arg: %#v", args[2])
+	}
+
+	if gotIdempotencyKey, ok := args[3].(*string); !ok || gotIdempotencyKey == nil || *gotIdempotencyKey != "idem-1" {
+		t.Fatalf("unexpected idempotency key arg: %#v", args[3])
+	}
+
+	if gotDeliverAt, ok := args[4].(*time.Time); !ok || gotDeliverAt == nil || !gotDeliverAt.Equal(deliverAt) {
+		t.Fatalf("unexpected deliver_at arg: %#v", args[4])
+	}
+
+	_, nilArgs, err := SendQuery("test_queue", payload{Value: "hello"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nilArgs) != 5 {
+		t.Fatalf("expected 5 args for nil opts, got %d", len(nilArgs))
+	}
+	if gotTopic, ok := nilArgs[2].(*string); !ok || gotTopic != nil {
+		t.Fatalf("expected nil *string topic arg for nil opts, got %#v", nilArgs[2])
+	}
+	if gotIdempotencyKey, ok := nilArgs[3].(*string); !ok || gotIdempotencyKey != nil {
+		t.Fatalf("expected nil *string idempotency key arg for nil opts, got %#v", nilArgs[3])
+	}
+	if gotDeliverAt, ok := nilArgs[4].(*time.Time); !ok || gotDeliverAt != nil {
+		t.Fatalf("expected nil *time.Time deliver_at arg for nil opts, got %#v", nilArgs[4])
+	}
+}
+
+func TestPublishQuery(t *testing.T) {
+	type payload struct {
+		Value string `json:"value"`
+	}
+
+	deliverAt := time.Unix(1700000100, 0).UTC()
+	query, args, err := PublishQuery(
+		"topic.test",
+		payload{Value: "world"},
+		&PublishOpts{
+			IdempotencyKey: "idem-2",
+			DeliverAt:      &deliverAt,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedQuery := `SELECT cb_publish(topic => $1, payload => $2, idempotency_key => $3, deliver_at => $4);`
+	if query != expectedQuery {
+		t.Fatalf("unexpected query: %s", query)
+	}
+
+	if len(args) != 4 {
+		t.Fatalf("expected 4 args, got %d", len(args))
+	}
+
+	if gotTopic, ok := args[0].(string); !ok || gotTopic != "topic.test" {
+		t.Fatalf("unexpected topic arg: %#v", args[0])
+	}
+
+	if gotPayload, ok := args[1].([]byte); !ok || string(gotPayload) != `{"value":"world"}` {
+		t.Fatalf("unexpected payload arg: %#v", args[1])
+	}
+
+	if gotIdempotencyKey, ok := args[2].(*string); !ok || gotIdempotencyKey == nil || *gotIdempotencyKey != "idem-2" {
+		t.Fatalf("unexpected idempotency key arg: %#v", args[2])
+	}
+
+	if gotDeliverAt, ok := args[3].(**time.Time); !ok || gotDeliverAt == nil || *gotDeliverAt == nil || !(*gotDeliverAt).Equal(deliverAt) {
+		t.Fatalf("unexpected deliver_at arg: %#v", args[3])
+	}
+
+	_, nilArgs, err := PublishQuery("topic.test", payload{Value: "world"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nilArgs) != 4 {
+		t.Fatalf("expected 4 args for nil opts, got %d", len(nilArgs))
+	}
+	if gotIdempotencyKey, ok := nilArgs[2].(*string); !ok || gotIdempotencyKey != nil {
+		t.Fatalf("expected nil *string idempotency key arg for nil opts, got %#v", nilArgs[2])
+	}
+	if gotDeliverAt, ok := nilArgs[3].(**time.Time); !ok || gotDeliverAt != nil {
+		t.Fatalf("expected nil **time.Time deliver_at arg for nil opts, got %#v", nilArgs[3])
+	}
+}
+
 func TestQueueCreate(t *testing.T) {
 	client := getTestClient(t)
 

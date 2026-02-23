@@ -349,6 +349,25 @@ Catbird includes multiple resiliency layers for runtime failures. Handler-level 
 - **Queue, task, flow, and step names**: Lowercase letters, digits, and underscores only (`a-z`, `0-9`, `_`). Max 58 characters. Step names must be unique within a flow. Reserved step names: `input`, `signal`.
 - **Topics/Patterns**: Letters (upper/lower), digits, dots, underscores, and hyphens (`a-z`, `A-Z`, `0-9`, `.`, `_`, `-`, plus wildcards `?`, `*`).
 
+## Query Helpers
+
+Use query builders when you want SQL + args directly (for `pgx.Batch` or custom execution):
+
+- `SendQuery(queue, payload, opts)`
+- `PublishQuery(topic, payload, opts)`
+- `RunTaskQuery(name, input, opts)`
+- `RunFlowQuery(name, input, opts)`
+
+```go
+// Queue into a batch
+var batch pgx.Batch
+q1, args1, err := catbird.SendQuery("my-queue", map[string]any{"user_id": 123}, nil)
+if err != nil {
+    return err
+}
+batch.Queue(q1, args1...)
+```
+
 # PostgreSQL API Reference
 
 Catbird is built on PostgreSQL functions, so you can use the API directly from any language or tool with PostgreSQL support (psql, Python, Node.js, Ruby, etc.).

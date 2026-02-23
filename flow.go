@@ -387,21 +387,35 @@ type RunFlowOpts = RunOpts
 
 // RunFlow enqueues a flow execution and returns a handle for monitoring.
 func RunFlow(ctx context.Context, conn Conn, name string, input any, opts *RunFlowOpts) (*RunHandle, error) {
+	q, args, err := RunFlowQuery(name, input, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	var id int64
+	err = conn.QueryRow(ctx, q, args...).Scan(&id)
+	if err != nil {
+		return nil, err
+	}
+	return &RunHandle{conn: conn, getFn: GetFlowRun, Name: name, ID: id}, nil
+}
+
+// RunFlowQuery builds the SQL query and args for a RunFlow operation.
+// Pass nil opts to use defaults.
+func RunFlowQuery(name string, input any, opts *RunFlowOpts) (string, []any, error) {
 	if opts == nil {
 		opts = &RunFlowOpts{}
 	}
 
 	b, err := json.Marshal(input)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
+
 	q := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4);`
-	var id int64
-	err = conn.QueryRow(ctx, q, name, b, ptrOrNil(opts.ConcurrencyKey), ptrOrNil(opts.IdempotencyKey)).Scan(&id)
-	if err != nil {
-		return nil, err
-	}
-	return &RunHandle{conn: conn, getFn: GetFlowRun, Name: name, ID: id}, nil
+	args := []any{name, b, ptrOrNil(opts.ConcurrencyKey), ptrOrNil(opts.IdempotencyKey)}
+
+	return q, args, nil
 }
 
 // GetFlowRun retrieves a specific flow run result by ID.

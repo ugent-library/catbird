@@ -11,6 +11,63 @@ import (
 	"time"
 )
 
+func TestRunFlowQuery(t *testing.T) {
+	type input struct {
+		Value string `json:"value"`
+	}
+
+	query, args, err := RunFlowQuery(
+		"test_flow",
+		input{Value: "hello"},
+		&RunFlowOpts{
+			ConcurrencyKey: "con-1",
+			IdempotencyKey: "idem-1",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedQuery := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4);`
+	if query != expectedQuery {
+		t.Fatalf("unexpected query: %s", query)
+	}
+
+	if len(args) != 4 {
+		t.Fatalf("expected 4 args, got %d", len(args))
+	}
+
+	if gotName, ok := args[0].(string); !ok || gotName != "test_flow" {
+		t.Fatalf("unexpected name arg: %#v", args[0])
+	}
+
+	if gotInput, ok := args[1].([]byte); !ok || string(gotInput) != `{"value":"hello"}` {
+		t.Fatalf("unexpected input arg: %#v", args[1])
+	}
+
+	if gotConcurrencyKey, ok := args[2].(*string); !ok || gotConcurrencyKey == nil || *gotConcurrencyKey != "con-1" {
+		t.Fatalf("unexpected concurrency key arg: %#v", args[2])
+	}
+
+	if gotIdempotencyKey, ok := args[3].(*string); !ok || gotIdempotencyKey == nil || *gotIdempotencyKey != "idem-1" {
+		t.Fatalf("unexpected idempotency key arg: %#v", args[3])
+	}
+
+	_, nilArgs, err := RunFlowQuery("test_flow", input{Value: "hello"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nilArgs) != 4 {
+		t.Fatalf("expected 4 args for nil opts, got %d", len(nilArgs))
+	}
+	if gotConcurrencyKey, ok := nilArgs[2].(*string); !ok || gotConcurrencyKey != nil {
+		t.Fatalf("expected nil *string concurrency key arg for nil opts, got %#v", nilArgs[2])
+	}
+	if gotIdempotencyKey, ok := nilArgs[3].(*string); !ok || gotIdempotencyKey != nil {
+		t.Fatalf("expected nil *string idempotency key arg for nil opts, got %#v", nilArgs[3])
+	}
+}
+
 func TestFlowCreate(t *testing.T) {
 	client := getTestClient(t)
 

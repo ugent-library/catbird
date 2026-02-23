@@ -97,20 +97,32 @@ type SendOpts struct {
 
 // Send enqueues a message to the specified queue.
 // Pass nil opts to use defaults.
-// The payload is marshaled to JSON.
 func Send(ctx context.Context, conn Conn, queue string, payload any, opts *SendOpts) error {
+	q, args, err := SendQuery(queue, payload, opts)
+	if err != nil {
+		return err
+	}
+
+	_, err = conn.Exec(ctx, q, args...)
+	return err
+}
+
+// SendQuery builds the SQL query and args for a Send operation.
+// Pass nil opts to use defaults.
+func SendQuery(queue string, payload any, opts *SendOpts) (string, []any, error) {
 	if opts == nil {
 		opts = &SendOpts{}
 	}
 
 	b, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 
 	q := `SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, deliver_at => $5);`
-	_, err = conn.Exec(ctx, q, queue, b, ptrOrNil(opts.Topic), ptrOrNil(opts.IdempotencyKey), ptrOrNil(opts.DeliverAt))
-	return err
+	args := []any{queue, b, ptrOrNil(opts.Topic), ptrOrNil(opts.IdempotencyKey), ptrOrNil(opts.DeliverAt)}
+
+	return q, args, nil
 }
 
 // Bind subscribes a queue to a topic pattern.
@@ -137,18 +149,31 @@ type PublishOpts struct {
 // Publish sends a message to topic-subscribed queues with options.
 // Pass nil opts to use defaults.
 func Publish(ctx context.Context, conn Conn, topic string, payload any, opts *PublishOpts) error {
+	q, args, err := PublishQuery(topic, payload, opts)
+	if err != nil {
+		return err
+	}
+
+	_, err = conn.Exec(ctx, q, args...)
+	return err
+}
+
+// PublishQuery builds the SQL query and args for a Publish operation.
+// Pass nil opts to use defaults.
+func PublishQuery(topic string, payload any, opts *PublishOpts) (string, []any, error) {
 	if opts == nil {
 		opts = &PublishOpts{}
 	}
 
 	b, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 
 	q := `SELECT cb_publish(topic => $1, payload => $2, idempotency_key => $3, deliver_at => $4);`
-	_, err = conn.Exec(ctx, q, topic, b, ptrOrNil(opts.IdempotencyKey), ptrOrNil(opts.DeliverAt))
-	return err
+	args := []any{topic, b, ptrOrNil(opts.IdempotencyKey), ptrOrNil(opts.DeliverAt)}
+
+	return q, args, nil
 }
 
 // Read reads up to quantity messages from the queue, hiding them from other
@@ -206,36 +231,6 @@ func DeleteMany(ctx context.Context, conn Conn, queue string, ids []int64) error
 	q := `SELECT * FROM cb_delete(queue => $1, ids => $2);`
 	_, err := conn.Exec(ctx, q, queue, ids)
 	return err
-}
-
-// EnqueueSend adds a Send operation to a batch for efficient bulk message sending.
-func EnqueueSend(batch *pgx.Batch, queue string, payload any, opts SendOpts) error {
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-
-	batch.Queue(
-		`SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, deliver_at => $5);`,
-		queue, b, ptrOrNil(opts.Topic), ptrOrNil(opts.IdempotencyKey), ptrOrNil(opts.DeliverAt),
-	)
-
-	return nil
-}
-
-// EnqueuePublish adds a Publish operation to a batch for efficient bulk message publishing.
-func EnqueuePublish(batch *pgx.Batch, topic string, payload any, opts PublishOpts) error {
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-
-	batch.Queue(
-		`SELECT cb_publish(topic => $1, payload => $2, idempotency_key => $3, deliver_at => $4);`,
-		topic, b, ptrOrNil(opts.IdempotencyKey), ptrOrNil(opts.DeliverAt),
-	)
-
-	return nil
 }
 
 func scanCollectibleMessage(row pgx.CollectableRow) (Message, error) {
