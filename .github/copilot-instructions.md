@@ -32,7 +32,7 @@ Catbird is a PostgreSQL-based message queue with task and workflow execution eng
 
 All schema is version-controlled in `migrations/` (goose-managed):
 - **Queues** (v1): `cb_queues` table (name PK, expires_at) + `cb_bindings` table (queue_name FK, pattern, pattern_type, prefix, regex) + message functions; custom types `cb_message` (7 fields including id, topic, payload). Bindings use exact match fast path (indexed) or wildcard (prefix filter + regex).
-- **Tasks/Flows** (v2): Task definitions, runs, flows; custom types `cb_task_message`, `cb_step_message`; `cb_create_flow()` handles step dependencies; `cb_start_steps()` uses LOOP for cascading dependency resolution
+- **Tasks/Flows** (v2): Task definitions, runs, flows; custom types `cb_task_claim`, `cb_step_claim`; `cb_create_flow()` handles step dependencies; `cb_start_steps()` uses LOOP for cascading dependency resolution
 - **GC** (v3): Garbage collection routines (`cb_gc()` deletes queues with `expires_at <= now()` and removes workers with stale heartbeats > 5 minutes old)
 - **Conditions** (v4): Conditional branching support with `cb_parse_condition()`, `cb_evaluate_condition()`/`cb_evaluate_condition_expr()`, and condition columns on `cb_step_dependencies`
 - **Conditions Integration** (v5): Modified `cb_create_flow()` to handle ConditionalDependency JSON and populate condition columns

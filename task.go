@@ -112,10 +112,10 @@ func makeTaskHandler(fn any, name string) (func(context.Context, json.RawMessage
 	}, nil
 }
 
-type taskMessage struct {
-	ID         int64           `json:"id"`
-	Deliveries int             `json:"deliveries"`
-	Input      json.RawMessage `json:"input"`
+type taskClaim struct {
+	ID       int64           `json:"id"`
+	Attempts int             `json:"attempts"`
+	Input    json.RawMessage `json:"input"`
 }
 
 type TaskInfo struct {

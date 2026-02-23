@@ -240,9 +240,9 @@ type StepDependencyInfo struct {
 	Name string `json:"name"`
 }
 
-type stepMessage struct {
+type stepClaim struct {
 	ID          int64                      `json:"id"`
-	Deliveries  int                        `json:"deliveries"`
+	Attempts    int                        `json:"attempts"`
 	Input       json.RawMessage            `json:"input"`
 	StepOutputs map[string]json.RawMessage `json:"step_outputs"`
 	SignalInput json.RawMessage            `json:"signal_input"`

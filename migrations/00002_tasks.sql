@@ -9,7 +9,7 @@
 --     Critical: MUST use UNION ALL fallback, not bare RETURNING (returns NULL on conflict without it)
 --   cb_run_flow(): Uses atomic CTE + UNION ALL pattern with ON CONFLICT DO UPDATE WHERE FALSE - SAFE
 --     Critical: MUST use UNION ALL fallback, not bare RETURNING (returns NULL on conflict without it)
---   cb_read_tasks(): Uses FOR UPDATE SKIP LOCKED for lock-free row polling - SAFE
+--   cb_poll_tasks(): Uses FOR UPDATE SKIP LOCKED for lock-free row polling - SAFE
 --   cb_read_poll_tasks(): Uses FOR UPDATE SKIP LOCKED in polling loop - SAFE
 --   cb_hide_tasks(): Direct UPDATE indexed by deliver_at, no locks - SAFE
 --   cb_delete_task_run(): Direct DELETE, no locks - SAFE
@@ -23,18 +23,18 @@
 -- +goose statementbegin
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'cb_task_message') THEN
-        CREATE TYPE cb_task_message AS (
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'cb_task_claim') THEN
+        CREATE TYPE cb_task_claim AS (
             id bigint,
-            deliveries int,
+            attempts int,
             input jsonb
        );
     END IF;
-    -- Drop and recreate cb_step_message to ensure it has the latest structure (including signal_input)
-    DROP TYPE IF EXISTS cb_step_message CASCADE;
-    CREATE TYPE cb_step_message AS (
+    -- Drop and recreate cb_step_claim to ensure it has the latest structure (including signal_input)
+    DROP TYPE IF EXISTS cb_step_claim CASCADE;
+    CREATE TYPE cb_step_claim AS (
         id bigint,
-        deliveries int,
+        attempts int,
         input jsonb,
         step_outputs jsonb,
         signal_input jsonb
@@ -481,7 +481,7 @@ BEGIN
         concurrency_key text,
         idempotency_key text,
         status text NOT NULL DEFAULT 'queued',
-        deliveries int NOT NULL DEFAULT 0,
+        attempts int NOT NULL DEFAULT 0,
         input jsonb NOT NULL,
         output jsonb,
         error_message text,
@@ -601,50 +601,50 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- cb_read_tasks: Read task runs from the queue
+-- cb_poll_tasks: Poll for task runs from the queue
 -- Parameters:
 --   name: Task name
 --   quantity: Number of task runs to read (must be > 0)
 --   hide_for: Duration in milliseconds to hide task runs from other workers (must be > 0)
 --   poll_for: Total duration in milliseconds to poll before timing out (must be > 0)
 --   poll_interval: Duration in milliseconds between poll attempts (must be > 0 and < poll_for)
--- Returns: Set of cb_task_message records
-CREATE OR REPLACE FUNCTION cb_read_tasks(
+-- Returns: Set of cb_task_claim records
+CREATE OR REPLACE FUNCTION cb_poll_tasks(
     name text,
     quantity int,
     hide_for int,
     poll_for int,
     poll_interval int
 )
-RETURNS SETOF cb_task_message
+RETURNS SETOF cb_task_claim
 LANGUAGE plpgsql AS $$
 DECLARE
-    _m cb_task_message;
+    _m cb_task_claim;
     _sleep_for double precision;
     _stop_at timestamp;
     _q text;
-    _t_table text := cb_table_name(cb_read_tasks.name, 't');
+    _t_table text := cb_table_name(cb_poll_tasks.name, 't');
 BEGIN
-    IF cb_read_tasks.quantity <= 0 THEN
+    IF cb_poll_tasks.quantity <= 0 THEN
         RAISE EXCEPTION 'cb: quantity must be greater than 0';
     END IF;
-    IF cb_read_tasks.hide_for <= 0 THEN
+    IF cb_poll_tasks.hide_for <= 0 THEN
         RAISE EXCEPTION 'cb: hide_for must be greater than 0';
     END IF;
-    IF cb_read_tasks.poll_for <= 0 THEN
+    IF cb_poll_tasks.poll_for <= 0 THEN
         RAISE EXCEPTION 'cb: poll_for must be greater than 0';
     END IF;
-    IF cb_read_tasks.poll_interval <= 0 THEN
+    IF cb_poll_tasks.poll_interval <= 0 THEN
         RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
     END IF;
 
-    _sleep_for := cb_read_tasks.poll_interval / 1000.0;
+    _sleep_for := cb_poll_tasks.poll_interval / 1000.0;
 
-    IF _sleep_for >= cb_read_tasks.poll_for / 1000.0 THEN
+    IF _sleep_for >= cb_poll_tasks.poll_for / 1000.0 THEN
         RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
     END IF;
 
-    _stop_at := clock_timestamp() + make_interval(secs => cb_read_tasks.poll_for / 1000.0);
+    _stop_at := clock_timestamp() + make_interval(secs => cb_poll_tasks.poll_for / 1000.0);
 
     _q := FORMAT(
         $QUERY$
@@ -660,12 +660,12 @@ BEGIN
         UPDATE %I m
         SET status = 'started',
             started_at = clock_timestamp(),
-            deliveries = deliveries + 1,
+            attempts = attempts + 1,
             deliver_at = clock_timestamp() + $2
         FROM runs
         WHERE m.id = runs.id
         RETURNING m.id,
-                  m.deliveries,
+                  m.attempts,
                   m.input;
         $QUERY$,
         _t_table, _t_table
@@ -677,7 +677,7 @@ BEGIN
       END IF;
 
       FOR _m IN
-        EXECUTE _q USING cb_read_tasks.quantity, make_interval(secs => cb_read_tasks.hide_for / 1000.0)
+        EXECUTE _q USING cb_poll_tasks.quantity, make_interval(secs => cb_poll_tasks.hide_for / 1000.0)
       LOOP
         RETURN NEXT _m;
       END LOOP;
@@ -950,7 +950,7 @@ BEGIN
       flow_run_id bigint NOT NULL,
       step_name text NOT NULL,
       status text NOT NULL DEFAULT 'created',
-      deliveries int NOT NULL DEFAULT 0,
+      attempts int NOT NULL DEFAULT 0,
       output jsonb,
       error_message text,
       signal_input jsonb,
@@ -967,7 +967,7 @@ BEGIN
       CONSTRAINT remaining_dependencies_valid CHECK (remaining_dependencies >= 0),
       CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
       CONSTRAINT skipped_and_completed_failed CHECK (NOT (skipped_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL))),
-      CONSTRAINT deliveries_valid CHECK (deliveries >= 0)
+      CONSTRAINT attempts_valid CHECK (attempts >= 0)
     )
     $QUERY$,
     _s_table, _f_table
@@ -1253,7 +1253,7 @@ $$ LANGUAGE plpgsql;
 -- +goose statementend
 
 -- +goose statementbegin
--- cb_read_steps: Read step runs from a flow
+-- cb_poll_steps: Poll for step runs from a flow
 -- Parameters:
 --   flow_name: Flow name
 --   step_name: Step name within the flow
@@ -1261,8 +1261,8 @@ $$ LANGUAGE plpgsql;
 --   hide_for: Duration in milliseconds to hide step runs from other workers (must be > 0)
 --   poll_for: Total duration in milliseconds to poll before timing out (must be > 0)
 --   poll_interval: Duration in milliseconds between poll attempts (must be > 0 and < poll_for)
--- Returns: Set of cb_step_message records
-CREATE OR REPLACE FUNCTION cb_read_steps(
+-- Returns: Set of cb_step_claim records
+CREATE OR REPLACE FUNCTION cb_poll_steps(
     flow_name text,
     step_name text,
     quantity int,
@@ -1270,36 +1270,36 @@ CREATE OR REPLACE FUNCTION cb_read_steps(
     poll_for int,
     poll_interval int
 )
-RETURNS SETOF cb_step_message
+RETURNS SETOF cb_step_claim
 LANGUAGE plpgsql AS $$
 DECLARE
-    _m cb_step_message;
+    _m cb_step_claim;
     _sleep_for double precision;
     _stop_at timestamp;
     _q text;
-    _f_table text := cb_table_name(cb_read_steps.flow_name, 'f');
-    _s_table text := cb_table_name(cb_read_steps.flow_name, 's');
+    _f_table text := cb_table_name(cb_poll_steps.flow_name, 'f');
+    _s_table text := cb_table_name(cb_poll_steps.flow_name, 's');
 BEGIN
-    IF cb_read_steps.quantity <= 0 THEN
+    IF cb_poll_steps.quantity <= 0 THEN
         RAISE EXCEPTION 'cb: quantity must be greater than 0';
     END IF;
-    IF cb_read_steps.hide_for <= 0 THEN
+    IF cb_poll_steps.hide_for <= 0 THEN
         RAISE EXCEPTION 'cb: hide_for must be greater than 0';
     END IF;
-    IF cb_read_steps.poll_for <= 0 THEN
+    IF cb_poll_steps.poll_for <= 0 THEN
         RAISE EXCEPTION 'cb: poll_for must be greater than 0';
     END IF;
-    IF cb_read_steps.poll_interval <= 0 THEN
+    IF cb_poll_steps.poll_interval <= 0 THEN
         RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
     END IF;
 
-    _sleep_for := cb_read_steps.poll_interval / 1000.0;
+    _sleep_for := cb_poll_steps.poll_interval / 1000.0;
 
-    IF _sleep_for >= cb_read_steps.poll_for / 1000.0 THEN
+    IF _sleep_for >= cb_poll_steps.poll_for / 1000.0 THEN
         RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
     END IF;
 
-    _stop_at := clock_timestamp() + make_interval(secs => cb_read_steps.poll_for / 1000.0);
+    _stop_at := clock_timestamp() + make_interval(secs => cb_poll_steps.poll_for / 1000.0);
 
     _q := FORMAT(
         $QUERY$
@@ -1316,13 +1316,13 @@ BEGIN
           FOR UPDATE SKIP LOCKED
         )
         UPDATE %I m
-        SET deliveries = deliveries + 1,
+        SET attempts = attempts + 1,
             deliver_at = clock_timestamp() + $3
         FROM runs
         WHERE m.id = runs.id
           AND EXISTS (SELECT 1 FROM %I f WHERE f.id = runs.flow_run_id AND f.status = 'started')
         RETURNING m.id,
-                  m.deliveries,
+                  m.attempts,
                   (SELECT input FROM %I f WHERE f.id = m.flow_run_id) AS input,
                   (SELECT jsonb_object_agg(deps.step_name, deps.output)
                    FROM %I deps
@@ -1345,7 +1345,7 @@ BEGIN
       END IF;
 
       FOR _m IN
-        EXECUTE _q USING cb_read_steps.step_name, cb_read_steps.quantity, make_interval(secs => cb_read_steps.hide_for / 1000.0), cb_read_steps.flow_name
+        EXECUTE _q USING cb_poll_steps.step_name, cb_poll_steps.quantity, make_interval(secs => cb_poll_steps.hide_for / 1000.0), cb_poll_steps.flow_name
       LOOP
         RETURN NEXT _m;
       END LOOP;
@@ -1792,7 +1792,7 @@ DROP FUNCTION IF EXISTS cb_signal_flow(text, bigint, text, jsonb);
 DROP FUNCTION IF EXISTS cb_fail_step(text, text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_step(text, text, bigint, jsonb);
 DROP FUNCTION IF EXISTS cb_hide_steps(text, text, bigint[], integer);
-DROP FUNCTION IF EXISTS cb_read_steps(text, text, int, int, int, int);
+DROP FUNCTION IF EXISTS cb_poll_steps(text, text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_start_steps(text, bigint);
 DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text);
 DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text, text);
@@ -1801,7 +1801,7 @@ DROP FUNCTION IF EXISTS cb_create_flow(text, jsonb);
 DROP FUNCTION IF EXISTS cb_fail_task(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_task(text, bigint, jsonb);
 DROP FUNCTION IF EXISTS cb_hide_tasks(text, bigint[], integer);
-DROP FUNCTION IF EXISTS cb_read_tasks(text, int, int, int, int);
+DROP FUNCTION IF EXISTS cb_poll_tasks(text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text);
 DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text, text);
 DROP FUNCTION IF EXISTS cb_delete_task(text);
@@ -1822,5 +1822,5 @@ DROP TABLE IF EXISTS cb_flows;
 DROP TABLE IF EXISTS cb_tasks;
 DROP TABLE IF EXISTS cb_workers;
 
-DROP TYPE IF EXISTS cb_step_message;
-DROP TYPE IF EXISTS cb_task_message;
+DROP TYPE IF EXISTS cb_step_claim;
+DROP TYPE IF EXISTS cb_task_claim;

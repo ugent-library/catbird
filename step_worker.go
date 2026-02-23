@@ -35,7 +35,7 @@ func newStepWorker(conn Conn, logger *slog.Logger, flowName string, step *Step) 
 }
 
 func (w *stepWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup) {
-	messages := make(chan stepMessage)
+	claims := make(chan stepClaim)
 
 	// Start periodic hiding of in-flight steps
 	wg.Go(func() {
@@ -55,7 +55,7 @@ func (w *stepWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 	// Start producer
 	// Start producer
 	wg.Go(func() {
-		defer close(messages)
+		defer close(claims)
 
 		retryAttempt := 0
 
@@ -66,13 +66,13 @@ func (w *stepWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 			default:
 			}
 
-			msgs, err := w.readMessages(shutdownCtx)
+			msgs, err := w.pollClaims(shutdownCtx)
 			if err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return
 				}
 
-				w.logger.ErrorContext(shutdownCtx, "worker: cannot read step messages", "flow", w.flowName, "step", w.step.name, "error", err)
+				w.logger.ErrorContext(shutdownCtx, "worker: cannot poll step claims", "flow", w.flowName, "step", w.step.name, "error", err)
 
 				delay := backoffWithFullJitter(retryAttempt, 250*time.Millisecond, 5*time.Second)
 				retryAttempt++
@@ -99,7 +99,7 @@ func (w *stepWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 				select {
 				case <-shutdownCtx.Done():
 					return
-				case messages <- msg:
+				case claims <- msg:
 				}
 			}
 		}
@@ -109,7 +109,7 @@ func (w *stepWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 	h := w.step.handlerOpts
 	for i := 0; i < h.Concurrency; i++ {
 		wg.Go(func() {
-			for msg := range messages {
+			for msg := range claims {
 				w.handle(handlerCtx, msg)
 			}
 		})
@@ -127,7 +127,7 @@ func (w *stepWorker) getInFlight() []int64 {
 	return ids
 }
 
-func (w *stepWorker) markInFlight(msgs []stepMessage) {
+func (w *stepWorker) markInFlight(msgs []stepClaim) {
 	w.inFlightMu.Lock()
 	for _, msg := range msgs {
 		w.inFlight[msg.ID] = struct{}{}
@@ -155,20 +155,20 @@ func (w *stepWorker) hideInFlight(ctx context.Context) {
 	}
 }
 
-func (w *stepWorker) readMessages(ctx context.Context) ([]stepMessage, error) {
+func (w *stepWorker) pollClaims(ctx context.Context) ([]stepClaim, error) {
 	h := w.step.handlerOpts
 
-	q := `SELECT id, deliveries, input, step_outputs, signal_input FROM cb_read_steps(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
+	q := `SELECT id, attempts, input, step_outputs, signal_input FROM cb_poll_steps(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
 
 	rows, err := queryWithRetry(ctx, w.conn, q, w.flowName, w.step.name, h.BatchSize, (10 * time.Minute).Milliseconds(), (10 * time.Second).Milliseconds(), (100 * time.Millisecond).Milliseconds())
 	if err != nil {
 		return nil, err
 	}
 
-	return pgx.CollectRows(rows, scanCollectibleStepMessage)
+	return pgx.CollectRows(rows, scanCollectibleStepClaim)
 }
 
-func (w *stepWorker) handle(ctx context.Context, msg stepMessage) {
+func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 	defer w.removeInFlight(msg.ID)
 
 	h := w.step.handlerOpts
@@ -194,7 +194,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepMessage) {
 			"flow", w.flowName,
 			"step", w.step.name,
 			"id", msg.ID,
-			"deliveries", msg.Deliveries,
+			"attempts", msg.Attempts,
 			"input", string(msg.Input),
 			"step_outputs", string(stepOutputsJSON),
 		)
@@ -252,15 +252,15 @@ func (w *stepWorker) handle(ctx context.Context, msg stepMessage) {
 		}
 		w.logger.ErrorContext(ctx, "worker: failed", "flow", w.flowName, "step", w.step.name, "error", err)
 
-		if msg.Deliveries > h.MaxRetries {
+		if msg.Attempts > h.MaxRetries {
 			q := `SELECT * FROM cb_fail_step(flow_name => $1, step_name => $2, step_id => $3, error_message => $4);`
 			if _, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.name, msg.ID, err.Error()); err != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot mark step as failed", "flow", w.flowName, "step", w.step.name, "error", err)
 			}
 		} else {
-			delay := backoffWithFullJitter(msg.Deliveries-1, 0, 0)
+			delay := backoffWithFullJitter(msg.Attempts-1, 0, 0)
 			if h.Backoff != nil {
-				delay = h.Backoff.NextDelay(msg.Deliveries - 1)
+				delay = h.Backoff.NextDelay(msg.Attempts - 1)
 			}
 			q := `SELECT * FROM cb_hide_steps(flow_name => $1, step_name => $2, ids => $3, hide_for => $4);`
 			if _, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds()); err != nil {
@@ -278,18 +278,18 @@ func (w *stepWorker) handle(ctx context.Context, msg stepMessage) {
 	}
 }
 
-func scanCollectibleStepMessage(row pgx.CollectableRow) (stepMessage, error) {
-	return scanStepMessage(row)
+func scanCollectibleStepClaim(row pgx.CollectableRow) (stepClaim, error) {
+	return scanStepClaim(row)
 }
 
-func scanStepMessage(row pgx.Row) (stepMessage, error) {
-	rec := stepMessage{}
+func scanStepClaim(row pgx.Row) (stepClaim, error) {
+	rec := stepClaim{}
 
 	var stepOutputs *map[string]json.RawMessage
 
 	if err := row.Scan(
 		&rec.ID,
-		&rec.Deliveries,
+		&rec.Attempts,
 		&rec.Input,
 		&stepOutputs,
 		&rec.SignalInput,

@@ -33,7 +33,7 @@ func newTaskWorker(conn Conn, logger *slog.Logger, task *Task) *taskWorker {
 }
 
 func (w *taskWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup) {
-	messages := make(chan taskMessage)
+	claims := make(chan taskClaim)
 
 	// Start periodic hiding of in-flight tasks
 	wg.Go(func() {
@@ -52,7 +52,7 @@ func (w *taskWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 
 	// Start producer
 	wg.Go(func() {
-		defer close(messages)
+		defer close(claims)
 
 		retryAttempt := 0
 
@@ -63,13 +63,13 @@ func (w *taskWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 			default:
 			}
 
-			msgs, err := w.readMessages(shutdownCtx)
+			msgs, err := w.pollClaims(shutdownCtx)
 			if err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return
 				}
 
-				w.logger.ErrorContext(shutdownCtx, "worker: cannot read task messages", "task", w.task.name, "error", err)
+				w.logger.ErrorContext(shutdownCtx, "worker: cannot poll task claims", "task", w.task.name, "error", err)
 
 				delay := backoffWithFullJitter(retryAttempt, 250*time.Millisecond, 5*time.Second)
 				retryAttempt++
@@ -96,7 +96,7 @@ func (w *taskWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 				select {
 				case <-shutdownCtx.Done():
 					return
-				case messages <- msg:
+				case claims <- msg:
 				}
 			}
 		}
@@ -110,14 +110,14 @@ func (w *taskWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 	}
 	for i := 0; i < h.Concurrency; i++ {
 		wg.Go(func() {
-			for msg := range messages {
+			for msg := range claims {
 				w.handle(handlerCtx, msg)
 			}
 		})
 	}
 }
 
-func (w *taskWorker) markInFlight(msgs []taskMessage) {
+func (w *taskWorker) markInFlight(msgs []taskClaim) {
 	w.inFlightMu.Lock()
 	for _, msg := range msgs {
 		w.inFlight[msg.ID] = struct{}{}
@@ -156,23 +156,23 @@ func (w *taskWorker) hideInFlight(ctx context.Context) {
 	}
 }
 
-func (w *taskWorker) readMessages(ctx context.Context) ([]taskMessage, error) {
+func (w *taskWorker) pollClaims(ctx context.Context) ([]taskClaim, error) {
 	h := w.task.handlerOpts
 	if h == nil {
 		return nil, nil
 	}
 
-	q := `SELECT id, deliveries, input FROM cb_read_tasks(name => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
+	q := `SELECT id, attempts, input FROM cb_poll_tasks(name => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
 
 	rows, err := queryWithRetry(ctx, w.conn, q, w.task.name, h.BatchSize, (10 * time.Minute).Milliseconds(), (10 * time.Second).Milliseconds(), (100 * time.Millisecond).Milliseconds())
 	if err != nil {
 		return nil, err
 	}
 
-	return pgx.CollectRows(rows, scanCollectibleTaskMessage)
+	return pgx.CollectRows(rows, scanCollectibleTaskClaim)
 }
 
-func (w *taskWorker) handle(ctx context.Context, msg taskMessage) {
+func (w *taskWorker) handle(ctx context.Context, msg taskClaim) {
 	defer w.removeInFlight(msg.ID)
 
 	h := w.task.handlerOpts
@@ -203,7 +203,7 @@ func (w *taskWorker) handle(ctx context.Context, msg taskMessage) {
 	w.logger.DebugContext(ctx, "worker: handleTask",
 		"task", w.task.name,
 		"id", msg.ID,
-		"deliveries", msg.Deliveries,
+		"attempts", msg.Attempts,
 		"input", string(msg.Input),
 	)
 
@@ -240,15 +240,15 @@ func (w *taskWorker) handle(ctx context.Context, msg taskMessage) {
 		}
 		w.logger.ErrorContext(ctx, "worker: failed", "task", w.task.name, "error", err)
 
-		if msg.Deliveries > h.MaxRetries {
+		if msg.Attempts > h.MaxRetries {
 			q := `SELECT * FROM cb_fail_task(name => $1, id => $2, error_message => $3);`
 			if _, err := execWithRetry(ctx, w.conn, q, w.task.name, msg.ID, err.Error()); err != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot mark task as failed", "task", w.task.name, "error", err)
 			}
 		} else {
-			delay := backoffWithFullJitter(msg.Deliveries-1, 0, 0)
+			delay := backoffWithFullJitter(msg.Attempts-1, 0, 0)
 			if h.Backoff != nil {
-				delay = h.Backoff.NextDelay(msg.Deliveries - 1)
+				delay = h.Backoff.NextDelay(msg.Attempts - 1)
 			}
 			q := `SELECT * FROM cb_hide_tasks(name => $1, ids => $2, hide_for => $3);`
 			if _, err := execWithRetry(ctx, w.conn, q, w.task.name, []int64{msg.ID}, delay.Milliseconds()); err != nil {
@@ -266,16 +266,16 @@ func (w *taskWorker) handle(ctx context.Context, msg taskMessage) {
 	}
 }
 
-func scanCollectibleTaskMessage(row pgx.CollectableRow) (taskMessage, error) {
-	return scanTaskMessage(row)
+func scanCollectibleTaskClaim(row pgx.CollectableRow) (taskClaim, error) {
+	return scanTaskClaim(row)
 }
 
-func scanTaskMessage(row pgx.Row) (taskMessage, error) {
-	rec := taskMessage{}
+func scanTaskClaim(row pgx.Row) (taskClaim, error) {
+	rec := taskClaim{}
 
 	if err := row.Scan(
 		&rec.ID,
-		&rec.Deliveries,
+		&rec.Attempts,
 		&rec.Input,
 	); err != nil {
 		return rec, err

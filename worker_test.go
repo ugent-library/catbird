@@ -253,7 +253,7 @@ func TestTaskRetriesIntegration(t *testing.T) {
 	slack := 150 * time.Millisecond
 
 	for i := 0; i < int(failTimes); i++ {
-		retryAttempt := i // deliveries-1 corresponds to 0,1,...
+		retryAttempt := i // attempts-1 corresponds to 0,1,...
 		delay := time.Duration(float64(minDelay) * math.Pow(2, float64(retryAttempt)))
 		if delay > maxDelay {
 			delay = maxDelay
