@@ -152,7 +152,11 @@ conditionalTask := catbird.NewTask("premium-processing").
         return "processed", nil
     }, nil)
 
-worker, err := client.NewWorker(ctx, catbird.WithTask(task), catbird.WithTask(conditionalTask))
+// Create worker
+worker, err := client.NewWorker(ctx)
+// Add tasks with options
+worker.AddTask(task, &catbird.TaskOpts{Schedule: "@hourly"})
+worker.AddTask(conditionalTask, nil)
 go worker.Start(ctx)
 
 // Run the task
@@ -164,9 +168,6 @@ handle, err := client.RunTask(ctx, "send-email", EmailRequest{
 // Get result
 var result EmailResponse
 err = handle.WaitForOutput(ctx, &result)
-
-// Schedule a task to run periodically
-worker.AddTask(task, &catbird.TaskOpts{Schedule: "@hourly"})
 ```
 
 # Flow Execution
@@ -178,7 +179,7 @@ A **flow** is a **directed acyclic graph (DAG)** of steps that execute when thei
 - Steps with no dependencies start immediately; independent branches run in parallel.
 - A flow has exactly one final step; the output of the final step is the output of the flow.
 - Conditions can skip steps; downstream handlers must accept `Optional[T]` for any conditional dependency.
-- A step with `.Signal(...)` waits for both its dependencies and the signal input.
+- A step with a signal waits for both its dependencies and the signal input.
 - `WaitForOutput()` returns the final step output once the flow completes.
 
 ## Examples: Workflows
@@ -223,8 +224,11 @@ flow := catbird.NewFlow("order-processing").
             }, nil
         }, nil))
 
-// Schedule a flow to run periodically
+// Create worker
+worker, err := client.NewWorker(ctx)
+// Add flow with schedule
 worker.AddFlow(flow, &catbird.FlowOpts{Schedule: "0 2 * * *"}) // Daily at 2 AM
+go worker.Start(ctx)
 ```
 
 ## Example: Signals & Human-in-the-Loop
@@ -239,7 +243,7 @@ flow := catbird.NewFlow("document_approval").
         }, nil)).
     AddStep(catbird.NewStep("approve").
         DependsOn("submit").
-        Signal(catbird.NewSignal[ApprovalInput](nil)).
+        Signal(true).
         Handler(func(ctx context.Context, doc Document, approval ApprovalInput, docID string) (ApprovalResult, error) {
             if !approval.Approved {
                 return ApprovalResult{}, fmt.Errorf("approval denied by %s: %s", approval.ApproverID, approval.Notes)
@@ -261,7 +265,6 @@ flow := catbird.NewFlow("document_approval").
 ```
 
 A step with both dependencies and a signal waits for **both** conditions: all dependencies must complete **and** the signal must be delivered before the step executes.
-
 
 # Conditional Execution
 
