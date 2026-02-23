@@ -165,7 +165,8 @@ handle, err := client.RunTask(ctx, "send-email", EmailRequest{
 var result EmailResponse
 err = handle.WaitForOutput(ctx, &result)
 
-// worker.AddTask(task, &TaskOpts{Schedule: "@hourly"})
+// Schedule a task to run periodically
+worker.AddTask(task, &catbird.TaskOpts{Schedule: "@hourly"})
 ```
 
 # Flow Execution
@@ -221,6 +222,9 @@ flow := catbird.NewFlow("order-processing").
                 EstimatedDays:  3,
             }, nil
         }, nil))
+
+// Schedule a flow to run periodically
+worker.AddFlow(flow, &catbird.FlowOpts{Schedule: "0 2 * * *"}) // Daily at 2 AM
 ```
 
 ## Example: Signals & Human-in-the-Loop
