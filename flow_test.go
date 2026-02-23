@@ -24,12 +24,7 @@ func TestFlowCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	worker, err := client.NewWorker(t.Context(),
-		WithFlow(flow),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 
 	startTestWorker(t, worker)
 
@@ -60,12 +55,7 @@ func TestFlowSingleStep(t *testing.T) {
 			return in + " processed by step 1", nil
 		}, nil))
 
-	worker, err := client.NewWorker(t.Context(),
-		WithFlow(flow),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 
 	startTestWorker(t, worker)
 
@@ -110,12 +100,7 @@ func TestFlowWithDependencies(t *testing.T) {
 				return step2Out + " and by step 3", nil
 			}, nil))
 
-	worker, err := client.NewWorker(t.Context(),
-		WithFlow(flow),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 
 	startTestWorker(t, worker)
 
@@ -169,13 +154,9 @@ func TestFlowListFlows(t *testing.T) {
 	}
 
 	// Start worker to execute flows
-	worker, err := client.NewWorker(t.Context(),
-		WithFlow(flow1),
-		WithFlow(flow2),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).
+		AddFlow(flow1, nil).
+		AddFlow(flow2, nil)
 
 	startTestWorker(t, worker)
 
@@ -288,13 +269,8 @@ func TestFlowComplexDependencies(t *testing.T) {
 	}
 
 	// Start worker to execute flow
-	worker, err := client.NewWorker(t.Context(),
-		WithLogger(logger),
-		WithFlow(flow),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), &WorkerOpts{Logger: logger}).
+		AddFlow(flow, nil)
 
 	startTestWorker(t, worker)
 
@@ -333,12 +309,7 @@ func TestFlowStepPanicRecovery(t *testing.T) {
 				panic("intentional panic in flow step")
 			}, nil))
 
-	worker, err := client.NewWorker(t.Context(),
-		WithFlow(flow),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 
 	startTestWorker(t, worker)
 
@@ -392,15 +363,11 @@ func TestStepCircuitBreaker(t *testing.T) {
 				return "ok", nil
 			}, &HandlerOpts{
 				MaxRetries:     2,
-				MinDelay:       minBackoff,
-				MaxDelay:       maxBackoff,
+				Backoff:        NewFullJitterBackoff(minBackoff, maxBackoff),
 				CircuitBreaker: &CircuitBreaker{failureThreshold: 1, openTimeout: openTimeout},
 			}))
 
-	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 
 	startTestWorker(t, worker)
 
@@ -468,10 +435,7 @@ func TestFlowWithSignal(t *testing.T) {
 				return "published: " + approveResult, nil
 			}, nil))
 
-	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 
 	startTestWorker(t, worker)
 
@@ -529,10 +493,7 @@ func TestFlowWithInitialSignal(t *testing.T) {
 				return startResult + " - processed", nil
 			}, nil))
 
-	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 
 	startTestWorker(t, worker)
 
@@ -594,10 +555,7 @@ func TestFlowSignalAlreadyDelivered(t *testing.T) {
 				return approveResult + " - completed", nil
 			}, nil))
 
-	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 
 	startTestWorker(t, worker)
 

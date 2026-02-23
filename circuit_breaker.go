@@ -32,7 +32,7 @@ func NewCircuitBreaker(failureThreshold int, openTimeout time.Duration) *Circuit
 	}
 }
 
-func (c *CircuitBreaker) validate() error {
+func (c *CircuitBreaker) Validate() error {
 	if c.failureThreshold <= 0 {
 		return fmt.Errorf("circuit breaker failure threshold must be greater than zero")
 	}
@@ -42,7 +42,7 @@ func (c *CircuitBreaker) validate() error {
 	return nil
 }
 
-func (c *CircuitBreaker) allow(now time.Time) (bool, time.Duration) {
+func (c *CircuitBreaker) Allow(now time.Time) (bool, time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -74,7 +74,7 @@ func (c *CircuitBreaker) allow(now time.Time) (bool, time.Duration) {
 	return true, 0
 }
 
-func (c *CircuitBreaker) recordSuccess() {
+func (c *CircuitBreaker) RecordSuccess() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -88,7 +88,7 @@ func (c *CircuitBreaker) recordSuccess() {
 	}
 }
 
-func (c *CircuitBreaker) recordFailure(now time.Time) {
+func (c *CircuitBreaker) RecordFailure(now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

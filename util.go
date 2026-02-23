@@ -23,6 +23,9 @@ func ptrOrNil[T comparable](t T) *T {
 // The first retryAttempt should be 0.
 // Always returns at least 1 millisecond to ensure database operations succeed.
 func backoffWithFullJitter(retryAttempt int, minDelay, maxDelay time.Duration) time.Duration {
+	if minDelay <= 0 || maxDelay <= 0 {
+		return time.Millisecond
+	}
 	delay := time.Duration(float64(minDelay) * math.Pow(2, float64(retryAttempt)))
 	if delay > maxDelay {
 		delay = maxDelay

@@ -25,16 +25,6 @@ type scheduleEntry struct {
 	inputFn  func(context.Context) (any, error)
 }
 
-type ScheduleOpt func(*scheduleEntry)
-
-func WithInput[T any](inputFn func(context.Context) (T, error)) ScheduleOpt {
-	return func(o *scheduleEntry) {
-		o.inputFn = func(ctx context.Context) (any, error) {
-			return inputFn(ctx)
-		}
-	}
-}
-
 // NewScheduler creates a new scheduler instance.
 func NewScheduler(conn Conn, logger *slog.Logger) *Scheduler {
 	return &Scheduler{
@@ -44,40 +34,40 @@ func NewScheduler(conn Conn, logger *slog.Logger) *Scheduler {
 }
 
 // AddTask registers a scheduled task execution using cron syntax.
-// The WithInput option can be used to provide dynamic input at execution time.
-// Otherwise an empty JSON object will be used as input to the task.
+// inputFn can be nil to use an empty JSON object as input, or it can provide dynamic input at execution time.
 //
 // All scheduled task executions use idempotency deduplication keyed on the
 // scheduled execution time. This means exactly one execution per cron tick will
 // occur even when running multiple workers concurrently.
-func (s *Scheduler) AddTask(taskName string, schedule string, opts ...ScheduleOpt) {
+func (s *Scheduler) AddTask(taskName string, schedule string, inputFn func(context.Context) (any, error)) {
+	if inputFn == nil {
+		inputFn = func(_ context.Context) (any, error) { return struct{}{}, nil }
+	}
+
 	entry := scheduleEntry{
 		name:     taskName,
 		schedule: schedule,
-		inputFn:  func(_ context.Context) (any, error) { return struct{}{}, nil },
-	}
-	for _, opt := range opts {
-		opt(&entry)
+		inputFn:  inputFn,
 	}
 
 	s.taskSchedules = append(s.taskSchedules, entry)
 }
 
 // AddFlow registers a scheduled flow execution using cron syntax.
-// The WithInput option can be used to provide dynamic input at execution time.
-// Otherwise an empty JSON object will be used as input to the flow.
+// inputFn can be nil to use an empty JSON object as input, or it can provide dynamic input at execution time.
 //
 // All scheduled flow executions use idempotency deduplication keyed on the
 // scheduled execution time. This means exactly one execution per cron tick will
 // occur even when running multiple workers concurrently.
-func (s *Scheduler) AddFlow(flowName string, schedule string, opts ...ScheduleOpt) {
+func (s *Scheduler) AddFlow(flowName string, schedule string, inputFn func(context.Context) (any, error)) {
+	if inputFn == nil {
+		inputFn = func(_ context.Context) (any, error) { return struct{}{}, nil }
+	}
+
 	entry := scheduleEntry{
 		name:     flowName,
 		schedule: schedule,
-		inputFn:  func(_ context.Context) (any, error) { return struct{}{}, nil },
-	}
-	for _, opt := range opts {
-		opt(&entry)
+		inputFn:  inputFn,
 	}
 
 	s.flowSchedules = append(s.flowSchedules, entry)

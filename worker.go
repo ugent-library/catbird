@@ -51,76 +51,99 @@ type Worker struct {
 	shutdownTimeout time.Duration
 }
 
-// WorkerOpt is an option for configuring a worker
-type WorkerOpt func(*Worker)
-
-// WithTask registers a task with the worker
-func WithTask(t *Task) WorkerOpt {
-	return func(w *Worker) {
-		w.tasks = append(w.tasks, t)
-	}
+// WorkerOpts is a configuration struct for creating workers
+type WorkerOpts struct {
+	Logger          *slog.Logger
+	ShutdownTimeout time.Duration
 }
 
-// WithFlow registers a flow with the worker
-func WithFlow(f *Flow) WorkerOpt {
-	return func(w *Worker) {
-		w.flows = append(w.flows, f)
-	}
+// TaskOpts is a configuration struct for registering tasks with optional scheduling.
+type TaskOpts struct {
+	Schedule      string                             // Cron syntax (e.g., "@hourly")
+	ScheduleInput func(context.Context) (any, error) // Optional input generator for scheduled runs
 }
 
-// WithLogger sets a custom logger for the worker. Default is slog.Default().
-func WithLogger(l *slog.Logger) WorkerOpt {
-	return func(w *Worker) {
-		w.logger = l
-	}
+// FlowOpts is a configuration struct for registering flows with optional scheduling.
+type FlowOpts struct {
+	Schedule      string                             // Cron syntax (e.g., "@hourly")
+	ScheduleInput func(context.Context) (any, error) // Optional input generator for scheduled runs
 }
 
-// WithGracefulShutdown sets the graceful shutdown timeout for the worker. Default is 5 seconds.
-func WithGracefulShutdown(d time.Duration) WorkerOpt {
-	return func(w *Worker) {
-		w.shutdownTimeout = d
+// NewWorker creates a new worker with the given connection and configuration.
+// Use builder methods (AddTask, AddFlow, etc.) to configure the worker.
+// Call Start(ctx) to begin processing tasks and flows.
+func NewWorker(conn Conn, opts *WorkerOpts) *Worker {
+	if opts == nil {
+		opts = &WorkerOpts{}
 	}
-}
 
-// WithScheduledTask registers a scheduled task execution using cron syntax.
-// The WithInput option can be used to provide dynamic input at execution time.
-// Otherwise an empty JSON object will be used as input to the task.
-func WithScheduledTask(taskName string, schedule string, opts ...ScheduleOpt) WorkerOpt {
-	return func(w *Worker) {
-		if w.scheduler == nil {
-			w.scheduler = NewScheduler(w.conn, w.logger)
-		}
-		w.scheduler.AddTask(taskName, schedule, opts...)
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
 	}
-}
 
-// WithScheduledFlow registers a scheduled flow execution using cron syntax.
-// The WithInput option can be used to provide dynamic input at execution time.
-// Otherwise an empty JSON object will be used as input to the flow.
-func WithScheduledFlow(flowName string, schedule string, opts ...ScheduleOpt) WorkerOpt {
-	return func(w *Worker) {
-		if w.scheduler == nil {
-			w.scheduler = NewScheduler(w.conn, w.logger)
-		}
-		w.scheduler.AddFlow(flowName, schedule, opts...)
+	shutdownTimeout := opts.ShutdownTimeout
+	if shutdownTimeout == 0 {
+		shutdownTimeout = 5 * time.Second
 	}
-}
 
-// NewWorker creates a new worker with the given options
-// The worker will register all tasks and flows it has been configured with.
-// Garbage collection is automatically enabled and runs every 5 minutes to clean up
-// expired queues and stale worker heartbeats.
-func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, error) {
-	w := &Worker{
+	return &Worker{
 		id:              uuid.NewString(),
 		conn:            conn,
-		logger:          slog.Default(),
-		shutdownTimeout: 5 * time.Second,
+		logger:          logger,
+		shutdownTimeout: shutdownTimeout,
 	}
-	for _, opt := range opts {
-		opt(w)
+}
+
+// AddTask registers a task with the worker. opts can be nil for default behavior.
+// If opts.Schedule is set, the task will be executed according to the cron schedule.
+func (w *Worker) AddTask(t *Task, opts *TaskOpts) *Worker {
+	w.tasks = append(w.tasks, t)
+
+	if opts != nil && opts.Schedule != "" {
+		if w.scheduler == nil {
+			w.scheduler = NewScheduler(w.conn, w.logger)
+		}
+		w.scheduler.AddTask(t.name, opts.Schedule, opts.ScheduleInput)
 	}
 
+	return w
+}
+
+// AddFlow registers a flow with the worker. opts can be nil for default behavior.
+// If opts.Schedule is set, the flow will be executed according to the cron schedule.
+func (w *Worker) AddFlow(f *Flow, opts *FlowOpts) *Worker {
+	w.flows = append(w.flows, f)
+
+	if opts != nil && opts.Schedule != "" {
+		if w.scheduler == nil {
+			w.scheduler = NewScheduler(w.conn, w.logger)
+		}
+		w.scheduler.AddFlow(f.name, opts.Schedule, opts.ScheduleInput)
+	}
+
+	return w
+}
+
+// Start begins processing tasks and flows.
+//
+// The worker will:
+//   - poll for new work and execute task and flow step handlers while ctx is active
+//   - run any configured cron-style task and flow schedules
+//   - send periodic heartbeats while it is running
+//   - register built-in garbage collection task running every 5 minutes
+//
+// Shutdown behaviour:
+//   - when ctx is cancelled the worker immediately stops reading new work and
+//     begins shutting down
+//   - if ShutdownTimeout is set to a value > 0, that duration is used as a
+//     grace period for in‑flight handlers after ctx is cancelled; once the
+//     grace period expires the handler context is cancelled and remaining
+//     handlers are asked to stop. The default graceful shutdown timeout is 5 seconds.
+//   - if ShutdownTimeout is not set or set to 0, there is no grace period:
+//     the handler context is cancelled immediately once ctx is cancelled and
+//     Start returns after all goroutines finish
+func (w *Worker) Start(ctx context.Context) error {
 	// Register built-in garbage collection task (automatic, runs every 5 minutes)
 	gcTask := NewTask("gc").Handler(func(ctx context.Context, in struct{}) (struct{}, error) {
 		return struct{}{}, GC(ctx, w.conn)
@@ -129,13 +152,13 @@ func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, erro
 	if w.scheduler == nil {
 		w.scheduler = NewScheduler(w.conn, w.logger)
 	}
-	w.scheduler.AddTask("gc", "@every 5m")
+	w.scheduler.AddTask("gc", "@every 5m", nil)
 
 	// Validate HandlerOpts for all tasks
 	for _, t := range w.tasks {
 		if t.handlerOpts != nil {
 			if err := t.handlerOpts.validate(); err != nil {
-				return nil, fmt.Errorf("task %q has invalid handler options: %w", t.name, err)
+				return fmt.Errorf("task %q has invalid handler options: %w", t.name, err)
 			}
 		}
 	}
@@ -145,45 +168,26 @@ func NewWorker(ctx context.Context, conn Conn, opts ...WorkerOpt) (*Worker, erro
 		for _, s := range f.steps {
 			if s.handlerOpts != nil {
 				if err := s.handlerOpts.validate(); err != nil {
-					return nil, fmt.Errorf("flow %q step %q has invalid handler options: %w", f.name, s.name, err)
+					return fmt.Errorf("flow %q step %q has invalid handler options: %w", f.name, s.name, err)
 				}
 			}
 		}
 	}
 
+	// Create tasks in database
 	for _, t := range w.tasks {
 		if err := CreateTask(ctx, w.conn, t); err != nil {
-			return nil, err
+			return err
 		}
 	}
 
+	// Create flows in database
 	for _, f := range w.flows {
 		if err := CreateFlow(ctx, w.conn, f); err != nil {
-			return nil, err
+			return err
 		}
 	}
 
-	return w, nil
-}
-
-// Start begins processing tasks and flows.
-//
-// The worker will:
-//   - poll for new work and execute task and flow step handlers while ctx is active
-//   - run any configured cron-style task and flow schedules
-//   - send periodic heartbeats while it is running
-//
-// Shutdown behaviour:
-//   - when ctx is cancelled the worker immediately stops reading new work and
-//     begins shutting down
-//   - if WithGracefulShutdown is set to a value > 0, that duration is used as a
-//     grace period for in‑flight handlers after ctx is cancelled; once the
-//     grace period expires the handler context is cancelled and remaining
-//     handlers are asked to stop. The default graceful shutdown timeout is 5 seconds.
-//   - if WithGracefulShutdown is not set or set to 0, there is no grace period:
-//     the handler context is cancelled immediately once ctx is cancelled and
-//     Start returns after all goroutines finish
-func (w *Worker) Start(ctx context.Context) error {
 	var wg sync.WaitGroup
 	var taskHandlers = make([]*TaskHandlerInfo, 0)
 	var stepHandlers = make([]*StepHandlerInfo, 0)

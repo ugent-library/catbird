@@ -42,12 +42,7 @@ func TestTaskRunAndWait(t *testing.T) {
 		return in.Value * 2, nil
 	}, nil)
 
-	worker, err := client.NewWorker(t.Context(),
-		WithTask(task),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
 
 	startTestWorker(t, worker)
 
@@ -78,12 +73,7 @@ func TestTaskPanicRecovery(t *testing.T) {
 		panic("intentional panic in task")
 	}, nil)
 
-	worker, err := client.NewWorker(t.Context(),
-		WithTask(task),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
 
 	startTestWorker(t, worker)
 
@@ -141,15 +131,11 @@ func TestTaskCircuitBreaker(t *testing.T) {
 		Concurrency:    1,
 		BatchSize:      10,
 		MaxRetries:     2,
-		MinDelay:       minBackoff,
-		MaxDelay:       maxBackoff,
+		Backoff:        NewFullJitterBackoff(minBackoff, maxBackoff),
 		CircuitBreaker: NewCircuitBreaker(1, openTimeout),
 	})
 
-	worker, err := client.NewWorker(t.Context(), WithTask(task))
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
 
 	startTestWorker(t, worker)
 

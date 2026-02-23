@@ -38,6 +38,16 @@ func startTestWorker(t *testing.T, worker *Worker) {
 		errCh <- worker.Start(ctx)
 	}()
 
+	// Wait briefly for Start to complete or error
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("worker.Start() failed: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		// Worker started successfully, continue
+	}
+
 	t.Cleanup(func() {
 		cancel()
 		select {

@@ -137,8 +137,7 @@ func TestHandlerOpts_WithRetriesAndBackoff(t *testing.T) {
 		Concurrency: 1,
 		BatchSize:   10,
 		MaxRetries:  3,
-		MinDelay:    min,
-		MaxDelay:    max,
+		Backoff:     NewFullJitterBackoff(min, max),
 	})
 
 	if task == nil {
@@ -177,8 +176,8 @@ func TestBackoffWithFullJitter(t *testing.T) {
 
 // Integration test: run a worker with a task that fails a couple of times
 // and then succeeds. Verify the handler was invoked the expected number
-// of times (retries + final success) when configured with WithMaxRetries
-// and WithBackoff.
+// of times (retries + final success) when configured with MaxRetries
+// and Backoff.
 func TestTaskRetriesIntegration(t *testing.T) {
 	client := getTestClient(t)
 
@@ -208,14 +207,10 @@ func TestTaskRetriesIntegration(t *testing.T) {
 		Concurrency: 1,
 		BatchSize:   10,
 		MaxRetries:  3,
-		MinDelay:    minDelay,
-		MaxDelay:    maxDelay,
+		Backoff:     NewFullJitterBackoff(minDelay, maxDelay),
 	})
 
-	worker, err := client.NewWorker(t.Context(), WithTask(task))
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
 
 	startTestWorker(t, worker)
 

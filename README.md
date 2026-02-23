@@ -99,10 +99,10 @@ handle, err := client.RunFlow(ctx, "order-processing", order, &catbird.RunFlowOp
 })
 
 // Scheduled tasks automatically use IdempotencyKey (UTC-normalized for multi-worker dedup)
-worker, err := client.NewWorker(ctx,
-    catbird.WithTask(hourlyTask),
-    catbird.WithScheduledTask("hourly_task", "@hourly"), // Uses IdempotencyKey internally
-)
+worker := client.NewWorker(ctx, &catbird.WorkerOpts{
+    Logger: logger,
+}).AddTask(hourlyTask, &TaskOpts{Schedule: "@hourly"}) // Uses IdempotencyKey internally
+err := worker.Start(ctx)
 ```
 
 **Behavior**:
@@ -218,8 +218,7 @@ task := catbird.NewTask("send-email").
     }, &catbird.HandlerOpts{
         Concurrency: 5,           // Allow up to 5 concurrent executions
         MaxRetries:  3,           // Retry 3 times
-        MinDelay:    500 * time.Millisecond,
-        MaxDelay:    10 * time.Second, // Exponential backoff between 500ms and 10s
+        Backoff:     catbird.NewFullJitterBackoff(500*time.Millisecond, 10*time.Second), // Exponential backoff between 500ms and 10s
         CircuitBreaker: &catbird.CircuitBreaker{
             FailureThreshold: 5,
             OpenTimeout:      30 * time.Second,
@@ -248,10 +247,9 @@ var result EmailResponse
 err = handle.WaitForOutput(ctx, &result)
 
 // Schedule a task to run periodically (using cron syntax)
-worker, err = client.NewWorker(ctx,
-    catbird.WithTask(task),
-    catbird.WithScheduledTask("send-email", "@hourly"), // Run every hour
-)
+worker := client.NewWorker(ctx, &catbird.WorkerOpts{
+    Logger: logger,
+}).AddTask(task, &TaskOpts{Schedule: "@hourly"}) // Run every hour
 go worker.Start(ctx)
 ```
 
@@ -447,10 +445,11 @@ flow := catbird.NewFlow("order-processing").
         }, nil))
 
 // Start a worker that handles the flow
-worker, err := client.NewWorker(ctx,
-    catbird.WithFlow(flow),
-)
-go worker.Start(ctx)
+worker := client.NewWorker(ctx, &catbird.WorkerOpts{
+    Logger: logger,
+}).AddFlow(flow, nil)
+err := worker.Start(ctx)
+go func() { <-ctx.Done() }() // Keep worker running
 
 // Run the flow
 handle, err := client.RunFlow(ctx, "order-processing", Order{
@@ -469,11 +468,10 @@ if err != nil {
 fmt.Println("Shipped with tracking:", result.TrackingNumber)
 
 // Schedule a flow to run periodically (using cron syntax)
-worker, err = client.NewWorker(ctx,
-    catbird.WithFlow(flow),
-    catbird.WithScheduledFlow("order-processing", "0 2 * * *"), // Run daily at 2 AM
-)
-go worker.Start(ctx)
+worker := client.NewWorker(ctx, &catbird.WorkerOpts{
+    Logger: logger,
+}).AddFlow(flow, &FlowOpts{Schedule: "0 2 * * *"}) // Run daily at 2 AM
+err := worker.Start(ctx)
 ```
 
 ### Workflow with Signals (Human-in-the-Loop)
@@ -1027,7 +1025,7 @@ task := catbird.NewTask("age_restricted",
 
 ## Resiliency
 
-Catbird includes multiple resiliency layers for runtime failures. Handler-level retries are configured with `TaskOpts` (`MaxRetries`, `MinDelay`, `MaxDelay`), and external calls can be protected with `TaskOpts.CircuitBreaker` (typically created via `NewCircuitBreaker(...)`) to avoid cascading outages. In worker database paths, PostgreSQL reads/writes are retried with bounded attempts and full-jitter backoff; retries stop immediately on context cancellation or deadline expiry.
+Catbird includes multiple resiliency layers for runtime failures. Handler-level retries are configured with `HandlerOpts` (`MaxRetries`, `Backoff`), and external calls can be protected with `HandlerOpts.CircuitBreaker` (typically created via `NewCircuitBreaker(...)`) to avoid cascading outages. In worker database paths, PostgreSQL reads/writes are retried with bounded attempts and full-jitter backoff; retries stop immediately on context cancellation or deadline expiry.
 
 ## Naming Rules
 

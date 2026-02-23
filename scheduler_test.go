@@ -17,14 +17,8 @@ func TestSchedulerIdempotencyKeyGeneration(t *testing.T) {
 		return in + " processed", nil
 	}, nil)
 
-	worker, err := client.NewWorker(t.Context(),
-		WithTask(task),
-		// Add a scheduled task that runs every minute
-		WithScheduledTask("scheduled_task", "@hourly"),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).
+		AddTask(task, &TaskOpts{Schedule: "@hourly"})
 
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
@@ -65,12 +59,7 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 	}, nil)
 
 	// Create and run worker to execute task (must create task before running)
-	worker, err := client.NewWorker(t.Context(),
-		WithTask(task),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
 
 	startTestWorker(t, worker)
 	time.Sleep(200 * time.Millisecond)
@@ -126,17 +115,10 @@ func TestSchedulerIdempotencyPersists(t *testing.T) {
 		return in * 2, nil
 	}, nil)
 
-	worker, err := client.NewWorker(t.Context(),
-		WithTask(task),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
-	// Enqueue first run with idempotency key
 	idempotencyKey := "schedule:1707759600"
 	h1, err := client.RunTask(t.Context(), "persisted_dedup_task", 21, &RunOpts{
 		IdempotencyKey: idempotencyKey,
@@ -219,12 +201,7 @@ func TestSchedulerFlowIdempotency(t *testing.T) {
 			return 42, nil
 		}, nil))
 
-	worker, err := client.NewWorker(t.Context(),
-		WithFlow(flow),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)

@@ -35,10 +35,7 @@ func TestTaskConcurrencyKey(t *testing.T) {
 		return in * 2, nil
 	}, nil)
 
-	worker, err := client.NewWorker(t.Context(), WithTask(task))
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -109,10 +106,7 @@ func TestTaskIdempotencyKey(t *testing.T) {
 		return in * 3, nil
 	}, nil)
 
-	worker, err := client.NewWorker(t.Context(), WithTask(task))
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -199,10 +193,7 @@ func TestTaskDeduplicationRetryOnFailure(t *testing.T) {
 		return "success", nil
 	}, nil)
 
-	worker, err := client.NewWorker(t.Context(), WithTask(task))
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -272,10 +263,7 @@ func TestFlowConcurrencyKey(t *testing.T) {
 			return in + " processed", nil
 		}, nil))
 
-	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -333,10 +321,7 @@ func TestFlowIdempotencyKey(t *testing.T) {
 			return in * 5, nil
 		}, nil))
 
-	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -404,15 +389,13 @@ func TestFlowIdempotencyKey(t *testing.T) {
 // IdempotencyKey is rejected.
 func TestTaskBothKeysRejected(t *testing.T) {
 	client := getTestClient(t)
+	var err error
 
 	task := NewTask("both_keys_task").Handler(func(ctx context.Context, in string) (string, error) {
 		return in, nil
 	}, nil)
 
-	worker, err := client.NewWorker(t.Context(), WithTask(task))
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -429,16 +412,14 @@ func TestTaskBothKeysRejected(t *testing.T) {
 // TestFlowBothKeysRejected verifies that providing both keys for flows is rejected.
 func TestFlowBothKeysRejected(t *testing.T) {
 	client := getTestClient(t)
+	var err error
 
 	flow := NewFlow("both_keys_flow").
 		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			return in, nil
 		}, nil))
 
-	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
-	if err != nil {
-		t.Fatal(err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 

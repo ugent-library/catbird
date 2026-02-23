@@ -18,7 +18,8 @@ func TestWorkerValidatesTaskHandlerOpts(t *testing.T) {
 			BatchSize:   10,
 		})
 
-		_, err := client.NewWorker(t.Context(), WithTask(task))
+		worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
+		err := worker.Start(t.Context())
 		if err == nil {
 			t.Fatal("expected error for negative concurrency")
 		}
@@ -36,7 +37,8 @@ func TestWorkerValidatesTaskHandlerOpts(t *testing.T) {
 			BatchSize:   -1,
 		})
 
-		_, err := client.NewWorker(t.Context(), WithTask(task))
+		worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
+		err := worker.Start(t.Context())
 		if err == nil {
 			t.Fatal("expected error for negative batch size")
 		}
@@ -53,11 +55,11 @@ func TestWorkerValidatesTaskHandlerOpts(t *testing.T) {
 			Concurrency: 1,
 			BatchSize:   10,
 			MaxRetries:  3,
-			MinDelay:    time.Second,
-			MaxDelay:    500 * time.Millisecond, // MaxDelay < MinDelay
+			Backoff:     NewFullJitterBackoff(time.Second, 500*time.Millisecond), // MaxDelay < MinDelay
 		})
 
-		_, err := client.NewWorker(t.Context(), WithTask(task))
+		worker := client.NewWorker(t.Context(), nil).AddTask(task, nil)
+		err := worker.Start(t.Context())
 		if err == nil {
 			t.Fatal("expected error for invalid backoff")
 		}
@@ -80,7 +82,8 @@ func TestWorkerValidatesFlowStepHandlerOpts(t *testing.T) {
 				BatchSize:   10,
 			}))
 
-		_, err := client.NewWorker(t.Context(), WithFlow(flow))
+		worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
+		err := worker.Start(t.Context())
 		if err == nil {
 			t.Fatal("expected error for negative concurrency")
 		}
@@ -99,7 +102,8 @@ func TestWorkerValidatesFlowStepHandlerOpts(t *testing.T) {
 				BatchSize:   -5, // Negative value
 			}))
 
-		_, err := client.NewWorker(t.Context(), WithFlow(flow))
+		worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
+		err := worker.Start(t.Context())
 		if err == nil {
 			t.Fatal("expected error for negative batch size")
 		}
@@ -119,7 +123,8 @@ func TestWorkerValidatesFlowStepHandlerOpts(t *testing.T) {
 				CircuitBreaker: &CircuitBreaker{failureThreshold: 0}, // Invalid threshold
 			}))
 
-		_, err := client.NewWorker(t.Context(), WithFlow(flow))
+		worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
+		err := worker.Start(t.Context())
 		if err == nil {
 			t.Fatal("expected error for invalid circuit breaker")
 		}

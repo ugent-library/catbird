@@ -21,7 +21,7 @@ Catbird is a PostgreSQL-based message queue with task and workflow execution eng
 **Main Components**:
 1. **Client** (`client.go`): Facade delegating to standalone functions; call `catbird.New(conn)` to create
 2. **Worker** (`worker.go`): Runs tasks and flows; initialized with `catbird.NewWorker(ctx, conn, opts...)`. Multiple workers can run concurrently; DB ensures each message is processed exactly once.
-3. **Scheduler** (`scheduler.go`): Manages cron-based task and flow scheduling using robfig/cron; created internally by worker when using `WithScheduledTask` or `WithScheduledFlow`. Can also be used standalone.
+3. **Scheduler** (`scheduler.go`): Manages cron-based task and flow scheduling using robfig/cron; created internally by worker when registering tasks/flows with `Schedule` field in `TaskOpts`/`FlowOpts`. Can also be used standalone.
 4. **Dashboard** (`dashboard/`): Web UI for starting task/flow runs, monitoring progress in real-time, and viewing results; served via CLI `cb dashboard`
 
 **Two Independent Systems**:
@@ -66,8 +66,7 @@ task := catbird.NewTask("my_task").
   }, &catbird.HandlerOpts{
     Concurrency: 5,
     MaxRetries:  3,
-    MinDelay:    500 * time.Millisecond,
-    MaxDelay:    10 * time.Second,
+    Backoff:     catbird.NewFullJitterBackoff(500*time.Millisecond, 10*time.Second),
     CircuitBreaker: &catbird.CircuitBreaker{
       FailureThreshold: 5,
       OpenTimeout:      30 * time.Second,
@@ -78,7 +77,7 @@ task := catbird.NewTask("my_task").
 **Key characteristics**:
 - **No type parameters**: Input/output types are discovered at runtime via reflection (handlers receive `[]byte` payloads internally)
 - **Builder pattern**: Construction via method chaining: `NewTask(name).Condition(...).Handler(fn, opts)`
-- **Execution options**: Applied via `HandlerOpts` struct with public fields (Concurrency, MaxRetries, MinDelay, MaxDelay, CircuitBreaker, BatchSize, Timeout)
+- **Execution options**: Applied via `HandlerOpts` struct with public fields (Concurrency, MaxRetries, Backoff, CircuitBreaker, BatchSize, Timeout)
 - **HandlerOpts validation**: Worker validates all task and flow step HandlerOpts at initialization time, catching configuration errors early before database operations
 - **Task/step metadata**: Conditions applied via `.Condition(expr)` method chain
 
@@ -162,12 +161,12 @@ NewFlow("workflow").
 
 ## Key Conventions
 
-- **Worker lifecycle**: `client.NewWorker(ctx, opts...)` → `worker.Start(ctx)` → `worker.Wait()` (graceful shutdown with timeout)
+- **Worker lifecycle**: `client.NewWorker(ctx, opts)` followed by `.AddTask(..., taskOpts)` and `.AddFlow(..., flowOpts)` builder methods, then `worker.Start(ctx)` (graceful shutdown with configurable timeout)
 - **HandlerOpts validation**: Worker validates all task and flow step HandlerOpts at initialization time. Invalid configs (negative concurrency/batch size, invalid backoff, invalid circuit breaker) are caught immediately with descriptive errors before reaching database operations. This ensures type safety at construction time.
-- **Options pattern**: HandlerOpts uses a public struct with public fields (Concurrency, BatchSize, Timeout, MaxRetries, MinDelay, MaxDelay, CircuitBreaker). WorkerOpts and other configs use closure functional options (WithScheduledTask, WithFlow, etc.).
+- **Options pattern**: HandlerOpts uses a public struct with public fields (Concurrency, BatchSize, Timeout, MaxRetries, Backoff, CircuitBreaker). WorkerOpts uses a config struct (Logger, ShutdownTimeout).
 - **Conn interface**: Abstracts pgx; accepts `*pgxpool.Pool`, `*pgx.Conn` or `pgx.Tx`
-- **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `WithLogger()`
-- **Scheduled tasks/flows**: Use robfig/cron syntax; `WithScheduledTask("name", "@hourly")`
+- **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `WorkerOpts.Logger` field
+- **Scheduled tasks/flows**: Use robfig/cron syntax via optional `TaskOpts{Schedule: "@hourly"}` or `FlowOpts{Schedule: "@hourly"}` parameters to `AddTask()`/`AddFlow()`. Optional `ScheduleInput` field allows dynamic input generation at execution time
 - **Automatic garbage collection**: All workers automatically run GC every 5 minutes (cleans up expired queues and stale worker heartbeats); no configuration needed
 - **Deduplication strategies**: Two strategies available:
   - **ConcurrencyKey**: Prevents concurrent/overlapping runs (deduplicates `queued`/`started` status). After completion or failure, same key can be used again.

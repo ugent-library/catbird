@@ -170,9 +170,10 @@ func (c *Client) SignalFlow(ctx context.Context, flowName string, flowRunID int6
 }
 
 // NewWorker creates a new worker that processes task and flow executions.
-// Configure the worker with options like WithTask, WithFlow, and WithScheduledTask.
-func (c *Client) NewWorker(ctx context.Context, opts ...WorkerOpt) (*Worker, error) {
-	return NewWorker(ctx, c.Conn, opts...)
+// Use the builder pattern methods (AddTask, AddFlow, etc.) to configure,
+// then call Start(ctx) to begin processing.
+func (c *Client) NewWorker(ctx context.Context, opts *WorkerOpts) *Worker {
+	return NewWorker(c.Conn, opts)
 }
 
 // ListWorkers returns all registered workers.

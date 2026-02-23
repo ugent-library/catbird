@@ -258,10 +258,7 @@ func TestFlowCondition(t *testing.T) {
 				return result, nil
 			}, nil))
 
-		worker, err := client.NewWorker(t.Context(), WithFlow(flow))
-		if err != nil {
-			t.Fatalf("NewWorker failed: %v", err)
-		}
+		worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 
 		startTestWorker(t, worker)
 
@@ -318,10 +315,7 @@ func TestFlowCondition(t *testing.T) {
 				return result, nil
 			}, nil))
 
-		worker, err := client.NewWorker(t.Context(), WithFlow(flow))
-		if err != nil {
-			t.Fatalf("NewWorker failed: %v", err)
-		}
+		worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 		startTestWorker(t, worker)
 
 		handle, err := client.RunFlow(t.Context(), flowName, 75, nil)
@@ -367,10 +361,7 @@ func TestFlowCondition(t *testing.T) {
 				return result, nil
 			}, nil))
 
-		worker, err := client.NewWorker(t.Context(), WithFlow(flow))
-		if err != nil {
-			t.Fatalf("NewWorker failed: %v", err)
-		}
+		worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 		startTestWorker(t, worker)
 
 		handle, err := client.RunFlow(t.Context(), flowName, 95, nil)
@@ -426,10 +417,7 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 				return result, nil
 			}, nil))
 
-		worker, err := client.NewWorker(t.Context(), WithFlow(flow))
-		if err != nil {
-			t.Fatalf("NewWorker failed: %v", err)
-		}
+		worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 		startTestWorker(t, worker)
 
 		handle, err := client.RunFlow(t.Context(), flowName, map[string]interface{}{"other": "data"}, nil)
@@ -472,10 +460,7 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 				return result, nil
 			}, nil))
 
-		worker, err := client.NewWorker(t.Context(), WithFlow(flow))
-		if err != nil {
-			t.Fatalf("NewWorker failed: %v", err)
-		}
+		worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 		startTestWorker(t, worker)
 
 		handle, err := client.RunFlow(t.Context(), flowName, map[string]interface{}{"field": nil}, nil)
@@ -521,10 +506,7 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 				return result, nil
 			}, nil))
 
-		worker, err := client.NewWorker(t.Context(), WithFlow(flow))
-		if err != nil {
-			t.Fatalf("NewWorker failed: %v", err)
-		}
+		worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 		startTestWorker(t, worker)
 
 		handle, err := client.RunFlow(t.Context(), flowName, map[string]interface{}{
@@ -584,10 +566,7 @@ func TestFlowOptionalDependency(t *testing.T) {
 				return 0, nil
 			}, nil))
 
-	worker, err := client.NewWorker(t.Context(), WithFlow(flow))
-	if err != nil {
-		t.Fatalf("NewWorker failed: %v", err)
-	}
+	worker := client.NewWorker(t.Context(), nil).AddFlow(flow, nil)
 	startTestWorker(t, worker)
 
 	// Step2 skipped
