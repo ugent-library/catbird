@@ -18,6 +18,7 @@
 - [ ] Metrics
 - [ ] Schemas for task/flow input/output? (see https://opensource.googleblog.com/2026/01/a-json-schema-package-for-go.html)
 - [ ] OnFail handlers
+- [ ] Delayed tasks, flows (and steps?)
 - [ ] Unlogged tasks and flows
 
 ## Project Management
