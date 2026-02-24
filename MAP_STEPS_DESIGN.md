@@ -1,6 +1,6 @@
 # Map Steps Design Document
 
-> **Updated**: Map steps use the **reflection-based builder pattern** from [REFLECTION_API_DESIGN.md](REFLECTION_API_DESIGN.md). Dependencies are validated at build time; array detection is automatic based on return types.
+> **Updated**: Map steps use the **reflection-based builder pattern** from [REFLECTION_API_DESIGN.md](REFLECTION_API_DESIGN.md). Dependencies are declared with `DependsOn(...string)`. Map steps are detected explicitly via proposal markers (e.g., `MapEach(...)`/`MapInput()`), not by `Dep[T]`.
 
 ## Overview
 
@@ -13,9 +13,9 @@ This document outlines the design for adding **map steps** to catbird - a featur
 Today, processing arrays in catbird flows requires handling all elements within a single step execution:
 
 ```go
-StepWithDependency("process_orders",
-    Dependency("fetch_orders"),
-    func(ctx context.Context, in Input, orders []Order) ([]OrderResult, error) {
+catbird.NewStep("process_orders").
+    DependsOn("fetch_orders").
+    Handler(func(ctx context.Context, in Input, orders []Order) ([]OrderResult, error) {
         var results []OrderResult
         for _, order := range orders {
             result, err := processOrder(ctx, order)
@@ -25,8 +25,7 @@ StepWithDependency("process_orders",
             results = append(results, result)
         }
         return results, nil
-    },
-)
+    }, nil)
 ```
 
 **Problems:**
@@ -72,7 +71,7 @@ Map steps enable:
 ┌─────────────────────────────────────────────────────────────────┐
 │ Flow Definition (Go Code)                                        │
 │                                                                   │
-│  InitialStep("fetch") → MapStep("process") → Step("aggregate")  │
+│  NewStep("fetch") → MapEach("process") → NewStep("aggregate")   │
 │       │                     │                      │             │
 │       └──── []Item ─────────┘                      │             │
 │                                                     │             │
@@ -110,7 +109,7 @@ Map steps enable:
 
 ### Component Overview
 
-1. **Go API**: Type-safe flow definition with `MapStep()` constructor
+1. **Go API**: Type-safe flow definition with `NewStep(...)` plus map markers (`MapEach(...)` / `MapInput()`)
 2. **PostgreSQL Schema**: Dedicated tables for map metadata and task runs
 3. **SQL Functions**: Task spawning, polling, completion, and aggregation
 4. **Worker**: Task polling loop and execution (similar to step worker)
@@ -801,42 +800,47 @@ $$;
 Map steps use the same **reflection-based builder pattern** as all flow steps (from [REFLECTION_API_DESIGN.md](REFLECTION_API_DESIGN.md)), with array support:
 
 ```go
-// All flow steps use reflection-based builders: NewStep, DependsOn, WithHandler, etc.
-// Map steps extend this with array processing
+// All flow steps use reflection-based builders: NewStep, DependsOn, Handler, etc.
+// Map steps extend this with explicit map markers (MapEach / MapInput)
 
 // Simple map step (no dependencies - operate on flow input array)
 mapStep1 := catbird.NewStep("process-items").
-    WithHandler(
+    MapInput().
+    Handler(
         func(
             ctx context.Context,
             item Item,  // Each element from input array
         ) (Result, error) {
             return processItem(ctx, item)
         },
-        catbird.WithConcurrency(10),  // Process 10 items in parallel
+        &catbird.HandlerOpts{Concurrency: 10},  // Process 10 items in parallel
     )
 
 // Map step with dependency (operate on dependency output array)
-// Note: Dep[T] captures type for validation, DependsOn uses reflection
 mapStep2 := catbird.NewStep("transform").
-    DependsOn(catbird.Dep[[]Record]("fetch-records")). // Depends on step that returns array
-    WithHandler(
+    DependsOn("fetch-records").
+    MapEach("fetch-records").
+    Handler(
         func(
             ctx context.Context,
             record Record,  // Each record from the array
         ) (Transformed, error) {
             return transform(ctx, record)
         },
-        catbird.WithConcurrency(20),
-        catbird.WithMaxRetries(3),
-        catbird.WithCircuitBreaker(5, 30*time.Second),
+        &catbird.HandlerOpts{
+            Concurrency:    20,
+            MaxRetries:     3,
+            CircuitBreaker: catbird.NewCircuitBreaker(5, 30*time.Second),
+        },
     )
 
 // Map step with signal and condition
 mapStep3 := catbird.NewStep("validate-with-approval").
-    DependsOn(catbird.Dep[[]FormSubmission]("collect-submissions")).
-    RequiresSignal().
-    WithHandler(
+    DependsOn("collect-submissions").
+    MapEach("collect-submissions").
+    Signal(true).
+    Condition("input.requires_review").
+    Handler(
         func(
             ctx context.Context,
             submission FormSubmission,
@@ -844,31 +848,44 @@ mapStep3 := catbird.NewStep("validate-with-approval").
         ) (ValidationResult, error) {
             return validateSubmission(ctx, submission, approval)
         },
-        catbird.WithCondition("input.requires_review"),
+        nil,
     )
 ```
 
 ### Array Detection
 
-The framework automatically detects array types using reflection:
+Map steps are detected explicitly using map markers:
 
 ```go
-// If Dep[T] specifies array type []T, the step becomes a map step
+// Mark a step as a map step by pointing at the array source
 step := NewStep("process").
-    DependsOn(catbird.Dep[[]Order]("fetch-orders")).  // Array type → map step
-    WithHandler(func(ctx context.Context, order Order) (Result, error) { ... })
+    DependsOn("fetch-orders").
+    MapEach("fetch-orders").
+    Handler(func(ctx context.Context, order Order) (Result, error) { ... }, nil)
 
-// Handler signature analysis (via reflection) detects array processing:
-// - Dependency returns []Order
-// - Handler accepts single Order → map step detected
+// Handler signature analysis (via reflection) validates array processing:
+// - Source step output is []Order at runtime
+// - Handler accepts single Order
 // - Runtime wrapper spawns tasks for each element
 
 // Framework handles:
 // - Spawning individual tasks for each array element
-// - Parallel execution (bounded by WithConcurrency)
+// - Parallel execution (bounded by HandlerOpts.Concurrency)
 // - Independent retry per element
 // - Result aggregation (preserves input order)
 ```
+
+### Proposed Builder Additions (Not Yet Implemented)
+
+These are proposal-only helpers to support map-step behavior while keeping the current builder style:
+
+- `MapEach(sourceStep string)`: mark a step as a map step and declare which dependency provides the array.
+- `MapInput()`: mark a step as mapping directly over the flow input array.
+- `ReduceWith(fn)`: optional reducer to transform the aggregated `[]Out` into a different final output.
+- `WithPriority(fn)`: optional per-item priority hook for polling order.
+- `WithProgressCallback(fn)`: optional progress hook for UI/telemetry.
+
+If adopted, these methods should be implemented as pure builder metadata (no runtime side effects) and serialized into the flow definition alongside `condition`, `signal`, and `depends_on`.
 
 ### Type Definitions (Internal)
 
@@ -1187,41 +1204,39 @@ func (w *Worker) Start(ctx context.Context) error {
 
 ```go
 // Process uploaded files in parallel
-flow := catbird.NewFlow("file-processor",
-    // Step 1: Initial input
-    InitialStep("upload", 
-        func(ctx context.Context, req UploadRequest) ([]File, error) {
+flow := catbird.NewFlow("file-processor").
+    AddStep(catbird.NewStep("upload").
+        Handler(func(ctx context.Context, req UploadRequest) ([]File, error) {
             return req.Files, nil
-        }),
-    
-    // Step 2: Map over files (automatically detected via reflection)
-    NewStep("process-file").
-        DependsOn(catbird.Dep[[]File]("upload")).
-        WithHandler(
-            func(ctx context.Context, file File) (FileResult, error) {
+        }, nil)).
+    AddStep(catbird.NewStep("process-file").
+        DependsOn("upload").
+        MapEach("upload").
+        Handler(
+            func(ctx context.Context, req UploadRequest, file File) (FileResult, error) {
                 // Process each file independently
                 data, err := os.ReadFile(file.Path)
                 if err != nil {
                     return FileResult{}, err
                 }
-                
+
                 checksum := sha256.Sum256(data)
-                
+
                 return FileResult{
                     Name:     file.Name,
                     Size:     len(data),
                     Checksum: hex.EncodeToString(checksum[:]),
                 }, nil
             },
-            catbird.WithConcurrency(5),      // Process 5 files at a time
-            catbird.WithMaxRetries(3),       // Retry failed files up to 3 times
-        ),
-    
-    // Step 3: Aggregate results
-    NewStep("summary").
-        DependsOn(catbird.Dep[[]FileResult]("process-file")).
-        WithHandler(
-            func(ctx context.Context, results []FileResult) (Summary, error) {
+            &catbird.HandlerOpts{
+                Concurrency: 5, // Process 5 files at a time
+                MaxRetries:  3, // Retry failed files up to 3 times
+            },
+        )).
+    AddStep(catbird.NewStep("summary").
+        DependsOn("process-file").
+        Handler(
+            func(ctx context.Context, req UploadRequest, results []FileResult) (Summary, error) {
                 var totalSize int
                 for _, r := range results {
                     totalSize += r.Size
@@ -1230,8 +1245,7 @@ flow := catbird.NewFlow("file-processor",
                     FileCount: len(results),
                     TotalSize: totalSize,
                 }, nil
-            }),
-)
+            }, nil))
 
 // Run it
 client := catbird.New(conn)
@@ -1241,9 +1255,10 @@ handle, err := client.RunFlow(ctx, "file-processor", UploadRequest{
         {Name: "doc2.pdf", Path: "/tmp/doc2.pdf"},
         {Name: "doc3.pdf", Path: "/tmp/doc3.pdf"},
     },
-})
+}, nil)
 
-output, err := handle.WaitForOutput(ctx)
+var output Summary
+err = handle.WaitForOutput(ctx, &output)
 // output: Summary{FileCount: 3, TotalSize: 45600}
 ```
 
@@ -1251,95 +1266,69 @@ output, err := handle.WaitForOutput(ctx)
 
 ```go
 // Batch email sending with circuit breaker protection
-flow := catbird.NewFlow("email-campaign",
-    InitialStep("get-subscribers",
-        func(ctx context.Context, campaignID string) ([]Subscriber, error) {
+flow := catbird.NewFlow("email-campaign").
+    AddStep(catbird.NewStep("get-subscribers").
+        Handler(func(ctx context.Context, campaignID string) ([]Subscriber, error) {
             return db.GetActiveSubscribers(ctx, campaignID)
-        }),
-    
-    // Map step with circuit breaker (array detected via reflection)
-    NewStep("send-email").
-        DependsOn(catbird.Dep[[]Subscriber]("get-subscribers")).
-        WithHandler(
-            func(ctx context.Context, sub Subscriber) (EmailResult, error) {
+        }, nil)).
+    AddStep(catbird.NewStep("send-email").
+        DependsOn("get-subscribers").
+        MapEach("get-subscribers").
+        Handler(
+            func(ctx context.Context, campaignID string, sub Subscriber) (EmailResult, error) {
                 // Circuit breaker: fail fast if email service is down
                 return emailService.Send(ctx, sub.Email)
             },
-            // Independent retry per subscriber, but circuit breaker stops spam on service failures
-            WithMaxRetries(2),
-            WithCircuitBreaker(10, 30*time.Second),  // Stop after 10 failures for 30s
-            WithConcurrency(20),  // Send 20 emails in parallel
-        ),
-    
-    NewStep("report").
-        DependsOn(catbird.Dep[[]EmailResult]("send-email")).
-        WithHandler(
-            func(ctx context.Context, results []EmailResult) (Report, error) {
+            &catbird.HandlerOpts{
+                Concurrency:    20,
+                MaxRetries:     2,
+                CircuitBreaker: catbird.NewCircuitBreaker(10, 30*time.Second),
+            },
+        )).
+    AddStep(catbird.NewStep("report").
+        DependsOn("send-email").
+        Handler(
+            func(ctx context.Context, campaignID string, results []EmailResult) (Report, error) {
                 sent, failed := 0, 0
                 for _, r := range results {
-                    if r.Success { sent++ } else { failed++ }
+                    if r.Success {
+                        sent++
+                    } else {
+                        failed++
+                    }
                 }
                 return Report{
                     Total:  len(results),
                     Sent:   sent,
                     Failed: failed,
                 }, nil
-            },
-        ),
-)
-```
-    catbird.MapStep("send_email", "get_subscribers",
-        func(ctx context.Context, sub Subscriber) (EmailStatus, error) {
-            err := emailAPI.Send(ctx, EmailMessage{
-                To:      sub.Email,
-                Subject: "Special Offer",
-                Body:    renderTemplate(sub),
-            })
-            
-            if err != nil {
-                return EmailStatus{}, err  // Will retry with backoff
-            }
-            
-            return EmailStatus{
-                Email:    sub.Email,
-                SentAt:   time.Now(),
-                Status:   "delivered",
-            }, nil
-        },
-        catbird.WithConcurrency(10),                          // 10 concurrent sends
-        catbird.WithBackoff(1*time.Second, 30*time.Second),  // Exponential backoff
-        catbird.WithCircuitBreaker(5, 1*time.Minute),        // Open after 5 failures
-    ),
-    
-    catbird.StepWithDependency("record_results",
-        catbird.Dependency("send_email"),
-        func(ctx context.Context, id string, statuses []EmailStatus) (CampaignResult, error) {
-            return db.SaveCampaignResults(ctx, id, statuses)
-        }),
-)
+            }, nil,
+        ))
 ```
 
 ### Root Map (Map Flow Input)
 
 ```go
 // Process array passed directly as flow input
-flow := catbird.NewFlow("batch-validator",
-    catbird.MapStep[FormData, ValidationResult]("validate", "",  // Empty = map flow input
-        func(ctx context.Context, data FormData) (ValidationResult, error) {
+flow := catbird.NewFlow("batch-validator").
+    AddStep(catbird.NewStep("validate").
+        MapInput().
+        Handler(func(ctx context.Context, all []FormData, data FormData) (ValidationResult, error) {
             errors := validateForm(data)
             return ValidationResult{
                 ID:     data.ID,
                 Valid:  len(errors) == 0,
                 Errors: errors,
             }, nil
-        }),
-)
+        }, nil))
 
 // Run with array input
-results, err := client.RunFlow(ctx, "batch-validator", []FormData{
+handle, err := client.RunFlow(ctx, "batch-validator", []FormData{
     {ID: 1, Name: "Alice", Email: "alice@example.com"},
     {ID: 2, Name: "Bob", Email: "invalid-email"},
-})
+}, nil)
+var results []ValidationResult
+err = handle.WaitForOutput(ctx, &results)
 // results: []ValidationResult{
 //     {ID: 1, Valid: true, Errors: []},
 //     {ID: 2, Valid: false, Errors: ["invalid email"]},
@@ -1350,81 +1339,75 @@ results, err := client.RunFlow(ctx, "batch-validator", []FormData{
 
 ```go
 // Multiple independent maps operating in parallel
-flow := catbird.NewFlow("data-pipeline",
-    catbird.InitialStep("extract",
-        func(ctx context.Context, query string) (DataSet, error) {
+flow := catbird.NewFlow("data-pipeline").
+    AddStep(catbird.NewStep("extract").
+        Handler(func(ctx context.Context, query string) (DataSet, error) {
             return DataSet{
-                Users:   fetchUsers(query),
-                Orders:  fetchOrders(query),
+                Users:    fetchUsers(query),
+                Orders:   fetchOrders(query),
                 Products: fetchProducts(query),
             }, nil
-        }),
-    
-    catbird.StepWithDependency("split_users",
-        catbird.Dependency("extract"),
-        func(ctx context.Context, q string, ds DataSet) ([]User, error) {
+        }, nil)).
+    AddStep(catbird.NewStep("split_users").
+        DependsOn("extract").
+        Handler(func(ctx context.Context, q string, ds DataSet) ([]User, error) {
             return ds.Users, nil
-        }),
-    
-    catbird.StepWithDependency("split_orders",
-        catbird.Dependency("extract"),
-        func(ctx context.Context, q string, ds DataSet) ([]Order, error) {
+        }, nil)).
+    AddStep(catbird.NewStep("split_orders").
+        DependsOn("extract").
+        Handler(func(ctx context.Context, q string, ds DataSet) ([]Order, error) {
             return ds.Orders, nil
-        }),
-    
-    // Two map steps process different arrays in parallel
-    catbird.MapStep("enrich_user", "split_users",
-        func(ctx context.Context, user User) (EnrichedUser, error) {
+        }, nil)).
+    AddStep(catbird.NewStep("enrich_user").
+        DependsOn("split_users").
+        MapEach("split_users").
+        Handler(func(ctx context.Context, q string, user User) (EnrichedUser, error) {
             return enrichUserData(ctx, user)
-        }),
-    
-    catbird.MapStep("enrich_order", "split_orders",
-        func(ctx context.Context, order Order) (EnrichedOrder, error) {
+        }, nil)).
+    AddStep(catbird.NewStep("enrich_order").
+        DependsOn("split_orders").
+        MapEach("split_orders").
+        Handler(func(ctx context.Context, q string, order Order) (EnrichedOrder, error) {
             return enrichOrderData(ctx, order)
-        }),
-    
-    catbird.StepWithDependencies("combine",
-        []catbird.StepDependency{
-            catbird.Dependency("enrich_user"),
-            catbird.Dependency("enrich_order"),
-        },
-        func(ctx context.Context, q string, users []EnrichedUser, orders []EnrichedOrder) (Report, error) {
+        }, nil)).
+    AddStep(catbird.NewStep("combine").
+        DependsOn("enrich_user", "enrich_order").
+        Handler(func(ctx context.Context, q string, users []EnrichedUser, orders []EnrichedOrder) (Report, error) {
             return generateReport(users, orders), nil
-        }),
-)
+        }, nil))
 ```
 
 ### Conditional Map Step
 
 ```go
 // Skip expensive processing for non-premium users
-flow := catbird.NewFlow("order-processor",
-    catbird.InitialStep("get_order",
-        func(ctx context.Context, orderID string) (Order, error) {
+flow := catbird.NewFlow("order-processor").
+    AddStep(catbird.NewStep("get_order").
+        Handler(func(ctx context.Context, orderID string) (Order, error) {
             return db.GetOrder(ctx, orderID)
-        }),
-    
-    catbird.StepWithDependency("get_items",
-        catbird.Dependency("get_order"),
-        func(ctx context.Context, id string, order Order) ([]OrderItem, error) {
+        }, nil)).
+    AddStep(catbird.NewStep("get_items").
+        DependsOn("get_order").
+        Handler(func(ctx context.Context, id string, order Order) ([]OrderItem, error) {
             return order.Items, nil
-        }),
-    
-    catbird.MapStep("apply_premium_discount", "get_items",
-        func(ctx context.Context, item OrderItem) (OrderItem, error) {
+        }, nil)).
+    AddStep(catbird.NewStep("apply_premium_discount").
+        DependsOn("get_items").
+        MapEach("get_items").
+        Condition("get_order.is_premium").
+        Handler(func(ctx context.Context, id string, item OrderItem) (OrderItem, error) {
             item.Price = item.Price * 0.9  // 10% discount
             return item, nil
-        },
-        catbird.WithCondition("get_order.is_premium"),  // Only for premium orders
-    ),
-    
-    catbird.StepWithDependency("finalize",
-        catbird.OptionalDependency("apply_premium_discount"),  // May be skipped
-        func(ctx context.Context, id string, items catbird.Optional[[]OrderItem]) (Invoice, error) {
-            finalItems := items.ValueOr(order.Items)  // Use discounted or original
+        }, nil)).
+    AddStep(catbird.NewStep("finalize").
+        DependsOn("get_order", "apply_premium_discount").
+        Handler(func(ctx context.Context, id string, order Order, items catbird.Optional[[]OrderItem]) (Invoice, error) {
+            finalItems := order.Items
+            if items.IsSet {
+                finalItems = items.Value
+            }
             return generateInvoice(finalItems), nil
-        }),
-)
+        }, nil))
 ```
 
 ## Edge Cases and Error Handling
@@ -1633,7 +1616,7 @@ ORDER BY task_index;
 3. Enhanced `cb_create_flow()` for map metadata
 4. Enhanced `cb_start_steps()` for task spawning
 5. New functions: `cb_read_map_tasks()`, `cb_complete_map_task()`, `cb_fail_map_task()`
-6. Go API: `MapStep()` constructor
+6. Go API: `NewStep(...)` plus `MapEach(...)` / `MapInput()` markers
 7. Worker: `mapTaskWorker` implementation
 8. Tests: Basic map step flow execution
 9. Documentation: README examples
@@ -1686,43 +1669,54 @@ ORDER BY task_index;
 ```go
 // Test map step creation
 func TestMapStepCreation(t *testing.T) {
-    flow := catbird.NewFlow("test",
-        catbird.MapStep("process", "fetch",
-            func(ctx context.Context, x int) (int, error) {
+    client := getTestClient(t)
+
+    flow := catbird.NewFlow("test").
+        AddStep(catbird.NewStep("fetch").
+            Handler(func(ctx context.Context, _ int) ([]int, error) {
+                return []int{1, 2, 3}, nil
+            }, nil)).
+        AddStep(catbird.NewStep("process").
+            DependsOn("fetch").
+            MapEach("fetch").
+            Handler(func(ctx context.Context, _ int, x int) (int, error) {
                 return x * 2, nil
-            },
-        ),
-    )
-    
-    require.Len(t, flow.Steps, 1)
-    require.True(t, flow.Steps[0].IsMapStep)
+            }, nil))
+
+    require.NoError(t, catbird.CreateFlow(t.Context(), client.Conn, flow))
 }
 
 // Test task spawning
 func TestTaskSpawning(t *testing.T) {
     client := getTestClient(t)
-    
-    flow := catbird.NewFlow("spawn-test",
-        catbird.InitialStep("fetch", func(ctx context.Context, _ int) ([]int, error) {
-            return []int{1, 2, 3}, nil
-        }),
-        catbird.MapStep("process", "fetch", func(ctx context.Context, x int) (int, error) {
-            return x * 2, nil
-        }),
-    )
-    
-    client.RegisterFlow(flow)
-    handle, err := client.RunFlow(ctx, "spawn-test", 0)
+
+    flow := catbird.NewFlow("spawn-test").
+        AddStep(catbird.NewStep("fetch").
+            Handler(func(ctx context.Context, _ int) ([]int, error) {
+                return []int{1, 2, 3}, nil
+            }, nil)).
+        AddStep(catbird.NewStep("process").
+            DependsOn("fetch").
+            MapEach("fetch").
+            Handler(func(ctx context.Context, _ int, x int) (int, error) {
+                return x * 2, nil
+            }, nil))
+
+    require.NoError(t, client.CreateFlow(t.Context(), flow))
+    worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+    go worker.Start(t.Context())
+
+    handle, err := client.RunFlow(t.Context(), "spawn-test", 0, nil)
     require.NoError(t, err)
-    
+
     // Wait briefly for fetch to complete and tasks to spawn
     time.Sleep(100 * time.Millisecond)
-    
+
     // Verify tasks created
     var count int
-    err = client.conn.QueryRow(ctx, 
+    err = client.Conn.QueryRow(t.Context(),
         "SELECT count(*) FROM cb_t_spawn_test WHERE flow_run_id = $1",
-        handle.FlowRunID).Scan(&count)
+        handle.ID).Scan(&count)
     require.NoError(t, err)
     require.Equal(t, 3, count)
 }
@@ -1730,48 +1724,57 @@ func TestTaskSpawning(t *testing.T) {
 // Test empty array
 func TestEmptyArray(t *testing.T) {
     client := getTestClient(t)
-    
-    flow := catbird.NewFlow("empty-test",
-        catbird.InitialStep("fetch", func(ctx context.Context, _ int) ([]int, error) {
-            return []int{}, nil
-        }),
-        catbird.MapStep("process", "fetch", func(ctx context.Context, x int) (int, error) {
-            return x * 2, nil
-        }),
-    )
-    
-    client.RegisterFlow(flow)
-    handle, err := client.RunFlow(ctx, "empty-test", 0)
+
+    flow := catbird.NewFlow("empty-test").
+        AddStep(catbird.NewStep("fetch").
+            Handler(func(ctx context.Context, _ int) ([]int, error) {
+                return []int{}, nil
+            }, nil)).
+        AddStep(catbird.NewStep("process").
+            DependsOn("fetch").
+            MapEach("fetch").
+            Handler(func(ctx context.Context, _ int, x int) (int, error) {
+                return x * 2, nil
+            }, nil))
+
+    require.NoError(t, client.CreateFlow(t.Context(), flow))
+    worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+    go worker.Start(t.Context())
+
+    handle, err := client.RunFlow(t.Context(), "empty-test", 0, nil)
     require.NoError(t, err)
-    
-    output, err := handle.WaitForOutput(ctx)
+
+    var output []int
+    err = handle.WaitForOutput(t.Context(), &output)
     require.NoError(t, err)
-    
-    // Map step should output empty array
-    require.Equal(t, map[string]any{
-        "fetch": []any{},
-        "process": []any{},
-    }, output)
+    require.Len(t, output, 0)
 }
 
 // Test type mismatch
 func TestTypeMismatch(t *testing.T) {
     client := getTestClient(t)
-    
-    flow := catbird.NewFlow("mismatch-test",
-        catbird.InitialStep("fetch", func(ctx context.Context, _ int) (string, error) {
-            return "not an array", nil  // Bug: should return []
-        }),
-        catbird.MapStep("process", "fetch", func(ctx context.Context, x int) (int, error) {
-            return x * 2, nil
-        }),
-    )
-    
-    client.RegisterFlow(flow)
-    handle, err := client.RunFlow(ctx, "mismatch-test", 0)
+
+    flow := catbird.NewFlow("mismatch-test").
+        AddStep(catbird.NewStep("fetch").
+            Handler(func(ctx context.Context, _ int) (string, error) {
+                return "not an array", nil  // Bug: should return []
+            }, nil)).
+        AddStep(catbird.NewStep("process").
+            DependsOn("fetch").
+            MapEach("fetch").
+            Handler(func(ctx context.Context, _ int, x int) (int, error) {
+                return x * 2, nil
+            }, nil))
+
+    require.NoError(t, client.CreateFlow(t.Context(), flow))
+    worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+    go worker.Start(t.Context())
+
+    handle, err := client.RunFlow(t.Context(), "mismatch-test", 0, nil)
     require.NoError(t, err)
-    
-    _, err = handle.WaitForOutput(ctx)
+
+    var output []int
+    err = handle.WaitForOutput(t.Context(), &output)
     require.Error(t, err)
     require.Contains(t, err.Error(), "expected array")
 }
@@ -1783,74 +1786,77 @@ func TestTypeMismatch(t *testing.T) {
 // Test full map step execution
 func TestMapStepExecution(t *testing.T) {
     client := getTestClient(t)
-    
-    flow := catbird.NewFlow("map-exec-test",
-        catbird.InitialStep("numbers", func(ctx context.Context, _ int) ([]int, error) {
-            return []int{1, 2, 3, 4, 5}, nil
-        }),
-        catbird.MapStep("double", "numbers", func(ctx context.Context, x int) (int, error) {
-            return x * 2, nil
-        }),
-    )
-    
-    client.RegisterFlow(flow)
-    
-    worker := catbird.NewWorker(ctx, client.conn,
-        catbird.WithFlow(flow),
-    )
-    
-    go worker.Start(ctx)
-    defer worker.Shutdown(ctx)
-    
-    handle, err := client.RunFlow(ctx, "map-exec-test", 0)
+
+    flow := catbird.NewFlow("map-exec-test").
+        AddStep(catbird.NewStep("numbers").
+            Handler(func(ctx context.Context, _ int) ([]int, error) {
+                return []int{1, 2, 3, 4, 5}, nil
+            }, nil)).
+        AddStep(catbird.NewStep("double").
+            DependsOn("numbers").
+            MapEach("numbers").
+            Handler(func(ctx context.Context, _ int, x int) (int, error) {
+                return x * 2, nil
+            }, nil))
+
+    require.NoError(t, client.CreateFlow(t.Context(), flow))
+
+    worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+    go worker.Start(t.Context())
+
+    handle, err := client.RunFlow(t.Context(), "map-exec-test", 0, nil)
     require.NoError(t, err)
-    
-    output, err := handle.WaitForOutput(ctx)
+
+    var output []int
+    err = handle.WaitForOutput(t.Context(), &output)
     require.NoError(t, err)
-    
-    require.Equal(t, []any{2.0, 4.0, 6.0, 8.0, 10.0}, output["double"])
+
+    require.Equal(t, []int{2, 4, 6, 8, 10}, output)
 }
 
 // Test task retry on failure
 func TestTaskRetry(t *testing.T) {
     client := getTestClient(t)
-    
+
     attempts := make(map[int]int)
     var mu sync.Mutex
-    
-    flow := catbird.NewFlow("retry-test",
-        catbird.InitialStep("numbers", func(ctx context.Context, _ int) ([]int, error) {
-            return []int{1, 2, 3}, nil
-        }),
-        catbird.MapStep("flaky", "numbers", func(ctx context.Context, x int) (int, error) {
-            mu.Lock()
-            attempts[x]++
-            attempt := attempts[x]
-            mu.Unlock()
-            
-            if x == 2 && attempt < 3 {
-                return 0, fmt.Errorf("simulated error")
-            }
-            
-            return x * 10, nil
-        },
-        catbird.WithMaxRetries(3),
-        catbird.WithBackoff(10*time.Millisecond, 100*time.Millisecond),
-        ),
-    )
-    
-    client.RegisterFlow(flow)
-    worker := catbird.NewWorker(ctx, client.conn, catbird.WithFlow(flow))
-    go worker.Start(ctx)
-    defer worker.Shutdown(ctx)
-    
-    handle, err := client.RunFlow(ctx, "retry-test", 0)
+
+    flow := catbird.NewFlow("retry-test").
+        AddStep(catbird.NewStep("numbers").
+            Handler(func(ctx context.Context, _ int) ([]int, error) {
+                return []int{1, 2, 3}, nil
+            }, nil)).
+        AddStep(catbird.NewStep("flaky").
+            DependsOn("numbers").
+            MapEach("numbers").
+            Handler(func(ctx context.Context, _ int, x int) (int, error) {
+                mu.Lock()
+                attempts[x]++
+                attempt := attempts[x]
+                mu.Unlock()
+
+                if x == 2 && attempt < 3 {
+                    return 0, fmt.Errorf("simulated error")
+                }
+
+                return x * 10, nil
+            }, &catbird.HandlerOpts{
+                MaxRetries: 3,
+                Backoff:    catbird.NewFullJitterBackoff(10*time.Millisecond, 100*time.Millisecond),
+            }))
+
+    require.NoError(t, client.CreateFlow(t.Context(), flow))
+    worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+    go worker.Start(t.Context())
+
+    handle, err := client.RunFlow(t.Context(), "retry-test", 0, nil)
     require.NoError(t, err)
-    
-    output, err := handle.WaitForOutput(ctx)
+
+    var output []int
+    err = handle.WaitForOutput(t.Context(), &output)
     require.NoError(t, err)
-    
-    require.Equal(t, []any{10.0, 20.0, 30.0}, output["flaky"])
+
+    require.Equal(t, []int{10, 20, 30}, output)
     require.Equal(t, 1, attempts[1])
     require.Equal(t, 3, attempts[2])  // Failed twice, succeeded third time
     require.Equal(t, 1, attempts[3])
@@ -1864,12 +1870,13 @@ func TestTaskRetry(t *testing.T) {
 Support maps of maps for 2D array processing:
 
 ```go
-catbird.MapStep("process_batch", "batches",
-    func(ctx context.Context, batch []Item) ([]Result, error) {
+catbird.NewStep("process_batch").
+    DependsOn("batches").
+    MapEach("batches").
+    Handler(func(ctx context.Context, _ any, batch []Item) ([]Result, error) {
         // Inner map: process each item in batch
         return catbird.MapInHandler(ctx, batch, processItem)
-    },
-)
+    }, nil)
 ```
 
 **Challenge**: Maintaining order across nested levels
@@ -1879,12 +1886,13 @@ catbird.MapStep("process_batch", "batches",
 Expose partial results as tasks complete:
 
 ```go
-catbird.MapStep("process", "fetch",
-    func(...) {...},
-    catbird.WithProgressCallback(func(completed, total int, latestResult Result) {
+catbird.NewStep("process").
+    DependsOn("fetch").
+    MapEach("fetch").
+    Handler(func(...) {...}, nil).
+    WithProgressCallback(func(completed, total int, latestResult Result) {
         updateProgressBar(completed, total)
-    }),
-)
+    })
 ```
 
 **Challenge**: Maintaining transaction semantics while streaming
@@ -1894,12 +1902,13 @@ catbird.MapStep("process", "fetch",
 Allow user-defined reduce functions:
 
 ```go
-catbird.MapStepWithReducer("process", "fetch",
-    func(ctx context.Context, item Item) (Result, error) {...},
-    func(results []Result) (Summary, error) {
+catbird.NewStep("process").
+    DependsOn("fetch").
+    MapEach("fetch").
+    Handler(func(ctx context.Context, _ any, item Item) (Result, error) {...}, nil).
+    ReduceWith(func(results []Result) (Summary, error) {
         return Summary{Max: maxBy(results, r => r.Score)}, nil
-    },
-)
+    })
 ```
 
 **Challenge**: Executing Go code in SQL context
@@ -1909,12 +1918,13 @@ catbird.MapStepWithReducer("process", "fetch",
 Process certain tasks before others:
 
 ```go
-catbird.MapStep("process", "fetch",
-    func(...) {...},
-    catbird.WithPriority(func(item Item) int {
+catbird.NewStep("process").
+    DependsOn("fetch").
+    MapEach("fetch").
+    Handler(func(...) {...}, nil).
+    WithPriority(func(item Item) int {
         return item.Urgency  // Higher urgency tasks polled first
-    }),
-)
+    })
 ```
 
 **Challenge**: Ordering in SQL `WHERE deliver_at <= now() ORDER BY priority`
