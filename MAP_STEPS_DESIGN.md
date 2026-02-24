@@ -1,6 +1,6 @@
 # Map Steps Design Document
 
-> **Updated**: Map steps use the **reflection-based builder pattern** from [REFLECTION_API_DESIGN.md](REFLECTION_API_DESIGN.md). Dependencies are declared with `DependsOn(...string)`. Map steps are detected explicitly via proposal markers (e.g., `MapEach(...)`/`MapInput()`), not by `Dep[T]`.
+> **Updated**: Map steps use the **reflection-based builder pattern** from [REFLECTION_API_DESIGN.md](REFLECTION_API_DESIGN.md). Dependencies are declared with `DependsOn(...string)`. Map steps are detected explicitly via proposal markers (e.g., `MapEach(...)`/`Map()`), not by `Dep[T]`.
 
 ## Overview
 
@@ -109,7 +109,7 @@ Map steps enable:
 
 ### Component Overview
 
-1. **Go API**: Type-safe flow definition with `NewStep(...)` plus map markers (`MapEach(...)` / `MapInput()`)
+1. **Go API**: Type-safe flow definition with `NewStep(...)` plus map markers (`MapEach(...)` / `Map()`)
 2. **PostgreSQL Schema**: Dedicated tables for map metadata and task runs
 3. **SQL Functions**: Task spawning, polling, completion, and aggregation
 4. **Worker**: Task polling loop and execution (similar to step worker)
@@ -805,7 +805,7 @@ Map steps use the same **reflection-based builder pattern** as all flow steps (f
 
 // Simple map step (no dependencies - operate on flow input array)
 mapStep1 := catbird.NewStep("process-items").
-    MapInput().
+    Map().
     Handler(
         func(
             ctx context.Context,
@@ -880,8 +880,8 @@ step := NewStep("process").
 These are proposal-only helpers to support map-step behavior while keeping the current builder style:
 
 - `MapEach(sourceStep string)`: mark a step as a map step and declare which dependency provides the array.
-- `MapInput()`: mark a step as mapping directly over the flow input array.
-- `ReduceWith(fn)`: optional reducer to transform the aggregated `[]Out` into a different final output.
+- `Map()`: mark a step as mapping directly over the flow input array.
+- `Reduce(fn)`: optional reducer to transform the aggregated `[]Out` into a different final output.
 - `WithPriority(fn)`: optional per-item priority hook for polling order.
 - `WithProgressCallback(fn)`: optional progress hook for UI/telemetry.
 
@@ -1312,7 +1312,7 @@ flow := catbird.NewFlow("email-campaign").
 // Process array passed directly as flow input
 flow := catbird.NewFlow("batch-validator").
     AddStep(catbird.NewStep("validate").
-        MapInput().
+        Map().
         Handler(func(ctx context.Context, all []FormData, data FormData) (ValidationResult, error) {
             errors := validateForm(data)
             return ValidationResult{
@@ -1616,7 +1616,7 @@ ORDER BY task_index;
 3. Enhanced `cb_create_flow()` for map metadata
 4. Enhanced `cb_start_steps()` for task spawning
 5. New functions: `cb_read_map_tasks()`, `cb_complete_map_task()`, `cb_fail_map_task()`
-6. Go API: `NewStep(...)` plus `MapEach(...)` / `MapInput()` markers
+6. Go API: `NewStep(...)` plus `MapEach(...)` / `Map()` markers
 7. Worker: `mapTaskWorker` implementation
 8. Tests: Basic map step flow execution
 9. Documentation: README examples
@@ -1906,7 +1906,7 @@ catbird.NewStep("process").
     DependsOn("fetch").
     MapEach("fetch").
     Handler(func(ctx context.Context, _ any, item Item) (Result, error) {...}, nil).
-    ReduceWith(func(results []Result) (Summary, error) {
+    Reduce(func(results []Result) (Summary, error) {
         return Summary{Max: maxBy(results, r => r.Score)}, nil
     })
 ```
