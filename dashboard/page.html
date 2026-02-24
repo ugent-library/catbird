@@ -50,8 +50,18 @@
               </button>
             </li>
             <li class="nav-item">
+              <button class="nav-link" hx-get="{{ route `task-schedules` }}" hx-target="main" hx-push-url="true">
+                Task Schedules
+              </button>
+            </li>
+            <li class="nav-item">
               <button class="nav-link" hx-get="{{ route `flows` }}" hx-target="main" hx-push-url="true">
                 Flows
+              </button>
+            </li>
+            <li class="nav-item">
+              <button class="nav-link" hx-get="{{ route `flow-schedules` }}" hx-target="main" hx-push-url="true">
+                Flow Schedules
               </button>
             </li>
             <li class="nav-item">

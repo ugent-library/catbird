@@ -20,15 +20,17 @@ import (
 var templatesFS embed.FS
 
 type App struct {
-	client  *catbird.Client
-	logger  *slog.Logger
-	index   *template.Template
-	queues  *template.Template
-	tasks   *template.Template
-	task    *template.Template
-	flows   *template.Template
-	flow    *template.Template
-	workers *template.Template
+	client        *catbird.Client
+	logger        *slog.Logger
+	index         *template.Template
+	queues        *template.Template
+	tasks         *template.Template
+	task          *template.Template
+	taskSchedules *template.Template
+	flows         *template.Template
+	flow          *template.Template
+	flowSchedules *template.Template
+	workers       *template.Template
 }
 
 // Config configures the dashboard web application.
@@ -78,15 +80,17 @@ func New(config Config) *App {
 	}
 
 	return &App{
-		client:  config.Client,
-		logger:  config.Log,
-		index:   template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "index.html")),
-		queues:  template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "queues.html")),
-		tasks:   template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "tasks.html")),
-		task:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "task.html", "task_runs.html")),
-		flows:   template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flows.html")),
-		flow:    template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flow.html", "flow_runs.html")),
-		workers: template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "workers.html")),
+		client:        config.Client,
+		logger:        config.Log,
+		index:         template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "index.html")),
+		queues:        template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "queues.html")),
+		tasks:         template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "tasks.html")),
+		task:          template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "task.html", "task_runs.html")),
+		taskSchedules: template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "task_schedules.html")),
+		flows:         template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flows.html")),
+		flow:          template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flow.html", "flow_runs.html")),
+		flowSchedules: template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "flow_schedules.html")),
+		workers:       template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "workers.html")),
 	}
 }
 
@@ -105,11 +109,15 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /task/{task_name}/runs", a.handleTaskRuns)
 	mux.HandleFunc("GET /task/{task_name}/form", a.handleTaskStartRunForm)
 	mux.HandleFunc("POST /task/{task_name}/run", a.handleStartTaskRun)
+	mux.HandleFunc("GET /task-schedules", a.handleTaskSchedules)
+	mux.HandleFunc("GET /task-schedules/table", a.handleTaskSchedulesTable)
 	mux.HandleFunc("GET /flows", a.handleFlows)
 	mux.HandleFunc("GET /flow/{flow_name}", a.handleFlow)
 	mux.HandleFunc("GET /flow/{flow_name}/runs", a.handleFlowRuns)
 	mux.HandleFunc("GET /flow/{flow_name}/form", a.handleFlowStartRunForm)
 	mux.HandleFunc("POST /flow/{flow_name}/run", a.handleStartFlowRun)
+	mux.HandleFunc("GET /flow-schedules", a.handleFlowSchedules)
+	mux.HandleFunc("GET /flow-schedules/table", a.handleFlowSchedulesTable)
 	mux.HandleFunc("GET /workers", a.handleWorkers)
 	mux.HandleFunc("GET /workers/table", a.handleWorkersTable)
 	mux.HandleFunc("GET /dark.css", func(w http.ResponseWriter, r *http.Request) {
@@ -553,4 +561,64 @@ func (a *App) handleStartFlowRun(w http.ResponseWriter, r *http.Request) {
 
 	// Return success message - table will auto-refresh
 	a.flow.ExecuteTemplate(w, "start_flow_run_success", nil)
+}
+
+func (a *App) handleTaskSchedules(w http.ResponseWriter, r *http.Request) {
+	schedules, err := a.client.ListTaskSchedules(r.Context())
+	if err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
+	a.render(w, r, a.taskSchedules, struct {
+		TaskSchedules []*catbird.TaskScheduleInfo
+	}{
+		TaskSchedules: schedules,
+	})
+}
+
+func (a *App) handleTaskSchedulesTable(w http.ResponseWriter, r *http.Request) {
+	schedules, err := a.client.ListTaskSchedules(r.Context())
+	if err != nil {
+		a.logger.Error("failed to list task schedules", "error", err)
+		return
+	}
+
+	if err := a.taskSchedules.ExecuteTemplate(w, "task_schedules_table", struct {
+		TaskSchedules []*catbird.TaskScheduleInfo
+	}{
+		TaskSchedules: schedules,
+	}); err != nil {
+		a.logger.Error("template execution error", "error", err)
+	}
+}
+
+func (a *App) handleFlowSchedules(w http.ResponseWriter, r *http.Request) {
+	schedules, err := a.client.ListFlowSchedules(r.Context())
+	if err != nil {
+		a.handleError(w, r, err)
+		return
+	}
+
+	a.render(w, r, a.flowSchedules, struct {
+		FlowSchedules []*catbird.FlowScheduleInfo
+	}{
+		FlowSchedules: schedules,
+	})
+}
+
+func (a *App) handleFlowSchedulesTable(w http.ResponseWriter, r *http.Request) {
+	schedules, err := a.client.ListFlowSchedules(r.Context())
+	if err != nil {
+		a.logger.Error("failed to list flow schedules", "error", err)
+		return
+	}
+
+	if err := a.flowSchedules.ExecuteTemplate(w, "flow_schedules_table", struct {
+		FlowSchedules []*catbird.FlowScheduleInfo
+	}{
+		FlowSchedules: schedules,
+	}); err != nil {
+		a.logger.Error("template execution error", "error", err)
+	}
 }

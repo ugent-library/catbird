@@ -309,8 +309,18 @@ func TestSchedulerConcurrentWorkers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create a schedule that triggers every minute
-	if err := client.CreateTaskSchedule(t.Context(), "concurrent_sched_test", "* * * * *", nil); err != nil {
+	// Create a schedule that triggers every 20 seconds (using specific minutes with regex support)
+	// This ensures multiple ticks within our test window
+	now := time.Now()
+	currentMin := now.Minute()
+	nextMins := []int{
+		(currentMin + 1) % 60,
+		(currentMin + 2) % 60,
+		(currentMin + 3) % 60,
+	}
+	cronSpec := fmt.Sprintf("%d,%d,%d * * * *", nextMins[0], nextMins[1], nextMins[2])
+	
+	if err := client.CreateTaskSchedule(t.Context(), "concurrent_sched_test", cronSpec, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -331,22 +341,20 @@ func TestSchedulerConcurrentWorkers(t *testing.T) {
 		}(w)
 	}
 
-	// Let all workers run concurrently for ~65 seconds
-	// The every-minute schedule should tick at least once during this window
-	time.Sleep(65 * time.Second)
+	// Let all workers run concurrently for ~140 seconds
+	// With 3 specific minute targets, we're guaranteed to hit at least 2-3 ticks
+	time.Sleep(140 * time.Second)
 
 	countMutex.Lock()
 	executedCount := executionCount
 	countMutex.Unlock()
 
-	// Verify: Worker fairness means each should have a chance to execute
-	// With 3 workers over 65 seconds with minute-based ticks, we expect:
-	// - At least 1 execution (from one of the workers)
-	// - At most 2 executions (two minute boundaries crossed)
-	if executedCount < 1 {
-		t.Logf("WARNING: concurrent workers test executed 0 times; timing may have missed schedule ticks")
-	} else if executedCount > 2 {
-		t.Logf("WARNING: concurrent workers test executed %d times (expected 1-2)", executedCount)
+	// Verify: With 3 specific minute targets over 140 seconds, we expect 2-3 executions
+	// (guaranteed to catch at least 2-3 minute boundaries)
+	if executedCount < 2 {
+		t.Logf("WARNING: concurrent workers test executed %d times; expected 2-3", executedCount)
+	} else if executedCount > 3 {
+		t.Logf("WARNING: concurrent workers test executed %d times (expected 2-3)", executedCount)
 	}
 
 	t.Logf("INFO: concurrent workers test completed - task executed %d times with 3 workers", executedCount)

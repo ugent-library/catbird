@@ -1,0 +1,40 @@
+{{ define "content" }}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+  <h1>Flow Schedules</h1>
+</div>
+
+<div id="flow-schedules-table" hx-get="/flow-schedules/table" hx-trigger="every 2s" hx-swap="outerHTML">
+  {{ template "flow_schedules_table" . }}
+</div>
+{{ end }}
+
+{{ define "flow_schedules_table" }}
+<div id="flow-schedules-table" hx-get="/flow-schedules/table" hx-trigger="every 2s" hx-swap="outerHTML">
+<table class="table">
+  <tbody>
+    <tr>
+      <th scope="col">Flow Name</th>
+      <th scope="col">Cron Spec</th>
+      <th scope="col">Next Run</th>
+      <th scope="col">Last Run</th>
+      <th scope="col">Enabled</th>
+      <th scope="col">Created</th>
+    </tr>
+    {{ range .FlowSchedules }}
+    <tr>
+      <td><code>{{ .FlowName }}</code></td>
+      <td><code>{{ .CronSpec }}</code></td>
+      <td>{{ formatTime .NextRunAt }}</td>
+      <td>{{ formatTime .LastRunAt }}</td>
+      <td>
+        <span class="badge bg-{{ if .Enabled }}success{{ else }}secondary{{ end }}">
+          {{ if .Enabled }}Enabled{{ else }}Disabled{{ end }}
+        </span>
+      </td>
+      <td>{{ formatTime .CreatedAt }}</td>
+    </tr>
+    {{ end }}
+  </tbody>
+</table>
+</div>
+{{ end }}
