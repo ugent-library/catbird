@@ -146,8 +146,8 @@ Wildcard rules:
 # Task Execution
 
 ```go
+// Define task (scheduling is separate)
 task := catbird.NewTask("send-email").
-    Schedule("@hourly", nil).
     Handler(func(ctx context.Context, input EmailRequest) (EmailResponse, error) {
         return EmailResponse{SentAt: time.Now()}, nil
     }, &catbird.HandlerOpts{
@@ -157,13 +157,13 @@ task := catbird.NewTask("send-email").
         CircuitBreaker: catbird.NewCircuitBreaker(5, 30*time.Second),
     })
 
-dynamicScheduledTask := catbird.NewTask("send-report").
-    Schedule("@hourly", &catbird.ScheduleOpts{Input: func(ctx context.Context) (any, error) {
-        return EmailRequest{To: "ops@example.com", Subject: "Hourly report"}, nil
-    }}).
-    Handler(func(ctx context.Context, input EmailRequest) (EmailResponse, error) {
-        return EmailResponse{SentAt: time.Now()}, nil
-    }, nil)
+// Create a schedule for the task (optional; can run manually via RunTask)
+client.CreateTaskSchedule(ctx, "send-email", "@hourly", nil)
+
+// Or with static input
+client.CreateTaskSchedule(ctx, "send-report", "@hourly", &catbird.ScheduleOpts{
+    Input: EmailRequest{To: "ops@example.com", Subject: "Hourly report"},
+})
 
 // Define a task with a condition (skipped when condition is false)
 conditionalTask := catbird.NewTask("premium-processing").
