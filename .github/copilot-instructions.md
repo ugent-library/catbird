@@ -31,14 +31,18 @@ Catbird is a PostgreSQL-based message queue with task and workflow execution eng
 ## Database Schema
 
 All schema is version-controlled in `migrations/` (goose-managed):
-- **Queues** (v1): `cb_queues` table (name PK, expires_at) + `cb_bindings` table (queue_name FK, pattern, pattern_type, prefix, regex) + message functions; custom types `cb_message` (7 fields including id, topic, payload). Bindings use exact match fast path (indexed) or wildcard (prefix filter + regex).
-- **Tasks/Flows** (v2): Task definitions, runs, flows; custom types `cb_task_claim`, `cb_step_claim`; `cb_create_flow()` handles step dependencies; `cb_start_steps()` uses LOOP for cascading dependency resolution
-- **GC** (v3): Garbage collection routines (`cb_gc()` deletes queues with `expires_at <= now()` and removes workers with stale heartbeats > 5 minutes old)
-- **Conditions** (v4): Conditional branching support with `cb_parse_condition()`, `cb_evaluate_condition()`/`cb_evaluate_condition_expr()`, and condition columns on `cb_step_dependencies`
-- **Conditions Integration** (v5): Modified `cb_create_flow()` to handle ConditionalDependency JSON and populate condition columns
-- **Conditions Validation** (v6): Added `cb_check_reconvergence()` for validating flow structure and enforcing no-reconvergence rule
+- **Queues Schema** (v1): `cb_queues` table (name PK, expires_at) + `cb_bindings` table (queue_name FK, pattern, pattern_type, prefix, regex); custom types `cb_message` (7 fields including id, topic, payload). Bindings use exact match fast path (indexed) or wildcard (prefix filter + regex). Also includes `cb_table_name()` function.
+- **Queues Functions** (v2): Message operations (`cb_create_queue`, `cb_delete_queue`, `cb_send`, `cb_read`, `cb_read_poll`, `cb_publish`), binding management (`cb_bind`, `cb_unbind`), message control (`cb_hide`, `cb_delete`)
+- **Condition Functions** (v3): Condition system (`cb_parse_condition`, `cb_parse_condition_value`, `cb_evaluate_condition`, `cb_get_jsonb_field`, `cb_evaluate_condition_expr`) for task/step conditional execution
+- **Tasks Schema** (v4): `cb_task_claim` type, `cb_tasks` table
+- **Flows Schema** (v5): `cb_step_claim` type, `cb_flows`, `cb_steps`, `cb_step_dependencies` tables; `cb_flow_info` view
+- **Tasks Functions** (v6): Task operations (`cb_create_task`, `cb_run_task`, `cb_poll_tasks`, `cb_hide_tasks`, `cb_complete_task`, `cb_fail_task`, `cb_delete_task`)
+- **Flows Functions** (v7): Flow operations (`cb_create_flow`, `cb_run_flow`, `cb_start_steps`, `cb_poll_steps`, `cb_hide_steps`, `cb_complete_step`, `cb_fail_step`, `cb_signal_flow`, `cb_delete_flow`)
+- **GC** (v8): Garbage collection (`cb_gc`) for stale workers and expired queues
+- **Workers Schema** (v9): `cb_workers` table + `cb_task_handlers` and `cb_step_handlers` tables (worker-to-task and worker-to-step mappings; depends on workers/tasks/flows)
+- **Workers Functions** (v10): Worker management (`cb_worker_started`, `cb_worker_heartbeat`) and `cb_worker_info` view
 
-Key: Migrations use goose with `DisableVersioning` + embedded FS. Current schema version = 3.
+Key: Migrations use goose with `DisableVersioning` + embedded FS. Current schema version = 10.
 
 **Table Name Construction**:
 All runtime tables (messages, task runs, flow runs, step runs) are created dynamically using the `cb_table_name(name, prefix)` function:
@@ -164,7 +168,7 @@ NewFlow("workflow").
 - **Conn interface**: Abstracts pgx; accepts `*pgxpool.Pool`, `*pgx.Conn` or `pgx.Tx`
 - **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `WorkerOpts.Logger` field
 - **Scheduled tasks/flows**: Use robfig/cron syntax via `.Schedule("@hourly", nil)` builder method on task/flow before adding to worker. Optional second parameter allows dynamic input generation at execution time. Example: `task := NewTask("t").Schedule("@hourly", func(ctx context.Context) (any, error) { return InputType{...}, nil })` then `worker.AddTask(task)`.
-- **Automatic garbage collection**: All workers automatically run GC every 5 minutes (cleans up expired queues and stale worker heartbeats); no configuration needed
+- **Automatic garbage collection**: Worker heartbeats (every 10 seconds) opportunistically clean up stale workers and expired queues; no configuration needed. Manual cleanup available via `client.GC(ctx)` for deployments without workers.
 - **Deduplication strategies**: Two strategies available:
   - **ConcurrencyKey**: Prevents concurrent/overlapping runs (deduplicates `queued`/`started` status). After completion or failure, same key can be used again.
   - **IdempotencyKey**: Ensures exactly-once execution (deduplicates `queued`/`started`/`completed` status). After successful completion, same key permanently rejected.

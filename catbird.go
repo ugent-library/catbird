@@ -48,7 +48,9 @@ type Conn interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-// GC runs garbage collection to clean up expired and deleted entries.
+// GC runs garbage collection to clean up expired queues and stale workers.
+// Note: Worker heartbeats automatically perform cleanup, so this is mainly
+// useful for deployments without workers or for manual control.
 func GC(ctx context.Context, conn Conn) error {
 	q := `SELECT cb_gc();`
 	_, err := conn.Exec(ctx, q)

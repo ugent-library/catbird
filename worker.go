@@ -132,16 +132,6 @@ func (w *Worker) AddFlow(f *Flow) *Worker {
 //     the handler context is cancelled immediately once ctx is cancelled and
 //     Start returns after all goroutines finish
 func (w *Worker) Start(ctx context.Context) error {
-	// Register built-in garbage collection task (automatic, runs every 5 minutes)
-	gcTask := NewTask("gc").Handler(func(ctx context.Context, in struct{}) (struct{}, error) {
-		return struct{}{}, GC(ctx, w.conn)
-	}, nil)
-	w.tasks = append(w.tasks, gcTask)
-	if w.scheduler == nil {
-		w.scheduler = NewScheduler(w.conn, w.logger)
-	}
-	w.scheduler.AddTask("gc", "@every 5m", nil)
-
 	// Validate HandlerOpts for all tasks
 	for _, t := range w.tasks {
 		if t.handlerOpts != nil {

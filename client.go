@@ -180,7 +180,9 @@ func (c *Client) ListWorkers(ctx context.Context) ([]*WorkerInfo, error) {
 	return ListWorkers(ctx, c.Conn)
 }
 
-// GC runs garbage collection to clean up expired and deleted entries.
+// GC runs garbage collection to clean up expired queues and stale workers.
+// Note: Worker heartbeats automatically perform cleanup, so this is mainly
+// useful for deployments without workers or for manual control.
 func (c *Client) GC(ctx context.Context) error {
 	return GC(ctx, c.Conn)
 }

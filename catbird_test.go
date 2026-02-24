@@ -69,10 +69,8 @@ const testDSN = "postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disa
 func verifyMigrationsApplied(ctx context.Context, db *sql.DB) error {
 	// Check for functions that should exist at different schema versions
 	requiredFunctions := map[int][]string{
-		1: {"cb_create_queue", "cb_send", "cb_read"},
-		2: {"cb_create_task", "cb_run_task", "cb_create_flow"},
-		3: {"cb_gc"},
-		4: {"cb_parse_condition", "cb_evaluate_condition", "cb_evaluate_condition_expr"},
+		2:  {"cb_create_queue", "cb_send", "cb_read"},
+		10: {"cb_create_task", "cb_run_task", "cb_create_flow", "cb_gc", "cb_parse_condition", "cb_evaluate_condition"},
 	}
 
 	for version, functions := range requiredFunctions {
