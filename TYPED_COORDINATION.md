@@ -1,12 +1,6 @@
 # Strong Typing for Coordination: StepContext & Advanced Patterns
 
 > **Status**: Conceptual exploration of advanced coordination patterns (dynamic task spawning, pools, producers)
-> 
-> **API Compatibility**: This document's patterns work with **both** API designs:
-> - **Typed Generics API** ([TYPED_GENERICS_API_DESIGN.md](TYPED_GENERICS_API_DESIGN.md)) - Recommended, validated
-> - **Reflection API** ([REFLECTION_API_DESIGN.md](REFLECTION_API_DESIGN.md)) - Alternative design
-> 
-> The key concepts (StepContext, task pools, dynamic spawning) are API-agnostic.
 
 This document explores advanced coordination patterns for flow steps that need side effects beyond simple data transformation:
 - **Dynamic task spawning**: Steps that create tasks during execution
@@ -16,52 +10,28 @@ This document explores advanced coordination patterns for flow steps that need s
 
 ## Core Insight: Dependencies as Parameters, Side Effects via StepContext
 
-**Dependencies** are injected as **function parameters** (type-checked at build time):
+**Dependencies** are injected as **function parameters** (type-checked at build time via reflection):
 
 ```go
-// Typed Generics API
-Step("process", 
-    Dependency("validate"),
-    func(ctx context.Context, in Input, validation ValidationResult) (Output, error) {
-        // validation parameter is type-checked at build time
-        return processWithDependencies(validation), nil
-    })
-
-// Reflection API (alternative)
 NewStep("process").
     DependsOn(Dep[ValidationResult]("validate")).
     WithHandler(
         func(ctx context.Context, in Input, v ValidationResult) (Output, error) {
             // v parameter type is validated via reflection at build time
             return processWithDependencies(v), nil
-        })
+        }
 ```
 
-**Side effects** are accessed via **StepContext parameter**:
+**Side effects** are accessed via **context.WithValue()** using `catbird.FromContext(ctx)`:
 
 ```go
-// Typed Generics API - StepContext as additional parameter
-Step("index-pages",
-    Dependency("create-index"),
-    func(ctx context.Context, stepCtx StepContext, cfg Config, indexID IndexID) (Summary, error) {
-        // StepContext provides side effect operations
-        for _, page := range fetchPages(cfg) {
-            stepCtx.SpawnTask(ctx, IndexTask{PageID: page.ID, IndexID: indexID})
-        }
-        stepCtx.PoolStartDrain(ctx)
-        stepCtx.WaitTaskPool(ctx)
-        return Summary{Indexed: len(pages)}, nil
-    },
-    WithTaskPool("index-ops"),  // Enables pool operations on stepCtx
-)
-
-// Reflection API (alternative)
 NewStep("index-pages").
     DependsOn(Dep[IndexID]("create-index")).
     WithTaskPool("index-ops").
     WithHandler(
-        func(ctx context.Context, stepCtx StepContext, cfg Config, indexID IndexID) (Summary, error) {
-            // Same StepContext interface regardless of API choice
+        func(ctx context.Context, cfg Config, indexID IndexID) (Summary, error) {
+            // Extract StepContext from context
+            stepCtx := catbird.FromContext(ctx)
             for _, page := range fetchPages(cfg) {
                 stepCtx.SpawnTask(ctx, IndexTask{PageID: page.ID, IndexID: indexID})
             }
@@ -71,20 +41,21 @@ NewStep("index-pages").
         })
 ```
 
-**Key design**: StepContext is NOT for dependencies (those are parameters). It's **only for side effects**.
+**Key design**: StepContext is NOT for dependencies (those are parameters). It's accessed via `catbird.FromContext(ctx)` for side effects. Handlers keep plain `context.Context` as the first parameter (idiomatic Go).
 
 ## StepContext: Typed Interface for Side Effects
 
 ### Design Principle
 
 `StepContext` is NOT for accessing dependencies (those are parameters). Instead:
-- **Dependencies**: injected as **function parameters** (type-checked at build time - via generics or reflection)
-- **Side effects**: accessed via **StepContext methods** (runtime interface, same in both APIs)
+- **Dependencies**: injected as **function parameters** (type-checked at build time via reflection)
+- **Side effects**: accessed via `catbird.FromContext(ctx)` (runtime lookup)
+- **Handler signature**: plain `context.Context` as first parameter (idiomatic Go, compatible with all Go libraries)
 
 ### Basic API
 
 ```go
-// Minimal StepContext - works for all steps
+// StepContext interface - obtained via catbird.FromContext(ctx)
 type StepContext interface {
     // Metadata
     FlowRunID() int64
@@ -97,9 +68,14 @@ type StepContext interface {
     WaitTaskPool(ctx context.Context) error
     PoolStatus(ctx context.Context) (PoolStatus, error)
 }
+
+// Extract StepContext from context (idiomatic Go pattern)
+stepCtx := catbird.FromContext(ctx)  // Returns StepContext or nil if not available
 ```
 
 ### Implementation at Runtime
+
+StepContext is attached to the handler context via `context.WithValue()` before invocation:
 
 ```go
 type stepContextImpl struct {
@@ -146,87 +122,24 @@ func (sc *stepContextImpl) WaitTaskPool(ctx context.Context) error {
         sc.taskPoolName, sc.flowRunID)
     return err
 }
-```
 
-## API-Specific Implementation Examples
+// At step invocation time (step_worker.go), wrap context before calling handler
+func invokeStepHandler(ctx context.Context, handler func(context.Context, ...) error, stepCtxImpl *stepContextImpl, args ...any) error {
+    // Attach StepContext to context via standard Go pattern
+    ctx = catbird.WithHandlerContext(ctx, stepCtxImpl)
+    return handler(ctx, args...)
+}
 
-The following sections show implementation details for each API design. The StepContext interface and task pool concepts are the same regardless of API choice.
-
-### Typed Generics API: StepContext Support
-
-> **Note**: This section shows the [Typed Generics API](TYPED_GENERICS_API_DESIGN.md) implementation (recommended, validated).
-
-With typed generics, StepContext is simply an additional parameter in the handler signature:
-
-```go
-// Step WITHOUT pool (no StepContext parameter)
-normalStep := Step("process",
-    Dependency("validate"),
-    func(ctx context.Context, in Request, validation ValidationResult) (Response, error) {
-        // No StepContext - regular step
-        return process(validation), nil
-    })
-
-// Step WITH pool (StepContext parameter added)
-poolStep := Step("index-pages",
-    Dependency("create-index"),
-    func(ctx context.Context, stepCtx StepContext, cfg Config, indexID IndexID) (Summary, error) {
-        // StepContext enables pool operations
-        pages := fetchPages(cfg)
-        for _, page := range pages {
-            stepCtx.SpawnTask(ctx, IndexTask{PageID: page.ID, IndexID: indexID})
-        }
-        stepCtx.PoolStartDrain(ctx)
-        stepCtx.WaitTaskPool(ctx)
-        return Summary{Indexed: len(pages)}, nil
-    },
-    WithTaskPool("index-ops"),  // Option enables pool operations
-)
-```
-
-**Type checking**: At `Build()` time, the flow builder would use reflection to detect if the handler has a `StepContext` parameter (by inspecting the second parameter type). If present and the step has `WithTaskPool()`, validation passes. If StepContext is present without a pool, build error. This is the same minimal reflection used for dependency type matching.
-
-**Constructor pattern**:
-```go
-// Step with 1 dependency, WITH StepContext
-func StepWithStepContext[In, D1, Out any](
-    name string,
-    dep1 string,
-    handler func(context.Context, StepContext, In, D1) (Out, error),
-    opts ...StepOpt,
-) *TypedStep[In, D1, Out]
-
-// Usage
-Step := StepWithStepContext("process",
-    "validate",
-    func(ctx context.Context, stepCtx StepContext, in Input, val ValidationResult) (Output, error) {
-        stepCtx.SpawnTask(ctx, task)
-        return Output{}, nil
-    },
-    WithTaskPool("ops"),
-)
-```
-
-Alternatively, a single `Step()` constructor with reflection check (hybrid approach):
-```go
-// Single constructor - detects StepContext via reflection at build time
-func Step[In, D1, Out any](
-    name string,
-    dep1 string,
-    handler any,  // Can be with or without StepContext
-    opts ...StepOpt,
-) *TypedStep[In, D1, Out] {
-    // Use reflection to check if second param is StepContext
-    // If yes, validate that opts includes WithTaskPool()
-    // This is the only reflection needed at build time
+// Handlers extract via:
+func(ctx context.Context, in Input) (Output, error) {
+    stepCtx := catbird.FromContext(ctx)  // Get StepContext
+    // use stepCtx for side effects
 }
 ```
 
-### Reflection API: StepContext Support (Alternative)
+### StepContext Support via Context Values
 
-> **Note**: This section shows the [Reflection API](REFLECTION_API_DESIGN.md) implementation (alternative design).
-
-The reflection-based builder pattern supports pool attachment and StepContext:
+The reflection-based builder pattern supports pool attachment without signature changes:
 
 ### Step Builder with Pool Support
 
@@ -254,17 +167,17 @@ func (s *Step) WithTaskPool(poolName string) *Step {
 }
 
 // WithHandler uses reflection to validate handler signature
-// If step has taskPoolName, validates that second param is StepContext
+// No StepContext parameter required; handlers extract via catbird.FromContext(ctx)
 func (s *Step) WithHandler(fn any, opts ...HandlerOpt) *Step {
     // Reflection validates:
     // 1. First param: context.Context
-    // 2. If s.taskPoolName != "": second param must be StepContext
-    // 3. Next param: input type
-    // 4. Following params: dependency types (validated against s.dependencies)
-    // 5. Last param if signal: signal type
-    // 6. Returns: (output, error)
+    // 2. Next param: input type
+    // 3. Following params: dependency types (validated against s.dependencies)
+    // 4. Last param if signal: signal type
+    // 5. Returns: (output, error)
+    // Pool attachment has NO signature impact
     
-    wrapper, err := makeStepWrapperWithContext(fn, s)
+    wrapper, err := makeStepWrapper(fn, s)
     if err != nil {
         panic(fmt.Errorf("invalid handler for step %s: %w", s.Name, err))
     }
@@ -274,12 +187,10 @@ func (s *Step) WithHandler(fn any, opts ...HandlerOpt) *Step {
 }
 ```
 
-### Usage Example (Reflection API)
-
-> **Note**: Same pattern works with Typed Generics API - just use `Step()` constructor with type parameters instead of `NewStep().WithHandler()` builder.
+### Usage Example
 
 ```go
-// Step WITHOUT pool (no StepContext parameter)
+// Step WITHOUT pool (regular handler)
 normalStep := catbird.NewStep("process").
     DependsOn(catbird.Dep[ValidationResult]("validate")).
     WithHandler(
@@ -288,16 +199,17 @@ normalStep := catbird.NewStep("process").
         },
     )
 
-// Step WITH pool (requires StepContext parameter)
+// Step WITH pool (extract from context)
 poolStep := catbird.NewStep("index-pages").
     DependsOn(catbird.Dep[IndexID]("create-index")).
     WithTaskPool("index-ops").
     WithHandler(
-        // Reflection validates: has StepContext param because step has pool
-        func(ctx context.Context, stepCtx StepContext, cfg Config, indexID IndexID) (Summary, error) {
+        // No StepContext parameter; extract from context as needed
+        func(ctx context.Context, cfg Config, indexID IndexID) (Summary, error) {
+            stepCtx := catbird.FromContext(ctx)  // Extract StepContext
             pages := fetchPages(cfg)
             for _, page := range pages {
-                stepCtx.SpawnTask(ctx, IndexTask{PageID: page.ID, IndexID: indexID})
+                    stepCtx.SpawnTask(ctx, IndexTask{PageID: page.ID, IndexID: indexID})
             }
             stepCtx.PoolStartDrain(ctx)
             stepCtx.WaitTaskPool(ctx)
@@ -319,9 +231,7 @@ poolStep := catbird.NewStep("index-pages").
 }
 ```
 
-## Usage: Reindexing Flow with Reflection API
-
-> **Note**: This example uses the Reflection API. The same coordination pattern (task pools, dynamic spawning, producer steps) works with the Typed Generics API - just use `Step()` constructors with type parameters instead of `NewStep().WithHandler()` builders. The StepContext interface and pool operations are identical.
+## Usage: Reindexing Flow Example
 
 ```go
 // Phase 1: Setup
@@ -445,9 +355,7 @@ flow := catbird.NewFlow("reindex-with-changes").
 
 ## ProducerStep: Conceptual Extension (Not Yet Implemented)
 
-> **Note**: This section describes a potential extension for specialized producer scenarios, compatible with **both** API designs (Typed Generics and Reflection). Regular steps with `WithTaskPool()` and drain configuration already handle most producer patterns. This shows how specialized producer steps could simplify common patterns if needed.
->
-> **Shown with**: Reflection API syntax (builder pattern). Typed Generics API would use constructor with type parameters.
+> **Note**: This section describes a potential extension for specialized producer scenarios. Regular steps with `WithTaskPool()` and drain configuration already handle most producer patterns. This shows how specialized producer steps could simplify common patterns if needed.
 
 ProducerStep would be a specialized builder that auto-drains on completion:
 
@@ -517,9 +425,7 @@ listenStep := catbird.NewProducerStep("listen").
 
 ## GeneratorStep: Conceptual Extension (Not Yet Implemented)
 
-> **Note**: This section describes a potential extension for channel-based item generation, compatible with **both** API designs. Regular steps that spawn tasks in loops already support generator patterns. This shows how a specialized generator abstraction could simplify common patterns.
->
-> **Shown with**: Reflection API syntax (builder pattern). Typed Generics API would use constructor with type parameters.
+> **Note**: This section describes a potential extension for channel-based item generation. Regular steps that spawn tasks in loops already support generator patterns. This shows how a specialized generator abstraction could simplify common patterns.
 
 GeneratorStep would abstract channel-based task generation:
 
@@ -590,8 +496,6 @@ indexStep := catbird.NewGeneratorStep("index-records").
 ```
 
 ## TaskPool API: Common Interface
-
-> **Note**: Task pool interface is the same for both Typed Generics and Reflection APIs.
 
 ```go
 // Untyped pool definition (shared across flows)
@@ -864,26 +768,7 @@ But this is beyond the scope of reflection-based API patterns.
 
 ## Summary: Type Safety with StepContext
 
-The coordination patterns in this document work with **both** API designs:
-
-### With Typed Generics API (Recommended)
-
-✅ **Compile-time + build-time type validation**
-```go
-// Handler signature type-checked via generics
-Step("process",
-    Dependency("validate"),
-    func(ctx context.Context, stepCtx StepContext, in Request, v ValidationResult) (Response, error) {
-        // ✅ v type is ValidationResult (verified by Go compiler)
-        // ✅ StepContext presence validated at build time if WithTaskPool() present
-        stepCtx.SpawnTask(ctx, task)
-        return Response{}, nil
-    },
-    WithTaskPool("ops"),
-)
-```
-
-### With Reflection API (Alternative)
+The reflection API provides strong type safety for coordination patterns:
 
 ✅ **Build-time type validation via reflection**
 ```go
@@ -892,16 +777,15 @@ NewStep("process").
     DependsOn(Dep[ValidationResult]("validate")).
     WithTaskPool("ops").
     WithHandler(
-        func(ctx context.Context, stepCtx StepContext, in Request, v ValidationResult) (Response, error) {
+        func(ctx context.Context, in Request, v ValidationResult) (Response, error) {
             // ✅ v is validated to be ValidationResult at build time via reflection
             // ❌ Wrong signature detected: func(..., v FraudResult) → panic at build time
+            stepCtx := catbird.FromContext(ctx)
             stepCtx.SpawnTask(ctx, task)
             return Response{}, nil
         },
     )
 ```
-
-### Common Benefits (Both APIs)
 
 ✅ **Minimal reflection overhead**
 ```go

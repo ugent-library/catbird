@@ -344,12 +344,16 @@ flow := catbird.NewFlow("payment_processing").
 
 Catbird includes multiple resiliency layers for runtime failures. Handler-level retries are configured with `HandlerOpts` (`MaxRetries`, `Backoff`), and external calls can be protected with `HandlerOpts.CircuitBreaker` (typically created via `NewCircuitBreaker(...)`) to avoid cascading outages. In worker database paths, PostgreSQL reads/writes are retried with bounded attempts and full-jitter backoff; retries stop immediately on context cancellation or deadline expiry.
 
+## Be aware of side effects
+
+Catbird deduplication (`ConcurrencyKey`/`IdempotencyKey`) controls duplicate run creation, while handler retries can still re-attempt the same run after transient failures. For non-repeatable side effects (payments, email, webhooks), use idempotent write patterns or upstream idempotency keys so retry attempts remain safe.
+
 # Naming Rules
 
 - **Queue, task, flow, and step names**: Lowercase letters, digits, and underscores only (`a-z`, `0-9`, `_`). Max 58 characters. Step names must be unique within a flow. Reserved step names: `input`, `signal`.
 - **Topics/Patterns**: Letters (upper/lower), digits, dots, underscores, and hyphens (`a-z`, `A-Z`, `0-9`, `.`, `_`, `-`, plus wildcards `?`, `*`).
 
-## Query Helpers
+# Query Helpers
 
 Use query builders when you want SQL + args directly (for `pgx.Batch` or custom execution):
 

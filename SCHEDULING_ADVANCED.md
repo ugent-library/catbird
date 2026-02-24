@@ -19,7 +19,10 @@ This document outlines the **strongest-guarantee scheduling solution** for Catbi
 - UTC-normalized cron (`cron.WithLocation(time.UTC)`)
 - Idempotency keys: `"schedule:{unix_seconds}"`
 - Database constraint: `UNIQUE (idempotency_key) WHERE status IN ('queued', 'started', 'completed')`
+- Input generation timing: schedule input is produced at enqueue time via `Schedule(..., inputFunc)`, marshaled, and stored with the run record
 - **Guarantee:** Exactly-one execution per cron tick when workers have UTC-synced clocks
+
+In current Option 1, input is **not** generated at worker startup and **not** deferred to "right before handler call." It is generated when the cron tick triggers enqueue, then persisted; handlers consume that persisted input when they claim the run.
 
 ### Theoretical Vulnerabilities
 
