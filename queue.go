@@ -3,7 +3,6 @@ package catbird
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -32,42 +31,26 @@ type QueueOpts struct {
 	Unlogged  bool
 }
 
-type Queue struct {
-	name string
-	opts *QueueOpts
-}
-
-// NewQueue creates a queue definition with optional options.
-func NewQueue(name string, opts *QueueOpts) *Queue {
-	return &Queue{name: name, opts: opts}
-}
-
-// CreateQueue creates one or more queue definitions.
+// CreateQueue creates a queue with the given name and optional options.
 // Use Bind() separately to create topic bindings.
-func CreateQueue(ctx context.Context, conn Conn, queues ...*Queue) error {
+func CreateQueue(ctx context.Context, conn Conn, queueName string, opts *QueueOpts) error {
 	q := `SELECT cb_create_queue(name => $1, expires_at => $2, unlogged => $3);`
-	for _, queue := range queues {
-		if queue == nil {
-			return fmt.Errorf("queue definition cannot be nil")
-		}
 
-		opts := queue.opts
-		if opts == nil {
-			opts = &QueueOpts{}
-		}
+	if opts == nil {
+		opts = &QueueOpts{}
+	}
 
-		if _, err := conn.Exec(ctx, q, queue.name, ptrOrNil(opts.ExpiresAt), opts.Unlogged); err != nil {
-			return err
-		}
+	if _, err := conn.Exec(ctx, q, queueName, ptrOrNil(opts.ExpiresAt), opts.Unlogged); err != nil {
+		return err
 	}
 
 	return nil
 }
 
 // GetQueue retrieves queue metadata by name.
-func GetQueue(ctx context.Context, conn Conn, name string) (*QueueInfo, error) {
+func GetQueue(ctx context.Context, conn Conn, queueName string) (*QueueInfo, error) {
 	q := `SELECT name, unlogged, created_at, expires_at FROM cb_queues WHERE name = $1;`
-	return scanQueue(conn.QueryRow(ctx, q, name))
+	return scanQueue(conn.QueryRow(ctx, q, queueName))
 }
 
 // ListQueues returns all queues
@@ -82,10 +65,10 @@ func ListQueues(ctx context.Context, conn Conn) ([]*QueueInfo, error) {
 
 // DeleteQueue deletes a queue and all its messages.
 // Returns true if the queue existed.
-func DeleteQueue(ctx context.Context, conn Conn, name string) (bool, error) {
+func DeleteQueue(ctx context.Context, conn Conn, queueName string) (bool, error) {
 	q := `SELECT * FROM cb_delete_queue(name => $1);`
 	existed := false
-	err := conn.QueryRow(ctx, q, name).Scan(&existed)
+	err := conn.QueryRow(ctx, q, queueName).Scan(&existed)
 	return existed, err
 }
 
@@ -97,8 +80,8 @@ type SendOpts struct {
 
 // Send enqueues a message to the specified queue.
 // Pass nil opts to use defaults.
-func Send(ctx context.Context, conn Conn, queue string, payload any, opts *SendOpts) error {
-	q, args, err := SendQuery(queue, payload, opts)
+func Send(ctx context.Context, conn Conn, queueName string, payload any, opts *SendOpts) error {
+	q, args, err := SendQuery(queueName, payload, opts)
 	if err != nil {
 		return err
 	}
@@ -109,7 +92,7 @@ func Send(ctx context.Context, conn Conn, queue string, payload any, opts *SendO
 
 // SendQuery builds the SQL query and args for a Send operation.
 // Pass nil opts to use defaults.
-func SendQuery(queue string, payload any, opts *SendOpts) (string, []any, error) {
+func SendQuery(queueName string, payload any, opts *SendOpts) (string, []any, error) {
 	if opts == nil {
 		opts = &SendOpts{}
 	}
@@ -120,7 +103,7 @@ func SendQuery(queue string, payload any, opts *SendOpts) (string, []any, error)
 	}
 
 	q := `SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, deliver_at => $5);`
-	args := []any{queue, b, ptrOrNil(opts.Topic), ptrOrNil(opts.IdempotencyKey), ptrOrNil(opts.DeliverAt)}
+	args := []any{queueName, b, ptrOrNil(opts.Topic), ptrOrNil(opts.IdempotencyKey), ptrOrNil(opts.DeliverAt)}
 
 	return q, args, nil
 }
@@ -128,16 +111,16 @@ func SendQuery(queue string, payload any, opts *SendOpts) (string, []any, error)
 // Bind subscribes a queue to a topic pattern.
 // Pattern supports exact topics and wildcards: ? (single token), * (multi-token tail).
 // Examples: "foo.bar", "foo.?.bar", "foo.bar.*"
-func Bind(ctx context.Context, conn Conn, queue string, pattern string) error {
+func Bind(ctx context.Context, conn Conn, queueName string, pattern string) error {
 	q := `SELECT cb_bind(queue_name => $1, pattern => $2);`
-	_, err := conn.Exec(ctx, q, queue, pattern)
+	_, err := conn.Exec(ctx, q, queueName, pattern)
 	return err
 }
 
 // Unbind unsubscribes a queue from a topic pattern.
-func Unbind(ctx context.Context, conn Conn, queue string, pattern string) error {
+func Unbind(ctx context.Context, conn Conn, queueName string, pattern string) error {
 	q := `SELECT cb_unbind(queue_name => $1, pattern => $2);`
-	_, err := conn.Exec(ctx, q, queue, pattern)
+	_, err := conn.Exec(ctx, q, queueName, pattern)
 	return err
 }
 
@@ -178,9 +161,9 @@ func PublishQuery(topic string, payload any, opts *PublishOpts) (string, []any, 
 
 // Read reads up to quantity messages from the queue, hiding them from other
 // readers for the specified duration.
-func Read(ctx context.Context, conn Conn, queue string, quantity int, hideFor time.Duration) ([]Message, error) {
+func Read(ctx context.Context, conn Conn, queueName string, quantity int, hideFor time.Duration) ([]Message, error) {
 	q := `SELECT * FROM cb_read(queue => $1, quantity => $2, hide_for => $3);`
-	rows, err := conn.Query(ctx, q, queue, quantity, hideFor.Milliseconds())
+	rows, err := conn.Query(ctx, q, queueName, quantity, hideFor.Milliseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -190,10 +173,10 @@ func Read(ctx context.Context, conn Conn, queue string, quantity int, hideFor ti
 // ReadPoll reads messages from a queue with polling support.
 // It polls repeatedly at the specified interval until messages are available
 // or the pollFor timeout is reached.
-func ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]Message, error) {
+func ReadPoll(ctx context.Context, conn Conn, queueName string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]Message, error) {
 	q := `SELECT * FROM cb_read_poll(queue => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
 
-	rows, err := conn.Query(ctx, q, queue, quantity, hideFor.Milliseconds(), pollFor.Milliseconds(), pollInterval.Milliseconds())
+	rows, err := conn.Query(ctx, q, queueName, quantity, hideFor.Milliseconds(), pollFor.Milliseconds(), pollInterval.Milliseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -203,33 +186,33 @@ func ReadPoll(ctx context.Context, conn Conn, queue string, quantity int, hideFo
 
 // Hide hides a single message from being read for the specified duration.
 // Returns true if the message existed.
-func Hide(ctx context.Context, conn Conn, queue string, id int64, hideFor time.Duration) (bool, error) {
+func Hide(ctx context.Context, conn Conn, queueName string, id int64, hideFor time.Duration) (bool, error) {
 	q := `SELECT * FROM cb_hide(queue => $1, id => $2, hide_for => $3);`
 	exists := false
-	err := conn.QueryRow(ctx, q, queue, id, hideFor.Milliseconds()).Scan(&exists)
+	err := conn.QueryRow(ctx, q, queueName, id, hideFor.Milliseconds()).Scan(&exists)
 	return exists, err
 }
 
 // HideMany hides multiple messages from being read for the specified duration.
-func HideMany(ctx context.Context, conn Conn, queue string, ids []int64, hideFor time.Duration) error {
+func HideMany(ctx context.Context, conn Conn, queueName string, ids []int64, hideFor time.Duration) error {
 	q := `SELECT * FROM cb_hide(queue => $1, ids => $2, hide_for => $3);`
-	_, err := conn.Exec(ctx, q, queue, ids, hideFor.Milliseconds())
+	_, err := conn.Exec(ctx, q, queueName, ids, hideFor.Milliseconds())
 	return err
 }
 
 // Delete deletes a single message from the queue.
 // Returns true if the message existed.
-func Delete(ctx context.Context, conn Conn, queue string, id int64) (bool, error) {
+func Delete(ctx context.Context, conn Conn, queueName string, id int64) (bool, error) {
 	q := `SELECT * FROM cb_delete(queue => $1, id => $2);`
 	existed := false
-	err := conn.QueryRow(ctx, q, queue, id).Scan(&existed)
+	err := conn.QueryRow(ctx, q, queueName, id).Scan(&existed)
 	return existed, err
 }
 
 // DeleteMany deletes multiple messages from the queue.
-func DeleteMany(ctx context.Context, conn Conn, queue string, ids []int64) error {
+func DeleteMany(ctx context.Context, conn Conn, queueName string, ids []int64) error {
 	q := `SELECT * FROM cb_delete(queue => $1, ids => $2);`
-	_, err := conn.Exec(ctx, q, queue, ids)
+	_, err := conn.Exec(ctx, q, queueName, ids)
 	return err
 }
 

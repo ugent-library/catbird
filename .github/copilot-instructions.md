@@ -162,12 +162,12 @@ NewFlow("workflow").
 
 ## Key Conventions
 
-- **Worker lifecycle**: `client.NewWorker(ctx, opts)` followed by `.AddTask(task)` and `.AddFlow(flow)` builder methods (schedule set via `task.Schedule(cron, inputFunc)` or `flow.Schedule(cron, inputFunc)`), then `worker.Start(ctx)` (graceful shutdown with configurable timeout)
+- **Worker lifecycle**: `client.NewWorker(ctx, opts)` followed by `.AddTask(task)` and `.AddFlow(flow)` builder methods (schedule set via `task.Schedule(cron, &ScheduleOpts{Input: fn})` or `flow.Schedule(cron, &ScheduleOpts{Input: fn})`), then `worker.Start(ctx)` (graceful shutdown with configurable timeout)
 - **HandlerOpts validation**: Worker validates all task and flow step HandlerOpts at initialization time. Invalid configs (negative concurrency/batch size, invalid backoff, invalid circuit breaker) are caught immediately with descriptive errors before reaching database operations. This ensures type safety at construction time.
 - **Options pattern**: HandlerOpts uses a public struct with public fields (Concurrency, BatchSize, Timeout, MaxRetries, Backoff, CircuitBreaker). WorkerOpts uses a config struct (Logger, ShutdownTimeout).
 - **Conn interface**: Abstracts pgx; accepts `*pgxpool.Pool`, `*pgx.Conn` or `pgx.Tx`
 - **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `WorkerOpts.Logger` field
-- **Scheduled tasks/flows**: Use robfig/cron syntax via `.Schedule("@hourly", nil)` builder method on task/flow before adding to worker. Optional second parameter allows dynamic input generation at execution time. Example: `task := NewTask("t").Schedule("@hourly", func(ctx context.Context) (any, error) { return InputType{...}, nil })` then `worker.AddTask(task)`.
+- **Scheduled tasks/flows**: Use cron syntax via `.Schedule("@hourly", nil)` builder method on task/flow before adding to worker. Optional `ScheduleOpts.Input` allows dynamic input generation at execution time. Example: `task := NewTask("t").Schedule("@hourly", &ScheduleOpts{Input: func(ctx context.Context) (any, error) { return InputType{...}, nil }})` then `worker.AddTask(task)`.
 - **Automatic garbage collection**: Worker heartbeats (every 10 seconds) opportunistically clean up stale workers and expired queues; no configuration needed. Manual cleanup available via `client.GC(ctx)` for deployments without workers.
 - **Deduplication strategies**: Two strategies available:
   - **ConcurrencyKey**: Prevents concurrent/overlapping runs (deduplicates `queued`/`started` status). After completion or failure, same key can be used again.

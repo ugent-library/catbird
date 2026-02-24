@@ -17,14 +17,14 @@ func New(conn Conn) *Client {
 	return &Client{Conn: conn}
 }
 
-// CreateQueue creates one or more queue definitions.
-func (c *Client) CreateQueue(ctx context.Context, queues ...*Queue) error {
-	return CreateQueue(ctx, c.Conn, queues...)
+// CreateQueue creates a queue with the given name and optional options.
+func (c *Client) CreateQueue(ctx context.Context, queueName string, opts *QueueOpts) error {
+	return CreateQueue(ctx, c.Conn, queueName, opts)
 }
 
 // GetQueue retrieves queue metadata by name.
-func (c *Client) GetQueue(ctx context.Context, name string) (*QueueInfo, error) {
-	return GetQueue(ctx, c.Conn, name)
+func (c *Client) GetQueue(ctx context.Context, queueName string) (*QueueInfo, error) {
+	return GetQueue(ctx, c.Conn, queueName)
 }
 
 // ListQueues returns all queues
@@ -34,25 +34,25 @@ func (c *Client) ListQueues(ctx context.Context) ([]*QueueInfo, error) {
 
 // DeleteQueue deletes a queue and all its messages.
 // Returns true if the queue existed.
-func (c *Client) DeleteQueue(ctx context.Context, name string) (bool, error) {
-	return DeleteQueue(ctx, c.Conn, name)
+func (c *Client) DeleteQueue(ctx context.Context, queueName string) (bool, error) {
+	return DeleteQueue(ctx, c.Conn, queueName)
 }
 
 // Send enqueues a message to the specified queue.
-func (c *Client) Send(ctx context.Context, queue string, payload any, opts *SendOpts) error {
-	return Send(ctx, c.Conn, queue, payload, opts)
+func (c *Client) Send(ctx context.Context, queueName string, payload any, opts *SendOpts) error {
+	return Send(ctx, c.Conn, queueName, payload, opts)
 }
 
 // Bind subscribes a queue to a topic pattern.
 // Pattern supports exact topics and wildcards: ? (single token), * (multi-token tail).
 // Examples: "foo.bar", "foo.?.bar", "foo.bar.*"
-func (c *Client) Bind(ctx context.Context, queue string, pattern string) error {
-	return Bind(ctx, c.Conn, queue, pattern)
+func (c *Client) Bind(ctx context.Context, queueName string, pattern string) error {
+	return Bind(ctx, c.Conn, queueName, pattern)
 }
 
 // Unbind unsubscribes a queue from a topic pattern.
-func (c *Client) Unbind(ctx context.Context, queue string, pattern string) error {
-	return Unbind(ctx, c.Conn, queue, pattern)
+func (c *Client) Unbind(ctx context.Context, queueName string, pattern string) error {
+	return Unbind(ctx, c.Conn, queueName, pattern)
 }
 
 // Publish sends a message to all queues subscribed to the specified topic.
@@ -62,37 +62,37 @@ func (c *Client) Publish(ctx context.Context, topic string, payload any, opts *P
 
 // Read reads up to quantity messages from the queue, hiding them from other
 // readers for the specified duration.
-func (c *Client) Read(ctx context.Context, queue string, quantity int, hideFor time.Duration) ([]Message, error) {
-	return Read(ctx, c.Conn, queue, quantity, hideFor)
+func (c *Client) Read(ctx context.Context, queueName string, quantity int, hideFor time.Duration) ([]Message, error) {
+	return Read(ctx, c.Conn, queueName, quantity, hideFor)
 }
 
 // ReadPoll reads messages from a queue with polling support.
 // It polls repeatedly at the specified interval until messages are available
 // or the pollFor timeout is reached.
-func (c *Client) ReadPoll(ctx context.Context, queue string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]Message, error) {
-	return ReadPoll(ctx, c.Conn, queue, quantity, hideFor, pollFor, pollInterval)
+func (c *Client) ReadPoll(ctx context.Context, queueName string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]Message, error) {
+	return ReadPoll(ctx, c.Conn, queueName, quantity, hideFor, pollFor, pollInterval)
 }
 
 // Hide hides a single message from being read for the specified duration.
 // Returns true if the message existed.
-func (c *Client) Hide(ctx context.Context, queue string, id int64, hideFor time.Duration) (bool, error) {
-	return Hide(ctx, c.Conn, queue, id, hideFor)
+func (c *Client) Hide(ctx context.Context, queueName string, id int64, hideFor time.Duration) (bool, error) {
+	return Hide(ctx, c.Conn, queueName, id, hideFor)
 }
 
 // HideMany hides multiple messages from being read for the specified duration.
-func (c *Client) HideMany(ctx context.Context, queue string, ids []int64, hideFor time.Duration) error {
-	return HideMany(ctx, c.Conn, queue, ids, hideFor)
+func (c *Client) HideMany(ctx context.Context, queueName string, ids []int64, hideFor time.Duration) error {
+	return HideMany(ctx, c.Conn, queueName, ids, hideFor)
 }
 
 // Delete deletes a single message from the queue.
 // Returns true if the message existed.
-func (c *Client) Delete(ctx context.Context, queue string, id int64) (bool, error) {
-	return Delete(ctx, c.Conn, queue, id)
+func (c *Client) Delete(ctx context.Context, queueName string, id int64) (bool, error) {
+	return Delete(ctx, c.Conn, queueName, id)
 }
 
 // DeleteMany deletes multiple messages from the queue.
-func (c *Client) DeleteMany(ctx context.Context, queue string, ids []int64) error {
-	return DeleteMany(ctx, c.Conn, queue, ids)
+func (c *Client) DeleteMany(ctx context.Context, queueName string, ids []int64) error {
+	return DeleteMany(ctx, c.Conn, queueName, ids)
 }
 
 // CreateTask creates one or more task definitions.
@@ -101,8 +101,8 @@ func (c *Client) CreateTask(ctx context.Context, tasks ...*Task) error {
 }
 
 // GetTask retrieves task metadata by name.
-func (c *Client) GetTask(ctx context.Context, name string) (*TaskInfo, error) {
-	return GetTask(ctx, c.Conn, name)
+func (c *Client) GetTask(ctx context.Context, taskName string) (*TaskInfo, error) {
+	return GetTask(ctx, c.Conn, taskName)
 }
 
 // ListTasks returns all tasks
@@ -112,18 +112,18 @@ func (c *Client) ListTasks(ctx context.Context) ([]*TaskInfo, error) {
 
 // RunTask enqueues a task execution and returns a handle for monitoring
 // progress and retrieving output.
-func (c *Client) RunTask(ctx context.Context, name string, input any, opts *RunOpts) (*RunHandle, error) {
-	return RunTask(ctx, c.Conn, name, input, opts)
+func (c *Client) RunTask(ctx context.Context, taskName string, input any, opts *RunOpts) (*RunHandle, error) {
+	return RunTask(ctx, c.Conn, taskName, input, opts)
 }
 
 // GetTaskRun retrieves a specific task run result by ID.
-func (c *Client) GetTaskRun(ctx context.Context, name string, id int64) (*RunInfo, error) {
-	return GetTaskRun(ctx, c.Conn, name, id)
+func (c *Client) GetTaskRun(ctx context.Context, taskName string, taskRunID int64) (*RunInfo, error) {
+	return GetTaskRun(ctx, c.Conn, taskName, taskRunID)
 }
 
 // ListTaskRuns returns recent task runs for the specified task.
-func (c *Client) ListTaskRuns(ctx context.Context, name string) ([]*RunInfo, error) {
-	return ListTaskRuns(ctx, c.Conn, name)
+func (c *Client) ListTaskRuns(ctx context.Context, taskName string) ([]*RunInfo, error) {
+	return ListTaskRuns(ctx, c.Conn, taskName)
 }
 
 // CreateFlow creates one or more flow definitions.
@@ -132,8 +132,8 @@ func (c *Client) CreateFlow(ctx context.Context, flows ...*Flow) error {
 }
 
 // GetFlow retrieves flow metadata by name.
-func (c *Client) GetFlow(ctx context.Context, name string) (*FlowInfo, error) {
-	return GetFlow(ctx, c.Conn, name)
+func (c *Client) GetFlow(ctx context.Context, flowName string) (*FlowInfo, error) {
+	return GetFlow(ctx, c.Conn, flowName)
 }
 
 // ListFlows returns all flows
@@ -142,18 +142,18 @@ func (c *Client) ListFlows(ctx context.Context) ([]*FlowInfo, error) {
 }
 
 // RunFlow enqueues a flow execution and returns a handle for monitoring.
-func (c *Client) RunFlow(ctx context.Context, name string, input any, opts *RunFlowOpts) (*RunHandle, error) {
-	return RunFlow(ctx, c.Conn, name, input, opts)
+func (c *Client) RunFlow(ctx context.Context, flowName string, input any, opts *RunFlowOpts) (*RunHandle, error) {
+	return RunFlow(ctx, c.Conn, flowName, input, opts)
 }
 
 // GetFlowRun retrieves a specific flow run result by ID.
-func (c *Client) GetFlowRun(ctx context.Context, name string, id int64) (*RunInfo, error) {
-	return GetFlowRun(ctx, c.Conn, name, id)
+func (c *Client) GetFlowRun(ctx context.Context, flowName string, flowRunID int64) (*RunInfo, error) {
+	return GetFlowRun(ctx, c.Conn, flowName, flowRunID)
 }
 
 // ListFlowRuns returns recent flow runs for the specified flow.
-func (c *Client) ListFlowRuns(ctx context.Context, name string) ([]*RunInfo, error) {
-	return ListFlowRuns(ctx, c.Conn, name)
+func (c *Client) ListFlowRuns(ctx context.Context, flowName string) ([]*RunInfo, error) {
+	return ListFlowRuns(ctx, c.Conn, flowName)
 }
 
 // GetFlowRunSteps retrieves all step runs for a specific flow run.
@@ -178,6 +178,20 @@ func (c *Client) NewWorker(ctx context.Context, opts *WorkerOpts) *Worker {
 // ListWorkers returns all registered workers.
 func (c *Client) ListWorkers(ctx context.Context) ([]*WorkerInfo, error) {
 	return ListWorkers(ctx, c.Conn)
+}
+
+// CreateTaskSchedule creates a cron-based schedule for a task.
+// cronSpec should be in 5-field format (min hour day month dow) or descriptors like @hourly, @daily.
+// opts is optional ScheduleOpts configuring the schedule (Input field for static input).
+func (c *Client) CreateTaskSchedule(ctx context.Context, taskName, cronSpec string, opts *ScheduleOpts) error {
+	return CreateTaskSchedule(ctx, c.Conn, taskName, cronSpec, opts)
+}
+
+// CreateFlowSchedule creates a cron-based schedule for a flow.
+// cronSpec should be in 5-field format (min hour day month dow) or descriptors like @hourly, @daily.
+// opts is optional ScheduleOpts configuring the schedule (Input field for static input).
+func (c *Client) CreateFlowSchedule(ctx context.Context, flowName, cronSpec string, opts *ScheduleOpts) error {
+	return CreateFlowSchedule(ctx, c.Conn, flowName, cronSpec, opts)
 }
 
 // GC runs garbage collection to clean up expired queues and stale workers.

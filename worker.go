@@ -47,7 +47,6 @@ type Worker struct {
 	logger          *slog.Logger
 	tasks           []*Task
 	flows           []*Flow
-	scheduler       *Scheduler
 	shutdownTimeout time.Duration
 }
 
@@ -84,32 +83,14 @@ func NewWorker(conn Conn, opts *WorkerOpts) *Worker {
 }
 
 // AddTask registers a task with the worker.
-// If the task has a Schedule set via .Schedule(), it will be executed according to the cron schedule.
 func (w *Worker) AddTask(t *Task) *Worker {
 	w.tasks = append(w.tasks, t)
-
-	if t.schedule != "" {
-		if w.scheduler == nil {
-			w.scheduler = NewScheduler(w.conn, w.logger)
-		}
-		w.scheduler.AddTask(t.name, t.schedule, t.scheduleInput)
-	}
-
 	return w
 }
 
 // AddFlow registers a flow with the worker.
-// If the flow has a Schedule set via .Schedule(), it will be executed according to the cron schedule.
 func (w *Worker) AddFlow(f *Flow) *Worker {
 	w.flows = append(w.flows, f)
-
-	if f.schedule != "" {
-		if w.scheduler == nil {
-			w.scheduler = NewScheduler(w.conn, w.logger)
-		}
-		w.scheduler.AddFlow(f.name, f.schedule, f.scheduleInput)
-	}
-
 	return w
 }
 
@@ -208,17 +189,34 @@ func (w *Worker) Start(ctx context.Context) error {
 		}
 	}
 
-	// Start scheduler if configured
-	if w.scheduler != nil {
-		if err := w.scheduler.Start(ctx); err != nil {
-			return err
-		}
+	// Start schedule polling goroutine for all schedules (both tasks and flows)
+	wg.Go(func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
 
-		wg.Go(func() {
-			<-ctx.Done()
-			w.scheduler.Stop(handlerCtx)
-		})
-	}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Poll for due task schedules and execute them
+				var taskCount int
+				if err := w.conn.QueryRow(ctx,
+					`SELECT cb_execute_due_task_schedules(array(SELECT task_name FROM cb_task_schedules WHERE enabled), 32)`,
+				).Scan(&taskCount); err != nil {
+					// Ignore errors - likely no schedules exist yet
+				}
+
+				// Poll for due flow schedules and execute them
+				var flowCount int
+				if err := w.conn.QueryRow(ctx,
+					`SELECT cb_execute_due_flow_schedules(array(SELECT flow_name FROM cb_flow_schedules WHERE enabled), 32)`,
+				).Scan(&flowCount); err != nil {
+					// Ignore errors - likely no schedules exist yet
+				}
+			}
+		}
+	})
 
 	tb, err := json.Marshal(taskHandlers)
 	if err != nil {

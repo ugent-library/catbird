@@ -12,20 +12,12 @@ import (
 )
 
 type Flow struct {
-	name          string
-	schedule      string
-	scheduleInput func(context.Context) (any, error)
-	steps         []Step
+	name  string
+	steps []Step
 }
 
 func NewFlow(name string) *Flow {
 	return &Flow{name: name}
-}
-
-func (f *Flow) Schedule(schedule string, inputFunc func(context.Context) (any, error)) *Flow {
-	f.schedule = schedule
-	f.scheduleInput = inputFunc
-	return f
 }
 
 func (f *Flow) AddStep(step *Step) *Flow {
@@ -368,9 +360,9 @@ func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 }
 
 // GetFlow retrieves flow metadata by name.
-func GetFlow(ctx context.Context, conn Conn, name string) (*FlowInfo, error) {
+func GetFlow(ctx context.Context, conn Conn, flowName string) (*FlowInfo, error) {
 	q := `SELECT * FROM cb_flow_info WHERE name = $1;`
-	return scanFlow(conn.QueryRow(ctx, q, name))
+	return scanFlow(conn.QueryRow(ctx, q, flowName))
 }
 
 // ListFlows returns all flows
@@ -386,8 +378,8 @@ func ListFlows(ctx context.Context, conn Conn) ([]*FlowInfo, error) {
 type RunFlowOpts = RunOpts
 
 // RunFlow enqueues a flow execution and returns a handle for monitoring.
-func RunFlow(ctx context.Context, conn Conn, name string, input any, opts *RunFlowOpts) (*RunHandle, error) {
-	q, args, err := RunFlowQuery(name, input, opts)
+func RunFlow(ctx context.Context, conn Conn, flowName string, input any, opts *RunFlowOpts) (*RunHandle, error) {
+	q, args, err := RunFlowQuery(flowName, input, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -397,12 +389,12 @@ func RunFlow(ctx context.Context, conn Conn, name string, input any, opts *RunFl
 	if err != nil {
 		return nil, err
 	}
-	return &RunHandle{conn: conn, getFn: GetFlowRun, Name: name, ID: id}, nil
+	return &RunHandle{conn: conn, getFn: GetFlowRun, Name: flowName, ID: id}, nil
 }
 
 // RunFlowQuery builds the SQL query and args for a RunFlow operation.
 // Pass nil opts to use defaults.
-func RunFlowQuery(name string, input any, opts *RunFlowOpts) (string, []any, error) {
+func RunFlowQuery(flowName string, input any, opts *RunFlowOpts) (string, []any, error) {
 	if opts == nil {
 		opts = &RunFlowOpts{}
 	}
@@ -413,21 +405,21 @@ func RunFlowQuery(name string, input any, opts *RunFlowOpts) (string, []any, err
 	}
 
 	q := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4);`
-	args := []any{name, b, ptrOrNil(opts.ConcurrencyKey), ptrOrNil(opts.IdempotencyKey)}
+	args := []any{flowName, b, ptrOrNil(opts.ConcurrencyKey), ptrOrNil(opts.IdempotencyKey)}
 
 	return q, args, nil
 }
 
 // GetFlowRun retrieves a specific flow run result by ID.
-func GetFlowRun(ctx context.Context, conn Conn, name string, id int64) (*RunInfo, error) {
-	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(name))
+func GetFlowRun(ctx context.Context, conn Conn, flowName string, flowRunID int64) (*RunInfo, error) {
+	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
 	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at, NULL::timestamptz as skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
-	return scanRun(conn.QueryRow(ctx, query, id))
+	return scanRun(conn.QueryRow(ctx, query, flowRunID))
 }
 
 // ListFlowRuns returns recent flow runs for the specified flow.
-func ListFlowRuns(ctx context.Context, conn Conn, name string) ([]*RunInfo, error) {
-	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(name))
+func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*RunInfo, error) {
+	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
 	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at, NULL::timestamptz as skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {

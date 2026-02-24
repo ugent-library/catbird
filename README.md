@@ -29,7 +29,7 @@ client := catbird.New(conn)
 ctx := context.Background()
 
 // Queue: create, send, read, delete
-err := client.CreateQueue(ctx, catbird.NewQueue("my-queue", nil))
+err := client.CreateQueue(ctx, "my-queue", nil)
 err = client.Send(ctx, "my-queue", map[string]any{"user_id": 123}, &catbird.SendOpts{
     IdempotencyKey: "user-123",
 })
@@ -123,8 +123,8 @@ _, err = client.RunTask(ctx, "charge-payment", payment, &catbird.RunOpts{
 # Topic-Based Routing
 
 ```go
-err := client.CreateQueue(ctx, catbird.NewQueue("user-events", nil))
-err = client.CreateQueue(ctx, catbird.NewQueue("audit-log", nil))
+err := client.CreateQueue(ctx, "user-events", nil)
+err = client.CreateQueue(ctx, "audit-log", nil)
 
 err = client.Bind(ctx, "user-events", "events.user.created")
 err = client.Bind(ctx, "user-events", "events.?.updated")
@@ -156,6 +156,14 @@ task := catbird.NewTask("send-email").
         Backoff:     catbird.NewFullJitterBackoff(500*time.Millisecond, 10*time.Second),
         CircuitBreaker: catbird.NewCircuitBreaker(5, 30*time.Second),
     })
+
+dynamicScheduledTask := catbird.NewTask("send-report").
+    Schedule("@hourly", &catbird.ScheduleOpts{Input: func(ctx context.Context) (any, error) {
+        return EmailRequest{To: "ops@example.com", Subject: "Hourly report"}, nil
+    }}).
+    Handler(func(ctx context.Context, input EmailRequest) (EmailResponse, error) {
+        return EmailResponse{SentAt: time.Now()}, nil
+    }, nil)
 
 // Define a task with a condition (skipped when condition is false)
 conditionalTask := catbird.NewTask("premium-processing").

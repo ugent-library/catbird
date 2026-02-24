@@ -15,12 +15,10 @@ import (
 // Use NewTask().Handler(fn, opts) for tasks with handlers.
 // Use NewTask() for definition-only tasks.
 type Task struct {
-	name          string
-	condition     string
-	schedule      string
-	scheduleInput func(context.Context) (any, error)
-	handler       func(context.Context, json.RawMessage) (json.RawMessage, error)
-	handlerOpts   *HandlerOpts
+	name        string
+	condition   string
+	handler     func(context.Context, json.RawMessage) (json.RawMessage, error)
+	handlerOpts *HandlerOpts
 }
 
 // NewTask creates a new task definition with the given name.
@@ -32,12 +30,6 @@ func NewTask(name string) *Task {
 // Condition sets the condition expression for the task.
 func (t *Task) Condition(condition string) *Task {
 	t.condition = condition
-	return t
-}
-
-func (t *Task) Schedule(schedule string, inputFunc func(context.Context) (any, error)) *Task {
-	t.schedule = schedule
-	t.scheduleInput = inputFunc
 	return t
 }
 
@@ -144,9 +136,9 @@ func CreateTask(ctx context.Context, conn Conn, tasks ...*Task) error {
 }
 
 // GetTask retrieves task metadata by name.
-func GetTask(ctx context.Context, conn Conn, name string) (*TaskInfo, error) {
+func GetTask(ctx context.Context, conn Conn, taskName string) (*TaskInfo, error) {
 	q := `SELECT name, created_at FROM cb_tasks WHERE name = $1;`
-	return scanTask(conn.QueryRow(ctx, q, name))
+	return scanTask(conn.QueryRow(ctx, q, taskName))
 }
 
 // ListTasks returns all tasks
@@ -166,8 +158,8 @@ type RunOpts struct {
 
 // RunTask enqueues a task execution and returns a handle for monitoring
 // progress and retrieving output.
-func RunTask(ctx context.Context, conn Conn, name string, input any, opts *RunOpts) (*RunHandle, error) {
-	q, args, err := RunTaskQuery(name, input, opts)
+func RunTask(ctx context.Context, conn Conn, taskName string, input any, opts *RunOpts) (*RunHandle, error) {
+	q, args, err := RunTaskQuery(taskName, input, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -178,12 +170,12 @@ func RunTask(ctx context.Context, conn Conn, name string, input any, opts *RunOp
 		return nil, err
 	}
 
-	return &RunHandle{conn: conn, getFn: GetTaskRun, Name: name, ID: id}, nil
+	return &RunHandle{conn: conn, getFn: GetTaskRun, Name: taskName, ID: id}, nil
 }
 
 // RunTaskQuery builds the SQL query and args for a RunTask operation.
 // Pass nil opts to use defaults.
-func RunTaskQuery(name string, input any, opts *RunOpts) (string, []any, error) {
+func RunTaskQuery(taskName string, input any, opts *RunOpts) (string, []any, error) {
 	if opts == nil {
 		opts = &RunOpts{}
 	}
@@ -194,21 +186,21 @@ func RunTaskQuery(name string, input any, opts *RunOpts) (string, []any, error) 
 	}
 
 	q := `SELECT * FROM cb_run_task(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4);`
-	args := []any{name, b, ptrOrNil(opts.ConcurrencyKey), ptrOrNil(opts.IdempotencyKey)}
+	args := []any{taskName, b, ptrOrNil(opts.ConcurrencyKey), ptrOrNil(opts.IdempotencyKey)}
 
 	return q, args, nil
 }
 
 // GetTaskRun retrieves a specific task run result by ID.
-func GetTaskRun(ctx context.Context, conn Conn, name string, id int64) (*RunInfo, error) {
-	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(name))
+func GetTaskRun(ctx context.Context, conn Conn, taskName string, taskRunID int64) (*RunInfo, error) {
+	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(taskName))
 	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at, skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
-	return scanRun(conn.QueryRow(ctx, query, id))
+	return scanRun(conn.QueryRow(ctx, query, taskRunID))
 }
 
 // ListTaskRuns returns recent task runs for the specified task.
-func ListTaskRuns(ctx context.Context, conn Conn, name string) ([]*RunInfo, error) {
-	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(name))
+func ListTaskRuns(ctx context.Context, conn Conn, taskName string) ([]*RunInfo, error) {
+	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(taskName))
 	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at, skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {

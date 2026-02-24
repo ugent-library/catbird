@@ -71,6 +71,8 @@ func verifyMigrationsApplied(ctx context.Context, db *sql.DB) error {
 	requiredFunctions := map[int][]string{
 		2:  {"cb_create_queue", "cb_send", "cb_read"},
 		10: {"cb_create_task", "cb_run_task", "cb_create_flow", "cb_gc", "cb_parse_condition", "cb_evaluate_condition"},
+		12: {"cb_next_cron_tick"},
+		13: {"cb_create_task_schedule", "cb_create_flow_schedule", "cb_advance_task_schedule", "cb_advance_flow_schedule", "cb_execute_due_task_schedules", "cb_execute_due_flow_schedules"},
 	}
 
 	for version, functions := range requiredFunctions {
