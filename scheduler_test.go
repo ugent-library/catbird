@@ -319,7 +319,7 @@ func TestSchedulerConcurrentWorkers(t *testing.T) {
 		(currentMin + 3) % 60,
 	}
 	cronSpec := fmt.Sprintf("%d,%d,%d * * * *", nextMins[0], nextMins[1], nextMins[2])
-	
+
 	if err := client.CreateTaskSchedule(t.Context(), "concurrent_sched_test", cronSpec, nil); err != nil {
 		t.Fatal(err)
 	}
