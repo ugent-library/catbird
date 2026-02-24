@@ -13,6 +13,7 @@ import (
 
 	"github.com/dustin/go-humanize"
 	"github.com/jackc/pgx/v5"
+	sloghttp "github.com/samber/slog-http"
 	"github.com/ugent-library/catbird"
 )
 
@@ -126,7 +127,9 @@ func (a *App) Handler() http.Handler {
 		w.Write(css)
 	})
 
-	return mux
+	handler := sloghttp.Recovery(mux)
+	handler = sloghttp.New(a.logger)(handler)
+	return handler
 }
 
 func (a *App) render(w http.ResponseWriter, r *http.Request, t *template.Template, data any) {

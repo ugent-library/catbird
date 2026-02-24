@@ -19,26 +19,26 @@ type ScheduleOpts struct {
 
 // TaskScheduleInfo contains metadata about a scheduled task.
 type TaskScheduleInfo struct {
-	TaskName       string     `json:"task_name"`
-	CronSpec       string     `json:"cron_spec"`
-	NextRunAt      time.Time  `json:"next_run_at"`
-	LastRunAt      *time.Time `json:"last_run_at,omitempty"`
-	LastEnqueuedAt *time.Time `json:"last_enqueued_at,omitempty"`
-	Enabled        bool       `json:"enabled"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	TaskName       string    `json:"task_name"`
+	CronSpec       string    `json:"cron_spec"`
+	NextRunAt      time.Time `json:"next_run_at"`
+	LastRunAt      time.Time `json:"last_run_at,omitzero"`
+	LastEnqueuedAt time.Time `json:"last_enqueued_at,omitzero"`
+	Enabled        bool      `json:"enabled"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // FlowScheduleInfo contains metadata about a scheduled flow.
 type FlowScheduleInfo struct {
-	FlowName       string     `json:"flow_name"`
-	CronSpec       string     `json:"cron_spec"`
-	NextRunAt      time.Time  `json:"next_run_at"`
-	LastRunAt      *time.Time `json:"last_run_at,omitempty"`
-	LastEnqueuedAt *time.Time `json:"last_enqueued_at,omitempty"`
-	Enabled        bool       `json:"enabled"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	FlowName       string    `json:"flow_name"`
+	CronSpec       string    `json:"cron_spec"`
+	NextRunAt      time.Time `json:"next_run_at"`
+	LastRunAt      time.Time `json:"last_run_at,omitzero"`
+	LastEnqueuedAt time.Time `json:"last_enqueued_at,omitzero"`
+	Enabled        bool      `json:"enabled"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // CreateTaskSchedule creates a cron-based schedule for a task.
@@ -120,7 +120,15 @@ func ListTaskSchedules(ctx context.Context, conn Conn) ([]*TaskScheduleInfo, err
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (*TaskScheduleInfo, error) {
 		var s TaskScheduleInfo
-		err := row.Scan(&s.TaskName, &s.CronSpec, &s.NextRunAt, &s.LastRunAt, &s.LastEnqueuedAt, &s.Enabled, &s.CreatedAt, &s.UpdatedAt)
+		var lastRunAt *time.Time
+		var lastEnqueuedAt *time.Time
+		err := row.Scan(&s.TaskName, &s.CronSpec, &s.NextRunAt, &lastRunAt, &lastEnqueuedAt, &s.Enabled, &s.CreatedAt, &s.UpdatedAt)
+		if lastRunAt != nil {
+			s.LastRunAt = *lastRunAt
+		}
+		if lastEnqueuedAt != nil {
+			s.LastEnqueuedAt = *lastEnqueuedAt
+		}
 		return &s, err
 	})
 }
@@ -136,7 +144,15 @@ func ListFlowSchedules(ctx context.Context, conn Conn) ([]*FlowScheduleInfo, err
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (*FlowScheduleInfo, error) {
 		var s FlowScheduleInfo
-		err := row.Scan(&s.FlowName, &s.CronSpec, &s.NextRunAt, &s.LastRunAt, &s.LastEnqueuedAt, &s.Enabled, &s.CreatedAt, &s.UpdatedAt)
+		var lastRunAt *time.Time
+		var lastEnqueuedAt *time.Time
+		err := row.Scan(&s.FlowName, &s.CronSpec, &s.NextRunAt, &lastRunAt, &lastEnqueuedAt, &s.Enabled, &s.CreatedAt, &s.UpdatedAt)
+		if lastRunAt != nil {
+			s.LastRunAt = *lastRunAt
+		}
+		if lastEnqueuedAt != nil {
+			s.LastEnqueuedAt = *lastEnqueuedAt
+		}
 		return &s, err
 	})
 }
