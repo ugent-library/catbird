@@ -194,9 +194,12 @@ func (c *Client) CreateFlowSchedule(ctx context.Context, flowName, cronSpec stri
 	return CreateFlowSchedule(ctx, c.Conn, flowName, cronSpec, opts)
 }
 
-// GC runs garbage collection to clean up expired queues and stale workers.
-// Note: Worker heartbeats automatically perform cleanup, so this is mainly
-// useful for deployments without workers or for manual control.
-func (c *Client) GC(ctx context.Context) error {
-	return GC(ctx, c.Conn)
+// ListTaskSchedules returns all task schedules ordered by next_run_at.
+func (c *Client) ListTaskSchedules(ctx context.Context) ([]*TaskScheduleInfo, error) {
+	return ListTaskSchedules(ctx, c.Conn)
+}
+
+// ListFlowSchedules returns all flow schedules ordered by next_run_at.
+func (c *Client) ListFlowSchedules(ctx context.Context) ([]*FlowScheduleInfo, error) {
+	return ListFlowSchedules(ctx, c.Conn)
 }
