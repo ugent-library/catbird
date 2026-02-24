@@ -879,8 +879,8 @@ step := NewStep("process").
 
 These are proposal-only helpers to support map-step behavior while keeping the current builder style:
 
-- `MapEach(sourceStep string)`: mark a step as a map step and declare which dependency provides the array.
-- `Map()`: mark a step as mapping directly over the flow input array.
+- `Map(sourceStep string)`: mark a step as a map step and declare which dependency provides the array.
+- `MapInput()`: mark a step as mapping directly over the flow input array.
 - `Reduce(fn)`: optional reducer to transform the aggregated `[]Out` into a different final output.
 - `WithPriority(fn)`: optional per-item priority hook for polling order.
 - `WithProgressCallback(fn)`: optional progress hook for UI/telemetry.
