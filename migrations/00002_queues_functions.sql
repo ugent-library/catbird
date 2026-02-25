@@ -121,8 +121,6 @@ $$;
 --   idempotency_key: Optional unique ID for idempotency (prevents duplicate messages)
 --   visible_at: Optional timestamp when message should become visible (default: now)
 -- Returns: void
-DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, timestamptz);
-DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, text, timestamptz);
 CREATE OR REPLACE FUNCTION cb_publish(
     topic text,
     payload jsonb,
@@ -279,9 +277,7 @@ $$;
 --   idempotency_key: Optional unique ID for idempotency (prevents duplicate messages)
 --   visible_at: Optional timestamp when message should become visible (default: now)
 -- Returns: bigint - the message ID
-DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, timestamptz);
-DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, text, timestamptz);
-CREATE FUNCTION cb_send(
+CREATE OR REPLACE FUNCTION cb_send(
     queue text,
     payload jsonb,
     topic text = null,
@@ -600,11 +596,9 @@ SELECT cb_delete_queue(name) FROM cb_queues;
 DROP FUNCTION IF EXISTS cb_unbind(text, text);
 DROP FUNCTION IF EXISTS cb_bind(text, text);
 DROP FUNCTION IF EXISTS cb_create_queue(text, timestamptz, boolean);
-DROP FUNCTION IF EXISTS cb_create_queue(text, text[], timestamptz, boolean);
 DROP FUNCTION IF EXISTS cb_delete_queue(text);
 DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, timestamptz);
 DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, timestamptz);
-DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, text, timestamptz);
 DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, text, timestamptz);
 DROP FUNCTION IF EXISTS cb_read(text, int, int);
 DROP FUNCTION IF EXISTS cb_read_poll(text, int, int, int, int);

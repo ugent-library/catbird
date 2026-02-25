@@ -361,8 +361,6 @@ $$;
 --   poll_for: Total duration in milliseconds to poll before timing out (must be > 0)
 --   poll_interval: Duration in milliseconds between poll attempts (must be > 0 and < poll_for)
 -- Returns: status/output/error_message once run reaches terminal state, or no rows on timeout
-DROP FUNCTION IF EXISTS cb_wait_task_output(text, bigint, int, int);
-DROP FUNCTION IF EXISTS cb_wait_task_output(text, bigint, int);
 CREATE OR REPLACE FUNCTION cb_wait_task_output(
     task_name text,
     run_id bigint,
@@ -469,7 +467,6 @@ DROP FUNCTION IF EXISTS cb_delete_task(text);
 DROP FUNCTION IF EXISTS cb_fail_task(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_task(text, bigint, jsonb);
 DROP FUNCTION IF EXISTS cb_wait_task_output(text, bigint, int, int);
-DROP FUNCTION IF EXISTS cb_wait_task_output(text, bigint, int);
 DROP FUNCTION IF EXISTS cb_hide_tasks(text, bigint[], integer);
 DROP FUNCTION IF EXISTS cb_poll_tasks(text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text, text, timestamptz);

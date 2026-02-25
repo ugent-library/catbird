@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS cb_steps (
     CONSTRAINT idx_valid CHECK (idx >= 0),
     CONSTRAINT dependency_count_valid CHECK (dependency_count >= 0),
     CONSTRAINT map_source_not_self CHECK (map_source IS NULL OR map_source <> name),
-    CONSTRAINT map_source_requires_map_step CHECK ((NOT is_map_step AND map_source IS NULL) OR is_map_step)
+    CONSTRAINT map_source_requires_map_step CHECK ((NOT is_map_step AND map_source IS NULL) OR is_map_step),
+    CONSTRAINT map_source_fk FOREIGN KEY (flow_name, map_source) REFERENCES cb_steps (flow_name, name)
 );
 
 CREATE TABLE IF NOT EXISTS cb_step_dependencies (

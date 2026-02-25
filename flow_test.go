@@ -458,14 +458,14 @@ func TestFlowMapParentCompletesAfterAllMapTasks(t *testing.T) {
 		SELECT
 			count(*) AS total,
 			count(*) FILTER (WHERE status = 'completed') AS completed,
-			count(*) FILTER (WHERE status IN ('created', 'started')) AS pending
+			count(*) FILTER (WHERE status IN ('queued', 'started')) AS active
 		FROM %s
 		WHERE flow_run_id = $1 AND step_name = $2;`, mapTable)
 
 	var total int
 	var completed int
-	var pending int
-	if err := client.Conn.QueryRow(t.Context(), earlyQ, h.ID, "work").Scan(&total, &completed, &pending); err != nil {
+	var active int
+	if err := client.Conn.QueryRow(t.Context(), earlyQ, h.ID, "work").Scan(&total, &completed, &active); err != nil {
 		t.Fatal(err)
 	}
 	if workStep.Status == "started" && total == 0 {

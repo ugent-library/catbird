@@ -208,7 +208,7 @@ BEGIN
       id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
       flow_run_id bigint NOT NULL,
       step_name text NOT NULL,
-      status text NOT NULL DEFAULT 'created',
+      status text NOT NULL DEFAULT 'pending',
       attempts int NOT NULL DEFAULT 0,
       output jsonb,
       error_message text,
@@ -222,7 +222,7 @@ BEGIN
       skipped_at timestamptz,
       UNIQUE (flow_run_id, step_name),
       FOREIGN KEY (flow_run_id) REFERENCES %I (id),
-      CONSTRAINT status_valid CHECK (status IN ('created', 'started', 'completed', 'failed', 'skipped')),
+      CONSTRAINT status_valid CHECK (status IN ('pending', 'queued', 'started', 'completed', 'failed', 'skipped')),
       CONSTRAINT remaining_dependencies_valid CHECK (remaining_dependencies >= 0),
       CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
       CONSTRAINT skipped_and_completed_failed CHECK (NOT (skipped_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL))),
@@ -235,6 +235,15 @@ BEGIN
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, status);', _s_table || '_flow_run_id_status_idx', _s_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at);', _s_table || '_visible_at_idx', _s_table);
 
+    -- Reconcile existing step tables from older schema versions
+    EXECUTE format('UPDATE %I SET status = ''pending'' WHERE status = ''created'';', _s_table);
+    EXECUTE format('ALTER TABLE %I ALTER COLUMN status SET DEFAULT ''pending'';', _s_table);
+    EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS status_valid;', _s_table);
+    EXECUTE format(
+      'ALTER TABLE %I ADD CONSTRAINT status_valid CHECK (status IN (''pending'', ''queued'', ''started'', ''completed'', ''failed'', ''skipped''));',
+      _s_table
+    );
+
     -- Create map task table used by map steps for per-item coordination
     EXECUTE format(
     $QUERY$
@@ -243,7 +252,7 @@ BEGIN
       flow_run_id bigint NOT NULL,
       step_name text NOT NULL,
       item_idx int NOT NULL,
-      status text NOT NULL DEFAULT 'created',
+      status text NOT NULL DEFAULT 'queued',
       attempts int NOT NULL DEFAULT 0,
       item jsonb NOT NULL,
       output jsonb,
@@ -255,7 +264,7 @@ BEGIN
       failed_at timestamptz,
       UNIQUE (flow_run_id, step_name, item_idx),
       FOREIGN KEY (flow_run_id, step_name) REFERENCES %I (flow_run_id, step_name),
-      CONSTRAINT status_valid CHECK (status IN ('created', 'started', 'completed', 'failed')),
+      CONSTRAINT status_valid CHECK (status IN ('queued', 'started', 'completed', 'failed')),
       CONSTRAINT item_idx_valid CHECK (item_idx >= 0),
       CONSTRAINT attempts_valid CHECK (attempts >= 0)
     )
@@ -265,6 +274,15 @@ BEGIN
 
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (step_name, status, visible_at);', _m_table || '_step_status_visible_idx', _m_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, step_name, status);', _m_table || '_flow_step_status_idx', _m_table);
+
+    -- Reconcile existing map tables from older schema versions
+    EXECUTE format('UPDATE %I SET status = ''queued'' WHERE status = ''created'';', _m_table);
+    EXECUTE format('ALTER TABLE %I ALTER COLUMN status SET DEFAULT ''queued'';', _m_table);
+    EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS status_valid;', _m_table);
+    EXECUTE format(
+      'ALTER TABLE %I ADD CONSTRAINT status_valid CHECK (status IN (''queued'', ''started'', ''completed'', ''failed''));',
+      _m_table
+    );
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -368,7 +386,7 @@ BEGIN
     EXECUTE format(
     $QUERY$
     INSERT INTO %I (flow_run_id, step_name, status, remaining_dependencies)
-    SELECT %L, s.name, 'created', s.dependency_count
+    SELECT %L, s.name, 'pending', s.dependency_count
     FROM cb_steps s
     WHERE s.flow_name = %L
     ON CONFLICT (flow_run_id, step_name) DO NOTHING
@@ -451,7 +469,7 @@ BEGIN
              (SELECT map_source FROM cb_steps WHERE flow_name = $3 AND name = sr.step_name) AS map_source
       FROM %I sr
       WHERE sr.flow_run_id = $1
-        AND sr.status = 'created'
+        AND sr.status = 'pending'
         AND sr.remaining_dependencies = 0
         AND (NOT (SELECT has_signal FROM cb_steps WHERE flow_name = $3 AND name = sr.step_name) 
              OR sr.signal_input IS NOT NULL)
@@ -501,7 +519,7 @@ BEGIN
           SET remaining_dependencies = remaining_dependencies - 1
           WHERE flow_run_id = $1
             AND step_name IN (SELECT step_name FROM cb_step_dependencies WHERE flow_name = $2 AND dependency_name = $3)
-            AND status = 'created'
+            AND status = 'pending'
           $QUERY$,
           _s_table
         )
@@ -551,7 +569,7 @@ BEGIN
         $QUERY$
         UPDATE %I
         SET status = 'started',
-            started_at = now(),
+            started_at = coalesce(started_at, now()),
             visible_at = coalesce($2, now())
         WHERE id = $1
         $QUERY$,
@@ -566,7 +584,7 @@ BEGIN
         SELECT $1,
                $2,
                ordinality - 1,
-               'created',
+           'queued',
                value,
                coalesce($3, now())
         FROM jsonb_array_elements($4) WITH ORDINALITY
@@ -589,8 +607,8 @@ BEGIN
     EXECUTE format(
       $QUERY$
       UPDATE %I
-      SET status = 'started',
-          started_at = now(),
+      SET status = 'queued',
+          started_at = NULL,
           visible_at = coalesce($2, now())
       WHERE id = $1
       $QUERY$,
@@ -665,14 +683,16 @@ BEGIN
           INNER JOIN %I f ON m.flow_run_id = f.id
           WHERE m.step_name = $1
             AND m.visible_at <= clock_timestamp()
-            AND m.status = 'started'
+            AND m.status IN ('queued', 'started')
             AND f.status = 'started'
           ORDER BY m.id ASC
           LIMIT $2
           FOR UPDATE SKIP LOCKED
         )
         UPDATE %I m
-        SET attempts = attempts + 1,
+        SET status = 'started',
+            attempts = attempts + 1,
+          started_at = clock_timestamp(),
             visible_at = clock_timestamp() + $3
         FROM runs
         WHERE m.id = runs.id
@@ -738,7 +758,8 @@ BEGIN
       UPDATE %I
       SET visible_at = (clock_timestamp() + $2)
       WHERE id = any($1)
-        AND step_name = $3;
+        AND step_name = $3
+        AND status IN ('queued', 'started');
       $QUERY$,
       _s_table
     )
@@ -797,7 +818,7 @@ BEGIN
         INNER JOIN %I s ON s.flow_run_id = m.flow_run_id AND s.step_name = m.step_name
         INNER JOIN %I f ON f.id = m.flow_run_id
         WHERE m.step_name = $1
-          AND m.status = 'created'
+          AND m.status IN ('queued', 'started')
           AND m.visible_at <= clock_timestamp()
           AND s.status = 'started'
           AND f.status = 'started'
@@ -808,7 +829,7 @@ BEGIN
       UPDATE %I m
       SET status = 'started',
           attempts = attempts + 1,
-          started_at = coalesce(m.started_at, now()),
+          started_at = clock_timestamp(),
           visible_at = clock_timestamp() + $3
       FROM runs
       WHERE m.id = runs.id
@@ -870,7 +891,7 @@ BEGIN
       SET visible_at = (clock_timestamp() + $2)
       WHERE id = any($1)
         AND step_name = $3
-        AND status IN ('created', 'started')
+        AND status IN ('queued', 'started')
       $QUERY$,
       _m_table
     )
@@ -914,7 +935,7 @@ BEGIN
     END IF;
 
     EXECUTE format(
-      'SELECT EXISTS (SELECT 1 FROM %I WHERE flow_run_id = $1 AND step_name = $2 AND status IN (''created'', ''started''))',
+      'SELECT EXISTS (SELECT 1 FROM %I WHERE flow_run_id = $1 AND step_name = $2 AND status IN (''queued'', ''started''))',
       _m_table
     )
     USING _flow_run_id, cb_complete_map_task.step_name
@@ -961,7 +982,7 @@ BEGIN
           failed_at = now(),
           error_message = $2
       WHERE id = $1
-        AND status IN ('created', 'started')
+        AND status IN ('queued', 'started')
       RETURNING flow_run_id
       $QUERY$,
       _m_table
@@ -1019,7 +1040,7 @@ BEGIN
     USING cb_complete_step.step_id, cb_complete_step.output
     INTO _flow_run_id;
 
-    -- If step wasn't in 'created' status, return early (already completed or failed)
+    -- If step wasn't in 'started' status, return early (already completed or failed)
     IF _flow_run_id IS NULL THEN
     RETURN;
     END IF;
@@ -1049,7 +1070,7 @@ BEGIN
     SET remaining_dependencies = remaining_dependencies - 1
     WHERE flow_run_id = $1
       AND step_name IN (SELECT step_name FROM cb_step_dependencies WHERE flow_name = $2 AND dependency_name = $3)
-      AND status = 'created'
+      AND status = 'pending'
     $QUERY$,
     _s_table
     )
@@ -1099,7 +1120,7 @@ DECLARE
     _s_table text := cb_table_name(cb_fail_step.flow_name, 's');
     _flow_run_id bigint;
 BEGIN
-    -- Fail step run atomically - only succeeds if status is 'created' or 'started'
+    -- Fail step run atomically - only succeeds if status is 'pending', 'queued', or 'started'
     EXECUTE format(
     $QUERY$
     UPDATE %I
@@ -1107,7 +1128,7 @@ BEGIN
         failed_at = now(),
         error_message = $2
     WHERE id = $1
-      AND status IN ('created', 'started')
+      AND status IN ('pending', 'queued', 'started')
     RETURNING flow_run_id
     $QUERY$,
     _s_table
@@ -1115,7 +1136,7 @@ BEGIN
     USING cb_fail_step.step_id, cb_fail_step.error_message
     INTO _flow_run_id;
 
-    -- If step wasn't in 'created' or 'started' status, return early (already completed/failed)
+    -- If step wasn't in 'pending', 'queued', or 'started' status, return early (already completed/failed)
     IF _flow_run_id IS NULL THEN
     RETURN;
     END IF;
@@ -1153,7 +1174,7 @@ DECLARE
     _s_table text := cb_table_name(cb_signal_flow.flow_name, 's');
     _updated boolean;
 BEGIN
-    -- Atomically update signal_input - only succeeds if step is created, requires signal, and not already signaled
+    -- Atomically update signal_input - only succeeds if step is pending, requires signal, and not already signaled
     EXECUTE format(
     $QUERY$
     UPDATE %I sr
@@ -1161,7 +1182,7 @@ BEGIN
     FROM cb_steps s
     WHERE sr.flow_run_id = $1
       AND sr.step_name = $2
-      AND sr.status = 'created'
+      AND sr.status = 'pending'
       AND sr.signal_input IS NULL
       AND s.flow_name = $4
       AND s.name = sr.step_name
@@ -1193,8 +1214,6 @@ $$;
 --   poll_for: Total duration in milliseconds to poll before timing out (must be > 0)
 --   poll_interval: Duration in milliseconds between poll attempts (must be > 0 and < poll_for)
 -- Returns: status/output/error_message once run reaches terminal state, or no rows on timeout
-DROP FUNCTION IF EXISTS cb_wait_flow_output(text, bigint, int, int);
-DROP FUNCTION IF EXISTS cb_wait_flow_output(text, bigint, int);
 CREATE OR REPLACE FUNCTION cb_wait_flow_output(
     flow_name text,
     run_id bigint,
@@ -1310,7 +1329,6 @@ $$;
 
 DROP FUNCTION IF EXISTS cb_delete_flow(text);
 DROP FUNCTION IF EXISTS cb_wait_flow_output(text, bigint, int, int);
-DROP FUNCTION IF EXISTS cb_wait_flow_output(text, bigint, int);
 DROP FUNCTION IF EXISTS cb_signal_flow(text, bigint, text, jsonb);
 DROP FUNCTION IF EXISTS cb_fail_step(text, text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_step(text, text, bigint, jsonb);

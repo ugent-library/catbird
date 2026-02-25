@@ -335,6 +335,17 @@ flow := catbird.NewFlow("double-numbers").
         }))
 ```
 
+## Status Values
+
+| Status | Meaning | Used by |
+|--------|---------|---------|
+| `queued` | Runnable and never picked up by a worker | Task runs, flow step runs, map item runs |
+| `pending` | Not runnable yet (waiting on dependencies and/or signal input) | Flow step runs |
+| `started` | Picked up by a worker at least once (including retries) | Task runs, flow runs, flow step runs, map item runs |
+| `completed` | Finished successfully and output is available | Task runs, flow runs, flow step runs, map item runs |
+| `failed` | Finished with an error | Task runs, flow runs, flow step runs, map item runs |
+| `skipped` | Intentionally skipped (typically due to a condition evaluating false) | Task runs, flow step runs |
+
 # Conditional Execution
 
 Both tasks and flow steps support conditional execution via `Condition` on the builder methods. If the condition evaluates to false (or a referenced field is missing), the task/step is marked `skipped` and its handler does not run.
