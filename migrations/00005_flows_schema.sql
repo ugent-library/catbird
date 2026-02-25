@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS cb_steps (
     dependency_count int NOT NULL DEFAULT 0,
     is_map_step boolean NOT NULL DEFAULT false,
     map_source text,
-    signal boolean NOT NULL DEFAULT false,
+    has_signal boolean NOT NULL DEFAULT false,
     condition jsonb,
     PRIMARY KEY (flow_name, name),
     UNIQUE (flow_name, idx),
@@ -77,7 +77,7 @@ CREATE OR REPLACE VIEW cb_flow_info AS
         'name', s.name,
         'is_map_step', s.is_map_step,
         'map_source', s.map_source,
-        'signal', s.signal,
+        'has_signal', s.has_signal,
         'depends_on', (
           SELECT jsonb_agg(jsonb_build_object('name', s_d.dependency_name))
           FROM cb_step_dependencies AS s_d

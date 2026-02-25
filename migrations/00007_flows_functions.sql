@@ -128,7 +128,7 @@ BEGIN
       _condition := cb_parse_condition(_step->>'condition');
     END IF;
 
-    INSERT INTO cb_steps (flow_name, name, idx, dependency_count, is_map_step, map_source, signal, condition)
+    INSERT INTO cb_steps (flow_name, name, idx, dependency_count, is_map_step, map_source, has_signal, condition)
     VALUES (
       cb_create_flow.name,
       _step_name,
@@ -136,7 +136,7 @@ BEGIN
       jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb)),
       _is_map_step,
       _map_source,
-      coalesce((_step->>'signal')::boolean, false),
+      coalesce((_step->>'has_signal')::boolean, false),
       _condition
     );
 
@@ -453,7 +453,7 @@ BEGIN
       WHERE sr.flow_run_id = $1
         AND sr.status = 'created'
         AND sr.remaining_dependencies = 0
-        AND (NOT (SELECT signal FROM cb_steps WHERE flow_name = $3 AND name = sr.step_name) 
+        AND (NOT (SELECT has_signal FROM cb_steps WHERE flow_name = $3 AND name = sr.step_name) 
              OR sr.signal_input IS NOT NULL)
       FOR UPDATE SKIP LOCKED
       $QUERY$,
@@ -466,7 +466,7 @@ BEGIN
 
     IF _step_condition IS NOT NULL THEN
       -- Build step_inputs: combine flow input, dependency outputs, and signal input
-      -- Flow input accessible as input.*, dependency outputs as dependency_name.*, signal as signal.*
+      -- Flow input accessible as input.*, dependency outputs as dependency_name.*, signal input as signal.*
       _step_inputs := jsonb_build_object('input', _flow_input);
       
       IF _step_to_process.step_outputs IS NOT NULL THEN
@@ -1165,7 +1165,7 @@ BEGIN
       AND sr.signal_input IS NULL
       AND s.flow_name = $4
       AND s.name = sr.step_name
-      AND s.signal = true
+      AND s.has_signal = true
     RETURNING true
     $QUERY$,
     _s_table

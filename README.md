@@ -273,7 +273,7 @@ flow := catbird.NewFlow("document_approval").
         })).
     AddStep(catbird.NewStep("approve").
         DependsOn("submit").
-        Signal(true).
+        Signal().
         Handler(func(ctx context.Context, doc Document, approval ApprovalInput, docID string) (ApprovalResult, error) {
             if !approval.Approved {
                 return ApprovalResult{}, fmt.Errorf("approval denied by %s: %s", approval.ApproverID, approval.Notes)
@@ -302,7 +302,7 @@ Map steps fan out array processing into per-item SQL-coordinated work and aggreg
 
 - Use `MapInput()` to map over flow input (flow input must be a JSON array)
 - Use `Map("step_name")` to map over a dependency step output array
-- Coordination is SQL-driven (`cb_m_<flow>` + map-task polling/complete/fail functions)
+- Each mapped item runs as its own task, so retries happen per item instead of rerunning the whole step.
 
 ### Map flow input
 

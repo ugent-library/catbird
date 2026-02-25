@@ -146,7 +146,7 @@ NewFlow("workflow").
     })).
   AddStep(NewStep("approve").
     DependsOn("step1").
-    Signal(true). // Wait for signal
+    Signal(). // Wait for signal
     Handler(func(ctx context.Context, in string, approval ApprovalInput, step1Out string) (string, error) {
       return step1Out + " approved by " + approval.ApproverID, nil
     }))
@@ -160,7 +160,7 @@ NewFlow("workflow").
 - **Optional outputs**: When a conditional step is skipped, dependent steps receive `Optional[T]{IsSet: false}`. When executed, `Optional[T]{IsSet: true, Value: result}`
 - **Cascading resolution**: `cb_start_steps()` loops until no more steps unblock; handles chains like step2 skips → step3 unblocks → step4 unblocks
 - **Validation**: Flow construction panics if a step depends on a conditional step without using `.OptionalDependency()` variant and `Optional[T]` parameter type
-- **Builder methods**: All construction through chainable methods: `NewStep(name).DependsOn(...).Condition(...).Signal(...).Handler(fn, opts...)`
+- **Builder methods**: All construction through chainable methods: `NewStep(name).DependsOn(...).Condition(...).Signal().Handler(fn, opts...)`
 
 ## Key Conventions
 

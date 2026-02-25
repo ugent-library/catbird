@@ -838,7 +838,7 @@ mapStep2 := catbird.NewStep("transform").
 mapStep3 := catbird.NewStep("validate-with-approval").
     DependsOn("collect-submissions").
     Map("collect-submissions").
-    Signal(true).
+    Signal().
     Condition("input.requires_review").
     Handler(
         func(
@@ -884,7 +884,7 @@ Map-step builder methods:
 - `WithPriority(fn)`: optional per-item priority hook for polling order.
 - `WithProgressCallback(fn)`: optional progress hook for UI/telemetry.
 
-`Map(...)` and `MapInput()` are implemented as builder metadata and serialized into flow definitions (`is_map_step`, `map_source`) alongside `condition`, `signal`, and `depends_on`.
+`Map(...)` and `MapInput()` are implemented as builder metadata and serialized into flow definitions (`is_map_step`, `map_source`, `has_signal`) alongside `condition` and `depends_on`.
 
 ### Type Definitions (Internal)
 
@@ -918,7 +918,7 @@ func (s *Step) MarshalJSON() ([]byte, error) {
         IsMapStep       bool              `json:"is_map,omitempty"`
         ArraySourceStep string            `json:"array_source,omitempty"`
         Condition       string            `json:"condition,omitempty"`
-        Signal       bool              `json:"signal"`
+        HasSignal    bool              `json:"has_signal"`
         DependsOn       []*StepDependency `json:"depends_on,omitempty"`
     }
     
@@ -927,7 +927,7 @@ func (s *Step) MarshalJSON() ([]byte, error) {
         IsMapStep:       s.IsMapStep,
         ArraySourceStep: s.ArraySourceStep,
         Condition:       s.Condition,
-        Signal:       s.Signal,
+        HasSignal:    s.HasSignal,
         DependsOn:       s.DependsOn,
     })
 }

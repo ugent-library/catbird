@@ -39,7 +39,7 @@ type Step struct {
 	isMapStep            bool
 	mapSource            string
 	condition            string
-	signal               bool
+	hasSignal            bool
 	handler              func(context.Context, []byte, map[string][]byte, []byte) ([]byte, error)
 	handlerOpts          *HandlerOpts
 }
@@ -61,8 +61,8 @@ func (s *Step) Condition(condition string) *Step {
 	return s
 }
 
-func (s *Step) Signal(signal bool) *Step {
-	s.signal = signal
+func (s *Step) Signal() *Step {
+	s.hasSignal = true
 	return s
 }
 
@@ -94,7 +94,7 @@ func (s *Step) Map(stepName string) *Step {
 }
 
 func (s *Step) Handler(fn any, opts ...HandlerOpts) *Step {
-	handler, optionalDeps, err := makeStepHandler(fn, s.name, s.dependencies, s.signal, s.isMapStep, s.mapSource)
+	handler, optionalDeps, err := makeStepHandler(fn, s.name, s.dependencies, s.hasSignal, s.isMapStep, s.mapSource)
 	if err != nil {
 		panic(err)
 	}
@@ -105,10 +105,10 @@ func (s *Step) Handler(fn any, opts ...HandlerOpts) *Step {
 }
 
 // makeStepHandler uses reflection once to extract types and create cached wrapper for step handlers.
-// Step handler signature: (context.Context, In, [Signal if signal], [Dep1, Dep2, ...]) (Out, error)
+// Step handler signature: (context.Context, In, [Signal if signal enabled], [Dep1, Dep2, ...]) (Out, error)
 // Returns wrapper with signature: (context.Context, flowInputJSON []byte, depsJSON map[string][]byte, signalInputJSON []byte) ([]byte, error)
 // Also returns a map indicating which dependencies are Optional[T]
-func makeStepHandler(fn any, stepName string, dependencies []string, signal bool, isMapStep bool, mapSource string) (func(context.Context, []byte, map[string][]byte, []byte) ([]byte, error), map[string]bool, error) {
+func makeStepHandler(fn any, stepName string, dependencies []string, hasSignal bool, isMapStep bool, mapSource string) (func(context.Context, []byte, map[string][]byte, []byte) ([]byte, error), map[string]bool, error) {
 	fnType := reflect.TypeOf(fn)
 	fnVal := reflect.ValueOf(fn)
 
@@ -117,9 +117,9 @@ func makeStepHandler(fn any, stepName string, dependencies []string, signal bool
 		return nil, nil, fmt.Errorf("step %s: handler must be a function", stepName)
 	}
 
-	// Expected signature: (context.Context, In, [Signal if signal], [Dep1, Dep2, ...]) (Out, error)
+	// Expected signature: (context.Context, In, [Signal if signal enabled], [Dep1, Dep2, ...]) (Out, error)
 	expectedInputs := 2 // ctx + flow input
-	if signal {
+	if hasSignal {
 		expectedInputs++ // signal input
 	}
 	expectedInputs += len(dependencies) // dependency outputs
@@ -128,7 +128,7 @@ func makeStepHandler(fn any, stepName string, dependencies []string, signal bool
 		return nil, nil, fmt.Errorf("step %s: handler must have %d inputs (context.Context, In%s%s), got %d",
 			stepName, expectedInputs,
 			func() string {
-				if signal {
+				if hasSignal {
 					return ", Signal"
 				}
 				return ""
@@ -156,14 +156,14 @@ func makeStepHandler(fn any, stepName string, dependencies []string, signal bool
 	// Determine parameter indices
 	signalParamIdx := 2 // Signal comes after ctx and flow input (if present)
 	depStartIdx := 2    // Dependencies start here
-	if signal {
+	if hasSignal {
 		depStartIdx = 3 // Dependencies start after signal
 	}
 
 	// CACHE: Extract all type info once - stored in closure
 	flowInputType := fnType.In(1)
 	var signalType reflect.Type
-	if signal {
+	if hasSignal {
 		signalType = fnType.In(signalParamIdx)
 	}
 
@@ -206,7 +206,7 @@ func makeStepHandler(fn any, stepName string, dependencies []string, signal bool
 	return func(ctx context.Context, flowInputJSON []byte, depsJSON map[string][]byte, signalInputJSON []byte) ([]byte, error) {
 		buildAndCall := func(flowArg reflect.Value, depValues []reflect.Value, signalValue reflect.Value) (reflect.Value, error) {
 			args := []reflect.Value{reflect.ValueOf(ctx), flowArg}
-			if signal {
+			if hasSignal {
 				args = append(args, signalValue)
 			}
 			args = append(args, depValues...)
@@ -237,7 +237,7 @@ func makeStepHandler(fn any, stepName string, dependencies []string, signal bool
 
 		// 2. Unmarshal signal if present (uses cached signalType)
 		var signalVal reflect.Value
-		if signal {
+		if hasSignal {
 			signalValPtr := reflect.New(signalType)
 			if len(signalInputJSON) > 0 {
 				if err := json.Unmarshal(signalInputJSON, signalValPtr.Interface()); err != nil {
@@ -356,7 +356,7 @@ type StepInfo struct {
 	Name      string               `json:"name"`
 	IsMapStep bool                 `json:"is_map_step,omitempty"`
 	MapSource string               `json:"map_source,omitempty"`
-	Signal    bool                 `json:"signal,omitempty"`
+	HasSignal bool                 `json:"has_signal,omitempty"`
 	DependsOn []StepDependencyInfo `json:"depends_on,omitempty"`
 }
 
@@ -494,7 +494,7 @@ func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 			Condition string            `json:"condition,omitempty"`
 			IsMapStep bool              `json:"is_map_step,omitempty"`
 			MapSource string            `json:"map_source,omitempty"`
-			Signal    bool              `json:"signal"`
+			HasSignal bool              `json:"has_signal"`
 			DependsOn []*stepDependency `json:"depends_on,omitempty"`
 		}
 
@@ -512,7 +512,7 @@ func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 				Name:      s.name,
 				IsMapStep: s.isMapStep,
 				MapSource: s.mapSource,
-				Signal:    s.signal,
+				HasSignal: s.hasSignal,
 				DependsOn: deps,
 			}
 			serStep.Condition = s.condition

@@ -383,7 +383,7 @@ func TestFlowMapSQLValidationRejectsMissingDependency(t *testing.T) {
 			"name": "numbers",
 		},
 		{
-			"name":       "mapped",
+			"name":        "mapped",
 			"is_map_step": true,
 			"map_source":  "numbers",
 			"depends_on":  []map[string]any{},
@@ -961,7 +961,7 @@ func TestFlowWithSignal(t *testing.T) {
 		})).
 		AddStep(NewStep("approve").
 			DependsOn("submit").
-			Signal(true).
+			Signal().
 			Handler(func(ctx context.Context, doc string, approval ApprovalInput, submitResult string) (string, error) {
 				if !approval.Approved {
 					return "", fmt.Errorf("approval denied by %s", approval.ApproverID)
@@ -1022,7 +1022,7 @@ func TestFlowWithInitialSignal(t *testing.T) {
 	flowName := testFlowName(t, "initial_signal_flow")
 	flow := NewFlow(flowName).
 		AddStep(NewStep("start").
-			Signal(true).
+			Signal().
 			Handler(func(ctx context.Context, flowInput string, signal StartInput) (string, error) {
 				return fmt.Sprintf("started by %s", signal.InitiatorID), nil
 			})).
@@ -1081,7 +1081,7 @@ func TestFlowSignalAlreadyDelivered(t *testing.T) {
 		})).
 		AddStep(NewStep("approve").
 			DependsOn("request").
-			Signal(true).
+			Signal().
 			Handler(func(ctx context.Context, doc string, approval ApprovalInput, reqResult string) (string, error) {
 				if approval.Response != "approved" {
 					return "", fmt.Errorf("approval denied by %s: %s", approval.ApproverID, approval.Response)
