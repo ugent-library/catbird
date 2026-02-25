@@ -25,7 +25,7 @@ catbird.NewStep("process_orders").
             results = append(results, result)
         }
         return results, nil
-    }, nil)
+    })
 ```
 
 **Problems:**
@@ -164,7 +164,7 @@ CREATE TABLE cb_t_myflow (
     output jsonb,
     error_message text,
     deliveries int NOT NULL DEFAULT 0,
-    deliver_at timestamptz NOT NULL DEFAULT now(),
+    visible_at timestamptz NOT NULL DEFAULT now(),
     created_at timestamptz NOT NULL DEFAULT now(),
     started_at timestamptz,
     completed_at timestamptz,
@@ -181,7 +181,7 @@ CREATE TABLE cb_t_myflow (
 );
 
 -- Hot path indexes: task polling uses these heavily
-CREATE INDEX cb_t_myflow_deliver_at_idx ON cb_t_myflow(deliver_at) WHERE status IN ('created', 'started');
+CREATE INDEX cb_t_myflow_visible_at_idx ON cb_t_myflow(visible_at) WHERE status IN ('created', 'started');
 CREATE INDEX cb_t_myflow_flow_step_idx ON cb_t_myflow(flow_run_id, step_name);
 CREATE INDEX cb_t_myflow_status_idx ON cb_t_myflow(status);
 
@@ -202,7 +202,7 @@ CREATE INDEX cb_t_myflow_status_idx ON cb_t_myflow(status);
 - `output`: Result from processing this element
 - `error_message`: Failure reason if status='failed'
 - `deliveries`: Retry counter (increments on failure)
-- `deliver_at`: Visibility timeout for concurrency control
+- `visible_at`: Visibility timeout for concurrency control
 - Timestamps for observability
 
 **Example data:**
@@ -322,7 +322,7 @@ BEGIN
             output jsonb,
             error_message text,
             deliveries int NOT NULL DEFAULT 0,
-            deliver_at timestamptz NOT NULL DEFAULT now(),
+            visible_at timestamptz NOT NULL DEFAULT now(),
             created_at timestamptz NOT NULL DEFAULT now(),
             started_at timestamptz,
             completed_at timestamptz,
@@ -344,8 +344,8 @@ BEGIN
     );
     
     -- Create indexes for task polling (hot path)
-    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (deliver_at) WHERE status IN (''created'', ''started'')',
-        _task_runs_table || '_deliver_at_idx', _task_runs_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at) WHERE status IN (''created'', ''started'')',
+        _task_runs_table || '_visible_at_idx', _task_runs_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, step_name)',
         _task_runs_table || '_flow_step_idx', _task_runs_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (status)',
@@ -495,13 +495,13 @@ BEGIN
                         ELSE t.started_at
                     END,
                     deliveries = t.deliveries + 1,
-                    deliver_at = clock_timestamp() + $2
+                    visible_at = clock_timestamp() + $2
                 WHERE t.id IN (
                     SELECT t2.id
                     FROM %I t2
-                    WHERE t2.deliver_at <= clock_timestamp()
+                    WHERE t2.visible_at <= clock_timestamp()
                       AND t2.status IN ('created', 'started')
-                    ORDER BY t2.deliver_at
+                    ORDER BY t2.visible_at
                     LIMIT $1
                     FOR UPDATE SKIP LOCKED
                 )
@@ -530,7 +530,7 @@ $$;
 **Performance notes:**
 - Uses `FOR UPDATE SKIP LOCKED` for lock-free concurrent polling
 - Bulk updates in single CTE (no N+1 queries)
-- Indexed on `deliver_at` for fast visibility timeout filtering
+- Indexed on `visible_at` for fast visibility timeout filtering
 - Poll-and-sleep pattern prevents thundering herd
 
 #### `cb_hide_map_tasks()` - Retry Failed Tasks
@@ -555,7 +555,7 @@ BEGIN
     EXECUTE format(
         $QUERY$
         UPDATE %I
-        SET deliver_at = (clock_timestamp() + $2)
+        SET visible_at = (clock_timestamp() + $2)
         WHERE id = ANY($1)
         $QUERY$,
         _task_runs_table
@@ -813,7 +813,7 @@ mapStep1 := catbird.NewStep("process-items").
         ) (Result, error) {
             return processItem(ctx, item)
         },
-        &catbird.HandlerOpts{Concurrency: 10},  // Process 10 items in parallel
+        catbird.HandlerOpts{Concurrency: 10},  // Process 10 items in parallel
     )
 
 // Map step with dependency (operate on dependency output array)
@@ -827,7 +827,7 @@ mapStep2 := catbird.NewStep("transform").
         ) (Transformed, error) {
             return transform(ctx, record)
         },
-        &catbird.HandlerOpts{
+        catbird.HandlerOpts{
             Concurrency:    20,
             MaxRetries:     3,
             CircuitBreaker: catbird.NewCircuitBreaker(5, 30*time.Second),
@@ -848,7 +848,6 @@ mapStep3 := catbird.NewStep("validate-with-approval").
         ) (ValidationResult, error) {
             return validateSubmission(ctx, submission, approval)
         },
-        nil,
     )
 ```
 
@@ -861,7 +860,7 @@ Map steps are detected explicitly using map markers:
 step := NewStep("process").
     DependsOn("fetch-orders").
     MapEach("fetch-orders").
-    Handler(func(ctx context.Context, order Order) (Result, error) { ... }, nil)
+    Handler(func(ctx context.Context, order Order) (Result, error) { ... })
 
 // Handler signature analysis (via reflection) validates array processing:
 // - Source step output is []Order at runtime
@@ -1208,7 +1207,7 @@ flow := catbird.NewFlow("file-processor").
     AddStep(catbird.NewStep("upload").
         Handler(func(ctx context.Context, req UploadRequest) ([]File, error) {
             return req.Files, nil
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("process-file").
         DependsOn("upload").
         MapEach("upload").
@@ -1228,7 +1227,7 @@ flow := catbird.NewFlow("file-processor").
                     Checksum: hex.EncodeToString(checksum[:]),
                 }, nil
             },
-            &catbird.HandlerOpts{
+            catbird.HandlerOpts{
                 Concurrency: 5, // Process 5 files at a time
                 MaxRetries:  3, // Retry failed files up to 3 times
             },
@@ -1245,7 +1244,7 @@ flow := catbird.NewFlow("file-processor").
                     FileCount: len(results),
                     TotalSize: totalSize,
                 }, nil
-            }, nil))
+            }))
 
 // Run it
 client := catbird.New(conn)
@@ -1255,7 +1254,7 @@ handle, err := client.RunFlow(ctx, "file-processor", UploadRequest{
         {Name: "doc2.pdf", Path: "/tmp/doc2.pdf"},
         {Name: "doc3.pdf", Path: "/tmp/doc3.pdf"},
     },
-}, nil)
+})
 
 var output Summary
 err = handle.WaitForOutput(ctx, &output)
@@ -1270,7 +1269,7 @@ flow := catbird.NewFlow("email-campaign").
     AddStep(catbird.NewStep("get-subscribers").
         Handler(func(ctx context.Context, campaignID string) ([]Subscriber, error) {
             return db.GetActiveSubscribers(ctx, campaignID)
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("send-email").
         DependsOn("get-subscribers").
         MapEach("get-subscribers").
@@ -1279,7 +1278,7 @@ flow := catbird.NewFlow("email-campaign").
                 // Circuit breaker: fail fast if email service is down
                 return emailService.Send(ctx, sub.Email)
             },
-            &catbird.HandlerOpts{
+            catbird.HandlerOpts{
                 Concurrency:    20,
                 MaxRetries:     2,
                 CircuitBreaker: catbird.NewCircuitBreaker(10, 30*time.Second),
@@ -1302,7 +1301,7 @@ flow := catbird.NewFlow("email-campaign").
                     Sent:   sent,
                     Failed: failed,
                 }, nil
-            }, nil,
+            },
         ))
 ```
 
@@ -1320,13 +1319,13 @@ flow := catbird.NewFlow("batch-validator").
                 Valid:  len(errors) == 0,
                 Errors: errors,
             }, nil
-        }, nil))
+        }))
 
 // Run with array input
 handle, err := client.RunFlow(ctx, "batch-validator", []FormData{
     {ID: 1, Name: "Alice", Email: "alice@example.com"},
     {ID: 2, Name: "Bob", Email: "invalid-email"},
-}, nil)
+})
 var results []ValidationResult
 err = handle.WaitForOutput(ctx, &results)
 // results: []ValidationResult{
@@ -1347,34 +1346,34 @@ flow := catbird.NewFlow("data-pipeline").
                 Orders:   fetchOrders(query),
                 Products: fetchProducts(query),
             }, nil
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("split_users").
         DependsOn("extract").
         Handler(func(ctx context.Context, q string, ds DataSet) ([]User, error) {
             return ds.Users, nil
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("split_orders").
         DependsOn("extract").
         Handler(func(ctx context.Context, q string, ds DataSet) ([]Order, error) {
             return ds.Orders, nil
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("enrich_user").
         DependsOn("split_users").
         MapEach("split_users").
         Handler(func(ctx context.Context, q string, user User) (EnrichedUser, error) {
             return enrichUserData(ctx, user)
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("enrich_order").
         DependsOn("split_orders").
         MapEach("split_orders").
         Handler(func(ctx context.Context, q string, order Order) (EnrichedOrder, error) {
             return enrichOrderData(ctx, order)
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("combine").
         DependsOn("enrich_user", "enrich_order").
         Handler(func(ctx context.Context, q string, users []EnrichedUser, orders []EnrichedOrder) (Report, error) {
             return generateReport(users, orders), nil
-        }, nil))
+        }))
 ```
 
 ### Conditional Map Step
@@ -1385,12 +1384,12 @@ flow := catbird.NewFlow("order-processor").
     AddStep(catbird.NewStep("get_order").
         Handler(func(ctx context.Context, orderID string) (Order, error) {
             return db.GetOrder(ctx, orderID)
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("get_items").
         DependsOn("get_order").
         Handler(func(ctx context.Context, id string, order Order) ([]OrderItem, error) {
             return order.Items, nil
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("apply_premium_discount").
         DependsOn("get_items").
         MapEach("get_items").
@@ -1398,7 +1397,7 @@ flow := catbird.NewFlow("order-processor").
         Handler(func(ctx context.Context, id string, item OrderItem) (OrderItem, error) {
             item.Price = item.Price * 0.9  // 10% discount
             return item, nil
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("finalize").
         DependsOn("get_order", "apply_premium_discount").
         Handler(func(ctx context.Context, id string, order Order, items catbird.Optional[[]OrderItem]) (Invoice, error) {
@@ -1407,7 +1406,7 @@ flow := catbird.NewFlow("order-processor").
                 finalItems = items.Value
             }
             return generateInvoice(finalItems), nil
-        }, nil))
+        }))
 ```
 
 ## Edge Cases and Error Handling
@@ -1481,7 +1480,7 @@ flow := catbird.NewFlow("order-processor").
 **Scenario**: Worker crashes while processing task
 
 **Recovery**:
-1. Task remains in `status='started'` with `deliver_at` in past
+1. Task remains in `status='started'` with `visible_at` in past
 2. Visibility timeout expires (30s)
 3. Another worker polls and gets same task (via `FOR UPDATE SKIP LOCKED`)
 4. Task `deliveries` increments, processing retries
@@ -1503,7 +1502,7 @@ flow := catbird.NewFlow("order-processor").
 
 **Large arrays (500-5000 items)**:
 - Bulk spawning performs well (single INSERT with unnest)
-- Index on `deliver_at` keeps polling fast
+- Index on `visible_at` keeps polling fast
 - Consider chunking for very large arrays
 
 **Very large arrays (5000+ items)**:
@@ -1515,13 +1514,13 @@ flow := catbird.NewFlow("order-processor").
 
 **Hot path indexes** (created automatically):
 ```sql
-CREATE INDEX ON cb_t_{flow} (deliver_at) WHERE status IN ('created', 'started');
+CREATE INDEX ON cb_t_{flow} (visible_at) WHERE status IN ('created', 'started');
 CREATE INDEX ON cb_t_{flow} (flow_run_id, step_name);
 CREATE INDEX ON cb_t_{flow} (status);
 ```
 
 **Query patterns**:
-- Task polling: `WHERE deliver_at <= now() AND status IN ('created', 'started')` → uses `deliver_at` index
+- Task polling: `WHERE visible_at <= now() AND status IN ('created', 'started')` → uses `visible_at` index
 - Aggregation check: `WHERE flow_run_id = X AND step_name = Y` → uses `flow_step_idx`
 - Dashboard queries: `WHERE status = 'failed'` → uses `status_idx`
 
@@ -1531,7 +1530,7 @@ CREATE INDEX ON cb_t_{flow} (status);
 2. **Lock-free polling**: `FOR UPDATE SKIP LOCKED` prevents worker contention
 3. **Bulk aggregation**: `jsonb_agg(output ORDER BY task_index)` in single query
 4. **Visibility timeout**: Prevents duplicate processing without explicit locks
-5. **Partial index on deliver_at**: Only indexes tasks eligible for polling
+5. **Partial index on visible_at**: Only indexes tasks eligible for polling
 
 ### Resource Usage
 
@@ -1675,13 +1674,13 @@ func TestMapStepCreation(t *testing.T) {
         AddStep(catbird.NewStep("fetch").
             Handler(func(ctx context.Context, _ int) ([]int, error) {
                 return []int{1, 2, 3}, nil
-            }, nil)).
+            })).
         AddStep(catbird.NewStep("process").
             DependsOn("fetch").
             MapEach("fetch").
             Handler(func(ctx context.Context, _ int, x int) (int, error) {
                 return x * 2, nil
-            }, nil))
+            }))
 
     require.NoError(t, catbird.CreateFlow(t.Context(), client.Conn, flow))
 }
@@ -1694,19 +1693,19 @@ func TestTaskSpawning(t *testing.T) {
         AddStep(catbird.NewStep("fetch").
             Handler(func(ctx context.Context, _ int) ([]int, error) {
                 return []int{1, 2, 3}, nil
-            }, nil)).
+            })).
         AddStep(catbird.NewStep("process").
             DependsOn("fetch").
             MapEach("fetch").
             Handler(func(ctx context.Context, _ int, x int) (int, error) {
                 return x * 2, nil
-            }, nil))
+            }))
 
     require.NoError(t, client.CreateFlow(t.Context(), flow))
-    worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+    worker := client.NewWorker(t.Context()).AddFlow(flow)
     go worker.Start(t.Context())
 
-    handle, err := client.RunFlow(t.Context(), "spawn-test", 0, nil)
+    handle, err := client.RunFlow(t.Context(), "spawn-test", 0)
     require.NoError(t, err)
 
     // Wait briefly for fetch to complete and tasks to spawn
@@ -1729,19 +1728,19 @@ func TestEmptyArray(t *testing.T) {
         AddStep(catbird.NewStep("fetch").
             Handler(func(ctx context.Context, _ int) ([]int, error) {
                 return []int{}, nil
-            }, nil)).
+            })).
         AddStep(catbird.NewStep("process").
             DependsOn("fetch").
             MapEach("fetch").
             Handler(func(ctx context.Context, _ int, x int) (int, error) {
                 return x * 2, nil
-            }, nil))
+            }))
 
     require.NoError(t, client.CreateFlow(t.Context(), flow))
-    worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+    worker := client.NewWorker(t.Context()).AddFlow(flow)
     go worker.Start(t.Context())
 
-    handle, err := client.RunFlow(t.Context(), "empty-test", 0, nil)
+    handle, err := client.RunFlow(t.Context(), "empty-test", 0)
     require.NoError(t, err)
 
     var output []int
@@ -1758,19 +1757,19 @@ func TestTypeMismatch(t *testing.T) {
         AddStep(catbird.NewStep("fetch").
             Handler(func(ctx context.Context, _ int) (string, error) {
                 return "not an array", nil  // Bug: should return []
-            }, nil)).
+            })).
         AddStep(catbird.NewStep("process").
             DependsOn("fetch").
             MapEach("fetch").
             Handler(func(ctx context.Context, _ int, x int) (int, error) {
                 return x * 2, nil
-            }, nil))
+            }))
 
     require.NoError(t, client.CreateFlow(t.Context(), flow))
-    worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+    worker := client.NewWorker(t.Context()).AddFlow(flow)
     go worker.Start(t.Context())
 
-    handle, err := client.RunFlow(t.Context(), "mismatch-test", 0, nil)
+    handle, err := client.RunFlow(t.Context(), "mismatch-test", 0)
     require.NoError(t, err)
 
     var output []int
@@ -1791,20 +1790,20 @@ func TestMapStepExecution(t *testing.T) {
         AddStep(catbird.NewStep("numbers").
             Handler(func(ctx context.Context, _ int) ([]int, error) {
                 return []int{1, 2, 3, 4, 5}, nil
-            }, nil)).
+            })).
         AddStep(catbird.NewStep("double").
             DependsOn("numbers").
             MapEach("numbers").
             Handler(func(ctx context.Context, _ int, x int) (int, error) {
                 return x * 2, nil
-            }, nil))
+            }))
 
     require.NoError(t, client.CreateFlow(t.Context(), flow))
 
-    worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+    worker := client.NewWorker(t.Context()).AddFlow(flow)
     go worker.Start(t.Context())
 
-    handle, err := client.RunFlow(t.Context(), "map-exec-test", 0, nil)
+    handle, err := client.RunFlow(t.Context(), "map-exec-test", 0)
     require.NoError(t, err)
 
     var output []int
@@ -1825,7 +1824,7 @@ func TestTaskRetry(t *testing.T) {
         AddStep(catbird.NewStep("numbers").
             Handler(func(ctx context.Context, _ int) ([]int, error) {
                 return []int{1, 2, 3}, nil
-            }, nil)).
+            })).
         AddStep(catbird.NewStep("flaky").
             DependsOn("numbers").
             MapEach("numbers").
@@ -1840,16 +1839,16 @@ func TestTaskRetry(t *testing.T) {
                 }
 
                 return x * 10, nil
-            }, &catbird.HandlerOpts{
+            }, catbird.HandlerOpts{
                 MaxRetries: 3,
                 Backoff:    catbird.NewFullJitterBackoff(10*time.Millisecond, 100*time.Millisecond),
             }))
 
     require.NoError(t, client.CreateFlow(t.Context(), flow))
-    worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+    worker := client.NewWorker(t.Context()).AddFlow(flow)
     go worker.Start(t.Context())
 
-    handle, err := client.RunFlow(t.Context(), "retry-test", 0, nil)
+    handle, err := client.RunFlow(t.Context(), "retry-test", 0)
     require.NoError(t, err)
 
     var output []int
@@ -1876,7 +1875,7 @@ catbird.NewStep("process_batch").
     Handler(func(ctx context.Context, _ any, batch []Item) ([]Result, error) {
         // Inner map: process each item in batch
         return catbird.MapInHandler(ctx, batch, processItem)
-    }, nil)
+    })
 ```
 
 **Challenge**: Maintaining order across nested levels
@@ -1889,7 +1888,7 @@ Expose partial results as tasks complete:
 catbird.NewStep("process").
     DependsOn("fetch").
     MapEach("fetch").
-    Handler(func(...) {...}, nil).
+    Handler(func(...) {...}).
     WithProgressCallback(func(completed, total int, latestResult Result) {
         updateProgressBar(completed, total)
     })
@@ -1905,7 +1904,7 @@ Allow user-defined reduce functions:
 catbird.NewStep("process").
     DependsOn("fetch").
     MapEach("fetch").
-    Handler(func(ctx context.Context, _ any, item Item) (Result, error) {...}, nil).
+    Handler(func(ctx context.Context, _ any, item Item) (Result, error) {...}).
     Reduce(func(results []Result) (Summary, error) {
         return Summary{Max: maxBy(results, r => r.Score)}, nil
     })
@@ -1921,13 +1920,13 @@ Process certain tasks before others:
 catbird.NewStep("process").
     DependsOn("fetch").
     MapEach("fetch").
-    Handler(func(...) {...}, nil).
+    Handler(func(...) {...}).
     WithPriority(func(item Item) int {
         return item.Urgency  // Higher urgency tasks polled first
     })
 ```
-
-**Challenge**: Ordering in SQL `WHERE deliver_at <= now() ORDER BY priority`
+**Challenge**: Ordering in SQL `WHERE visible_at <= now() ORDER BY priority`
+**Challenge**: Ordering in SQL `WHERE visible_at <= now() ORDER BY priority`
 
 ## Open Questions
 

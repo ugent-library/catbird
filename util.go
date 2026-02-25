@@ -11,6 +11,53 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+const (
+	defaultPollFor      = 5 * time.Second
+	defaultPollInterval = 200 * time.Millisecond
+)
+
+// ScheduleOpts configures scheduled task/flow behavior.
+type ScheduleOpts struct {
+	Input any
+}
+
+// WaitOpts configures WaitForOutput polling behavior.
+// Zero values use defaults.
+type WaitOpts struct {
+	PollFor      time.Duration
+	PollInterval time.Duration
+}
+
+func resolvePollDurations(defaultPollFor, defaultPollInterval, pollFor, pollInterval time.Duration) (pollForMs int, pollIntervalMs int) {
+	resolvedPollFor := defaultPollFor
+	resolvedPollInterval := defaultPollInterval
+
+	if pollFor > 0 {
+		resolvedPollFor = pollFor
+	}
+
+	if pollInterval > 0 {
+		resolvedPollInterval = pollInterval
+	}
+
+	if resolvedPollFor < time.Millisecond {
+		resolvedPollFor = time.Millisecond
+	}
+
+	if resolvedPollInterval < time.Millisecond {
+		resolvedPollInterval = time.Millisecond
+	}
+
+	if resolvedPollInterval >= resolvedPollFor {
+		resolvedPollInterval = resolvedPollFor / 2
+		if resolvedPollInterval < time.Millisecond {
+			resolvedPollInterval = time.Millisecond
+		}
+	}
+
+	return int(resolvedPollFor / time.Millisecond), int(resolvedPollInterval / time.Millisecond)
+}
+
 func ptrOrNil[T comparable](t T) *T {
 	var tt T
 	if t == tt {

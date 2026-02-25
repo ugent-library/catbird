@@ -18,8 +18,8 @@ func New(conn Conn) *Client {
 }
 
 // CreateQueue creates a queue with the given name and optional options.
-func (c *Client) CreateQueue(ctx context.Context, queueName string, opts *QueueOpts) error {
-	return CreateQueue(ctx, c.Conn, queueName, opts)
+func (c *Client) CreateQueue(ctx context.Context, queueName string, opts ...QueueOpts) error {
+	return CreateQueue(ctx, c.Conn, queueName, opts...)
 }
 
 // GetQueue retrieves queue metadata by name.
@@ -39,8 +39,8 @@ func (c *Client) DeleteQueue(ctx context.Context, queueName string) (bool, error
 }
 
 // Send enqueues a message to the specified queue.
-func (c *Client) Send(ctx context.Context, queueName string, payload any, opts *SendOpts) error {
-	return Send(ctx, c.Conn, queueName, payload, opts)
+func (c *Client) Send(ctx context.Context, queueName string, payload any, opts ...SendOpts) error {
+	return Send(ctx, c.Conn, queueName, payload, opts...)
 }
 
 // Bind subscribes a queue to a topic pattern.
@@ -56,8 +56,8 @@ func (c *Client) Unbind(ctx context.Context, queueName string, pattern string) e
 }
 
 // Publish sends a message to all queues subscribed to the specified topic.
-func (c *Client) Publish(ctx context.Context, topic string, payload any, opts *PublishOpts) error {
-	return Publish(ctx, c.Conn, topic, payload, opts)
+func (c *Client) Publish(ctx context.Context, topic string, payload any, opts ...PublishOpts) error {
+	return Publish(ctx, c.Conn, topic, payload, opts...)
 }
 
 // Read reads up to quantity messages from the queue, hiding them from other
@@ -69,8 +69,8 @@ func (c *Client) Read(ctx context.Context, queueName string, quantity int, hideF
 // ReadPoll reads messages from a queue with polling support.
 // It polls repeatedly at the specified interval until messages are available
 // or the pollFor timeout is reached.
-func (c *Client) ReadPoll(ctx context.Context, queueName string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]Message, error) {
-	return ReadPoll(ctx, c.Conn, queueName, quantity, hideFor, pollFor, pollInterval)
+func (c *Client) ReadPoll(ctx context.Context, queueName string, quantity int, hideFor time.Duration, opts ...ReadPollOpts) ([]Message, error) {
+	return ReadPoll(ctx, c.Conn, queueName, quantity, hideFor, opts...)
 }
 
 // Hide hides a single message from being read for the specified duration.
@@ -112,17 +112,17 @@ func (c *Client) ListTasks(ctx context.Context) ([]*TaskInfo, error) {
 
 // RunTask enqueues a task execution and returns a handle for monitoring
 // progress and retrieving output.
-func (c *Client) RunTask(ctx context.Context, taskName string, input any, opts *RunOpts) (*RunHandle, error) {
-	return RunTask(ctx, c.Conn, taskName, input, opts)
+func (c *Client) RunTask(ctx context.Context, taskName string, input any, opts ...RunTaskOpts) (*TaskHandle, error) {
+	return RunTask(ctx, c.Conn, taskName, input, opts...)
 }
 
 // GetTaskRun retrieves a specific task run result by ID.
-func (c *Client) GetTaskRun(ctx context.Context, taskName string, taskRunID int64) (*RunInfo, error) {
+func (c *Client) GetTaskRun(ctx context.Context, taskName string, taskRunID int64) (*TaskRunInfo, error) {
 	return GetTaskRun(ctx, c.Conn, taskName, taskRunID)
 }
 
 // ListTaskRuns returns recent task runs for the specified task.
-func (c *Client) ListTaskRuns(ctx context.Context, taskName string) ([]*RunInfo, error) {
+func (c *Client) ListTaskRuns(ctx context.Context, taskName string) ([]*TaskRunInfo, error) {
 	return ListTaskRuns(ctx, c.Conn, taskName)
 }
 
@@ -142,17 +142,17 @@ func (c *Client) ListFlows(ctx context.Context) ([]*FlowInfo, error) {
 }
 
 // RunFlow enqueues a flow execution and returns a handle for monitoring.
-func (c *Client) RunFlow(ctx context.Context, flowName string, input any, opts *RunFlowOpts) (*RunHandle, error) {
-	return RunFlow(ctx, c.Conn, flowName, input, opts)
+func (c *Client) RunFlow(ctx context.Context, flowName string, input any, opts ...RunFlowOpts) (*FlowHandle, error) {
+	return RunFlow(ctx, c.Conn, flowName, input, opts...)
 }
 
 // GetFlowRun retrieves a specific flow run result by ID.
-func (c *Client) GetFlowRun(ctx context.Context, flowName string, flowRunID int64) (*RunInfo, error) {
+func (c *Client) GetFlowRun(ctx context.Context, flowName string, flowRunID int64) (*FlowRunInfo, error) {
 	return GetFlowRun(ctx, c.Conn, flowName, flowRunID)
 }
 
 // ListFlowRuns returns recent flow runs for the specified flow.
-func (c *Client) ListFlowRuns(ctx context.Context, flowName string) ([]*RunInfo, error) {
+func (c *Client) ListFlowRuns(ctx context.Context, flowName string) ([]*FlowRunInfo, error) {
 	return ListFlowRuns(ctx, c.Conn, flowName)
 }
 
@@ -171,8 +171,8 @@ func (c *Client) SignalFlow(ctx context.Context, flowName string, flowRunID int6
 // NewWorker creates a new worker that processes task and flow executions.
 // Use the builder pattern methods (AddTask, AddFlow, etc.) to configure,
 // then call Start(ctx) to begin processing.
-func (c *Client) NewWorker(ctx context.Context, opts *WorkerOpts) *Worker {
-	return NewWorker(c.Conn, opts)
+func (c *Client) NewWorker(ctx context.Context, opts ...WorkerOpts) *Worker {
+	return NewWorker(c.Conn, opts...)
 }
 
 // ListWorkers returns all registered workers.
@@ -183,15 +183,15 @@ func (c *Client) ListWorkers(ctx context.Context) ([]*WorkerInfo, error) {
 // CreateTaskSchedule creates a cron-based schedule for a task.
 // cronSpec should be in 5-field format (min hour day month dow) or descriptors like @hourly, @daily.
 // opts is optional ScheduleOpts configuring the schedule (Input field for static input).
-func (c *Client) CreateTaskSchedule(ctx context.Context, taskName, cronSpec string, opts *ScheduleOpts) error {
-	return CreateTaskSchedule(ctx, c.Conn, taskName, cronSpec, opts)
+func (c *Client) CreateTaskSchedule(ctx context.Context, taskName, cronSpec string, opts ...ScheduleOpts) error {
+	return CreateTaskSchedule(ctx, c.Conn, taskName, cronSpec, opts...)
 }
 
 // CreateFlowSchedule creates a cron-based schedule for a flow.
 // cronSpec should be in 5-field format (min hour day month dow) or descriptors like @hourly, @daily.
 // opts is optional ScheduleOpts configuring the schedule (Input field for static input).
-func (c *Client) CreateFlowSchedule(ctx context.Context, flowName, cronSpec string, opts *ScheduleOpts) error {
-	return CreateFlowSchedule(ctx, c.Conn, flowName, cronSpec, opts)
+func (c *Client) CreateFlowSchedule(ctx context.Context, flowName, cronSpec string, opts ...ScheduleOpts) error {
+	return CreateFlowSchedule(ctx, c.Conn, flowName, cronSpec, opts...)
 }
 
 // ListTaskSchedules returns all task schedules ordered by next_run_at.

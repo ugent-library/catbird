@@ -3,23 +3,28 @@ package catbird
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"sync"
 	"testing"
 	"time"
 )
 
+func uniqueQueueName(base string) string {
+	return fmt.Sprintf("%s_%d", base, time.Now().UnixNano())
+}
+
 func TestBindExactTopic(t *testing.T) {
 	client := getTestClient(t)
 	ctx := context.Background()
 
-	q1 := "bind_exact_q1"
-	q2 := "bind_exact_q2"
+	q1 := uniqueQueueName("bind_exact_q1")
+	q2 := uniqueQueueName("bind_exact_q2")
 
-	if err := client.CreateQueue(ctx, q1, nil); err != nil {
+	if err := client.CreateQueue(ctx, q1); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.CreateQueue(ctx, q2, nil); err != nil {
+	if err := client.CreateQueue(ctx, q2); err != nil {
 		t.Fatal(err)
 	}
 
@@ -34,7 +39,7 @@ func TestBindExactTopic(t *testing.T) {
 	}
 
 	// Dispatch to first topic
-	if err := client.Publish(ctx, "events.user.created", map[string]string{"id": "123"}, nil); err != nil {
+	if err := client.Publish(ctx, "events.user.created", map[string]string{"id": "123"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -64,8 +69,8 @@ func TestBindSingleTokenWildcard(t *testing.T) {
 	client := getTestClient(t)
 	ctx := context.Background()
 
-	q := "bind_single_wildcard_q"
-	if err := client.CreateQueue(ctx, q, nil); err != nil {
+	q := uniqueQueueName("bind_single_wildcard_q")
+	if err := client.CreateQueue(ctx, q); err != nil {
 		t.Fatal(err)
 	}
 
@@ -88,7 +93,7 @@ func TestBindSingleTokenWildcard(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		if err := client.Publish(ctx, tc.topic, map[string]string{"test": "data"}, nil); err != nil {
+		if err := client.Publish(ctx, tc.topic, map[string]string{"test": "data"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -128,8 +133,8 @@ func TestBindMultiTokenWildcard(t *testing.T) {
 	client := getTestClient(t)
 	ctx := context.Background()
 
-	q := "bind_multi_wildcard_q"
-	if err := client.CreateQueue(ctx, q, nil); err != nil {
+	q := uniqueQueueName("bind_multi_wildcard_q")
+	if err := client.CreateQueue(ctx, q); err != nil {
 		t.Fatal(err)
 	}
 
@@ -152,7 +157,7 @@ func TestBindMultiTokenWildcard(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		if err := client.Publish(ctx, tc.topic, map[string]string{"test": "data"}, nil); err != nil {
+		if err := client.Publish(ctx, tc.topic, map[string]string{"test": "data"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -178,8 +183,8 @@ func TestBindMultiplePatterns(t *testing.T) {
 	client := getTestClient(t)
 	ctx := context.Background()
 
-	q := "bind_multiple_q"
-	if err := client.CreateQueue(ctx, q, nil); err != nil {
+	q := uniqueQueueName("bind_multiple_q")
+	if err := client.CreateQueue(ctx, q); err != nil {
 		t.Fatal(err)
 	}
 
@@ -211,7 +216,7 @@ func TestBindMultiplePatterns(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		if err := client.Publish(ctx, tc.topic, map[string]string{"test": "data"}, nil); err != nil {
+		if err := client.Publish(ctx, tc.topic, map[string]string{"test": "data"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -238,9 +243,9 @@ func TestBindFanout(t *testing.T) {
 	ctx := context.Background()
 
 	// Create multiple queues
-	queues := []string{"fanout_q1", "fanout_q2", "fanout_q3"}
+	queues := []string{uniqueQueueName("fanout_q1"), uniqueQueueName("fanout_q2"), uniqueQueueName("fanout_q3")}
 	for _, q := range queues {
-		if err := client.CreateQueue(ctx, q, nil); err != nil {
+		if err := client.CreateQueue(ctx, q); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -254,7 +259,7 @@ func TestBindFanout(t *testing.T) {
 
 	// Dispatch one message
 	payload := map[string]string{"msg": "hello all"}
-	if err := client.Publish(ctx, "broadcast.message", payload, nil); err != nil {
+	if err := client.Publish(ctx, "broadcast.message", payload); err != nil {
 		t.Fatal(err)
 	}
 
@@ -283,7 +288,7 @@ func TestUnbind(t *testing.T) {
 	ctx := context.Background()
 
 	q := "unbind_q"
-	if err := client.CreateQueue(ctx, q, nil); err != nil {
+	if err := client.CreateQueue(ctx, q); err != nil {
 		t.Fatal(err)
 	}
 
@@ -292,7 +297,7 @@ func TestUnbind(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := client.Publish(ctx, "test.topic", "before unbind", nil); err != nil {
+	if err := client.Publish(ctx, "test.topic", "before unbind"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -313,7 +318,7 @@ func TestUnbind(t *testing.T) {
 	}
 
 	// Dispatch again - should not be received
-	if err := client.Publish(ctx, "test.topic", "after unbind", nil); err != nil {
+	if err := client.Publish(ctx, "test.topic", "after unbind"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -331,7 +336,7 @@ func TestBindInvalidPatterns(t *testing.T) {
 	ctx := context.Background()
 
 	q := "invalid_pattern_q"
-	if err := client.CreateQueue(ctx, q, nil); err != nil {
+	if err := client.CreateQueue(ctx, q); err != nil {
 		t.Fatal(err)
 	}
 
@@ -360,7 +365,7 @@ func TestBindValidPatterns(t *testing.T) {
 	ctx := context.Background()
 
 	q := "valid_pattern_q"
-	if err := client.CreateQueue(ctx, q, nil); err != nil {
+	if err := client.CreateQueue(ctx, q); err != nil {
 		t.Fatal(err)
 	}
 
@@ -397,8 +402,8 @@ func TestBindPrefixOptimization(t *testing.T) {
 	ctx := context.Background()
 
 	// Test that prefix extraction works for performance
-	q := "prefix_opt_q"
-	if err := client.CreateQueue(ctx, q, nil); err != nil {
+	q := uniqueQueueName("prefix_opt_q")
+	if err := client.CreateQueue(ctx, q); err != nil {
 		t.Fatal(err)
 	}
 
@@ -408,12 +413,12 @@ func TestBindPrefixOptimization(t *testing.T) {
 	}
 
 	// Should match
-	if err := client.Publish(ctx, "very.long.prefix.path.to.resource.created", "match", nil); err != nil {
+	if err := client.Publish(ctx, "very.long.prefix.path.to.resource.created", "match"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Should not match (different prefix)
-	if err := client.Publish(ctx, "very.long.different.path.to.resource.created", "nomatch", nil); err != nil {
+	if err := client.Publish(ctx, "very.long.different.path.to.resource.created", "nomatch"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -431,8 +436,8 @@ func TestBindCaseSensitivity(t *testing.T) {
 	client := getTestClient(t)
 	ctx := context.Background()
 
-	q := "case_sensitive_q"
-	if err := client.CreateQueue(ctx, q, nil); err != nil {
+	q := uniqueQueueName("case_sensitive_q")
+	if err := client.CreateQueue(ctx, q); err != nil {
 		t.Fatal(err)
 	}
 
@@ -463,7 +468,7 @@ func TestBindCaseSensitivity(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		if err := client.Publish(ctx, tc.topic, tc.topic, nil); err != nil {
+		if err := client.Publish(ctx, tc.topic, tc.topic); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -489,8 +494,8 @@ func TestBindOrderIndependence(t *testing.T) {
 	client := getTestClient(t)
 	ctx := context.Background()
 
-	q := "order_test_q"
-	if err := client.CreateQueue(ctx, q, nil); err != nil {
+	q := uniqueQueueName("order_test_q")
+	if err := client.CreateQueue(ctx, q); err != nil {
 		t.Fatal(err)
 	}
 
@@ -505,7 +510,7 @@ func TestBindOrderIndependence(t *testing.T) {
 	// Dispatch messages
 	topics := []string{"a.b.c", "x.y.z", "p.m.q"}
 	for _, topic := range topics {
-		if err := client.Publish(ctx, topic, "test", nil); err != nil {
+		if err := client.Publish(ctx, topic, "test"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -538,8 +543,8 @@ func TestBindRebind(t *testing.T) {
 	client := getTestClient(t)
 	ctx := context.Background()
 
-	q := "rebind_q"
-	if err := client.CreateQueue(ctx, q, nil); err != nil {
+	q := uniqueQueueName("rebind_q")
+	if err := client.CreateQueue(ctx, q); err != nil {
 		t.Fatal(err)
 	}
 
@@ -554,7 +559,7 @@ func TestBindRebind(t *testing.T) {
 	}
 
 	// Dispatch once
-	if err := client.Publish(ctx, "test.topic", "data", nil); err != nil {
+	if err := client.Publish(ctx, "test.topic", "data"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -573,8 +578,8 @@ func TestBindEmptyPrefix(t *testing.T) {
 	client := getTestClient(t)
 	ctx := context.Background()
 
-	q := "empty_prefix_q"
-	if err := client.CreateQueue(ctx, q, nil); err != nil {
+	q := uniqueQueueName("empty_prefix_q")
+	if err := client.CreateQueue(ctx, q); err != nil {
 		t.Fatal(err)
 	}
 
@@ -584,7 +589,7 @@ func TestBindEmptyPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := client.Publish(ctx, "foo.bar", "test", nil); err != nil {
+	if err := client.Publish(ctx, "foo.bar", "test"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -601,6 +606,8 @@ func TestBindEmptyPrefix(t *testing.T) {
 // TestBindingRaceQueueDeletion tests the race condition where a queue
 // is deleted while cb_dispatch is iterating over bindings
 func TestBindingRaceQueueDeletion(t *testing.T) {
+	requireSlowTests(t)
+
 	client := getTestClient(t)
 	ctx := context.Background()
 
@@ -608,7 +615,7 @@ func TestBindingRaceQueueDeletion(t *testing.T) {
 	queueName := "race_queue"
 	topic := "race.topic"
 
-	if err := client.CreateQueue(ctx, queueName, nil); err != nil {
+	if err := client.CreateQueue(ctx, queueName); err != nil {
 		t.Fatal(err)
 	}
 
@@ -625,7 +632,7 @@ func TestBindingRaceQueueDeletion(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 50; i++ {
-			if err := client.Publish(ctx, topic, map[string]int{"value": i}, nil); err != nil {
+			if err := client.Publish(ctx, topic, map[string]int{"value": i}); err != nil {
 				errors <- err
 				return
 			}
@@ -644,7 +651,7 @@ func TestBindingRaceQueueDeletion(t *testing.T) {
 				return
 			}
 			time.Sleep(5 * time.Millisecond)
-			if err := client.CreateQueue(ctx, queueName, nil); err != nil {
+			if err := client.CreateQueue(ctx, queueName); err != nil {
 				errors <- err
 				return
 			}
@@ -667,13 +674,15 @@ func TestBindingRaceQueueDeletion(t *testing.T) {
 
 // TestBindingConcurrentBindUnbind tests concurrent bind/unbind operations
 func TestBindingConcurrentBindUnbind(t *testing.T) {
+	requireSlowTests(t)
+
 	client := getTestClient(t)
 	ctx := context.Background()
 
 	queueName := "concurrent_queue"
 	patterns := []string{"pattern1", "pattern2", "pattern3"}
 
-	if err := client.CreateQueue(ctx, queueName, nil); err != nil {
+	if err := client.CreateQueue(ctx, queueName); err != nil {
 		t.Fatal(err)
 	}
 
@@ -720,13 +729,15 @@ func TestBindingConcurrentBindUnbind(t *testing.T) {
 
 // TestBindingDispatchDuringModification tests dispatch while bindings are being modified
 func TestBindingDispatchDuringModification(t *testing.T) {
+	requireSlowTests(t)
+
 	client := getTestClient(t)
 	ctx := context.Background()
 
 	queueName := "modify_queue"
 	topic := "modify.topic"
 
-	if err := client.CreateQueue(ctx, queueName, nil); err != nil {
+	if err := client.CreateQueue(ctx, queueName); err != nil {
 		t.Fatal(err)
 	}
 
@@ -755,7 +766,7 @@ func TestBindingDispatchDuringModification(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < 50; i++ {
 			// This should never error, just may or may not find a binding
-			if err := client.Publish(ctx, topic, map[string]int{"value": i}, nil); err != nil {
+			if err := client.Publish(ctx, topic, map[string]int{"value": i}); err != nil {
 				errors <- err
 				return
 			}

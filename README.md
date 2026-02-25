@@ -3,7 +3,7 @@
 [![Go Version](https://img.shields.io/badge/go-1.25+-blue.svg)](https://golang.org)
 [![Go Report Card](https://goreportcard.com/badge/github.com/ugent-library/catbird)](https://goreportcard.com/report/github.com/ugent-library/catbird)
 
-![CatBird](catbird-banner.svg "CatBird banner")
+![CatBird](assets/banner.svg "CatBird banner")
 
 # Catbird
 
@@ -20,7 +20,7 @@ A PostgreSQL-powered message queue and task execution engine. Catbird brings rel
 - **Operational UX**: web dashboard for runs, queues, and workers.
 
 <p align="center">
-  <img src="screenshots/dashboard-flows.png" alt="Flow Visualization" width="800" />
+  <img src="assets/screenshots/dashboard-flows.png" alt="Flow Visualization" width="800" />
 </p>
 
 ## Quick Start
@@ -28,9 +28,9 @@ A PostgreSQL-powered message queue and task execution engine. Catbird brings rel
 client := catbird.New(conn)
 ctx := context.Background()
 
-// Queue: create, send, read, delete
-err := client.CreateQueue(ctx, "my-queue", nil)
-err = client.Send(ctx, "my-queue", map[string]any{"user_id": 123}, &catbird.SendOpts{
+// Queues
+err := client.CreateQueue(ctx, "my-queue")
+err = client.Send(ctx, "my-queue", map[string]any{"user_id": 123}, catbird.SendOpts{
     IdempotencyKey: "user-123",
 })
 messages, err := client.Read(ctx, "my-queue", 10, 30*time.Second)
@@ -38,35 +38,42 @@ for _, msg := range messages {
     err = client.Delete(ctx, "my-queue", msg.ID)
 }
 
-// Task + flow definitions
+// Delayed send
+client.Send(ctx, "my_queue", map[string]any{"job": "cleanup"}, catbird.SendOpts{VisibleAt: time.Now().Add(30 * time.Minute)})
+
+// Tasks and flows
 task := catbird.NewTask("send-email").
     Handler(func(ctx context.Context, input string) (string, error) {
         return "sent", nil
-    }, nil)
+    })
 
 flow := catbird.NewFlow("double-add").
     AddStep(catbird.NewStep("double").
         Handler(func(ctx context.Context, input int) (int, error) {
             return input * 2, nil
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("add").
         DependsOn("double").
         Handler(func(ctx context.Context, input int, doubled int) (int, error) {
             return doubled + 1, nil
-        }, nil))
+        }))
 
-worker, err := client.NewWorker(ctx, nil)
+worker := client.NewWorker(ctx)
 worker.AddTask(task)
 worker.AddFlow(flow)
 go worker.Start(ctx)
 
-taskHandle, err := client.RunTask(ctx, "send-email", "hello", nil)
+taskHandle, err := client.RunTask(ctx, "send-email", "hello")
 var taskOut string
 err = taskHandle.WaitForOutput(ctx, &taskOut)
 
-flowHandle, err := client.RunFlow(ctx, "double-add", 10, nil)
+flowHandle, err := client.RunFlow(ctx, "double-add", 10)
 var flowOut int
 err = flowHandle.WaitForOutput(ctx, &flowOut)
+
+// Delayed execution
+client.RunTask(ctx, "process-user", userID, catbird.RunTaskOpts{VisibleAt: time.Now().Add(5 * time.Minute)})
+client.RunFlow(ctx, "order_processing", map[string]any{"order_id": 123}, catbird.RunFlowOpts{VisibleAt: time.Now().Add(30 * time.Second)})
 
 // Ensure definitions exist before usage; this is not necessary if you
 // just want to run a worker, definitions will be created for you on
@@ -75,7 +82,7 @@ err := client.CreateTask(ctx, taskA, taskB)
 err := client.CreateFlow(ctx, flowA, flowB)
 
 // Direct package-level usage (no Client), for example in a transaction:
-taskHandle, err := catbird.RunTask(ctx, tx, "send-email", "hello", nil)
+taskHandle, err := catbird.RunTask(ctx, tx, "send-email", "hello")
 ```
 
 # Deduplication Strategies
@@ -92,12 +99,12 @@ Ensures exactly-once execution; blocks reuse after completion.
 
 ```go
 // ConcurrencyKey: prevent overlap
-_, err := client.RunTask(ctx, "process-user", userID, &catbird.RunOpts{
+_, err := client.RunTask(ctx, "process-user", userID, catbird.RunTaskOpts{
     ConcurrencyKey: fmt.Sprintf("user-%d", userID),
 })
 
 // IdempotencyKey: exactly once
-_, err = client.RunTask(ctx, "charge-payment", payment, &catbird.RunOpts{
+_, err = client.RunTask(ctx, "charge-payment", payment, catbird.RunTaskOpts{
     IdempotencyKey: fmt.Sprintf("payment-%s", payment.ID),
 })
 ```
@@ -123,8 +130,8 @@ _, err = client.RunTask(ctx, "charge-payment", payment, &catbird.RunOpts{
 # Topic-Based Routing
 
 ```go
-err := client.CreateQueue(ctx, "user-events", nil)
-err = client.CreateQueue(ctx, "audit-log", nil)
+err := client.CreateQueue(ctx, "user-events")
+err = client.CreateQueue(ctx, "audit-log")
 
 err = client.Bind(ctx, "user-events", "events.user.created")
 err = client.Bind(ctx, "user-events", "events.?.updated")
@@ -133,7 +140,7 @@ err = client.Bind(ctx, "audit-log", "events.*")
 err = client.Publish(ctx, "events.user.created", map[string]any{
     "user_id": 123,
     "email":   "user@example.com",
-}, nil)
+})
 err = client.Unbind(ctx, "user-events", "events.?.updated")
 ```
 
@@ -150,7 +157,7 @@ Wildcard rules:
 task := catbird.NewTask("send-email").
     Handler(func(ctx context.Context, input EmailRequest) (EmailResponse, error) {
         return EmailResponse{SentAt: time.Now()}, nil
-    }, &catbird.HandlerOpts{
+    }, catbird.HandlerOpts{
         Concurrency: 5,
         MaxRetries:  3,
         Backoff:     catbird.NewFullJitterBackoff(500*time.Millisecond, 10*time.Second),
@@ -158,10 +165,10 @@ task := catbird.NewTask("send-email").
     })
 
 // Create a schedule for the task (optional; can run manually via RunTask)
-client.CreateTaskSchedule(ctx, "send-email", "@hourly", nil)
+client.CreateTaskSchedule(ctx, "send-email", "@hourly")
 
 // Or with static input
-client.CreateTaskSchedule(ctx, "send-report", "@hourly", &catbird.ScheduleOpts{
+client.CreateTaskSchedule(ctx, "send-report", "@hourly", catbird.ScheduleOpts{
     Input: EmailRequest{To: "ops@example.com", Subject: "Hourly report"},
 })
 
@@ -170,10 +177,10 @@ conditionalTask := catbird.NewTask("premium-processing").
     Condition("input.is_premium"). // Skipped if is_premium = false
     Handler(func(ctx context.Context, input ProcessRequest) (string, error) {
         return "processed", nil
-    }, nil)
+    })
 
 // Create worker
-worker, err := client.NewWorker(ctx)
+worker := client.NewWorker(ctx)
 // Add tasks
 worker.AddTask(task)
 worker.AddTask(conditionalTask)
@@ -183,7 +190,7 @@ go worker.Start(ctx)
 handle, err := client.RunTask(ctx, "send-email", EmailRequest{
     To:      "user@example.com",
     Subject: "Hello",
-}, nil)
+})
 
 // Get result
 var result EmailResponse
@@ -206,14 +213,13 @@ A **flow** is a **directed acyclic graph (DAG)** of steps that execute when thei
 
 ```go
 flow := catbird.NewFlow("order-processing").
-    Schedule("0 2 * * *", nil). // Daily at 2 AM
     AddStep(catbird.NewStep("validate").
         Handler(func(ctx context.Context, order Order) (ValidationResult, error) {
             if order.Amount <= 0 {
                 return ValidationResult{Valid: false, Reason: "Invalid amount"}, nil
             }
             return ValidationResult{Valid: true}, nil
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("charge").
         DependsOn("validate").
         Handler(func(ctx context.Context, order Order, validated ValidationResult) (ChargeResult, error) {
@@ -224,7 +230,7 @@ flow := catbird.NewFlow("order-processing").
                 TransactionID: "txn-" + order.ID,
                 Amount:        order.Amount,
             }, nil
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("check-inventory").
         DependsOn("validate").
         Handler(func(ctx context.Context, order Order, validated ValidationResult) (InventoryCheck, error) {
@@ -232,7 +238,7 @@ flow := catbird.NewFlow("order-processing").
                 InStock: true,
                 Qty:     order.Amount,
             }, nil
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("ship").
         DependsOn("charge", "check-inventory").
         Handler(func(ctx context.Context, order Order, chargeResult ChargeResult, inventory InventoryCheck) (ShipmentResult, error) {
@@ -243,10 +249,13 @@ flow := catbird.NewFlow("order-processing").
                 TrackingNumber: "TRK-" + chargeResult.TransactionID,
                 EstimatedDays:  3,
             }, nil
-        }, nil))
+        }))
+
+    // Create a schedule for the flow (optional; can run manually via RunFlow)
+    client.CreateFlowSchedule(ctx, "order-processing", "0 2 * * *") // Daily at 2 AM
 
 // Create worker
-worker, err := client.NewWorker(ctx)
+    worker := client.NewWorker(ctx)
 // Add flow
 worker.AddFlow(flow)
 go worker.Start(ctx)
@@ -261,7 +270,7 @@ flow := catbird.NewFlow("document_approval").
     AddStep(catbird.NewStep("submit").
         Handler(func(ctx context.Context, doc Document) (string, error) {
             return doc.ID, nil
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("approve").
         DependsOn("submit").
         Signal(true).
@@ -274,7 +283,7 @@ flow := catbird.NewFlow("document_approval").
                 ApprovedBy: approval.ApproverID,
                 Timestamp:  time.Now().Format(time.RFC3339),
             }, nil
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("publish").
         DependsOn("approve").
         Handler(func(ctx context.Context, doc Document, approval ApprovalResult) (PublishResult, error) {
@@ -282,7 +291,7 @@ flow := catbird.NewFlow("document_approval").
                 PublishedAt: time.Now().Format(time.RFC3339),
                 URL:         "https://example.com/docs/" + approval.ApprovedBy,
             }, nil
-        }, nil))
+        }))
 ```
 
 A step with both dependencies and a signal waits for **both** conditions: all dependencies must complete **and** the signal must be delivered before the step executes.
@@ -315,10 +324,10 @@ premiumTask := catbird.NewTask("premium_processing").
     Condition("input.is_premium"). // Skipped if is_premium = false
     Handler(func(ctx context.Context, req ProcessRequest) (string, error) {
         return fmt.Sprintf("Processed premium user %d", req.UserID), nil
-    }, nil)
+    })
 
 // Run task - may be skipped based on input
-client.RunTask(ctx, "premium_processing", ProcessRequest{UserID: 123, IsPremium: false}, nil)
+client.RunTask(ctx, "premium_processing", ProcessRequest{UserID: 123, IsPremium: false})
 // This task run will be skipped (is_premium = false)
 ```
 
@@ -331,13 +340,13 @@ flow := catbird.NewFlow("payment_processing").
     AddStep(catbird.NewStep("validate").
         Handler(func(ctx context.Context, order Order) (ValidationResult, error) {
             return ValidationResult{Valid: order.Amount > 0}, nil
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("charge").
         DependsOn("validate").
         Condition("validate.valid").
         Handler(func(ctx context.Context, order Order, validation ValidationResult) (ChargeResult, error) {
             return ChargeResult{TransactionID: "txn-123"}, nil
-        }, nil)).
+        })).
     AddStep(catbird.NewStep("finalize").
         DependsOn("charge").
         Handler(func(ctx context.Context, order Order, charge catbird.Optional[ChargeResult]) (FinalResult, error) {
@@ -345,7 +354,7 @@ flow := catbird.NewFlow("payment_processing").
                 return FinalResult{Status: "charged", TxnID: charge.Value.TransactionID}, nil
             }
             return FinalResult{Status: "free_order", TxnID: ""}, nil
-        }, nil))
+        }))
 ```
 
 # Resiliency
@@ -373,7 +382,7 @@ Use query builders when you want SQL + args directly (for `pgx.Batch` or custom 
 ```go
 // Queue into a batch
 var batch pgx.Batch
-q1, args1, err := catbird.SendQuery("my-queue", map[string]any{"user_id": 123}, nil)
+q1, args1, err := catbird.SendQuery("my-queue", map[string]any{"user_id": 123})
 if err != nil {
     return err
 }
@@ -392,14 +401,14 @@ SELECT cb_create_queue(name => 'my_queue', expires_at => null, unlogged => false
 
 -- Send a message
 SELECT cb_send(queue => 'my_queue', payload => '{"user_id": 123, "action": "process"}'::jsonb, 
-               topic => null, idempotency_key => null, deliver_at => null);
+               topic => null, idempotency_key => null, visible_at => null);
 
 -- Publish to topic-bound queues
 SELECT cb_publish(topic => 'events.user.created', payload => '{"user_id": 456}'::jsonb,
-                   idempotency_key => 'user-456-created', deliver_at => null);
+                   idempotency_key => 'user-456-created', visible_at => null);
 
 -- Read messages (with 30 second visibility timeout)
-SELECT * FROM cb_read(queue => 'my_queue', limit => 10, hide_for => 30);
+SELECT * FROM cb_read(queue => 'my_queue', quantity => 10, hide_for => 30000);
 
 -- Delete a message
 SELECT cb_delete(queue => 'my_queue', id => 1);
@@ -417,7 +426,7 @@ SELECT cb_create_task(name => 'send_email');
 
 -- Run a task
 SELECT * FROM cb_run_task(name => 'send_email', input => '{"to": "user@example.com"}'::jsonb, 
-                          concurrency_key => null, idempotency_key => null);
+                          concurrency_key => null, idempotency_key => null, visible_at => null);
 ```
 
 ## Workflows
@@ -432,7 +441,7 @@ SELECT cb_create_flow(name => 'order_processing', steps => '[
 
 -- Run a flow
 SELECT * FROM cb_run_flow(name => 'order_processing', input => '{"order_id": 123}'::jsonb,
-                          concurrency_key => null, idempotency_key => null);
+                          concurrency_key => null, idempotency_key => null, visible_at => null);
 ```
 
 ## Monitoring Task and Flow Runs

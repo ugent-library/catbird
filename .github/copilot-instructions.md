@@ -20,7 +20,7 @@ Catbird is a PostgreSQL-based message queue with task and workflow execution eng
 
 **Main Components**:
 1. **Client** (`client.go`): Facade delegating to standalone functions; call `catbird.New(conn)` to create
-2. **Worker** (`worker.go`): Runs tasks and flows; initialized with `catbird.NewWorker(conn, opts)` or `client.NewWorker(ctx, opts)`. Multiple workers can run concurrently; DB ensures each message is processed exactly once.
+2. **Worker** (`worker.go`): Runs tasks and flows; initialized with `catbird.NewWorker(conn, opts...)` or `client.NewWorker(ctx, opts...)`. Multiple workers can run concurrently; DB ensures each message is processed exactly once.
 3. **Scheduler** (`scheduler.go`): Manages cron-based task and flow scheduling using robfig/cron; created internally by worker when registering tasks/flows with `Schedule` method. Can also be used standalone.
 4. **Dashboard** (`dashboard/`): Web UI for starting task/flow runs, monitoring progress in real-time, and viewing results; served via CLI `cb dashboard`
 
@@ -67,7 +67,7 @@ tableName := fmt.Sprintf("cb_q_%s", strings.ToLower(queueName)) // Queues
 task := catbird.NewTask("my_task").
   Handler(func(ctx context.Context, input MyInput) (MyOutput, error) {
     return MyOutput{}, nil
-  }, &catbird.HandlerOpts{
+  }, catbird.HandlerOpts{
     Concurrency: 5,
     MaxRetries:  3,
     Backoff:     catbird.NewFullJitterBackoff(500*time.Millisecond, 10*time.Second),
@@ -77,7 +77,7 @@ task := catbird.NewTask("my_task").
 
 **Key characteristics**:
 - **No type parameters**: Input/output types are discovered at runtime via reflection (handlers receive `[]byte` payloads internally)
-- **Builder pattern**: Construction via method chaining: `NewTask(name).Condition(...).Handler(fn, opts)`
+- **Builder pattern**: Construction via method chaining: `NewTask(name).Condition(...).Handler(fn, opts...)`
 - **Execution options**: Applied via `HandlerOpts` struct with public fields (Concurrency, MaxRetries, Backoff, CircuitBreaker, BatchSize, Timeout)
 - **HandlerOpts validation**: Worker validates all task and flow step HandlerOpts at initialization time, catching configuration errors early before database operations
 - **Task/step metadata**: Conditions applied via `.Condition(expr)` method chain
@@ -88,12 +88,12 @@ flow := catbird.NewFlow("my_flow").
   AddStep(catbird.NewStep("step1").
     Handler(func(ctx context.Context, in string) (string, error) {
       return in + " modified", nil
-    }, nil)).
+    })).
   AddStep(catbird.NewStep("step2").
     DependsOn("step1").
     Handler(func(ctx context.Context, in string, step1Out string) (string, error) {
       return step1Out + " from step2", nil
-    }, nil))
+    }))
 ```
 
 **CRITICAL - Flow Output Design**: Flow output is **the unwrapped output value of the final step** (the step with no dependents after completion). This is NOT an aggregated object. The flow's remaining_steps counter reaches 0 when the last step completes; that step's output becomes the flow's output. When the flow completes in `cb_complete_step()`, it directly selects that step's output and stores it as the flow's output.
@@ -107,7 +107,7 @@ task := catbird.NewTask("premium_processing").
   Condition("input.is_premium"). // Skipped if is_premium = false
   Handler(func(ctx context.Context, req ProcessRequest) (string, error) {
     return "processed", nil
-  }, nil)
+  })
 // Other examples: "input.amount gte 1000", "input.env eq \"production\""
 ```
 
@@ -117,13 +117,13 @@ NewFlow("risk-check").
   AddStep(NewStep("validate").
     Handler(func(ctx context.Context, amount int) (int, error) {
       return amount, nil
-    }, nil)).
+    })).
   AddStep(NewStep("audit").
     DependsOn("validate").
     Condition("validate gt 1000"). // Conditional step
     Handler(func(ctx context.Context, in int, validateOut int) (int, error) {
       return validateOut * 2, nil  // expensive check
-    }, nil)).
+    })).
   AddStep(NewStep("finalize").
     DependsOn("audit").
     Handler(func(ctx context.Context, in int, auditResult catbird.Optional[int]) (int, error) {
@@ -131,7 +131,7 @@ NewFlow("risk-check").
         return auditResult.Value, nil  // used audit result
       }
       return in, nil  // audit was skipped
-    }, nil))
+    }))
 // Flow input: 500 → audit skipped → finalize gets Optional[int]{IsSet: false}
 // Flow input: 2000 → audit runs → finalize gets Optional[int]{IsSet: true, Value: 4000}
 ```
@@ -142,13 +142,13 @@ NewFlow("workflow").
   AddStep(NewStep("step1").
     Handler(func(ctx context.Context, in string) (string, error) {
       return in + " processed by step 1", nil
-    }, nil)).
+    })).
   AddStep(NewStep("approve").
     DependsOn("step1").
     Signal(true). // Wait for signal
     Handler(func(ctx context.Context, in string, approval ApprovalInput, step1Out string) (string, error) {
       return step1Out + " approved by " + approval.ApproverID, nil
-    }, nil))
+    }))
 // Signal delivery: client.SignalFlow(ctx, "workflow", flowRunID, "approve", ApprovalInput{...})
 ```
 
@@ -158,16 +158,16 @@ NewFlow("workflow").
 - **Optional outputs**: When a conditional step is skipped, dependent steps receive `Optional[T]{IsSet: false}`. When executed, `Optional[T]{IsSet: true, Value: result}`
 - **Cascading resolution**: `cb_start_steps()` loops until no more steps unblock; handles chains like step2 skips → step3 unblocks → step4 unblocks
 - **Validation**: Flow construction panics if a step depends on a conditional step without using `.OptionalDependency()` variant and `Optional[T]` parameter type
-- **Builder methods**: All construction through chainable methods: `NewStep(name).DependsOn(...).Condition(...).Signal(...).Handler(fn, opts)`
+- **Builder methods**: All construction through chainable methods: `NewStep(name).DependsOn(...).Condition(...).Signal(...).Handler(fn, opts...)`
 
 ## Key Conventions
 
-- **Worker lifecycle**: `client.NewWorker(ctx, opts)` followed by `.AddTask(task)` and `.AddFlow(flow)` builder methods, then `worker.Start(ctx)` (graceful shutdown with configurable timeout). Scheduling is decoupled: create schedules separately via `client.CreateTaskSchedule(ctx, name, cronSpec, opts)` or `client.CreateFlowSchedule(ctx, name, cronSpec, opts)` with optional `&ScheduleOpts{Input: value}` for static input.
+- **Worker lifecycle**: `client.NewWorker(ctx, opts...)` followed by `.AddTask(task)` and `.AddFlow(flow)` builder methods, then `worker.Start(ctx)` (graceful shutdown with configurable timeout). Scheduling is decoupled: create schedules separately via `client.CreateTaskSchedule(ctx, name, cronSpec, opts...)` or `client.CreateFlowSchedule(ctx, name, cronSpec, opts...)` with optional `ScheduleOpts{Input: value}` for static input.
 - **HandlerOpts validation**: Worker validates all task and flow step HandlerOpts at initialization time. Invalid configs (negative concurrency/batch size, invalid backoff, invalid circuit breaker) are caught immediately with descriptive errors before reaching database operations. This ensures type safety at construction time.
 - **Options pattern**: HandlerOpts uses a public struct with public fields (Concurrency, BatchSize, Timeout, MaxRetries, Backoff, CircuitBreaker). WorkerOpts uses a config struct (Logger, ShutdownTimeout). ScheduleOpts uses public fields (Input for static JSON input).
 - **Conn interface**: Abstracts pgx; accepts `*pgxpool.Pool`, `*pgx.Conn` or `pgx.Tx`
 - **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `WorkerOpts.Logger` field
-- **Scheduled tasks/flows**: Decoupled from task/flow definitions. Create via `client.CreateTaskSchedule(ctx, taskName, cronSpec, opts)` and `client.CreateFlowSchedule(ctx, flowName, cronSpec, opts)`. Pass optional `&ScheduleOpts{Input: value}` for static JSON input (defaults to `{}`). Example: `client.CreateTaskSchedule(ctx, "mytask", "@hourly", &ScheduleOpts{Input: MyInput{...}})`. Worker polls for due schedules automatically and enqueues them with idempotency deduplication.
+- **Scheduled tasks/flows**: Decoupled from task/flow definitions. Create via `client.CreateTaskSchedule(ctx, taskName, cronSpec, opts...)` and `client.CreateFlowSchedule(ctx, flowName, cronSpec, opts...)`. Pass optional `ScheduleOpts{Input: value}` for static JSON input (defaults to `{}`). Example: `client.CreateTaskSchedule(ctx, "mytask", "@hourly", ScheduleOpts{Input: MyInput{...}})`. Worker polls for due schedules automatically and enqueues them with idempotency deduplication.
 - **Automatic garbage collection**: Worker heartbeats (every 10 seconds) opportunistically clean up stale workers and expired queues; no configuration needed. Manual cleanup available via `client.GC(ctx)` for deployments without workers.
 - **Deduplication strategies**: Two strategies available:
   - **ConcurrencyKey**: Prevents concurrent/overlapping runs (deduplicates `queued`/`started` status). After completion or failure, same key can be used again.

@@ -133,7 +133,7 @@ func TestHandlerOpts_WithRetriesAndBackoff(t *testing.T) {
 
 	// Just verify that task can be created with these options
 	// Internal fields are not exposed via interface
-	task := NewTask("test").Handler(func(_ context.Context, _ any) (any, error) { return nil, nil }, &HandlerOpts{
+	task := NewTask("test").Handler(func(_ context.Context, _ any) (any, error) { return nil, nil }, HandlerOpts{
 		Concurrency: 1,
 		BatchSize:   10,
 		MaxRetries:  3,
@@ -203,21 +203,21 @@ func TestTaskRetriesIntegration(t *testing.T) {
 			return "", fmt.Errorf("intentional failure %d", n)
 		}
 		return fmt.Sprintf("success at %d", n), nil
-	}, &HandlerOpts{
+	}, HandlerOpts{
 		Concurrency: 1,
 		BatchSize:   10,
 		MaxRetries:  3,
 		Backoff:     NewFullJitterBackoff(minDelay, maxDelay),
 	})
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task)
+	worker := client.NewWorker(t.Context()).AddTask(task)
 
 	startTestWorker(t, worker)
 
 	// give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunTask(t.Context(), "retry_task", "input", nil)
+	h, err := client.RunTask(t.Context(), "retry_task", "input")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -8,7 +8,7 @@
 --     Critical: MUST use UNION ALL fallback, not bare RETURNING (returns NULL on conflict without it)
 --   cb_poll_steps(): Uses FOR UPDATE SKIP LOCKED for lock-free row polling - SAFE
 --   cb_activate_steps(): Lock-free condition evaluation + FOR UPDATE SKIP LOCKED - SAFE
---   cb_hide_steps(): Direct UPDATE indexed by deliver_at, no locks - SAFE
+--   cb_hide_steps(): Direct UPDATE indexed by visible_at, no locks - SAFE
 -- All operations maintain flow state invariants and step ordering
 -- Deduplication pattern reference: https://stackoverflow.com/a/35953488
 
@@ -155,7 +155,7 @@ BEGIN
       error_message text,
       signal_input jsonb,
       remaining_dependencies int NOT NULL DEFAULT 0,
-      deliver_at timestamptz NOT NULL DEFAULT now(),
+      visible_at timestamptz NOT NULL DEFAULT now(),
       created_at timestamptz NOT NULL DEFAULT now(),
       started_at timestamptz,
       completed_at timestamptz,
@@ -174,7 +174,7 @@ BEGIN
     );
 
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, status);', _s_table || '_flow_run_id_status_idx', _s_table);
-    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (deliver_at);', _s_table || '_deliver_at_idx', _s_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at);', _s_table || '_visible_at_idx', _s_table);
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -192,7 +192,8 @@ CREATE OR REPLACE FUNCTION cb_run_flow(
     name text,
     input jsonb,
     concurrency_key text = NULL,
-    idempotency_key text = NULL
+  idempotency_key text = NULL,
+  visible_at timestamptz = NULL
 )
 RETURNS bigint
 LANGUAGE plpgsql AS $$
@@ -288,7 +289,7 @@ BEGIN
     );
 
     -- Start steps with no dependencies
-    PERFORM cb_start_steps(cb_run_flow.name, _id);
+    PERFORM cb_start_steps(cb_run_flow.name, _id, cb_run_flow.visible_at);
 
     RETURN _id;
 END;
@@ -303,7 +304,7 @@ $$;
 --   flow_name: Flow name
 --   flow_run_id: Flow run ID
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_start_steps(flow_name text, flow_run_id bigint)
+CREATE OR REPLACE FUNCTION cb_start_steps(flow_name text, flow_run_id bigint, initial_visible_at timestamptz DEFAULT NULL)
 RETURNS void AS $$
 DECLARE
     _f_table text := cb_table_name(cb_start_steps.flow_name, 'f');
@@ -435,12 +436,12 @@ BEGIN
       UPDATE %I
       SET status = 'started',
           started_at = now(),
-          deliver_at = now()
+          visible_at = coalesce($2, now())
       WHERE id = $1
       $QUERY$,
       _s_table
     )
-    USING _step_to_process.id;
+    USING _step_to_process.id, cb_start_steps.initial_visible_at;
 
     _steps_processed_this_iteration := _steps_processed_this_iteration + 1;
     END LOOP;
@@ -508,7 +509,7 @@ BEGIN
           FROM %I m
           INNER JOIN %I f ON m.flow_run_id = f.id
           WHERE m.step_name = $1
-            AND m.deliver_at <= clock_timestamp()
+            AND m.visible_at <= clock_timestamp()
             AND m.status = 'started'
             AND f.status = 'started'
           ORDER BY m.id ASC
@@ -517,7 +518,7 @@ BEGIN
         )
         UPDATE %I m
         SET attempts = attempts + 1,
-            deliver_at = clock_timestamp() + $3
+            visible_at = clock_timestamp() + $3
         FROM runs
         WHERE m.id = runs.id
           AND EXISTS (SELECT 1 FROM %I f WHERE f.id = runs.flow_run_id AND f.status = 'started')
@@ -580,7 +581,7 @@ BEGIN
     EXECUTE format(
       $QUERY$
       UPDATE %I
-      SET deliver_at = (clock_timestamp() + $2)
+      SET visible_at = (clock_timestamp() + $2)
       WHERE id = any($1)
         AND step_name = $3;
       $QUERY$,
@@ -685,7 +686,7 @@ BEGIN
     END IF;
 
     -- Start steps with no dependencies
-    PERFORM cb_start_steps(cb_complete_step.flow_name, _flow_run_id);
+    PERFORM cb_start_steps(cb_complete_step.flow_name, _flow_run_id, NULL);
 END;
 $$;
 -- +goose statementend
@@ -786,9 +787,89 @@ BEGIN
     END IF;
 
     -- Try to start steps now that signal has been delivered
-    PERFORM cb_start_steps(cb_signal_flow.flow_name, cb_signal_flow.flow_run_id);
+    PERFORM cb_start_steps(cb_signal_flow.flow_name, cb_signal_flow.flow_run_id, NULL);
 
     RETURN true;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_wait_flow_output: Long-poll for flow completion without client-side polling loops
+-- Parameters:
+--   name: Flow name
+--   run_id: Flow run ID
+--   poll_for: Total duration in milliseconds to poll before timing out (must be > 0)
+--   poll_interval: Duration in milliseconds between poll attempts (must be > 0 and < poll_for)
+-- Returns: status/output/error_message once run reaches terminal state, or no rows on timeout
+DROP FUNCTION IF EXISTS cb_wait_flow_output(text, bigint, int, int);
+DROP FUNCTION IF EXISTS cb_wait_flow_output(text, bigint, int);
+CREATE OR REPLACE FUNCTION cb_wait_flow_output(
+  flow_name text,
+    run_id bigint,
+    poll_for int DEFAULT 5000,
+    poll_interval int DEFAULT 200
+)
+RETURNS TABLE(status text, output jsonb, error_message text)
+LANGUAGE plpgsql AS $$
+DECLARE
+  _f_table text := cb_table_name(cb_wait_flow_output.flow_name, 'f');
+    _status text;
+    _output jsonb;
+    _error_message text;
+    _sleep_for double precision;
+    _stop_at timestamp;
+BEGIN
+    IF cb_wait_flow_output.poll_for <= 0 THEN
+        RAISE EXCEPTION 'cb: poll_for must be greater than 0';
+    END IF;
+
+    IF cb_wait_flow_output.poll_interval <= 0 THEN
+        RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
+    END IF;
+
+    _sleep_for := cb_wait_flow_output.poll_interval / 1000.0;
+
+    IF _sleep_for >= cb_wait_flow_output.poll_for / 1000.0 THEN
+        RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
+    END IF;
+
+    _stop_at := clock_timestamp() + make_interval(secs => cb_wait_flow_output.poll_for / 1000.0);
+
+    LOOP
+        IF clock_timestamp() >= _stop_at THEN
+            RETURN;
+        END IF;
+
+      _status := NULL;
+      _output := NULL;
+      _error_message := NULL;
+
+        EXECUTE format(
+          $QUERY$
+          SELECT f.status, f.output, f.error_message
+          FROM %I f
+          WHERE f.id = $1
+          $QUERY$,
+          _f_table
+        )
+        USING cb_wait_flow_output.run_id
+        INTO _status, _output, _error_message;
+
+        IF _status IS NULL THEN
+          RAISE EXCEPTION 'cb: flow run % not found for flow %', cb_wait_flow_output.run_id, cb_wait_flow_output.flow_name;
+        END IF;
+
+        IF _status IN ('completed', 'failed') THEN
+            status := _status;
+            output := _output;
+            error_message := _error_message;
+            RETURN NEXT;
+            RETURN;
+        END IF;
+
+        PERFORM pg_sleep(_sleep_for);
+    END LOOP;
 END;
 $$;
 -- +goose statementend
@@ -835,11 +916,13 @@ $$;
 -- +goose down
 
 DROP FUNCTION IF EXISTS cb_delete_flow(text);
+DROP FUNCTION IF EXISTS cb_wait_flow_output(text, bigint, int, int);
+DROP FUNCTION IF EXISTS cb_wait_flow_output(text, bigint, int);
 DROP FUNCTION IF EXISTS cb_signal_flow(text, bigint, text, jsonb);
 DROP FUNCTION IF EXISTS cb_fail_step(text, text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_step(text, text, bigint, jsonb);
 DROP FUNCTION IF EXISTS cb_hide_steps(text, text, bigint[], integer);
 DROP FUNCTION IF EXISTS cb_poll_steps(text, text, int, int, int, int);
-DROP FUNCTION IF EXISTS cb_start_steps(text, bigint);
-DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text, text);
+DROP FUNCTION IF EXISTS cb_start_steps(text, bigint, timestamptz);
+DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text, text, timestamptz);
 DROP FUNCTION IF EXISTS cb_create_flow(text, jsonb);

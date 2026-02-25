@@ -38,17 +38,18 @@ type HandlerOpts struct {
 }
 
 // applyDefaultHandlerOpts sets default values for handler options.
-func applyDefaultHandlerOpts(opts *HandlerOpts) *HandlerOpts {
-	if opts == nil {
-		opts = &HandlerOpts{}
+func applyDefaultHandlerOpts(opts ...HandlerOpts) *HandlerOpts {
+	var resolved HandlerOpts
+	if len(opts) > 0 {
+		resolved = opts[0]
 	}
-	if opts.Concurrency == 0 {
-		opts.Concurrency = 1
+	if resolved.Concurrency == 0 {
+		resolved.Concurrency = 1
 	}
-	if opts.BatchSize == 0 {
-		opts.BatchSize = 10
+	if resolved.BatchSize == 0 {
+		resolved.BatchSize = 10
 	}
-	return opts
+	return &resolved
 }
 
 // validate checks handler options for consistency.

@@ -11,21 +11,21 @@ func TestSendQuery(t *testing.T) {
 		Value string `json:"value"`
 	}
 
-	deliverAt := time.Unix(1700000000, 0).UTC()
+	visibleAt := time.Unix(1700000000, 0).UTC()
 	query, args, err := SendQuery(
 		"test_queue",
 		payload{Value: "hello"},
-		&SendOpts{
+		SendOpts{
 			Topic:          "topic.a",
 			IdempotencyKey: "idem-1",
-			DeliverAt:      deliverAt,
+			VisibleAt:      visibleAt,
 		},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	expectedQuery := `SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, deliver_at => $5);`
+	expectedQuery := `SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, visible_at => $5);`
 	if query != expectedQuery {
 		t.Fatalf("unexpected query: %s", query)
 	}
@@ -50,11 +50,11 @@ func TestSendQuery(t *testing.T) {
 		t.Fatalf("unexpected idempotency key arg: %#v", args[3])
 	}
 
-	if gotDeliverAt, ok := args[4].(*time.Time); !ok || gotDeliverAt == nil || !gotDeliverAt.Equal(deliverAt) {
-		t.Fatalf("unexpected deliver_at arg: %#v", args[4])
+	if gotVisibleAt, ok := args[4].(*time.Time); !ok || gotVisibleAt == nil || !gotVisibleAt.Equal(visibleAt) {
+		t.Fatalf("unexpected visible_at arg: %#v", args[4])
 	}
 
-	_, nilArgs, err := SendQuery("test_queue", payload{Value: "hello"}, nil)
+	_, nilArgs, err := SendQuery("test_queue", payload{Value: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,8 +67,8 @@ func TestSendQuery(t *testing.T) {
 	if gotIdempotencyKey, ok := nilArgs[3].(*string); !ok || gotIdempotencyKey != nil {
 		t.Fatalf("expected nil *string idempotency key arg for nil opts, got %#v", nilArgs[3])
 	}
-	if gotDeliverAt, ok := nilArgs[4].(*time.Time); !ok || gotDeliverAt != nil {
-		t.Fatalf("expected nil *time.Time deliver_at arg for nil opts, got %#v", nilArgs[4])
+	if gotVisibleAt, ok := nilArgs[4].(*time.Time); !ok || gotVisibleAt != nil {
+		t.Fatalf("expected nil *time.Time visible_at arg for nil opts, got %#v", nilArgs[4])
 	}
 }
 
@@ -77,20 +77,20 @@ func TestPublishQuery(t *testing.T) {
 		Value string `json:"value"`
 	}
 
-	deliverAt := time.Unix(1700000100, 0).UTC()
+	visibleAt := time.Unix(1700000100, 0).UTC()
 	query, args, err := PublishQuery(
 		"topic.test",
 		payload{Value: "world"},
-		&PublishOpts{
+		PublishOpts{
 			IdempotencyKey: "idem-2",
-			DeliverAt:      &deliverAt,
+			VisibleAt:      &visibleAt,
 		},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	expectedQuery := `SELECT cb_publish(topic => $1, payload => $2, idempotency_key => $3, deliver_at => $4);`
+	expectedQuery := `SELECT cb_publish(topic => $1, payload => $2, idempotency_key => $3, visible_at => $4);`
 	if query != expectedQuery {
 		t.Fatalf("unexpected query: %s", query)
 	}
@@ -111,11 +111,11 @@ func TestPublishQuery(t *testing.T) {
 		t.Fatalf("unexpected idempotency key arg: %#v", args[2])
 	}
 
-	if gotDeliverAt, ok := args[3].(**time.Time); !ok || gotDeliverAt == nil || *gotDeliverAt == nil || !(*gotDeliverAt).Equal(deliverAt) {
-		t.Fatalf("unexpected deliver_at arg: %#v", args[3])
+	if gotVisibleAt, ok := args[3].(**time.Time); !ok || gotVisibleAt == nil || *gotVisibleAt == nil || !(*gotVisibleAt).Equal(visibleAt) {
+		t.Fatalf("unexpected visible_at arg: %#v", args[3])
 	}
 
-	_, nilArgs, err := PublishQuery("topic.test", payload{Value: "world"}, nil)
+	_, nilArgs, err := PublishQuery("topic.test", payload{Value: "world"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,15 +125,15 @@ func TestPublishQuery(t *testing.T) {
 	if gotIdempotencyKey, ok := nilArgs[2].(*string); !ok || gotIdempotencyKey != nil {
 		t.Fatalf("expected nil *string idempotency key arg for nil opts, got %#v", nilArgs[2])
 	}
-	if gotDeliverAt, ok := nilArgs[3].(**time.Time); !ok || gotDeliverAt != nil {
-		t.Fatalf("expected nil **time.Time deliver_at arg for nil opts, got %#v", nilArgs[3])
+	if gotVisibleAt, ok := nilArgs[3].(**time.Time); !ok || gotVisibleAt != nil {
+		t.Fatalf("expected nil **time.Time visible_at arg for nil opts, got %#v", nilArgs[3])
 	}
 }
 
 func TestQueueCreate(t *testing.T) {
 	client := getTestClient(t)
 
-	err := client.CreateQueue(t.Context(), "simple_queue", nil)
+	err := client.CreateQueue(t.Context(), "simple_queue")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestQueueSendAndRead(t *testing.T) {
 	client := getTestClient(t)
 
 	queueName := "send_read_queue"
-	err := client.CreateQueue(t.Context(), queueName, nil)
+	err := client.CreateQueue(t.Context(), queueName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestQueueSendAndRead(t *testing.T) {
 	}
 
 	payload := TestPayload{Message: "hello", Count: 42}
-	err = client.Send(t.Context(), queueName, payload, nil)
+	err = client.Send(t.Context(), queueName, payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +189,7 @@ func TestQueuePublish(t *testing.T) {
 	client := getTestClient(t)
 
 	queueName := "dispatch_queue"
-	err := client.CreateQueue(t.Context(), queueName, nil)
+	err := client.CreateQueue(t.Context(), queueName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +204,7 @@ func TestQueuePublish(t *testing.T) {
 	}
 
 	event := Event{EventType: "test_event", Data: "test_data"}
-	err = client.Publish(t.Context(), "event_topic", event, nil)
+	err = client.Publish(t.Context(), "event_topic", event)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,12 +225,12 @@ func TestQueueDelete(t *testing.T) {
 	client := getTestClient(t)
 
 	queueName := "delete_queue"
-	err := client.CreateQueue(t.Context(), queueName, nil)
+	err := client.CreateQueue(t.Context(), queueName)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = client.Send(t.Context(), queueName, "test", nil)
+	err = client.Send(t.Context(), queueName, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,12 +264,12 @@ func TestQueueHide(t *testing.T) {
 	client := getTestClient(t)
 
 	queueName := "hide_queue"
-	err := client.CreateQueue(t.Context(), queueName, nil)
+	err := client.CreateQueue(t.Context(), queueName)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = client.Send(t.Context(), queueName, "test message", nil)
+	err = client.Send(t.Context(), queueName, "test message")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,12 +304,12 @@ func TestQueueHideExpiry(t *testing.T) {
 	client := getTestClient(t)
 
 	queueName := "hide_expiry_queue"
-	err := client.CreateQueue(t.Context(), queueName, nil)
+	err := client.CreateQueue(t.Context(), queueName)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = client.Send(t.Context(), queueName, "test message", nil)
+	err = client.Send(t.Context(), queueName, "test message")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,11 +359,11 @@ func TestQueueListQueues(t *testing.T) {
 	q1 := "list_queue_1"
 	q2 := "list_queue_2"
 
-	err := client.CreateQueue(t.Context(), q1, nil)
+	err := client.CreateQueue(t.Context(), q1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = client.CreateQueue(t.Context(), q2, nil)
+	err = client.CreateQueue(t.Context(), q2)
 	if err != nil {
 		t.Fatal(err)
 	}

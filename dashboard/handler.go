@@ -230,7 +230,7 @@ func (a *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		opts.Topic = topic
 	}
 
-	err := a.client.Send(r.Context(), queue, json.RawMessage(payload), &opts)
+	err := a.client.Send(r.Context(), queue, json.RawMessage(payload), opts)
 	if err != nil {
 		a.queues.ExecuteTemplate(w, "send_message_error", struct {
 			Error string
@@ -269,7 +269,7 @@ func (a *App) handleCreateQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := a.client.CreateQueue(r.Context(), name, nil)
+	err := a.client.CreateQueue(r.Context(), name)
 	if err != nil {
 		a.queues.ExecuteTemplate(w, "create_queue_error", struct {
 			Error string
@@ -313,7 +313,7 @@ func (a *App) handleTask(w http.ResponseWriter, r *http.Request) {
 
 	a.render(w, r, a.task, struct {
 		Task     *catbird.TaskInfo
-		TaskRuns []*catbird.RunInfo
+		TaskRuns []*catbird.TaskRunInfo
 	}{
 		Task:     task,
 		TaskRuns: taskRuns,
@@ -362,7 +362,7 @@ func (a *App) handleFlow(w http.ResponseWriter, r *http.Request) {
 
 	a.render(w, r, a.flow, struct {
 		Flow              *catbird.FlowInfo
-		FlowRuns          []*catbird.RunInfo
+		FlowRuns          []*catbird.FlowRunInfo
 		StepRunsByFlowRun map[int64][]*catbird.StepRunInfo
 	}{
 		Flow:              flow,
@@ -419,7 +419,7 @@ func (a *App) handleTaskRuns(w http.ResponseWriter, r *http.Request) {
 	// Render just the task runs table partial
 	if err := a.task.ExecuteTemplate(w, "task_runs_table", struct {
 		Task     *catbird.TaskInfo
-		TaskRuns []*catbird.RunInfo
+		TaskRuns []*catbird.TaskRunInfo
 	}{
 		Task:     task,
 		TaskRuns: taskRuns,
@@ -463,7 +463,7 @@ func (a *App) handleStartTaskRun(w http.ResponseWriter, r *http.Request) {
 		input = "{}"
 	}
 
-	_, err := a.client.RunTask(r.Context(), taskName, json.RawMessage(input), nil)
+	_, err := a.client.RunTask(r.Context(), taskName, json.RawMessage(input))
 	if err != nil {
 		a.task.ExecuteTemplate(w, "start_task_run_error", struct {
 			Error string
@@ -506,7 +506,7 @@ func (a *App) handleFlowRuns(w http.ResponseWriter, r *http.Request) {
 	// Render just the flow runs table partial
 	if err := a.flow.ExecuteTemplate(w, "flow_runs_table", struct {
 		Flow              *catbird.FlowInfo
-		FlowRuns          []*catbird.RunInfo
+		FlowRuns          []*catbird.FlowRunInfo
 		StepRunsByFlowRun map[int64][]*catbird.StepRunInfo
 	}{
 		Flow:              flow,
@@ -552,7 +552,7 @@ func (a *App) handleStartFlowRun(w http.ResponseWriter, r *http.Request) {
 		input = "{}"
 	}
 
-	_, err := a.client.RunFlow(r.Context(), flowName, json.RawMessage(input), nil)
+	_, err := a.client.RunFlow(r.Context(), flowName, json.RawMessage(input))
 	if err != nil {
 		a.flow.ExecuteTemplate(w, "start_flow_run_error", struct {
 			Error string

@@ -33,14 +33,14 @@ func TestTaskConcurrencyKey(t *testing.T) {
 	task := NewTask("concurrent_task").Handler(func(ctx context.Context, in int) (int, error) {
 		time.Sleep(200 * time.Millisecond) // Simulate work
 		return in * 2, nil
-	}, nil)
+	})
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task)
+	worker := client.NewWorker(t.Context()).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
 	// Run 1: Start first execution with ConcurrencyKey
-	h1, err := client.RunTask(t.Context(), "concurrent_task", 10, &RunOpts{
+	h1, err := client.RunTask(t.Context(), "concurrent_task", 10, RunTaskOpts{
 		ConcurrencyKey: "run-123",
 	})
 	if err != nil {
@@ -51,7 +51,7 @@ func TestTaskConcurrencyKey(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Run 2: Attempt duplicate while first is running (should be rejected)
-	h2, err := client.RunTask(t.Context(), "concurrent_task", 20, &RunOpts{
+	h2, err := client.RunTask(t.Context(), "concurrent_task", 20, RunTaskOpts{
 		ConcurrencyKey: "run-123",
 	})
 	if err != nil {
@@ -75,7 +75,7 @@ func TestTaskConcurrencyKey(t *testing.T) {
 	}
 
 	// Run 3: Now that first run completed, same ConcurrencyKey should create new run
-	h3, err := client.RunTask(t.Context(), "concurrent_task", 30, &RunOpts{
+	h3, err := client.RunTask(t.Context(), "concurrent_task", 30, RunTaskOpts{
 		ConcurrencyKey: "run-123",
 	})
 	if err != nil {
@@ -104,14 +104,14 @@ func TestTaskIdempotencyKey(t *testing.T) {
 	task := NewTask("idempotent_task").Handler(func(ctx context.Context, in int) (int, error) {
 		time.Sleep(100 * time.Millisecond) // Simulate work
 		return in * 3, nil
-	}, nil)
+	})
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task)
+	worker := client.NewWorker(t.Context()).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
 	// Run 1: First execution with IdempotencyKey
-	h1, err := client.RunTask(t.Context(), "idempotent_task", 7, &RunOpts{
+	h1, err := client.RunTask(t.Context(), "idempotent_task", 7, RunTaskOpts{
 		IdempotencyKey: "payment-456",
 	})
 	if err != nil {
@@ -122,7 +122,7 @@ func TestTaskIdempotencyKey(t *testing.T) {
 	}
 
 	// Run 2: Duplicate while running (should return existing ID)
-	h2, err := client.RunTask(t.Context(), "idempotent_task", 8, &RunOpts{
+	h2, err := client.RunTask(t.Context(), "idempotent_task", 8, RunTaskOpts{
 		IdempotencyKey: "payment-456",
 	})
 	if err != nil {
@@ -144,7 +144,7 @@ func TestTaskIdempotencyKey(t *testing.T) {
 	}
 
 	// Run 3: After completion, IdempotencyKey should still return existing ID (exactly-once)
-	h3, err := client.RunTask(t.Context(), "idempotent_task", 9, &RunOpts{
+	h3, err := client.RunTask(t.Context(), "idempotent_task", 9, RunTaskOpts{
 		IdempotencyKey: "payment-456",
 	})
 	if err != nil {
@@ -155,7 +155,7 @@ func TestTaskIdempotencyKey(t *testing.T) {
 	}
 
 	// Run 4: Different IdempotencyKey should create new run
-	h4, err := client.RunTask(t.Context(), "idempotent_task", 10, &RunOpts{
+	h4, err := client.RunTask(t.Context(), "idempotent_task", 10, RunTaskOpts{
 		IdempotencyKey: "payment-789",
 	})
 	if err != nil {
@@ -191,14 +191,14 @@ func TestTaskDeduplicationRetryOnFailure(t *testing.T) {
 			return "", fmt.Errorf("task failed")
 		}
 		return "success", nil
-	}, nil)
+	})
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task)
+	worker := client.NewWorker(t.Context()).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
 	// Test ConcurrencyKey allows retry on failure
-	h1, err := client.RunTask(t.Context(), taskName, RetryInput{Fail: true}, &RunOpts{
+	h1, err := client.RunTask(t.Context(), taskName, RetryInput{Fail: true}, RunTaskOpts{
 		ConcurrencyKey: "retry-test-1",
 	})
 	if err != nil {
@@ -212,7 +212,7 @@ func TestTaskDeduplicationRetryOnFailure(t *testing.T) {
 	waitForTaskRunStatus(t, client, taskName, h1.ID, "failed", 5*time.Second)
 
 	// Retry with same ConcurrencyKey (should work because first failed)
-	h2, err := client.RunTask(t.Context(), taskName, RetryInput{Fail: false}, &RunOpts{
+	h2, err := client.RunTask(t.Context(), taskName, RetryInput{Fail: false}, RunTaskOpts{
 		ConcurrencyKey: "retry-test-1",
 	})
 	if err != nil {
@@ -223,7 +223,7 @@ func TestTaskDeduplicationRetryOnFailure(t *testing.T) {
 	}
 
 	// Test IdempotencyKey allows retry on failure
-	h3, err := client.RunTask(t.Context(), taskName, RetryInput{Fail: true}, &RunOpts{
+	h3, err := client.RunTask(t.Context(), taskName, RetryInput{Fail: true}, RunTaskOpts{
 		IdempotencyKey: "idempotent-retry-1",
 	})
 	if err != nil {
@@ -237,7 +237,7 @@ func TestTaskDeduplicationRetryOnFailure(t *testing.T) {
 	waitForTaskRunStatus(t, client, taskName, h3.ID, "failed", 5*time.Second)
 
 	// Retry with same IdempotencyKey (should work because first failed)
-	h4, err := client.RunTask(t.Context(), taskName, RetryInput{Fail: false}, &RunOpts{
+	h4, err := client.RunTask(t.Context(), taskName, RetryInput{Fail: false}, RunTaskOpts{
 		IdempotencyKey: "idempotent-retry-1",
 	})
 	if err != nil {
@@ -261,14 +261,14 @@ func TestFlowConcurrencyKey(t *testing.T) {
 		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			time.Sleep(200 * time.Millisecond) // Simulate work
 			return in + " processed", nil
-		}, nil))
+		}))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
 	// Run 1: Start first execution
-	h1, err := client.RunFlow(t.Context(), flowName, input1, &RunFlowOpts{
+	h1, err := client.RunFlow(t.Context(), flowName, input1, RunFlowOpts{
 		ConcurrencyKey: concurrencyKey,
 	})
 	if err != nil {
@@ -278,7 +278,7 @@ func TestFlowConcurrencyKey(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Run 2: Duplicate while running (should return existing ID)
-	h2, err := client.RunFlow(t.Context(), flowName, input1, &RunFlowOpts{
+	h2, err := client.RunFlow(t.Context(), flowName, input1, RunFlowOpts{
 		ConcurrencyKey: concurrencyKey,
 	})
 	if err != nil {
@@ -300,7 +300,7 @@ func TestFlowConcurrencyKey(t *testing.T) {
 	}
 
 	// Run 3: After completion, same ConcurrencyKey should create new run
-	h3, err := client.RunFlow(t.Context(), flowName, input2, &RunFlowOpts{
+	h3, err := client.RunFlow(t.Context(), flowName, input2, RunFlowOpts{
 		ConcurrencyKey: concurrencyKey,
 	})
 	if err != nil {
@@ -319,9 +319,9 @@ func TestFlowIdempotencyKey(t *testing.T) {
 		AddStep(NewStep("step1").Handler(func(ctx context.Context, in int) (int, error) {
 			time.Sleep(100 * time.Millisecond)
 			return in * 5, nil
-		}, nil))
+		}))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -330,7 +330,7 @@ func TestFlowIdempotencyKey(t *testing.T) {
 	uniqueKey2 := fmt.Sprintf("order-888-%d", time.Now().UnixNano())
 
 	// Run 1: First execution
-	h1, err := client.RunFlow(t.Context(), "idempotent_flow", 10, &RunFlowOpts{
+	h1, err := client.RunFlow(t.Context(), "idempotent_flow", 10, RunFlowOpts{
 		IdempotencyKey: uniqueKey1,
 	})
 	if err != nil {
@@ -341,7 +341,7 @@ func TestFlowIdempotencyKey(t *testing.T) {
 	}
 
 	// Run 2: Duplicate (should return existing ID)
-	h2, err := client.RunFlow(t.Context(), "idempotent_flow", 20, &RunFlowOpts{
+	h2, err := client.RunFlow(t.Context(), "idempotent_flow", 20, RunFlowOpts{
 		IdempotencyKey: uniqueKey1,
 	})
 	if err != nil {
@@ -363,7 +363,7 @@ func TestFlowIdempotencyKey(t *testing.T) {
 	}
 
 	// Run 3: After completion, still return existing ID (exactly-once)
-	h3, err := client.RunFlow(t.Context(), "idempotent_flow", 30, &RunFlowOpts{
+	h3, err := client.RunFlow(t.Context(), "idempotent_flow", 30, RunFlowOpts{
 		IdempotencyKey: uniqueKey1,
 	})
 	if err != nil {
@@ -374,7 +374,7 @@ func TestFlowIdempotencyKey(t *testing.T) {
 	}
 
 	// Run 4: Different IdempotencyKey should create new run
-	h4, err := client.RunFlow(t.Context(), "idempotent_flow", 40, &RunFlowOpts{
+	h4, err := client.RunFlow(t.Context(), "idempotent_flow", 40, RunFlowOpts{
 		IdempotencyKey: uniqueKey2,
 	})
 	if err != nil {
@@ -393,14 +393,14 @@ func TestTaskBothKeysRejected(t *testing.T) {
 
 	task := NewTask("both_keys_task").Handler(func(ctx context.Context, in string) (string, error) {
 		return in, nil
-	}, nil)
+	})
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task)
+	worker := client.NewWorker(t.Context()).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
 	// Attempt to run with both keys (should fail)
-	_, err = client.RunTask(t.Context(), "both_keys_task", "input", &RunOpts{
+	_, err = client.RunTask(t.Context(), "both_keys_task", "input", RunTaskOpts{
 		ConcurrencyKey: "key1",
 		IdempotencyKey: "key2",
 	})
@@ -417,14 +417,14 @@ func TestFlowBothKeysRejected(t *testing.T) {
 	flow := NewFlow("both_keys_flow").
 		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			return in, nil
-		}, nil))
+		}))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
 	// Attempt to run with both keys (should fail)
-	_, err = client.RunFlow(t.Context(), "both_keys_flow", "input", &RunFlowOpts{
+	_, err = client.RunFlow(t.Context(), "both_keys_flow", "input", RunFlowOpts{
 		ConcurrencyKey: "key1",
 		IdempotencyKey: "key2",
 	})

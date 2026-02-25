@@ -13,17 +13,11 @@
 - [ ] Reuse queue topic bindings implementation for event triggered task execution?
 - [ ] Task coördination and dynamic tasks (see COORDINATION_PATTERNS.md)
 - [ ] Task cancellation and early exit
-- [ ] Wait for output long polling
 - [ ] Description and other meta fields 
 - [ ] Metrics
 - [ ] Schemas for task/flow input/output? (see https://opensource.googleblog.com/2026/01/a-json-schema-package-for-go.html)
 - [ ] OnFail handlers
-- [ ] Delayed tasks, flows (and steps?)
 - [ ] Unlogged tasks and flows
-
-## Project Management
-
-- [ ] Focus project on tasks and flows? Queues largely duplicate pgmq.
 
 ## Client Implementations
 

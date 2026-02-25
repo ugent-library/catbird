@@ -107,6 +107,15 @@ These are hardcoded in:
 ./scripts/test.sh -cover
 ```
 
+### Include Long-Running Concurrency Tests
+Some stress/concurrency tests are optional by default to keep local runs fast.
+
+```bash
+CATBIRD_SLOW_TESTS=1 ./scripts/test.sh
+```
+
+By default, these tests are skipped unless `CATBIRD_SLOW_TESTS` is set to `1`, `true`, or `yes`.
+
 ## Verifying Setup
 
 ```bash

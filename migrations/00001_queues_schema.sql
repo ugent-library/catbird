@@ -14,7 +14,7 @@ BEGIN
         payload jsonb,
         deliveries int,
         created_at timestamptz,
-        deliver_at timestamptz
+        visible_at timestamptz
     );
 END$$;
 -- +goose statementend

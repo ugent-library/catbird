@@ -19,22 +19,23 @@ func TestRunFlowQuery(t *testing.T) {
 	query, args, err := RunFlowQuery(
 		"test_flow",
 		input{Value: "hello"},
-		&RunFlowOpts{
+		RunFlowOpts{
 			ConcurrencyKey: "con-1",
 			IdempotencyKey: "idem-1",
+			VisibleAt:      time.Unix(1700000300, 0).UTC(),
 		},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	expectedQuery := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4);`
+	expectedQuery := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, visible_at => $5);`
 	if query != expectedQuery {
 		t.Fatalf("unexpected query: %s", query)
 	}
 
-	if len(args) != 4 {
-		t.Fatalf("expected 4 args, got %d", len(args))
+	if len(args) != 5 {
+		t.Fatalf("expected 5 args, got %d", len(args))
 	}
 
 	if gotName, ok := args[0].(string); !ok || gotName != "test_flow" {
@@ -53,18 +54,25 @@ func TestRunFlowQuery(t *testing.T) {
 		t.Fatalf("unexpected idempotency key arg: %#v", args[3])
 	}
 
-	_, nilArgs, err := RunFlowQuery("test_flow", input{Value: "hello"}, nil)
+	if gotVisibleAt, ok := args[4].(*time.Time); !ok || gotVisibleAt == nil || !gotVisibleAt.Equal(time.Unix(1700000300, 0).UTC()) {
+		t.Fatalf("unexpected visible_at arg: %#v", args[4])
+	}
+
+	_, nilArgs, err := RunFlowQuery("test_flow", input{Value: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nilArgs) != 4 {
-		t.Fatalf("expected 4 args for nil opts, got %d", len(nilArgs))
+	if len(nilArgs) != 5 {
+		t.Fatalf("expected 5 args for nil opts, got %d", len(nilArgs))
 	}
 	if gotConcurrencyKey, ok := nilArgs[2].(*string); !ok || gotConcurrencyKey != nil {
 		t.Fatalf("expected nil *string concurrency key arg for nil opts, got %#v", nilArgs[2])
 	}
 	if gotIdempotencyKey, ok := nilArgs[3].(*string); !ok || gotIdempotencyKey != nil {
 		t.Fatalf("expected nil *string idempotency key arg for nil opts, got %#v", nilArgs[3])
+	}
+	if gotVisibleAt, ok := nilArgs[4].(*time.Time); !ok || gotVisibleAt != nil {
+		t.Fatalf("expected nil *time.Time visible_at arg for nil opts, got %#v", nilArgs[4])
 	}
 }
 
@@ -74,20 +82,20 @@ func TestFlowCreate(t *testing.T) {
 	flow := NewFlow("test_flow").
 		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			return in + " processed", nil
-		}, nil))
+		}))
 
 	err := client.CreateFlow(t.Context(), flow)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunFlow(t.Context(), "test_flow", "input", nil)
+	h, err := client.RunFlow(t.Context(), "test_flow", "input")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,16 +118,16 @@ func TestFlowSingleStep(t *testing.T) {
 	flow := NewFlow("single_step_flow").
 		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			return in + " processed by step 1", nil
-		}, nil))
+		}))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunFlow(t.Context(), "single_step_flow", "input", nil)
+	h, err := client.RunFlow(t.Context(), "single_step_flow", "input")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,6 +144,48 @@ func TestFlowSingleStep(t *testing.T) {
 	}
 }
 
+func TestFlowRunDelayedVisibleAt(t *testing.T) {
+	client := getTestClient(t)
+
+	flowName := testFlowName(t, "delayed_flow")
+	flow := NewFlow(flowName).
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
+			return in + " processed", nil
+		}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, "input", RunFlowOpts{
+		VisibleAt: time.Now().Add(3 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	runInfo, err := client.GetFlowRun(t.Context(), flowName, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runInfo.Status != StatusStarted {
+		t.Fatalf("expected delayed flow to remain started before visible_at, got %s", runInfo.Status)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var out string
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out != "input processed" {
+		t.Fatalf("unexpected output: %s", out)
+	}
+}
+
 func TestFlowWithDependencies(t *testing.T) {
 	client := getTestClient(t)
 
@@ -145,26 +195,26 @@ func TestFlowWithDependencies(t *testing.T) {
 	flow := NewFlow("dependency_flow").
 		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			return in + " processed by step 1", nil
-		}, nil)).
+		})).
 		AddStep(NewStep("step2").
 			DependsOn("step1").
 			Handler(func(ctx context.Context, in string, step1Out string) (string, error) {
 				return step1Out + " and by step 2", nil
-			}, nil)).
+			})).
 		AddStep(NewStep("step3").
 			DependsOn("step2").
 			Handler(func(ctx context.Context, in string, step2Out string) (string, error) {
 				return step2Out + " and by step 3", nil
-			}, nil))
+			}))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunFlow(t.Context(), "dependency_flow", "input", nil)
+	h, err := client.RunFlow(t.Context(), "dependency_flow", "input")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,12 +241,12 @@ func TestFlowListFlows(t *testing.T) {
 	flow1 := NewFlow("list_flow_1").
 		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			return in, nil
-		}, nil))
+		}))
 
 	flow2 := NewFlow("list_flow_2").
 		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			return in, nil
-		}, nil))
+		}))
 
 	flows[0] = flow1
 	flows[1] = flow2
@@ -211,7 +261,7 @@ func TestFlowListFlows(t *testing.T) {
 	}
 
 	// Start worker to execute flows
-	worker := client.NewWorker(t.Context(), nil).
+	worker := client.NewWorker(t.Context()).
 		AddFlow(flow1).
 		AddFlow(flow2)
 
@@ -220,7 +270,7 @@ func TestFlowListFlows(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Verify both flows execute successfully
-	h1, err := client.RunFlow(t.Context(), "list_flow_1", "input_1", nil)
+	h1, err := client.RunFlow(t.Context(), "list_flow_1", "input_1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +282,7 @@ func TestFlowListFlows(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	h2, err := client.RunFlow(t.Context(), "list_flow_2", "input_2", nil)
+	h2, err := client.RunFlow(t.Context(), "list_flow_2", "input_2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,11 +304,11 @@ func TestTaskListTasks(t *testing.T) {
 
 	task1 := NewTask("list_task_1").Handler(func(ctx context.Context, in string) (string, error) {
 		return in, nil
-	}, nil)
+	})
 
 	task2 := NewTask("list_task_2").Handler(func(ctx context.Context, in string) (string, error) {
 		return in, nil
-	}, nil)
+	})
 
 	err := client.CreateTask(t.Context(), task1)
 	if err != nil {
@@ -303,22 +353,22 @@ func TestFlowComplexDependencies(t *testing.T) {
 	flow := NewFlow("complex_flow").
 		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (int, error) {
 			return 10, nil
-		}, nil)).
+		})).
 		AddStep(NewStep("step2").
 			DependsOn("step1").
 			Handler(func(ctx context.Context, in string, step1Out int) (int, error) {
 				return step1Out * 2, nil // 20
-			}, nil)).
+			})).
 		AddStep(NewStep("step3").
 			DependsOn("step1").
 			Handler(func(ctx context.Context, in string, step1Out int) (int, error) {
 				return step1Out * 3, nil // 30
-			}, nil)).
+			})).
 		AddStep(NewStep("step4").
 			DependsOn("step2", "step3").
 			Handler(func(ctx context.Context, in string, step2Out, step3Out int) (int, error) {
 				return step2Out + step3Out, nil // 20 + 30 = 50
-			}, nil))
+			}))
 
 	err := client.CreateFlow(t.Context(), flow)
 	if err != nil {
@@ -326,7 +376,7 @@ func TestFlowComplexDependencies(t *testing.T) {
 	}
 
 	// Start worker to execute flow
-	worker := client.NewWorker(t.Context(), &WorkerOpts{Logger: logger}).
+	worker := client.NewWorker(t.Context(), WorkerOpts{Logger: logger}).
 		AddFlow(flow)
 
 	startTestWorker(t, worker)
@@ -334,7 +384,7 @@ func TestFlowComplexDependencies(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Run the flow
-	h, err := client.RunFlow(t.Context(), "complex_flow", "input", nil)
+	h, err := client.RunFlow(t.Context(), "complex_flow", "input")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,21 +409,21 @@ func TestFlowStepPanicRecovery(t *testing.T) {
 	flow := NewFlow("panic_flow").
 		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 			return "success", nil
-		}, nil)).
+		})).
 		AddStep(NewStep("step2").
 			DependsOn("step1").
 			Handler(func(ctx context.Context, in string, step1Out string) (string, error) {
 				panic("intentional panic in flow step")
-			}, nil))
+			}))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	if _, err := client.RunFlow(t.Context(), "panic_flow", "test input", nil); err != nil {
+	if _, err := client.RunFlow(t.Context(), "panic_flow", "test input"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -419,20 +469,20 @@ func TestStepCircuitBreaker(t *testing.T) {
 					return "", fmt.Errorf("intentional failure")
 				}
 				return "ok", nil
-			}, &HandlerOpts{
+			}, HandlerOpts{
 				MaxRetries:     2,
 				Backoff:        NewFullJitterBackoff(minBackoff, maxBackoff),
 				CircuitBreaker: &CircuitBreaker{failureThreshold: 1, openTimeout: openTimeout},
 			}))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunFlow(t.Context(), flowName, "input", nil)
+	h, err := client.RunFlow(t.Context(), flowName, "input")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,7 +527,7 @@ func TestFlowWithSignal(t *testing.T) {
 	flow := NewFlow(flowName).
 		AddStep(NewStep("submit").Handler(func(ctx context.Context, doc string) (string, error) {
 			return "submitted: " + doc, nil
-		}, nil)).
+		})).
 		AddStep(NewStep("approve").
 			DependsOn("submit").
 			Signal(true).
@@ -486,21 +536,21 @@ func TestFlowWithSignal(t *testing.T) {
 					return "", fmt.Errorf("approval denied by %s", approval.ApproverID)
 				}
 				return fmt.Sprintf("approved by %s: %s", approval.ApproverID, submitResult), nil
-			}, nil)).
+			})).
 		AddStep(NewStep("publish").
 			DependsOn("approve").
 			Handler(func(ctx context.Context, doc string, approveResult string) (string, error) {
 				return "published: " + approveResult, nil
-			}, nil))
+			}))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunFlow(t.Context(), flowName, "my_document", nil)
+	h, err := client.RunFlow(t.Context(), flowName, "my_document")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,21 +594,21 @@ func TestFlowWithInitialSignal(t *testing.T) {
 			Signal(true).
 			Handler(func(ctx context.Context, flowInput string, signal StartInput) (string, error) {
 				return fmt.Sprintf("started by %s", signal.InitiatorID), nil
-			}, nil)).
+			})).
 		AddStep(NewStep("process").
 			DependsOn("start").
 			Handler(func(ctx context.Context, flowInput string, startResult string) (string, error) {
 				return startResult + " - processed", nil
-			}, nil))
+			}))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunFlow(t.Context(), flowName, "test_flow", nil)
+	h, err := client.RunFlow(t.Context(), flowName, "test_flow")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -597,7 +647,7 @@ func TestFlowSignalAlreadyDelivered(t *testing.T) {
 	flow := NewFlow(flowName).
 		AddStep(NewStep("request").Handler(func(ctx context.Context, doc string) (string, error) {
 			return "approval requested for: " + doc, nil
-		}, nil)).
+		})).
 		AddStep(NewStep("approve").
 			DependsOn("request").
 			Signal(true).
@@ -606,21 +656,21 @@ func TestFlowSignalAlreadyDelivered(t *testing.T) {
 					return "", fmt.Errorf("approval denied by %s: %s", approval.ApproverID, approval.Response)
 				}
 				return fmt.Sprintf("approved by %s: %s", approval.ApproverID, reqResult), nil
-			}, nil)).
+			})).
 		AddStep(NewStep("complete").
 			DependsOn("approve").
 			Handler(func(ctx context.Context, doc string, approveResult string) (string, error) {
 				return approveResult + " - completed", nil
-			}, nil))
+			}))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunFlow(t.Context(), flowName, "my_doc", nil)
+	h, err := client.RunFlow(t.Context(), flowName, "my_doc")
 	if err != nil {
 		t.Fatal(err)
 	}

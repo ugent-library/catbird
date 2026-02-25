@@ -18,22 +18,23 @@ func TestRunTaskQuery(t *testing.T) {
 	query, args, err := RunTaskQuery(
 		"test_task",
 		input{Value: "hello"},
-		&RunOpts{
+		RunTaskOpts{
 			ConcurrencyKey: "con-1",
 			IdempotencyKey: "idem-1",
+			VisibleAt:      time.Unix(1700000200, 0).UTC(),
 		},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	expectedQuery := `SELECT * FROM cb_run_task(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4);`
+	expectedQuery := `SELECT * FROM cb_run_task(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, visible_at => $5);`
 	if query != expectedQuery {
 		t.Fatalf("unexpected query: %s", query)
 	}
 
-	if len(args) != 4 {
-		t.Fatalf("expected 4 args, got %d", len(args))
+	if len(args) != 5 {
+		t.Fatalf("expected 5 args, got %d", len(args))
 	}
 
 	if gotName, ok := args[0].(string); !ok || gotName != "test_task" {
@@ -52,18 +53,25 @@ func TestRunTaskQuery(t *testing.T) {
 		t.Fatalf("unexpected idempotency key arg: %#v", args[3])
 	}
 
-	_, nilArgs, err := RunTaskQuery("test_task", input{Value: "hello"}, nil)
+	if gotVisibleAt, ok := args[4].(*time.Time); !ok || gotVisibleAt == nil || !gotVisibleAt.Equal(time.Unix(1700000200, 0).UTC()) {
+		t.Fatalf("unexpected visible_at arg: %#v", args[4])
+	}
+
+	_, nilArgs, err := RunTaskQuery("test_task", input{Value: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nilArgs) != 4 {
-		t.Fatalf("expected 4 args for nil opts, got %d", len(nilArgs))
+	if len(nilArgs) != 5 {
+		t.Fatalf("expected 5 args for nil opts, got %d", len(nilArgs))
 	}
 	if gotConcurrencyKey, ok := nilArgs[2].(*string); !ok || gotConcurrencyKey != nil {
 		t.Fatalf("expected nil *string concurrency key arg for nil opts, got %#v", nilArgs[2])
 	}
 	if gotIdempotencyKey, ok := nilArgs[3].(*string); !ok || gotIdempotencyKey != nil {
 		t.Fatalf("expected nil *string idempotency key arg for nil opts, got %#v", nilArgs[3])
+	}
+	if gotVisibleAt, ok := nilArgs[4].(*time.Time); !ok || gotVisibleAt != nil {
+		t.Fatalf("expected nil *time.Time visible_at arg for nil opts, got %#v", nilArgs[4])
 	}
 }
 
@@ -72,7 +80,7 @@ func TestTaskCreate(t *testing.T) {
 
 	task := NewTask("test_task").Handler(func(ctx context.Context, in string) (string, error) {
 		return in + " processed", nil
-	}, nil)
+	})
 
 	err := client.CreateTask(t.Context(), task)
 	if err != nil {
@@ -97,16 +105,16 @@ func TestTaskRunAndWait(t *testing.T) {
 
 	task := NewTask("math_task").Handler(func(ctx context.Context, in TaskInput) (int, error) {
 		return in.Value * 2, nil
-	}, nil)
+	})
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task)
+	worker := client.NewWorker(t.Context()).AddTask(task)
 
 	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunTask(t.Context(), "math_task", TaskInput{Value: 21}, nil)
+	h, err := client.RunTask(t.Context(), "math_task", TaskInput{Value: 21})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,21 +131,62 @@ func TestTaskRunAndWait(t *testing.T) {
 	}
 }
 
+func TestTaskRunDelayedVisibleAt(t *testing.T) {
+	client := getTestClient(t)
+
+	taskName := fmt.Sprintf("delayed_task_%d", time.Now().UnixNano())
+	task := NewTask(taskName).Handler(func(ctx context.Context, in string) (string, error) {
+		return in + " processed", nil
+	})
+
+	worker := client.NewWorker(t.Context()).AddTask(task)
+	startTestWorker(t, worker)
+
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunTask(t.Context(), taskName, "input", RunTaskOpts{
+		VisibleAt: time.Now().Add(3 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	runInfo, err := client.GetTaskRun(t.Context(), taskName, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runInfo.Status != "queued" {
+		t.Fatalf("expected delayed task to remain queued before visible_at, got %s", runInfo.Status)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var out string
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out != "input processed" {
+		t.Fatalf("unexpected output: %s", out)
+	}
+}
+
 func TestTaskPanicRecovery(t *testing.T) {
 	client := getTestClient(t)
 
 	task := NewTask("panic_task").Handler(func(ctx context.Context, in string) (string, error) {
 		panic("intentional panic in task")
-	}, nil)
+	})
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task)
+	worker := client.NewWorker(t.Context()).AddTask(task)
 
 	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	if _, err := client.RunTask(t.Context(), "panic_task", "test input", nil); err != nil {
+	if _, err := client.RunTask(t.Context(), "panic_task", "test input"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -184,7 +233,7 @@ func TestTaskCircuitBreaker(t *testing.T) {
 			return "", fmt.Errorf("intentional failure")
 		}
 		return "ok", nil
-	}, &HandlerOpts{
+	}, HandlerOpts{
 		Concurrency:    1,
 		BatchSize:      10,
 		MaxRetries:     2,
@@ -192,14 +241,14 @@ func TestTaskCircuitBreaker(t *testing.T) {
 		CircuitBreaker: NewCircuitBreaker(1, openTimeout),
 	})
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task)
+	worker := client.NewWorker(t.Context()).AddTask(task)
 
 	startTestWorker(t, worker)
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)
 
-	h, err := client.RunTask(t.Context(), "circuit_task", "input", nil)
+	h, err := client.RunTask(t.Context(), "circuit_task", "input")
 	if err != nil {
 		t.Fatal(err)
 	}

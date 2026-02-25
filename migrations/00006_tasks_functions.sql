@@ -7,7 +7,7 @@
 --   cb_run_task(): Uses atomic CTE + UNION ALL pattern with ON CONFLICT DO UPDATE WHERE FALSE - SAFE
 --     Critical: MUST use UNION ALL fallback, not bare RETURNING (returns NULL on conflict without it)
 --   cb_poll_tasks(): Uses FOR UPDATE SKIP LOCKED for lock-free row polling - SAFE
---   cb_hide_tasks(): Direct UPDATE indexed by deliver_at, no locks - SAFE
+--   cb_hide_tasks(): Direct UPDATE indexed by visible_at, no locks - SAFE
 -- All operations maintain task state invariants
 -- Deduplication pattern reference: https://stackoverflow.com/a/35953488
 
@@ -53,7 +53,7 @@ BEGIN
         input jsonb NOT NULL,
         output jsonb,
         error_message text,
-        deliver_at timestamptz NOT NULL DEFAULT now(),
+        visible_at timestamptz NOT NULL DEFAULT now(),
         started_at timestamptz NOT NULL DEFAULT now(),
         completed_at timestamptz,
         failed_at timestamptz,
@@ -72,7 +72,7 @@ BEGIN
 
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (concurrency_key) WHERE concurrency_key IS NOT NULL AND status IN (''queued'', ''started'')', _t_table || '_concurrency_key_idx', _t_table);
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN (''queued'', ''started'', ''completed'')', _t_table || '_idempotency_key_idx', _t_table);
-    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (deliver_at);', _t_table || '_deliver_at_idx', _t_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at);', _t_table || '_visible_at_idx', _t_table);
 END;
 $$;
 -- +goose statementend
@@ -89,7 +89,8 @@ CREATE OR REPLACE FUNCTION cb_run_task(
     name text,
     input jsonb,
     concurrency_key text = NULL,
-    idempotency_key text = NULL
+    idempotency_key text = NULL,
+    visible_at timestamptz = NULL
 )
 RETURNS bigint
 LANGUAGE plpgsql AS $$
@@ -112,8 +113,8 @@ BEGIN
         EXECUTE format(
             $QUERY$
             WITH ins AS (
-                INSERT INTO %I (input, concurrency_key)
-                VALUES ($1, $2)
+                INSERT INTO %I (input, concurrency_key, visible_at)
+                VALUES ($1, $2, $3)
                 ON CONFLICT (concurrency_key) WHERE concurrency_key IS NOT NULL AND status IN ('queued', 'started')
                 DO UPDATE SET status = EXCLUDED.status WHERE FALSE
                 RETURNING id
@@ -126,15 +127,15 @@ BEGIN
             $QUERY$,
             _t_table, _t_table
         )
-        USING cb_run_task.input, cb_run_task.concurrency_key
+        USING cb_run_task.input, cb_run_task.concurrency_key, coalesce(cb_run_task.visible_at, now())
         INTO _id;
     ELSIF cb_run_task.idempotency_key IS NOT NULL THEN
         -- Idempotency: dedupe queued/started/completed
         EXECUTE format(
             $QUERY$
             WITH ins AS (
-                INSERT INTO %I (input, idempotency_key)
-                VALUES ($1, $2)
+                INSERT INTO %I (input, idempotency_key, visible_at)
+                VALUES ($1, $2, $3)
                 ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('queued', 'started', 'completed')
                 DO UPDATE SET status = EXCLUDED.status WHERE FALSE
                 RETURNING id
@@ -147,19 +148,19 @@ BEGIN
             $QUERY$,
             _t_table, _t_table
         )
-        USING cb_run_task.input, cb_run_task.idempotency_key
+        USING cb_run_task.input, cb_run_task.idempotency_key, coalesce(cb_run_task.visible_at, now())
         INTO _id;
     ELSE
         -- No deduplication
         EXECUTE format(
             $QUERY$
-            INSERT INTO %I (input)
-            VALUES ($1)
+            INSERT INTO %I (input, visible_at)
+            VALUES ($1, $2)
             RETURNING id
             $QUERY$,
             _t_table
         )
-        USING cb_run_task.input
+        USING cb_run_task.input, coalesce(cb_run_task.visible_at, now())
         INTO _id;
     END IF;
 
@@ -219,7 +220,7 @@ BEGIN
         WITH runs AS (
           SELECT id
           FROM %I
-          WHERE deliver_at <= clock_timestamp()
+          WHERE visible_at <= clock_timestamp()
             AND status IN ('queued', 'started')
           ORDER BY id ASC
           LIMIT $1
@@ -229,7 +230,7 @@ BEGIN
         SET status = 'started',
             started_at = clock_timestamp(),
             attempts = attempts + 1,
-            deliver_at = clock_timestamp() + $2
+            visible_at = clock_timestamp() + $2
         FROM runs
         WHERE m.id = runs.id
         RETURNING m.id,
@@ -279,7 +280,7 @@ BEGIN
     EXECUTE format(
       $QUERY$
       UPDATE %I
-      SET deliver_at = (clock_timestamp() + $2)
+    SET visible_at = (clock_timestamp() + $2)
       WHERE id = any($1);
       $QUERY$,
       _t_table
@@ -353,6 +354,86 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_wait_task_output: Long-poll for task completion without client-side polling loops
+-- Parameters:
+--   name: Task name
+--   run_id: Task run ID
+--   poll_for: Total duration in milliseconds to poll before timing out (must be > 0)
+--   poll_interval: Duration in milliseconds between poll attempts (must be > 0 and < poll_for)
+-- Returns: status/output/error_message once run reaches terminal state, or no rows on timeout
+DROP FUNCTION IF EXISTS cb_wait_task_output(text, bigint, int, int);
+DROP FUNCTION IF EXISTS cb_wait_task_output(text, bigint, int);
+CREATE OR REPLACE FUNCTION cb_wait_task_output(
+    task_name text,
+    run_id bigint,
+    poll_for int DEFAULT 5000,
+    poll_interval int DEFAULT 200
+)
+RETURNS TABLE(status text, output jsonb, error_message text)
+LANGUAGE plpgsql AS $$
+DECLARE
+    _t_table text := cb_table_name(cb_wait_task_output.task_name, 't');
+    _status text;
+    _output jsonb;
+    _error_message text;
+    _sleep_for double precision;
+    _stop_at timestamp;
+BEGIN
+    IF cb_wait_task_output.poll_for <= 0 THEN
+        RAISE EXCEPTION 'cb: poll_for must be greater than 0';
+    END IF;
+
+    IF cb_wait_task_output.poll_interval <= 0 THEN
+        RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
+    END IF;
+
+    _sleep_for := cb_wait_task_output.poll_interval / 1000.0;
+
+    IF _sleep_for >= cb_wait_task_output.poll_for / 1000.0 THEN
+        RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
+    END IF;
+
+    _stop_at := clock_timestamp() + make_interval(secs => cb_wait_task_output.poll_for / 1000.0);
+
+    LOOP
+        IF clock_timestamp() >= _stop_at THEN
+            RETURN;
+        END IF;
+
+        _status := NULL;
+        _output := NULL;
+        _error_message := NULL;
+
+        EXECUTE format(
+          $QUERY$
+          SELECT t.status, t.output, t.error_message
+          FROM %I t
+          WHERE t.id = $1
+          $QUERY$,
+          _t_table
+        )
+        USING cb_wait_task_output.run_id
+        INTO _status, _output, _error_message;
+
+        IF _status IS NULL THEN
+            RAISE EXCEPTION 'cb: task run % not found for task %', cb_wait_task_output.run_id, cb_wait_task_output.task_name;
+        END IF;
+
+        IF _status IN ('completed', 'failed', 'skipped') THEN
+            status := _status;
+            output := _output;
+            error_message := _error_message;
+            RETURN NEXT;
+            RETURN;
+        END IF;
+
+        PERFORM pg_sleep(_sleep_for);
+    END LOOP;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
 -- cb_delete_task: Delete a task definition and all its runs
 -- Removes the task metadata, handlers, and drops the associated queue table
 -- Parameters:
@@ -387,7 +468,9 @@ $$;
 DROP FUNCTION IF EXISTS cb_delete_task(text);
 DROP FUNCTION IF EXISTS cb_fail_task(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_task(text, bigint, jsonb);
+DROP FUNCTION IF EXISTS cb_wait_task_output(text, bigint, int, int);
+DROP FUNCTION IF EXISTS cb_wait_task_output(text, bigint, int);
 DROP FUNCTION IF EXISTS cb_hide_tasks(text, bigint[], integer);
 DROP FUNCTION IF EXISTS cb_poll_tasks(text, int, int, int, int);
-DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text, text);
+DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text, text, timestamptz);
 DROP FUNCTION IF EXISTS cb_create_task(text);

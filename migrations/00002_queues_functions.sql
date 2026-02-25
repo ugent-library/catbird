@@ -11,7 +11,7 @@
 --   cb_read(): Uses FOR UPDATE SKIP LOCKED for row-level concurrency - SAFE
 --   cb_read_poll(): Uses FOR UPDATE SKIP LOCKED in polling loop - SAFE
 --   cb_publish(): Iterates bindings, uses ON CONFLICT per queue - SAFE
---   cb_hide(): Uses UPDATE with indexed deliver_at, no locks - SAFE
+--   cb_hide(): Uses UPDATE with indexed visible_at, no locks - SAFE
 --   cb_delete(): Direct DELETE operation, no locks - SAFE
 -- All operations maintain message ordering and deduplication invariants
 -- Deduplication pattern reference: https://stackoverflow.com/a/35953488
@@ -48,7 +48,7 @@ BEGIN
                 payload jsonb NOT NULL,
                 deliveries int NOT NULL DEFAULT 0,
                 created_at timestamptz NOT NULL DEFAULT now(),
-                deliver_at timestamptz NOT NULL DEFAULT now()
+                visible_at timestamptz NOT NULL DEFAULT now()
             )
             $QUERY$,
             _q_table
@@ -63,7 +63,7 @@ BEGIN
                 payload jsonb NOT NULL,
                 deliveries int NOT NULL DEFAULT 0,
                 created_at timestamptz NOT NULL DEFAULT now(),
-                deliver_at timestamptz NOT NULL DEFAULT now()
+                visible_at timestamptz NOT NULL DEFAULT now()
             )
             $QUERY$,
             _q_table
@@ -71,7 +71,7 @@ BEGIN
     END IF;
 
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (idempotency_key);', _q_table || '_idempotency_key_idx', _q_table);
-    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (deliver_at);', _q_table || '_deliver_at_idx', _q_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at);', _q_table || '_visible_at_idx', _q_table);
 
     -- Insert queue metadata
     INSERT INTO cb_queues (name, unlogged, expires_at)
@@ -119,18 +119,20 @@ $$;
 --   topic: Topic string to route to subscribed queues
 --   payload: JSON message payload
 --   idempotency_key: Optional unique ID for idempotency (prevents duplicate messages)
---   deliver_at: Optional timestamp when message should become deliverable (default: now)
+--   visible_at: Optional timestamp when message should become visible (default: now)
 -- Returns: void
+DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, timestamptz);
+DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, text, timestamptz);
 CREATE OR REPLACE FUNCTION cb_publish(
     topic text,
     payload jsonb,
     idempotency_key text = null,
-    deliver_at timestamptz = null
+    visible_at timestamptz = null
 )
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-    _deliver_at timestamptz = coalesce(cb_publish.deliver_at, now());
+    _visible_at timestamptz = coalesce(cb_publish.visible_at, now());
     _rec record;
     _q_table text;
 BEGIN
@@ -152,7 +154,7 @@ BEGIN
         BEGIN
             EXECUTE format(
                 $QUERY$
-                INSERT INTO %I (topic, payload, idempotency_key, deliver_at)
+                INSERT INTO %I (topic, payload, idempotency_key, visible_at)
                 VALUES ($1, $2, $3, $4)
                 ON CONFLICT (idempotency_key) DO NOTHING;
                 $QUERY$,
@@ -161,7 +163,7 @@ BEGIN
             USING cb_publish.topic,
                 cb_publish.payload,
                 cb_publish.idempotency_key,
-                  _deliver_at;
+                  _visible_at;
         EXCEPTION WHEN undefined_table THEN
             -- Queue was deleted between SELECT and INSERT, skip it
             CONTINUE;
@@ -275,7 +277,7 @@ $$;
 --   payload: JSON message payload
 --   topic: Optional topic string for categorization
 --   idempotency_key: Optional unique ID for idempotency (prevents duplicate messages)
---   deliver_at: Optional timestamp when message should become deliverable (default: now)
+--   visible_at: Optional timestamp when message should become visible (default: now)
 -- Returns: bigint - the message ID
 DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, timestamptz);
 DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, text, timestamptz);
@@ -284,12 +286,12 @@ CREATE FUNCTION cb_send(
     payload jsonb,
     topic text = null,
     idempotency_key text = null,
-    deliver_at timestamptz = null
+    visible_at timestamptz = null
 )
 RETURNS bigint
 LANGUAGE plpgsql AS $$
 DECLARE
-    _deliver_at timestamptz := coalesce(cb_send.deliver_at, now());
+    _visible_at timestamptz := coalesce(cb_send.visible_at, now());
     _q_table text := cb_table_name(cb_send.queue, 'q');
     _id bigint;
 BEGIN
@@ -299,10 +301,10 @@ BEGIN
     EXECUTE format(
         $QUERY$
         WITH ins AS (
-            INSERT INTO %I (topic, payload, idempotency_key, deliver_at)
+            INSERT INTO %I (topic, payload, idempotency_key, visible_at)
             VALUES ($1, $2, $3, $4)
             ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
-            DO UPDATE SET deliver_at = EXCLUDED.deliver_at WHERE FALSE
+            DO UPDATE SET visible_at = EXCLUDED.visible_at WHERE FALSE
             RETURNING id
         )
         SELECT id FROM ins
@@ -316,7 +318,7 @@ BEGIN
     USING cb_send.topic,
           cb_send.payload,
           cb_send.idempotency_key,
-          _deliver_at
+          _visible_at
     INTO _id;
 
     RETURN _id;
@@ -354,14 +356,14 @@ BEGIN
         WITH msgs AS (
           SELECT id
           FROM %I
-          WHERE deliver_at <= clock_timestamp()
+          WHERE visible_at <= clock_timestamp()
           ORDER BY id ASC
           LIMIT $1
           FOR UPDATE SKIP LOCKED
         )
         UPDATE %I m
         SET deliveries = deliveries + 1,
-            deliver_at = clock_timestamp() + $2
+            visible_at = clock_timestamp() + $2
         FROM msgs
         WHERE m.id = msgs.id
         RETURNING m.id,
@@ -370,7 +372,7 @@ BEGIN
                   m.payload,
                   m.deliveries,
                   m.created_at,
-                  m.deliver_at;
+                  m.visible_at;
         $QUERY$,
         _q_table, _q_table
     );
@@ -436,14 +438,14 @@ BEGIN
             WITH msgs AS (
                 SELECT id
                 FROM %I
-                WHERE deliver_at <= clock_timestamp()
+                WHERE visible_at <= clock_timestamp()
                 ORDER BY id ASC
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE %I m
             SET deliveries = deliveries + 1,
-                deliver_at = clock_timestamp() + $2
+                visible_at = clock_timestamp() + $2
             FROM msgs
             WHERE m.id = msgs.id
             RETURNING m.id,
@@ -452,7 +454,7 @@ BEGIN
                       m.payload,
                       m.deliveries,
                       m.created_at,
-                      m.deliver_at;
+                      m.visible_at;
             $QUERY$,
             _q_table, _q_table
       );
@@ -497,7 +499,7 @@ BEGIN
     EXECUTE format(
         $QUERY$
         UPDATE %I
-        SET deliver_at = (clock_timestamp() + $2)
+        SET visible_at = (clock_timestamp() + $2)
         WHERE id = $1
         RETURNING TRUE;
         $QUERY$,
@@ -534,7 +536,7 @@ BEGIN
     EXECUTE format(
         $QUERY$
         UPDATE %I
-        SET deliver_at = (clock_timestamp() + $2)
+        SET visible_at = (clock_timestamp() + $2)
         WHERE id = any($1);
         $QUERY$,
         _q_table

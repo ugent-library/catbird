@@ -16,16 +16,16 @@ func TestSchedulerIdempotencyKeyGeneration(t *testing.T) {
 	task := NewTask("scheduled_task").
 		Handler(func(ctx context.Context, in string) (string, error) {
 			return in + " processed", nil
-		}, nil)
+		})
 
-	worker := client.NewWorker(t.Context(), nil).
+	worker := client.NewWorker(t.Context()).
 		AddTask(task)
 
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
 	// Create schedule separately
-	if err := client.CreateTaskSchedule(t.Context(), "scheduled_task", "@hourly", nil); err != nil {
+	if err := client.CreateTaskSchedule(t.Context(), "scheduled_task", "@hourly"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -62,10 +62,10 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 		executionCount++
 		countMutex.Unlock()
 		return in, nil
-	}, nil)
+	})
 
 	// Create and run worker to execute task (must create task before running)
-	worker := client.NewWorker(t.Context(), nil).AddTask(task)
+	worker := client.NewWorker(t.Context()).AddTask(task)
 
 	startTestWorker(t, worker)
 	time.Sleep(200 * time.Millisecond)
@@ -76,7 +76,7 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 	idempotencyKey := fmt.Sprintf("schedule:%d", scheduledTime.Unix())
 
 	// First "worker" enqueues
-	h1, err := client.RunTask(t.Context(), "dedup_test_task", "test", &RunOpts{
+	h1, err := client.RunTask(t.Context(), "dedup_test_task", "test", RunTaskOpts{
 		IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {
@@ -84,7 +84,7 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 	}
 
 	// Second "worker" tries to enqueue same run (should be deduplicated)
-	h2, err := client.RunTask(t.Context(), "dedup_test_task", "test", &RunOpts{
+	h2, err := client.RunTask(t.Context(), "dedup_test_task", "test", RunTaskOpts{
 		IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {
@@ -119,14 +119,14 @@ func TestSchedulerIdempotencyPersists(t *testing.T) {
 
 	task := NewTask("persisted_dedup_task").Handler(func(ctx context.Context, in int) (int, error) {
 		return in * 2, nil
-	}, nil)
+	})
 
-	worker := client.NewWorker(t.Context(), nil).AddTask(task)
+	worker := client.NewWorker(t.Context()).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
 	idempotencyKey := "schedule:1707759600"
-	h1, err := client.RunTask(t.Context(), "persisted_dedup_task", 21, &RunOpts{
+	h1, err := client.RunTask(t.Context(), "persisted_dedup_task", 21, RunTaskOpts{
 		IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {
@@ -205,29 +205,29 @@ func TestSchedulerFlowIdempotency(t *testing.T) {
 	flow := NewFlow("scheduled_flow").
 		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (int, error) {
 			return 42, nil
-		}, nil))
+		}))
 
-	worker := client.NewWorker(t.Context(), nil).AddFlow(flow)
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
 
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
 	// Create schedule separately
-	if err := client.CreateFlowSchedule(t.Context(), "scheduled_flow", "@hourly", nil); err != nil {
+	if err := client.CreateFlowSchedule(t.Context(), "scheduled_flow", "@hourly"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Enqueue two flows with same idempotency key
 	idempotencyKey := "schedule:1707759600"
 
-	h1, err := client.RunFlow(t.Context(), "scheduled_flow", "test1", &RunOpts{
+	h1, err := client.RunFlow(t.Context(), "scheduled_flow", "test1", RunFlowOpts{
 		IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	h2, err := client.RunFlow(t.Context(), "scheduled_flow", "test2", &RunOpts{
+	h2, err := client.RunFlow(t.Context(), "scheduled_flow", "test2", RunFlowOpts{
 		IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {
@@ -258,14 +258,14 @@ func TestSchedulerEnqueueRollback(t *testing.T) {
 	// Create a task first
 	task := NewTask("test_sched_task").Handler(func(ctx context.Context, in string) (string, error) {
 		return "done", nil
-	}, nil)
+	})
 
 	if err := CreateTask(t.Context(), client.Conn, task); err != nil {
 		t.Fatal(err)
 	}
 
 	// Now create a schedule independently
-	err := client.CreateTaskSchedule(t.Context(), "test_sched_task", "@hourly", nil)
+	err := client.CreateTaskSchedule(t.Context(), "test_sched_task", "@hourly")
 	if err != nil {
 		t.Fatalf("CreateTaskSchedule failed: %v", err)
 	}
@@ -273,13 +273,13 @@ func TestSchedulerEnqueueRollback(t *testing.T) {
 	// Similarly for flows
 	flow := NewFlow("test_sched_flow").AddStep(NewStep("s1").Handler(func(ctx context.Context, in int) (int, error) {
 		return in, nil
-	}, nil))
+	}))
 
 	if err := CreateFlow(t.Context(), client.Conn, flow); err != nil {
 		t.Fatal(err)
 	}
 
-	err = client.CreateFlowSchedule(t.Context(), "test_sched_flow", "@daily", nil)
+	err = client.CreateFlowSchedule(t.Context(), "test_sched_flow", "@daily")
 	if err != nil {
 		t.Fatalf("CreateFlowSchedule failed: %v", err)
 	}
@@ -290,6 +290,8 @@ func TestSchedulerEnqueueRollback(t *testing.T) {
 // This tests the core distributed scheduling guarantee: exactly one execution
 // per schedule tick, even with many concurrent workers polling simultaneously.
 func TestSchedulerConcurrentWorkers(t *testing.T) {
+	requireSlowTests(t)
+
 	client := getTestClient(t)
 
 	// Track executions
@@ -302,7 +304,7 @@ func TestSchedulerConcurrentWorkers(t *testing.T) {
 			executionCount++
 			countMutex.Unlock()
 			return "executed", nil
-		}, nil)
+		})
 
 	// Create task in database first
 	if err := CreateTask(t.Context(), client.Conn, task); err != nil {
@@ -320,7 +322,7 @@ func TestSchedulerConcurrentWorkers(t *testing.T) {
 	}
 	cronSpec := fmt.Sprintf("%d,%d,%d * * * *", nextMins[0], nextMins[1], nextMins[2])
 
-	if err := client.CreateTaskSchedule(t.Context(), "concurrent_sched_test", cronSpec, nil); err != nil {
+	if err := client.CreateTaskSchedule(t.Context(), "concurrent_sched_test", cronSpec); err != nil {
 		t.Fatal(err)
 	}
 
@@ -328,7 +330,7 @@ func TestSchedulerConcurrentWorkers(t *testing.T) {
 	workers := make([]*Worker, 3)
 
 	for i := 0; i < 3; i++ {
-		w := client.NewWorker(t.Context(), nil).AddTask(task)
+		w := client.NewWorker(t.Context()).AddTask(task)
 		w.shutdownTimeout = 0
 
 		workers[i] = w

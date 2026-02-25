@@ -3,6 +3,7 @@ package catbird
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -10,6 +11,12 @@ import (
 
 	"github.com/jackc/pgx/v5"
 )
+
+// Optional wraps a dependency output that may be absent.
+type Optional[T any] struct {
+	IsSet bool
+	Value T
+}
 
 type Flow struct {
 	name  string
@@ -57,14 +64,14 @@ func (s *Step) Signal(signal bool) *Step {
 	return s
 }
 
-func (s *Step) Handler(fn any, opts *HandlerOpts) *Step {
+func (s *Step) Handler(fn any, opts ...HandlerOpts) *Step {
 	handler, optionalDeps, err := makeStepHandler(fn, s.name, s.dependencies, s.signal)
 	if err != nil {
 		panic(err)
 	}
 	s.handler = handler
 	s.optionalDependencies = optionalDeps
-	s.handlerOpts = applyDefaultHandlerOpts(opts)
+	s.handlerOpts = applyDefaultHandlerOpts(opts...)
 	return s
 }
 
@@ -223,6 +230,18 @@ type FlowInfo struct {
 	CreatedAt time.Time  `json:"created_at"`
 }
 
+// FlowScheduleInfo contains metadata about a scheduled flow.
+type FlowScheduleInfo struct {
+	FlowName       string    `json:"flow_name"`
+	CronSpec       string    `json:"cron_spec"`
+	NextRunAt      time.Time `json:"next_run_at"`
+	LastRunAt      time.Time `json:"last_run_at,omitzero"`
+	LastEnqueuedAt time.Time `json:"last_enqueued_at,omitzero"`
+	Enabled        bool      `json:"enabled"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
 type StepInfo struct {
 	Name      string               `json:"name"`
 	DependsOn []StepDependencyInfo `json:"depends_on,omitempty"`
@@ -375,11 +394,94 @@ func ListFlows(ctx context.Context, conn Conn) ([]*FlowInfo, error) {
 	return pgx.CollectRows(rows, scanCollectibleFlow)
 }
 
-type RunFlowOpts = RunOpts
+type RunFlowOpts struct {
+	ConcurrencyKey string // Prevents overlapping runs; allows reruns after completion
+	IdempotencyKey string // Prevents all duplicate runs; permanent across all statuses
+	VisibleAt      time.Time
+}
+
+// FlowRunInfo represents the details of a flow execution.
+type FlowRunInfo struct {
+	ID             int64           `json:"id"`
+	ConcurrencyKey string          `json:"concurrency_key,omitempty"`
+	IdempotencyKey string          `json:"idempotency_key,omitempty"`
+	Status         string          `json:"status"`
+	Input          json.RawMessage `json:"input,omitempty"`
+	Output         json.RawMessage `json:"output,omitempty"`
+	ErrorMessage   string          `json:"error_message,omitempty"`
+	StartedAt      time.Time       `json:"started_at,omitzero"`
+	CompletedAt    time.Time       `json:"completed_at,omitzero"`
+	FailedAt       time.Time       `json:"failed_at,omitzero"`
+}
+
+// OutputAs unmarshals the output of a completed flow run.
+// Returns an error if the flow run has failed or is not completed yet.
+func (r *FlowRunInfo) OutputAs(out any) error {
+	if r.Status == StatusFailed {
+		return fmt.Errorf("%w: %s", ErrRunFailed, r.ErrorMessage)
+	}
+	if r.Status != StatusCompleted {
+		return fmt.Errorf("run not completed: current status is %s", r.Status)
+	}
+	return json.Unmarshal(r.Output, out)
+}
+
+// FlowHandle is a handle to a flow execution.
+type FlowHandle struct {
+	conn Conn
+	Name string
+	ID   int64
+}
+
+// WaitForOutput blocks until the flow execution completes and unmarshals the output.
+// Pass optional WaitOpts to customize polling behavior; defaults are used when omitted.
+func (h *FlowHandle) WaitForOutput(ctx context.Context, out any, opts ...WaitOpts) error {
+	var pollFor time.Duration
+	var pollInterval time.Duration
+
+	if len(opts) > 0 {
+		pollFor = opts[0].PollFor
+		pollInterval = opts[0].PollInterval
+	}
+
+	pollForMs, pollIntervalMs := resolvePollDurations(defaultPollFor, defaultPollInterval, pollFor, pollInterval)
+
+	q := `
+		SELECT status, output, error_message
+		FROM cb_wait_flow_output(flow_name => $1, run_id => $2, poll_for => $3, poll_interval => $4);
+	`
+
+	for {
+		var status string
+		var output json.RawMessage
+		var errorMessage *string
+
+		err := h.conn.QueryRow(ctx, q, h.Name, h.ID, pollForMs, pollIntervalMs).Scan(&status, &output, &errorMessage)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				continue
+			}
+			return err
+		}
+
+		switch status {
+		case StatusCompleted:
+			return json.Unmarshal(output, out)
+		case StatusFailed:
+			if errorMessage != nil {
+				return fmt.Errorf("%w: %s", ErrRunFailed, *errorMessage)
+			}
+			return ErrRunFailed
+		}
+	}
+}
 
 // RunFlow enqueues a flow execution and returns a handle for monitoring.
-func RunFlow(ctx context.Context, conn Conn, flowName string, input any, opts *RunFlowOpts) (*RunHandle, error) {
-	q, args, err := RunFlowQuery(flowName, input, opts)
+func RunFlow(ctx context.Context, conn Conn, flowName string, input any, opts ...RunFlowOpts) (*FlowHandle, error) {
+	q, args, err := RunFlowQuery(flowName, input, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -389,14 +491,15 @@ func RunFlow(ctx context.Context, conn Conn, flowName string, input any, opts *R
 	if err != nil {
 		return nil, err
 	}
-	return &RunHandle{conn: conn, getFn: GetFlowRun, Name: flowName, ID: id}, nil
+	return &FlowHandle{conn: conn, Name: flowName, ID: id}, nil
 }
 
 // RunFlowQuery builds the SQL query and args for a RunFlow operation.
-// Pass nil opts to use defaults.
-func RunFlowQuery(flowName string, input any, opts *RunFlowOpts) (string, []any, error) {
-	if opts == nil {
-		opts = &RunFlowOpts{}
+// Pass no opts to use defaults.
+func RunFlowQuery(flowName string, input any, opts ...RunFlowOpts) (string, []any, error) {
+	var resolved RunFlowOpts
+	if len(opts) > 0 {
+		resolved = opts[0]
 	}
 
 	b, err := json.Marshal(input)
@@ -404,28 +507,83 @@ func RunFlowQuery(flowName string, input any, opts *RunFlowOpts) (string, []any,
 		return "", nil, err
 	}
 
-	q := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4);`
-	args := []any{flowName, b, ptrOrNil(opts.ConcurrencyKey), ptrOrNil(opts.IdempotencyKey)}
+	q := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, visible_at => $5);`
+	args := []any{flowName, b, ptrOrNil(resolved.ConcurrencyKey), ptrOrNil(resolved.IdempotencyKey), ptrOrNil(resolved.VisibleAt)}
 
 	return q, args, nil
 }
 
 // GetFlowRun retrieves a specific flow run result by ID.
-func GetFlowRun(ctx context.Context, conn Conn, flowName string, flowRunID int64) (*RunInfo, error) {
+func GetFlowRun(ctx context.Context, conn Conn, flowName string, flowRunID int64) (*FlowRunInfo, error) {
 	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
-	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at, NULL::timestamptz as skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
-	return scanRun(conn.QueryRow(ctx, query, flowRunID))
+	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
+	return scanFlowRun(conn.QueryRow(ctx, query, flowRunID))
 }
 
 // ListFlowRuns returns recent flow runs for the specified flow.
-func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*RunInfo, error) {
+func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunInfo, error) {
 	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
-	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at, NULL::timestamptz as skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, scanCollectibleRun)
+	return pgx.CollectRows(rows, scanCollectibleFlowRun)
+}
+
+func scanCollectibleFlowRun(row pgx.CollectableRow) (*FlowRunInfo, error) {
+	return scanFlowRun(row)
+}
+
+func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
+	rec := FlowRunInfo{}
+
+	var concurrencyKey *string
+	var idempotencyKey *string
+	var input *json.RawMessage
+	var output *json.RawMessage
+	var errorMessage *string
+	var completedAt *time.Time
+	var failedAt *time.Time
+
+	if err := row.Scan(
+		&rec.ID,
+		&concurrencyKey,
+		&idempotencyKey,
+		&rec.Status,
+		&input,
+		&output,
+		&errorMessage,
+		&rec.StartedAt,
+		&completedAt,
+		&failedAt,
+	); err != nil {
+		return nil, err
+	}
+
+	if concurrencyKey != nil {
+		rec.ConcurrencyKey = *concurrencyKey
+	}
+	if idempotencyKey != nil {
+		rec.IdempotencyKey = *idempotencyKey
+	}
+	if input != nil {
+		rec.Input = *input
+	}
+	if output != nil {
+		rec.Output = *output
+	}
+	if errorMessage != nil {
+		rec.ErrorMessage = *errorMessage
+	}
+	if completedAt != nil {
+		rec.CompletedAt = *completedAt
+	}
+	if failedAt != nil {
+		rec.FailedAt = *failedAt
+	}
+
+	return &rec, nil
 }
 
 // StepRunInfo represents the execution state of a single step within a flow run.
@@ -541,4 +699,54 @@ func scanFlow(row pgx.Row) (*FlowInfo, error) {
 	}
 
 	return &rec, nil
+}
+
+// CreateFlowSchedule creates a cron-based schedule for a flow.
+func CreateFlowSchedule(ctx context.Context, conn Conn, flowName, cronSpec string, opts ...ScheduleOpts) error {
+	var inputJSON []byte
+	var err error
+
+	var resolved ScheduleOpts
+	if len(opts) > 0 {
+		resolved = opts[0]
+	}
+
+	if resolved.Input == nil {
+		inputJSON = []byte("{}")
+	} else {
+		inputJSON, err = json.Marshal(resolved.Input)
+		if err != nil {
+			return fmt.Errorf("failed to marshal flow schedule input: %w", err)
+		}
+	}
+
+	_, err = conn.Exec(ctx, `SELECT cb_create_flow_schedule($1, $2, $3);`, flowName, cronSpec, inputJSON)
+	if err != nil {
+		return fmt.Errorf("failed to create flow schedule %q: %w", flowName, err)
+	}
+	return nil
+}
+
+// ListFlowSchedules returns all flow schedules ordered by next_run_at.
+func ListFlowSchedules(ctx context.Context, conn Conn) ([]*FlowScheduleInfo, error) {
+	q := `SELECT flow_name, cron_spec, next_run_at, last_run_at, last_enqueued_at, enabled, created_at, updated_at
+		FROM cb_flow_schedules
+		ORDER BY next_run_at ASC;`
+	rows, err := conn.Query(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (*FlowScheduleInfo, error) {
+		var s FlowScheduleInfo
+		var lastRunAt *time.Time
+		var lastEnqueuedAt *time.Time
+		err := row.Scan(&s.FlowName, &s.CronSpec, &s.NextRunAt, &lastRunAt, &lastEnqueuedAt, &s.Enabled, &s.CreatedAt, &s.UpdatedAt)
+		if lastRunAt != nil {
+			s.LastRunAt = *lastRunAt
+		}
+		if lastEnqueuedAt != nil {
+			s.LastEnqueuedAt = *lastEnqueuedAt
+		}
+		return &s, err
+	})
 }

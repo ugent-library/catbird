@@ -16,7 +16,7 @@ type Message struct {
 	Payload        json.RawMessage `json:"payload"`
 	Deliveries     int             `json:"deliveries"`
 	CreatedAt      time.Time       `json:"created_at"`
-	DeliverAt      time.Time       `json:"deliver_at"`
+	VisibleAt      time.Time       `json:"visible_at"`
 }
 
 type QueueInfo struct {
@@ -33,14 +33,15 @@ type QueueOpts struct {
 
 // CreateQueue creates a queue with the given name and optional options.
 // Use Bind() separately to create topic bindings.
-func CreateQueue(ctx context.Context, conn Conn, queueName string, opts *QueueOpts) error {
+func CreateQueue(ctx context.Context, conn Conn, queueName string, opts ...QueueOpts) error {
 	q := `SELECT cb_create_queue(name => $1, expires_at => $2, unlogged => $3);`
 
-	if opts == nil {
-		opts = &QueueOpts{}
+	var resolved QueueOpts
+	if len(opts) > 0 {
+		resolved = opts[0]
 	}
 
-	if _, err := conn.Exec(ctx, q, queueName, ptrOrNil(opts.ExpiresAt), opts.Unlogged); err != nil {
+	if _, err := conn.Exec(ctx, q, queueName, ptrOrNil(resolved.ExpiresAt), resolved.Unlogged); err != nil {
 		return err
 	}
 
@@ -75,13 +76,13 @@ func DeleteQueue(ctx context.Context, conn Conn, queueName string) (bool, error)
 type SendOpts struct {
 	Topic          string
 	IdempotencyKey string
-	DeliverAt      time.Time
+	VisibleAt      time.Time
 }
 
 // Send enqueues a message to the specified queue.
-// Pass nil opts to use defaults.
-func Send(ctx context.Context, conn Conn, queueName string, payload any, opts *SendOpts) error {
-	q, args, err := SendQuery(queueName, payload, opts)
+// Pass no opts to use defaults.
+func Send(ctx context.Context, conn Conn, queueName string, payload any, opts ...SendOpts) error {
+	q, args, err := SendQuery(queueName, payload, opts...)
 	if err != nil {
 		return err
 	}
@@ -91,10 +92,11 @@ func Send(ctx context.Context, conn Conn, queueName string, payload any, opts *S
 }
 
 // SendQuery builds the SQL query and args for a Send operation.
-// Pass nil opts to use defaults.
-func SendQuery(queueName string, payload any, opts *SendOpts) (string, []any, error) {
-	if opts == nil {
-		opts = &SendOpts{}
+// Pass no opts to use defaults.
+func SendQuery(queueName string, payload any, opts ...SendOpts) (string, []any, error) {
+	var resolved SendOpts
+	if len(opts) > 0 {
+		resolved = opts[0]
 	}
 
 	b, err := json.Marshal(payload)
@@ -102,8 +104,8 @@ func SendQuery(queueName string, payload any, opts *SendOpts) (string, []any, er
 		return "", nil, err
 	}
 
-	q := `SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, deliver_at => $5);`
-	args := []any{queueName, b, ptrOrNil(opts.Topic), ptrOrNil(opts.IdempotencyKey), ptrOrNil(opts.DeliverAt)}
+	q := `SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, visible_at => $5);`
+	args := []any{queueName, b, ptrOrNil(resolved.Topic), ptrOrNil(resolved.IdempotencyKey), ptrOrNil(resolved.VisibleAt)}
 
 	return q, args, nil
 }
@@ -126,13 +128,13 @@ func Unbind(ctx context.Context, conn Conn, queueName string, pattern string) er
 
 type PublishOpts struct {
 	IdempotencyKey string
-	DeliverAt      *time.Time
+	VisibleAt      *time.Time
 }
 
 // Publish sends a message to topic-subscribed queues with options.
-// Pass nil opts to use defaults.
-func Publish(ctx context.Context, conn Conn, topic string, payload any, opts *PublishOpts) error {
-	q, args, err := PublishQuery(topic, payload, opts)
+// Pass no opts to use defaults.
+func Publish(ctx context.Context, conn Conn, topic string, payload any, opts ...PublishOpts) error {
+	q, args, err := PublishQuery(topic, payload, opts...)
 	if err != nil {
 		return err
 	}
@@ -142,10 +144,11 @@ func Publish(ctx context.Context, conn Conn, topic string, payload any, opts *Pu
 }
 
 // PublishQuery builds the SQL query and args for a Publish operation.
-// Pass nil opts to use defaults.
-func PublishQuery(topic string, payload any, opts *PublishOpts) (string, []any, error) {
-	if opts == nil {
-		opts = &PublishOpts{}
+// Pass no opts to use defaults.
+func PublishQuery(topic string, payload any, opts ...PublishOpts) (string, []any, error) {
+	var resolved PublishOpts
+	if len(opts) > 0 {
+		resolved = opts[0]
 	}
 
 	b, err := json.Marshal(payload)
@@ -153,8 +156,8 @@ func PublishQuery(topic string, payload any, opts *PublishOpts) (string, []any, 
 		return "", nil, err
 	}
 
-	q := `SELECT cb_publish(topic => $1, payload => $2, idempotency_key => $3, deliver_at => $4);`
-	args := []any{topic, b, ptrOrNil(opts.IdempotencyKey), ptrOrNil(opts.DeliverAt)}
+	q := `SELECT cb_publish(topic => $1, payload => $2, idempotency_key => $3, visible_at => $4);`
+	args := []any{topic, b, ptrOrNil(resolved.IdempotencyKey), ptrOrNil(resolved.VisibleAt)}
 
 	return q, args, nil
 }
@@ -170,13 +173,31 @@ func Read(ctx context.Context, conn Conn, queueName string, quantity int, hideFo
 	return pgx.CollectRows(rows, scanCollectibleMessage)
 }
 
+// ReadPollOpts configures ReadPoll polling behavior.
+// Zero values use defaults.
+type ReadPollOpts struct {
+	PollFor      time.Duration
+	PollInterval time.Duration
+}
+
 // ReadPoll reads messages from a queue with polling support.
 // It polls repeatedly at the specified interval until messages are available
-// or the pollFor timeout is reached.
-func ReadPoll(ctx context.Context, conn Conn, queueName string, quantity int, hideFor, pollFor, pollInterval time.Duration) ([]Message, error) {
+// or the pollFor timeout is reached. Pass optional ReadPollOpts to configure
+// polling behavior; defaults are used when omitted.
+func ReadPoll(ctx context.Context, conn Conn, queueName string, quantity int, hideFor time.Duration, opts ...ReadPollOpts) ([]Message, error) {
+	var pollFor time.Duration
+	var pollInterval time.Duration
+
+	if len(opts) > 0 {
+		pollFor = opts[0].PollFor
+		pollInterval = opts[0].PollInterval
+	}
+
+	pollForMs, pollIntervalMs := resolvePollDurations(defaultPollFor, defaultPollInterval, pollFor, pollInterval)
+
 	q := `SELECT * FROM cb_read_poll(queue => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
 
-	rows, err := conn.Query(ctx, q, queueName, quantity, hideFor.Milliseconds(), pollFor.Milliseconds(), pollInterval.Milliseconds())
+	rows, err := conn.Query(ctx, q, queueName, quantity, hideFor.Milliseconds(), pollForMs, pollIntervalMs)
 	if err != nil {
 		return nil, err
 	}
@@ -233,7 +254,7 @@ func scanMessage(row pgx.Row) (Message, error) {
 		&rec.Payload,
 		&rec.Deliveries,
 		&rec.CreatedAt,
-		&rec.DeliverAt,
+		&rec.VisibleAt,
 	); err != nil {
 		return rec, err
 	}
