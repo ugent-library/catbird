@@ -171,7 +171,7 @@ func TestFlowRunDelayedVisibleAt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runInfo.Status != StatusStarted {
+	if runInfo.Status != "started" {
 		t.Fatalf("expected delayed flow to remain started before visible_at, got %s", runInfo.Status)
 	}
 
@@ -449,7 +449,7 @@ func TestFlowMapParentCompletesAfterAllMapTasks(t *testing.T) {
 	if workStep == nil {
 		t.Fatalf("work step not found")
 	}
-	if workStep.Status == StatusCompleted {
+	if workStep.Status == "completed" {
 		t.Fatalf("expected map parent step not to be completed while tasks are still in-flight")
 	}
 
@@ -468,7 +468,7 @@ func TestFlowMapParentCompletesAfterAllMapTasks(t *testing.T) {
 	if err := client.Conn.QueryRow(t.Context(), earlyQ, h.ID, "work").Scan(&total, &completed, &pending); err != nil {
 		t.Fatal(err)
 	}
-	if workStep.Status == StatusStarted && total == 0 {
+	if workStep.Status == "started" && total == 0 {
 		t.Fatalf("expected spawned map tasks while parent step is started")
 	}
 
@@ -549,7 +549,7 @@ func TestFlowMapTaskFailureFailsParentAndFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runInfo.Status != StatusFailed {
+	if runInfo.Status != "failed" {
 		t.Fatalf("expected flow status failed, got %s", runInfo.Status)
 	}
 
@@ -565,7 +565,7 @@ func TestFlowMapTaskFailureFailsParentAndFlow(t *testing.T) {
 			break
 		}
 	}
-	if workStatus != StatusFailed {
+	if workStatus != "failed" {
 		t.Fatalf("expected map parent step to be failed, got %s", workStatus)
 	}
 

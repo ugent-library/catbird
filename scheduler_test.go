@@ -149,8 +149,8 @@ func TestSchedulerIdempotencyPersists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run1.Status != StatusCompleted {
-		t.Fatalf("expected status %s, got %s", StatusCompleted, run1.Status)
+	if run1.Status != "completed" {
+		t.Fatalf("expected status %s, got %s", "completed", run1.Status)
 	}
 
 	// Try to enqueue with same idempotency key (should be rejected)

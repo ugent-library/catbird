@@ -572,10 +572,10 @@ type FlowRunInfo struct {
 // OutputAs unmarshals the output of a completed flow run.
 // Returns an error if the flow run has failed or is not completed yet.
 func (r *FlowRunInfo) OutputAs(out any) error {
-	if r.Status == StatusFailed {
+	if r.Status == "failed" {
 		return fmt.Errorf("%w: %s", ErrRunFailed, r.ErrorMessage)
 	}
-	if r.Status != StatusCompleted {
+	if r.Status != "completed" {
 		return fmt.Errorf("run not completed: current status is %s", r.Status)
 	}
 	return json.Unmarshal(r.Output, out)
@@ -623,9 +623,9 @@ func (h *FlowHandle) WaitForOutput(ctx context.Context, out any, opts ...WaitOpt
 		}
 
 		switch status {
-		case StatusCompleted:
+		case "completed":
 			return json.Unmarshal(output, out)
-		case StatusFailed:
+		case "failed":
 			if errorMessage != nil {
 				return fmt.Errorf("%w: %s", ErrRunFailed, *errorMessage)
 			}

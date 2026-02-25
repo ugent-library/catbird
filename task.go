@@ -146,10 +146,10 @@ type TaskRunInfo struct {
 // OutputAs unmarshals the output of a completed task run.
 // Returns an error if the task run has failed or is not completed yet.
 func (r *TaskRunInfo) OutputAs(out any) error {
-	if r.Status == StatusFailed {
+	if r.Status == "failed" {
 		return fmt.Errorf("%w: %s", ErrRunFailed, r.ErrorMessage)
 	}
-	if r.Status != StatusCompleted {
+	if r.Status != "completed" {
 		return fmt.Errorf("run not completed: current status is %s", r.Status)
 	}
 	return json.Unmarshal(r.Output, out)
@@ -197,14 +197,14 @@ func (h *TaskHandle) WaitForOutput(ctx context.Context, out any, opts ...WaitOpt
 		}
 
 		switch status {
-		case StatusCompleted:
+		case "completed":
 			return json.Unmarshal(output, out)
-		case StatusFailed:
+		case "failed":
 			if errorMessage != nil {
 				return fmt.Errorf("%w: %s", ErrRunFailed, *errorMessage)
 			}
 			return ErrRunFailed
-		case StatusSkipped:
+		case "skipped":
 			return fmt.Errorf("run skipped: condition not met")
 		}
 	}
