@@ -116,6 +116,11 @@ CATBIRD_SLOW_TESTS=1 ./scripts/test.sh
 
 By default, these tests are skipped unless `CATBIRD_SLOW_TESTS` is set to `1`, `true`, or `yes`.
 
+Run the map-step concurrency stress test explicitly:
+```bash
+CATBIRD_SLOW_TESTS=1 go test -race ./... -run 'TestFlowMapStepConcurrentWorkersSlow'
+```
+
 ## Verifying Setup
 
 ```bash

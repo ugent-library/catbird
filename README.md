@@ -296,6 +296,45 @@ flow := catbird.NewFlow("document_approval").
 
 A step with both dependencies and a signal waits for **both** conditions: all dependencies must complete **and** the signal must be delivered before the step executes.
 
+## Map Steps
+
+Map steps fan out array processing into per-item SQL-coordinated work and aggregate results back in item order.
+
+- Use `MapInput()` to map over flow input (flow input must be a JSON array)
+- Use `Map("step_name")` to map over a dependency step output array
+- Coordination is SQL-driven (`cb_m_<flow>` + map-task polling/complete/fail functions)
+
+### Map flow input
+
+```go
+flow := catbird.NewFlow("double-input").
+    AddStep(catbird.NewStep("double").
+        MapInput().
+        Handler(func(ctx context.Context, n int) (int, error) {
+            return n * 2, nil
+        }))
+
+handle, _ := client.RunFlow(ctx, "double-input", []int{1, 2, 3})
+var out []int
+_ = handle.WaitForOutput(ctx, &out)
+// out == []int{2, 4, 6}
+```
+
+### Map dependency output
+
+```go
+flow := catbird.NewFlow("double-numbers").
+    AddStep(catbird.NewStep("numbers").
+        Handler(func(ctx context.Context, _ string) ([]int, error) {
+            return []int{1, 2, 3}, nil
+        })).
+    AddStep(catbird.NewStep("double").
+        Map("numbers").
+        Handler(func(ctx context.Context, _ string, n int) (int, error) {
+            return n * 2, nil
+        }))
+```
+
 # Conditional Execution
 
 Both tasks and flow steps support conditional execution via `Condition` on the builder methods. If the condition evaluates to false (or a referenced field is missing), the task/step is marked `skipped` and its handler does not run.
@@ -305,6 +344,7 @@ Both tasks and flow steps support conditional execution via `Condition` on the b
 - **Prefixes**: tasks use `input.*`; flow steps use `input.*`, `step_name.*`, or `signal.*`.
 - **Operators**: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `exists`, `contains`, plus `not <expr>`.
 - **Optional outputs**: if a step can be skipped, downstream handlers must accept `Optional[T]` for that dependency.
+- **Map steps**: use `MapInput()` or `Map("step_name")`; map source values must be arrays.
 - **No AND/OR**: only one expression per task/step; compute a derived field upstream if needed.
 
 ## Tasks with Conditions
@@ -437,6 +477,12 @@ SELECT cb_create_flow(name => 'order_processing', steps => '[
   {"name": "validate"},
   {"name": "charge", "depends_on": [{"name": "validate"}]},
   {"name": "ship", "depends_on": [{"name": "charge"}]}
+]'::jsonb);
+
+-- Create a flow with a map step
+SELECT cb_create_flow(name => 'map_example', steps => '[
+    {"name": "numbers"},
+    {"name": "double", "is_map_step": true, "map_source": "numbers", "depends_on": [{"name": "numbers"}]}
 ]'::jsonb);
 
 -- Run a flow

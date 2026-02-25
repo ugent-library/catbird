@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS cb_steps (
     name text NOT NULL,
     idx int NOT NULL DEFAULT 0,
     dependency_count int NOT NULL DEFAULT 0,
+    is_map_step boolean NOT NULL DEFAULT false,
+    map_source text,
     signal boolean NOT NULL DEFAULT false,
     condition jsonb,
     PRIMARY KEY (flow_name, name),
@@ -35,7 +37,9 @@ CREATE TABLE IF NOT EXISTS cb_steps (
     CONSTRAINT name_valid CHECK (name <> ''),
     CONSTRAINT name_not_reserved CHECK (name NOT IN ('input', 'signal')),
     CONSTRAINT idx_valid CHECK (idx >= 0),
-    CONSTRAINT dependency_count_valid CHECK (dependency_count >= 0)
+    CONSTRAINT dependency_count_valid CHECK (dependency_count >= 0),
+    CONSTRAINT map_source_not_self CHECK (map_source IS NULL OR map_source <> name),
+    CONSTRAINT map_source_requires_map_step CHECK ((NOT is_map_step AND map_source IS NULL) OR is_map_step)
 );
 
 CREATE TABLE IF NOT EXISTS cb_step_dependencies (
@@ -71,6 +75,8 @@ CREATE OR REPLACE VIEW cb_flow_info AS
       s.flow_name,
       jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
         'name', s.name,
+        'is_map_step', s.is_map_step,
+        'map_source', s.map_source,
         'signal', s.signal,
         'depends_on', (
           SELECT jsonb_agg(jsonb_build_object('name', s_d.dependency_name))

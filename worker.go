@@ -185,7 +185,14 @@ func (w *Worker) Start(ctx context.Context) error {
 		for _, s := range f.steps {
 			if s.handlerOpts != nil {
 				stepHandlers = append(stepHandlers, &StepHandlerInfo{FlowName: f.name, StepName: s.name})
-				worker := newStepWorker(w.conn, w.logger, f.name, &s)
+				var worker interface {
+					start(context.Context, context.Context, *sync.WaitGroup)
+				}
+				if s.isMapStep {
+					worker = newMapStepWorker(w.conn, w.logger, f.name, &s)
+				} else {
+					worker = newStepWorker(w.conn, w.logger, f.name, &s)
+				}
 				worker.start(ctx, handlerCtx, &wg)
 			}
 		}
@@ -858,6 +865,310 @@ func scanStepClaim(row pgx.Row) (stepClaim, error) {
 		&rec.Input,
 		&stepOutputs,
 		&rec.SignalInput,
+	); err != nil {
+		return rec, err
+	}
+
+	if stepOutputs != nil {
+		rec.StepOutputs = *stepOutputs
+	}
+
+	return rec, nil
+}
+
+type mapTaskClaim struct {
+	ID          int64                      `json:"id"`
+	Attempts    int                        `json:"attempts"`
+	Input       json.RawMessage            `json:"input"`
+	StepOutputs map[string]json.RawMessage `json:"step_outputs"`
+	SignalInput json.RawMessage            `json:"signal_input"`
+	Item        json.RawMessage            `json:"item"`
+}
+
+type mapStepWorker struct {
+	conn     Conn
+	logger   *slog.Logger
+	flowName string
+	step     *Step
+
+	inFlight   map[int64]struct{}
+	inFlightMu sync.Mutex
+}
+
+func newMapStepWorker(conn Conn, logger *slog.Logger, flowName string, step *Step) *mapStepWorker {
+	return &mapStepWorker{
+		conn:     conn,
+		logger:   logger,
+		flowName: flowName,
+		step:     step,
+		inFlight: make(map[int64]struct{}),
+	}
+}
+
+func (w *mapStepWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup) {
+	claims := make(chan mapTaskClaim)
+
+	wg.Go(func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-handlerCtx.Done():
+				return
+			case <-ticker.C:
+				w.hideInFlight(handlerCtx)
+			}
+		}
+	})
+
+	wg.Go(func() {
+		defer close(claims)
+
+		retryAttempt := 0
+		for {
+			select {
+			case <-shutdownCtx.Done():
+				return
+			default:
+			}
+
+			msgs, err := w.pollClaims(shutdownCtx)
+			if err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return
+				}
+
+				w.logger.ErrorContext(shutdownCtx, "worker: cannot poll map task claims", "flow", w.flowName, "step", w.step.name, "error", err)
+
+				delay := backoffWithFullJitter(retryAttempt, 250*time.Millisecond, 5*time.Second)
+				retryAttempt++
+				timer := time.NewTimer(delay)
+				select {
+				case <-shutdownCtx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				continue
+			}
+
+			retryAttempt = 0
+			if len(msgs) == 0 {
+				continue
+			}
+
+			w.markInFlight(msgs)
+			for _, msg := range msgs {
+				select {
+				case <-shutdownCtx.Done():
+					return
+				case claims <- msg:
+				}
+			}
+		}
+	})
+
+	h := w.step.handlerOpts
+	for i := 0; i < h.Concurrency; i++ {
+		wg.Go(func() {
+			for msg := range claims {
+				w.handle(handlerCtx, msg)
+			}
+		})
+	}
+}
+
+func (w *mapStepWorker) getInFlight() []int64 {
+	w.inFlightMu.Lock()
+	defer w.inFlightMu.Unlock()
+
+	ids := make([]int64, 0, len(w.inFlight))
+	for id := range w.inFlight {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func (w *mapStepWorker) markInFlight(msgs []mapTaskClaim) {
+	w.inFlightMu.Lock()
+	for _, msg := range msgs {
+		w.inFlight[msg.ID] = struct{}{}
+	}
+	w.inFlightMu.Unlock()
+}
+
+func (w *mapStepWorker) removeInFlight(id int64) {
+	w.inFlightMu.Lock()
+	delete(w.inFlight, id)
+	w.inFlightMu.Unlock()
+}
+
+func (w *mapStepWorker) hideInFlight(ctx context.Context) {
+	ids := w.getInFlight()
+	if len(ids) == 0 {
+		return
+	}
+
+	q := `SELECT * FROM cb_hide_map_tasks(flow_name => $1, step_name => $2, ids => $3, hide_for => $4);`
+	_, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.name, ids, (10 * time.Minute).Milliseconds())
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		w.logger.ErrorContext(ctx, "worker: cannot hide in-flight map tasks", "flow", w.flowName, "step", w.step.name, "error", err)
+	}
+}
+
+func (w *mapStepWorker) pollClaims(ctx context.Context) ([]mapTaskClaim, error) {
+	h := w.step.handlerOpts
+	q := `SELECT id, attempts, input, step_outputs, signal_input, item FROM cb_poll_map_tasks(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
+
+	rows, err := queryWithRetry(ctx, w.conn, q, w.flowName, w.step.name, h.BatchSize, (10 * time.Minute).Milliseconds(), defaultPollFor.Milliseconds(), defaultPollInterval.Milliseconds())
+	if err != nil {
+		return nil, err
+	}
+
+	return pgx.CollectRows(rows, scanCollectibleMapTaskClaim)
+}
+
+func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
+	defer w.removeInFlight(msg.ID)
+
+	h := w.step.handlerOpts
+	if h.CircuitBreaker != nil {
+		allowed, delay := h.CircuitBreaker.Allow(time.Now())
+		if !allowed {
+			if delay <= 0 {
+				delay = time.Second
+			}
+			q := `SELECT * FROM cb_hide_map_tasks(flow_name => $1, step_name => $2, ids => $3, hide_for => $4);`
+			if _, err := execWithRetry(ctx, w.conn, q, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds()); err != nil {
+				w.logger.ErrorContext(ctx, "worker: cannot delay map task due to open circuit", "flow", w.flowName, "step", w.step.name, "error", err)
+			}
+			return
+		}
+	}
+
+	fnCtx := ctx
+	if h.Timeout > 0 {
+		var cancel context.CancelFunc
+		fnCtx, cancel = context.WithTimeout(ctx, h.Timeout)
+		defer cancel()
+	}
+
+	var itemOutput json.RawMessage
+	var err error
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("step handler panic: %v", r)
+			}
+		}()
+
+		flowInputJSON, marshalErr := json.Marshal(msg.Input)
+		if marshalErr != nil {
+			err = fmt.Errorf("marshal flow input: %w", marshalErr)
+			return
+		}
+
+		signalInputJSON, marshalErr := json.Marshal(msg.SignalInput)
+		if marshalErr != nil {
+			err = fmt.Errorf("marshal signal input: %w", marshalErr)
+			return
+		}
+
+		depsJSON := make(map[string][]byte)
+		for name, depOut := range msg.StepOutputs {
+			depJSON, marshalErr := json.Marshal(depOut)
+			if marshalErr != nil {
+				err = fmt.Errorf("marshal dependency %s output: %w", name, marshalErr)
+				return
+			}
+			depsJSON[name] = depJSON
+		}
+
+		singleItemArrayJSON, marshalErr := json.Marshal([]json.RawMessage{msg.Item})
+		if marshalErr != nil {
+			err = fmt.Errorf("marshal map item wrapper: %w", marshalErr)
+			return
+		}
+
+		if w.step.mapSource == "" {
+			flowInputJSON = singleItemArrayJSON
+		} else {
+			depsJSON[w.step.mapSource] = singleItemArrayJSON
+		}
+
+		if w.step.handler == nil {
+			err = fmt.Errorf("step %s has no handler", w.step.name)
+			return
+		}
+
+		out, handlerErr := w.step.handler(fnCtx, flowInputJSON, depsJSON, signalInputJSON)
+		if handlerErr != nil {
+			err = handlerErr
+			return
+		}
+
+		var arr []json.RawMessage
+		if unmarshalErr := json.Unmarshal(out, &arr); unmarshalErr != nil {
+			err = fmt.Errorf("unmarshal map step output array: %w", unmarshalErr)
+			return
+		}
+		if len(arr) != 1 {
+			err = fmt.Errorf("map step handler must produce exactly one output item per map task, got %d", len(arr))
+			return
+		}
+		itemOutput = arr[0]
+	}()
+
+	if err != nil {
+		if h.CircuitBreaker != nil {
+			h.CircuitBreaker.RecordFailure(time.Now())
+		}
+
+		if msg.Attempts > h.MaxRetries {
+			q := `SELECT * FROM cb_fail_map_task(flow_name => $1, step_name => $2, map_task_id => $3, error_message => $4);`
+			if _, qErr := execWithRetry(ctx, w.conn, q, w.flowName, w.step.name, msg.ID, err.Error()); qErr != nil {
+				w.logger.ErrorContext(ctx, "worker: cannot mark map task as failed", "flow", w.flowName, "step", w.step.name, "error", qErr)
+			}
+		} else {
+			delay := backoffWithFullJitter(msg.Attempts-1, 0, 0)
+			if h.Backoff != nil {
+				delay = h.Backoff.NextDelay(msg.Attempts - 1)
+			}
+			q := `SELECT * FROM cb_hide_map_tasks(flow_name => $1, step_name => $2, ids => $3, hide_for => $4);`
+			if _, qErr := execWithRetry(ctx, w.conn, q, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds()); qErr != nil {
+				w.logger.ErrorContext(ctx, "worker: cannot delay map task retry", "flow", w.flowName, "step", w.step.name, "error", qErr)
+			}
+		}
+		return
+	}
+
+	if h.CircuitBreaker != nil {
+		h.CircuitBreaker.RecordSuccess()
+	}
+
+	q := `SELECT * FROM cb_complete_map_task(flow_name => $1, step_name => $2, map_task_id => $3, output => $4);`
+	if _, qErr := execWithRetry(ctx, w.conn, q, w.flowName, w.step.name, msg.ID, itemOutput); qErr != nil {
+		w.logger.ErrorContext(ctx, "worker: cannot mark map task as completed", "flow", w.flowName, "step", w.step.name, "error", qErr)
+	}
+}
+
+func scanCollectibleMapTaskClaim(row pgx.CollectableRow) (mapTaskClaim, error) {
+	return scanMapTaskClaim(row)
+}
+
+func scanMapTaskClaim(row pgx.Row) (mapTaskClaim, error) {
+	rec := mapTaskClaim{}
+	var stepOutputs *map[string]json.RawMessage
+
+	if err := row.Scan(
+		&rec.ID,
+		&rec.Attempts,
+		&rec.Input,
+		&stepOutputs,
+		&rec.SignalInput,
+		&rec.Item,
 	); err != nil {
 		return rec, err
 	}

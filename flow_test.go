@@ -2,6 +2,7 @@ package catbird
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -230,6 +231,436 @@ func TestFlowWithDependencies(t *testing.T) {
 	if out != "input processed by step 1 and by step 2 and by step 3" {
 		t.Fatalf("unexpected flow output for step3: %s", out)
 	}
+}
+
+func TestFlowMapInput(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "map_input_flow")
+
+	flow := NewFlow(flowName).
+		AddStep(NewStep("double").
+			MapInput().
+			Handler(func(ctx context.Context, n int) (int, error) {
+				return n * 2, nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, []int{1, 2, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out []int
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(out) != 3 || out[0] != 2 || out[1] != 4 || out[2] != 6 {
+		t.Fatalf("unexpected output: %#v", out)
+	}
+}
+
+func TestFlowMapStepOutput(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "map_dep_flow")
+
+	flow := NewFlow(flowName).
+		AddStep(NewStep("numbers").Handler(func(ctx context.Context, in string) ([]int, error) {
+			return []int{1, 2, 3, 4}, nil
+		})).
+		AddStep(NewStep("double").
+			Map("numbers").
+			Handler(func(ctx context.Context, in string, n int) (int, error) {
+				return n * 2, nil
+			})).
+		AddStep(NewStep("sum").
+			DependsOn("double").
+			Handler(func(ctx context.Context, in string, doubled []int) (int, error) {
+				sum := 0
+				for _, n := range doubled {
+					sum += n
+				}
+				return sum, nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out int
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	if out != 20 {
+		t.Fatalf("unexpected output: %d", out)
+	}
+}
+
+func TestFlowMapMetadataInInfo(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "map_info_flow")
+
+	flow := NewFlow(flowName).
+		AddStep(NewStep("numbers").Handler(func(ctx context.Context, in string) ([]int, error) {
+			return []int{1, 2, 3}, nil
+		})).
+		AddStep(NewStep("double").
+			Map("numbers").
+			Handler(func(ctx context.Context, in string, n int) (int, error) {
+				return n * 2, nil
+			}))
+
+	if err := client.CreateFlow(t.Context(), flow); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := client.GetFlow(t.Context(), flowName)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(info.Steps) != 2 {
+		t.Fatalf("expected 2 steps, got %d", len(info.Steps))
+	}
+
+	var foundMapped bool
+	for _, s := range info.Steps {
+		if s.Name == "double" {
+			foundMapped = true
+			if !s.IsMapStep {
+				t.Fatalf("expected step %q to be marked as map step", s.Name)
+			}
+			if s.MapSource != "numbers" {
+				t.Fatalf("expected map source 'numbers', got %q", s.MapSource)
+			}
+		}
+	}
+
+	if !foundMapped {
+		t.Fatalf("mapped step not found in flow info")
+	}
+}
+
+func TestFlowMapSourceMustExist(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "map_missing_source")
+
+	flow := NewFlow(flowName).
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
+			return in, nil
+		})).
+		AddStep(NewStep("mapped").
+			Map("does_not_exist").
+			Handler(func(ctx context.Context, in string, v int) (int, error) {
+				return v, nil
+			}))
+
+	err := client.CreateFlow(t.Context(), flow)
+	if err == nil {
+		t.Fatalf("expected CreateFlow to fail for missing map source")
+	}
+}
+
+func TestFlowMapSQLValidationRejectsMissingDependency(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "map_sql_validation")
+
+	steps := []map[string]any{
+		{
+			"name": "numbers",
+		},
+		{
+			"name":       "mapped",
+			"is_map_step": true,
+			"map_source":  "numbers",
+			"depends_on":  []map[string]any{},
+		},
+	}
+
+	stepsJSON, err := json.Marshal(steps)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.Conn.Exec(t.Context(), `SELECT * FROM cb_create_flow(name => $1, steps => $2);`, flowName, stepsJSON)
+	if err == nil {
+		t.Fatalf("expected SQL map validation to reject step without map_source dependency")
+	}
+}
+
+func TestFlowMapParentCompletesAfterAllMapTasks(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "map_parent_waits")
+
+	flow := NewFlow(flowName).
+		AddStep(NewStep("numbers").Handler(func(ctx context.Context, in int) ([]int, error) {
+			return []int{0, 1, 2, 3, 4}, nil
+		})).
+		AddStep(NewStep("work").
+			Map("numbers").
+			Handler(func(ctx context.Context, in int, item int) (int, error) {
+				if item == 4 {
+					time.Sleep(300 * time.Millisecond)
+				}
+				return item + 10, nil
+			})).
+		AddStep(NewStep("collect").
+			DependsOn("work").
+			Handler(func(ctx context.Context, in int, items []int) ([]int, error) {
+				return items, nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(120 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(120 * time.Millisecond)
+
+	steps, err := client.GetFlowRunSteps(t.Context(), flowName, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var workStep *StepRunInfo
+	for _, step := range steps {
+		if step.StepName == "work" {
+			workStep = step
+			break
+		}
+	}
+	if workStep == nil {
+		t.Fatalf("work step not found")
+	}
+	if workStep.Status == StatusCompleted {
+		t.Fatalf("expected map parent step not to be completed while tasks are still in-flight")
+	}
+
+	mapTable := fmt.Sprintf("cb_m_%s", flowName)
+	earlyQ := fmt.Sprintf(`
+		SELECT
+			count(*) AS total,
+			count(*) FILTER (WHERE status = 'completed') AS completed,
+			count(*) FILTER (WHERE status IN ('created', 'started')) AS pending
+		FROM %s
+		WHERE flow_run_id = $1 AND step_name = $2;`, mapTable)
+
+	var total int
+	var completed int
+	var pending int
+	if err := client.Conn.QueryRow(t.Context(), earlyQ, h.ID, "work").Scan(&total, &completed, &pending); err != nil {
+		t.Fatal(err)
+	}
+	if workStep.Status == StatusStarted && total == 0 {
+		t.Fatalf("expected spawned map tasks while parent step is started")
+	}
+
+	var out []int
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(out) != 5 {
+		t.Fatalf("unexpected output length: got=%d want=5", len(out))
+	}
+	for i := 0; i < 5; i++ {
+		want := i + 10
+		if out[i] != want {
+			t.Fatalf("unexpected output ordering at index %d: got=%d want=%d", i, out[i], want)
+		}
+	}
+
+	finalQ := fmt.Sprintf(`
+		SELECT
+			count(*) AS total,
+			count(*) FILTER (WHERE status = 'completed') AS completed,
+			count(*) FILTER (WHERE status = 'failed') AS failed
+		FROM %s
+		WHERE flow_run_id = $1 AND step_name = $2;`, mapTable)
+
+	var failed int
+	if err := client.Conn.QueryRow(t.Context(), finalQ, h.ID, "work").Scan(&total, &completed, &failed); err != nil {
+		t.Fatal(err)
+	}
+	if total != 5 || completed != 5 || failed != 0 {
+		t.Fatalf("unexpected map task terminal counts: total=%d completed=%d failed=%d", total, completed, failed)
+	}
+}
+
+func TestFlowMapTaskFailureFailsParentAndFlow(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "map_failure_propagation")
+
+	flow := NewFlow(flowName).
+		AddStep(NewStep("numbers").Handler(func(ctx context.Context, in int) ([]int, error) {
+			return []int{0, 1, 2, 3}, nil
+		})).
+		AddStep(NewStep("work").
+			Map("numbers").
+			Handler(func(ctx context.Context, in int, item int) (int, error) {
+				if item == 2 {
+					return 0, fmt.Errorf("intentional map task failure")
+				}
+				return item + 10, nil
+			})).
+		AddStep(NewStep("collect").
+			DependsOn("work").
+			Handler(func(ctx context.Context, in int, items []int) ([]int, error) {
+				return items, nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(120 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out []int
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+	err = h.WaitForOutput(ctx, &out)
+	if err == nil {
+		t.Fatalf("expected flow to fail due to map task failure")
+	}
+
+	runInfo, err := client.GetFlowRun(t.Context(), flowName, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runInfo.Status != StatusFailed {
+		t.Fatalf("expected flow status failed, got %s", runInfo.Status)
+	}
+
+	steps, err := client.GetFlowRunSteps(t.Context(), flowName, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var workStatus string
+	for _, step := range steps {
+		if step.StepName == "work" {
+			workStatus = step.Status
+			break
+		}
+	}
+	if workStatus != StatusFailed {
+		t.Fatalf("expected map parent step to be failed, got %s", workStatus)
+	}
+
+	mapTable := fmt.Sprintf("cb_m_%s", flowName)
+	q := fmt.Sprintf(`
+		SELECT
+			count(*) AS total,
+			count(*) FILTER (WHERE status = 'failed') AS failed
+		FROM %s
+		WHERE flow_run_id = $1 AND step_name = $2;`, mapTable)
+
+	var total int
+	var failed int
+	if err := client.Conn.QueryRow(t.Context(), q, h.ID, "work").Scan(&total, &failed); err != nil {
+		t.Fatal(err)
+	}
+	if total == 0 || failed == 0 {
+		t.Fatalf("expected at least one failed map task, got total=%d failed=%d", total, failed)
+	}
+}
+
+func TestFlowMapStepConcurrentWorkersSlow(t *testing.T) {
+	requireSlowTests(t)
+
+	client := getTestClient(t)
+	flowName := testFlowName(t, "map_concurrency")
+
+	var processed atomic.Int64
+
+	flow := NewFlow(flowName).
+		AddStep(NewStep("numbers").Handler(func(ctx context.Context, n int) ([]int, error) {
+			items := make([]int, n)
+			for i := 0; i < n; i++ {
+				items[i] = i
+			}
+			return items, nil
+		})).
+		AddStep(NewStep("work").
+			Map("numbers").
+			Handler(func(ctx context.Context, n int, item int) (int, error) {
+				processed.Add(1)
+				// tiny delay to increase overlap opportunity across workers
+				time.Sleep(1 * time.Millisecond)
+				return item * 2, nil
+			})).
+		AddStep(NewStep("sum").
+			DependsOn("work").
+			Handler(func(ctx context.Context, n int, doubled []int) (int, error) {
+				sum := 0
+				for _, v := range doubled {
+					sum += v
+				}
+				return sum, nil
+			}))
+
+	// Start multiple workers for same flow to stress DB claim concurrency.
+	for i := 0; i < 4; i++ {
+		worker := client.NewWorker(t.Context(), WorkerOpts{Logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))}).AddFlow(flow)
+		startTestWorker(t, worker)
+	}
+
+	time.Sleep(150 * time.Millisecond)
+
+	const itemCount = 200
+	h, err := client.RunFlow(t.Context(), flowName, itemCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out int
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	// sum(2*i, i=0..n-1) = n*(n-1)
+	wantSum := itemCount * (itemCount - 1)
+	if out != wantSum {
+		t.Fatalf("unexpected output sum: got=%d want=%d", out, wantSum)
+	}
+
+	if got := processed.Load(); got != itemCount {
+		t.Fatalf("map handler processed wrong item count: got=%d want=%d", got, itemCount)
+	}
+}
+
+func TestStepMapModeConflictPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic when setting conflicting map source")
+		}
+	}()
+
+	_ = NewStep("conflict").MapInput().Map("numbers")
 }
 
 func TestFlowListFlows(t *testing.T) {

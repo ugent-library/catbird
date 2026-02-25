@@ -29,10 +29,14 @@ DECLARE
     _dep jsonb;
     _step_name text;
     _dep_name text;
+    _is_map_step boolean;
+    _map_source text;
+    _has_map_source_dependency boolean;
     _idx int := 0;
     _dep_idx int;
     _f_table text;
     _s_table text;
+    _m_table text;
     _condition jsonb;
 BEGIN
     IF cb_create_flow.name IS NULL OR cb_create_flow.name = '' THEN
@@ -49,6 +53,7 @@ BEGIN
 
     _f_table := cb_table_name(cb_create_flow.name, 'f');
     _s_table := cb_table_name(cb_create_flow.name, 's');
+    _m_table := cb_table_name(cb_create_flow.name, 'm');
 
     PERFORM pg_advisory_xact_lock(hashtext(_f_table));
 
@@ -83,18 +88,54 @@ BEGIN
       RAISE EXCEPTION 'cb: step name "%" is too long, maximum length is 58', _step_name;
     END IF;
 
+    _is_map_step := coalesce((_step->>'is_map_step')::boolean, false);
+    _map_source := nullif(_step->>'map_source', '');
+
+    IF NOT _is_map_step AND _map_source IS NOT NULL THEN
+      RAISE EXCEPTION 'cb: step "%" has map_source but is_map_step is false', _step_name;
+    END IF;
+
+    -- Map input mode: is_map_step=true and map_source omitted/null.
+    -- Map dependency mode: is_map_step=true and map_source set to a dependency step name.
+    IF _is_map_step AND _map_source IS NULL THEN
+      -- map-input mode, valid
+      NULL;
+    END IF;
+
+    IF _is_map_step AND _map_source = _step_name THEN
+      RAISE EXCEPTION 'cb: step "%" cannot map its own output', _step_name;
+    END IF;
+
+    IF _map_source IS NOT NULL THEN
+      IF NOT _map_source ~ '^[a-z0-9_]+$' THEN
+        RAISE EXCEPTION 'cb: map source "%" contains invalid characters, allowed: a-z, 0-9, _', _map_source;
+      END IF;
+
+      SELECT EXISTS(
+        SELECT 1
+        FROM jsonb_array_elements(coalesce(_step->'depends_on', '[]'::jsonb)) d
+        WHERE d->>'name' = _map_source
+      ) INTO _has_map_source_dependency;
+
+      IF NOT _has_map_source_dependency THEN
+        RAISE EXCEPTION 'cb: step "%" maps "%" but does not depend on it', _step_name, _map_source;
+      END IF;
+    END IF;
+
     -- Extract condition from step if present
     _condition := NULL;
     IF _step ? 'condition' AND _step->>'condition' IS NOT NULL AND _step->>'condition' != '' THEN
       _condition := cb_parse_condition(_step->>'condition');
     END IF;
 
-    INSERT INTO cb_steps (flow_name, name, idx, dependency_count, signal, condition)
+    INSERT INTO cb_steps (flow_name, name, idx, dependency_count, is_map_step, map_source, signal, condition)
     VALUES (
       cb_create_flow.name,
       _step_name,
       _idx,
       jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb)),
+      _is_map_step,
+      _map_source,
       coalesce((_step->>'signal')::boolean, false),
       _condition
     );
@@ -111,6 +152,24 @@ BEGIN
 
     _idx := _idx + 1;
     END LOOP;
+
+    -- SQL-level map-step validation (independent from Go-side builder checks)
+    IF EXISTS (
+      SELECT 1
+      FROM cb_steps s
+      WHERE s.flow_name = cb_create_flow.name
+        AND s.is_map_step = true
+        AND s.map_source IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM cb_step_dependencies d
+          WHERE d.flow_name = s.flow_name
+            AND d.step_name = s.name
+            AND d.dependency_name = s.map_source
+        )
+    ) THEN
+      RAISE EXCEPTION 'cb: map step must depend on its map_source (flow=%)', cb_create_flow.name;
+    END IF;
 
     EXECUTE format(
     $QUERY$
@@ -175,6 +234,37 @@ BEGIN
 
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, status);', _s_table || '_flow_run_id_status_idx', _s_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at);', _s_table || '_visible_at_idx', _s_table);
+
+    -- Create map task table used by map steps for per-item coordination
+    EXECUTE format(
+    $QUERY$
+    CREATE TABLE IF NOT EXISTS %I (
+      id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+      flow_run_id bigint NOT NULL,
+      step_name text NOT NULL,
+      item_idx int NOT NULL,
+      status text NOT NULL DEFAULT 'created',
+      attempts int NOT NULL DEFAULT 0,
+      item jsonb NOT NULL,
+      output jsonb,
+      error_message text,
+      visible_at timestamptz NOT NULL DEFAULT now(),
+      created_at timestamptz NOT NULL DEFAULT now(),
+      started_at timestamptz,
+      completed_at timestamptz,
+      failed_at timestamptz,
+      UNIQUE (flow_run_id, step_name, item_idx),
+      FOREIGN KEY (flow_run_id, step_name) REFERENCES %I (flow_run_id, step_name),
+      CONSTRAINT status_valid CHECK (status IN ('created', 'started', 'completed', 'failed')),
+      CONSTRAINT item_idx_valid CHECK (item_idx >= 0),
+      CONSTRAINT attempts_valid CHECK (attempts >= 0)
+    )
+    $QUERY$,
+    _m_table, _s_table
+    );
+
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (step_name, status, visible_at);', _m_table || '_step_status_visible_idx', _m_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, step_name, status);', _m_table || '_flow_step_status_idx', _m_table);
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -192,8 +282,8 @@ CREATE OR REPLACE FUNCTION cb_run_flow(
     name text,
     input jsonb,
     concurrency_key text = NULL,
-  idempotency_key text = NULL,
-  visible_at timestamptz = NULL
+    idempotency_key text = NULL,
+    visible_at timestamptz = NULL
 )
 RETURNS bigint
 LANGUAGE plpgsql AS $$
@@ -309,11 +399,14 @@ RETURNS void AS $$
 DECLARE
     _f_table text := cb_table_name(cb_start_steps.flow_name, 'f');
     _s_table text := cb_table_name(cb_start_steps.flow_name, 's');
+    _m_table text := cb_table_name(cb_start_steps.flow_name, 'm');
     _flow_input jsonb;
     _step_to_process record;
     _step_condition jsonb;
     _step_inputs jsonb;
     _is_condition_true boolean;
+    _map_items jsonb;
+    _map_item_count int;
     _remaining int;
     _steps_processed_this_iteration int;
 BEGIN
@@ -353,7 +446,9 @@ BEGIN
               AND deps.status = 'completed'
              ) AS step_outputs,
              sr.signal_input,
-             (SELECT condition FROM cb_steps WHERE flow_name = $3 AND name = sr.step_name) AS condition
+             (SELECT condition FROM cb_steps WHERE flow_name = $3 AND name = sr.step_name) AS condition,
+             (SELECT is_map_step FROM cb_steps WHERE flow_name = $3 AND name = sr.step_name) AS is_map_step,
+             (SELECT map_source FROM cb_steps WHERE flow_name = $3 AND name = sr.step_name) AS map_source
       FROM %I sr
       WHERE sr.flow_run_id = $1
         AND sr.status = 'created'
@@ -428,6 +523,66 @@ BEGIN
         -- Continue to next step
         CONTINUE;
       END IF;
+    END IF;
+
+    -- Map-step activation: spawn item-level map tasks coordinated in SQL
+    IF _step_to_process.is_map_step THEN
+      IF _step_to_process.map_source IS NULL THEN
+        _map_items := _flow_input;
+      ELSE
+        _map_items := _step_to_process.step_outputs -> _step_to_process.map_source;
+      END IF;
+
+      IF _map_items IS NULL OR jsonb_typeof(_map_items) <> 'array' THEN
+        PERFORM cb_fail_step(
+          cb_start_steps.flow_name,
+          _step_to_process.step_name,
+          _step_to_process.id,
+          format('map source for step %s must be a JSON array', _step_to_process.step_name)
+        );
+        _steps_processed_this_iteration := _steps_processed_this_iteration + 1;
+        CONTINUE;
+      END IF;
+
+      _map_item_count := jsonb_array_length(_map_items);
+
+      -- Mark parent step started
+      EXECUTE format(
+        $QUERY$
+        UPDATE %I
+        SET status = 'started',
+            started_at = now(),
+            visible_at = coalesce($2, now())
+        WHERE id = $1
+        $QUERY$,
+        _s_table
+      )
+      USING _step_to_process.id, cb_start_steps.initial_visible_at;
+
+      -- Spawn map tasks in deterministic order
+      EXECUTE format(
+        $QUERY$
+        INSERT INTO %I (flow_run_id, step_name, item_idx, status, item, visible_at)
+        SELECT $1,
+               $2,
+               ordinality - 1,
+               'created',
+               value,
+               coalesce($3, now())
+        FROM jsonb_array_elements($4) WITH ORDINALITY
+        ON CONFLICT (flow_run_id, step_name, item_idx) DO NOTHING
+        $QUERY$,
+        _m_table
+      )
+      USING cb_start_steps.flow_run_id, _step_to_process.step_name, cb_start_steps.initial_visible_at, _map_items;
+
+      -- Empty map completes immediately with []
+      IF _map_item_count = 0 THEN
+        PERFORM cb_complete_step(cb_start_steps.flow_name, _step_to_process.step_name, _step_to_process.id, '[]'::jsonb);
+      END IF;
+
+      _steps_processed_this_iteration := _steps_processed_this_iteration + 1;
+      CONTINUE;
     END IF;
 
     -- Normal activation (no condition or condition is true)
@@ -590,6 +745,242 @@ BEGIN
     USING cb_hide_steps.ids,
           make_interval(secs => cb_hide_steps.hide_for / 1000.0),
           cb_hide_steps.step_name;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_poll_map_tasks: Poll map-item tasks for a specific map step
+CREATE OR REPLACE FUNCTION cb_poll_map_tasks(
+    flow_name text,
+    step_name text,
+    quantity int,
+    hide_for int,
+    poll_for int,
+    poll_interval int
+)
+RETURNS TABLE(id bigint, attempts int, input jsonb, step_outputs jsonb, signal_input jsonb, item jsonb)
+LANGUAGE plpgsql AS $$
+DECLARE
+    _sleep_for double precision;
+    _stop_at timestamp;
+    _q text;
+    _f_table text := cb_table_name(cb_poll_map_tasks.flow_name, 'f');
+    _s_table text := cb_table_name(cb_poll_map_tasks.flow_name, 's');
+    _m_table text := cb_table_name(cb_poll_map_tasks.flow_name, 'm');
+BEGIN
+    IF cb_poll_map_tasks.quantity <= 0 THEN
+        RAISE EXCEPTION 'cb: quantity must be greater than 0';
+    END IF;
+    IF cb_poll_map_tasks.hide_for <= 0 THEN
+        RAISE EXCEPTION 'cb: hide_for must be greater than 0';
+    END IF;
+    IF cb_poll_map_tasks.poll_for <= 0 THEN
+        RAISE EXCEPTION 'cb: poll_for must be greater than 0';
+    END IF;
+    IF cb_poll_map_tasks.poll_interval <= 0 THEN
+        RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
+    END IF;
+
+    _sleep_for := cb_poll_map_tasks.poll_interval / 1000.0;
+    IF _sleep_for >= cb_poll_map_tasks.poll_for / 1000.0 THEN
+        RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
+    END IF;
+
+    _stop_at := clock_timestamp() + make_interval(secs => cb_poll_map_tasks.poll_for / 1000.0);
+
+    _q := format(
+      $QUERY$
+      WITH runs AS (
+        SELECT m.id, m.flow_run_id, m.item
+        FROM %I m
+        INNER JOIN %I s ON s.flow_run_id = m.flow_run_id AND s.step_name = m.step_name
+        INNER JOIN %I f ON f.id = m.flow_run_id
+        WHERE m.step_name = $1
+          AND m.status = 'created'
+          AND m.visible_at <= clock_timestamp()
+          AND s.status = 'started'
+          AND f.status = 'started'
+        ORDER BY m.id ASC
+        LIMIT $2
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE %I m
+      SET status = 'started',
+          attempts = attempts + 1,
+          started_at = coalesce(m.started_at, now()),
+          visible_at = clock_timestamp() + $3
+      FROM runs
+      WHERE m.id = runs.id
+      RETURNING m.id,
+                m.attempts,
+                (SELECT input FROM %I f WHERE f.id = m.flow_run_id) AS input,
+                (SELECT jsonb_object_agg(deps.step_name, deps.output)
+                 FROM %I deps
+                 WHERE deps.flow_run_id = m.flow_run_id
+                   AND deps.step_name IN (
+                     SELECT dependency_name
+                     FROM cb_step_dependencies
+                     WHERE flow_name = $4 AND step_name = m.step_name
+                   )
+                   AND deps.status = 'completed'
+                ) AS step_outputs,
+                (SELECT signal_input FROM %I s WHERE s.flow_run_id = m.flow_run_id AND s.step_name = m.step_name) AS signal_input,
+                m.item;
+      $QUERY$,
+      _m_table, _s_table, _f_table, _m_table, _f_table, _s_table, _s_table
+    );
+
+    LOOP
+      IF clock_timestamp() >= _stop_at THEN
+        RETURN;
+      END IF;
+
+      RETURN QUERY EXECUTE _q
+        USING cb_poll_map_tasks.step_name,
+              cb_poll_map_tasks.quantity,
+              make_interval(secs => cb_poll_map_tasks.hide_for / 1000.0),
+              cb_poll_map_tasks.flow_name;
+
+      IF FOUND THEN
+        RETURN;
+      END IF;
+
+      PERFORM pg_sleep(_sleep_for);
+    END LOOP;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_hide_map_tasks: Hide map tasks from workers for a duration
+CREATE OR REPLACE FUNCTION cb_hide_map_tasks(flow_name text, step_name text, ids bigint[], hide_for int)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    _m_table text := cb_table_name(cb_hide_map_tasks.flow_name, 'm');
+BEGIN
+    IF cb_hide_map_tasks.hide_for <= 0 THEN
+        RAISE EXCEPTION 'cb: hide_for must be greater than 0';
+    END IF;
+
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET visible_at = (clock_timestamp() + $2)
+      WHERE id = any($1)
+        AND step_name = $3
+        AND status IN ('created', 'started')
+      $QUERY$,
+      _m_table
+    )
+    USING cb_hide_map_tasks.ids,
+          make_interval(secs => cb_hide_map_tasks.hide_for / 1000.0),
+          cb_hide_map_tasks.step_name;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_complete_map_task: Complete one map task and complete parent step when all items finish
+CREATE OR REPLACE FUNCTION cb_complete_map_task(flow_name text, step_name text, map_task_id bigint, output jsonb)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    _s_table text := cb_table_name(cb_complete_map_task.flow_name, 's');
+    _m_table text := cb_table_name(cb_complete_map_task.flow_name, 'm');
+    _flow_run_id bigint;
+    _step_id bigint;
+    _agg_output jsonb;
+    _has_pending boolean;
+BEGIN
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET status = 'completed',
+          completed_at = now(),
+          output = $2
+      WHERE id = $1
+        AND status = 'started'
+      RETURNING flow_run_id
+      $QUERY$,
+      _m_table
+    )
+    USING cb_complete_map_task.map_task_id, cb_complete_map_task.output
+    INTO _flow_run_id;
+
+    IF _flow_run_id IS NULL THEN
+      RETURN;
+    END IF;
+
+    EXECUTE format(
+      'SELECT EXISTS (SELECT 1 FROM %I WHERE flow_run_id = $1 AND step_name = $2 AND status IN (''created'', ''started''))',
+      _m_table
+    )
+    USING _flow_run_id, cb_complete_map_task.step_name
+    INTO _has_pending;
+
+    IF _has_pending THEN
+      RETURN;
+    END IF;
+
+    EXECUTE format(
+      'SELECT id FROM %I WHERE flow_run_id = $1 AND step_name = $2',
+      _s_table
+    )
+    USING _flow_run_id, cb_complete_map_task.step_name
+    INTO _step_id;
+
+    EXECUTE format(
+      'SELECT coalesce(jsonb_agg(output ORDER BY item_idx), ''[]''::jsonb) FROM %I WHERE flow_run_id = $1 AND step_name = $2 AND status = ''completed''',
+      _m_table
+    )
+    USING _flow_run_id, cb_complete_map_task.step_name
+    INTO _agg_output;
+
+    PERFORM cb_complete_step(cb_complete_map_task.flow_name, cb_complete_map_task.step_name, _step_id, _agg_output);
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_fail_map_task: Fail one map task and fail parent step/flow
+CREATE OR REPLACE FUNCTION cb_fail_map_task(flow_name text, step_name text, map_task_id bigint, error_message text)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    _s_table text := cb_table_name(cb_fail_map_task.flow_name, 's');
+    _m_table text := cb_table_name(cb_fail_map_task.flow_name, 'm');
+    _flow_run_id bigint;
+    _step_id bigint;
+BEGIN
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET status = 'failed',
+          failed_at = now(),
+          error_message = $2
+      WHERE id = $1
+        AND status IN ('created', 'started')
+      RETURNING flow_run_id
+      $QUERY$,
+      _m_table
+    )
+    USING cb_fail_map_task.map_task_id, cb_fail_map_task.error_message
+    INTO _flow_run_id;
+
+    IF _flow_run_id IS NULL THEN
+      RETURN;
+    END IF;
+
+    EXECUTE format(
+      'SELECT id FROM %I WHERE flow_run_id = $1 AND step_name = $2',
+      _s_table
+    )
+    USING _flow_run_id, cb_fail_map_task.step_name
+    INTO _step_id;
+
+    PERFORM cb_fail_step(cb_fail_map_task.flow_name, cb_fail_map_task.step_name, _step_id, cb_fail_map_task.error_message);
 END;
 $$;
 -- +goose statementend
@@ -805,7 +1196,7 @@ $$;
 DROP FUNCTION IF EXISTS cb_wait_flow_output(text, bigint, int, int);
 DROP FUNCTION IF EXISTS cb_wait_flow_output(text, bigint, int);
 CREATE OR REPLACE FUNCTION cb_wait_flow_output(
-  flow_name text,
+    flow_name text,
     run_id bigint,
     poll_for int DEFAULT 5000,
     poll_interval int DEFAULT 200
@@ -813,7 +1204,7 @@ CREATE OR REPLACE FUNCTION cb_wait_flow_output(
 RETURNS TABLE(status text, output jsonb, error_message text)
 LANGUAGE plpgsql AS $$
 DECLARE
-  _f_table text := cb_table_name(cb_wait_flow_output.flow_name, 'f');
+    _f_table text := cb_table_name(cb_wait_flow_output.flow_name, 'f');
     _status text;
     _output jsonb;
     _error_message text;
@@ -886,6 +1277,7 @@ LANGUAGE plpgsql AS $$
 DECLARE
     _f_table text := cb_table_name(cb_delete_flow.name, 'f');
     _s_table text := cb_table_name(cb_delete_flow.name, 's');
+    _m_table text := cb_table_name(cb_delete_flow.name, 'm');
     _res boolean;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext(_f_table));
@@ -899,6 +1291,7 @@ BEGIN
     DELETE FROM cb_steps s
     WHERE s.flow_name = cb_delete_flow.name;
 
+    EXECUTE format('DROP TABLE IF EXISTS %I CASCADE;', _m_table);
     EXECUTE format('DROP TABLE IF EXISTS %I CASCADE;', _s_table);
     EXECUTE format('DROP TABLE IF EXISTS %I CASCADE;', _f_table);
 
@@ -921,6 +1314,10 @@ DROP FUNCTION IF EXISTS cb_wait_flow_output(text, bigint, int);
 DROP FUNCTION IF EXISTS cb_signal_flow(text, bigint, text, jsonb);
 DROP FUNCTION IF EXISTS cb_fail_step(text, text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_step(text, text, bigint, jsonb);
+DROP FUNCTION IF EXISTS cb_fail_map_task(text, text, bigint, text);
+DROP FUNCTION IF EXISTS cb_complete_map_task(text, text, bigint, jsonb);
+DROP FUNCTION IF EXISTS cb_hide_map_tasks(text, text, bigint[], int);
+DROP FUNCTION IF EXISTS cb_poll_map_tasks(text, text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_hide_steps(text, text, bigint[], integer);
 DROP FUNCTION IF EXISTS cb_poll_steps(text, text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_start_steps(text, bigint, timestamptz);

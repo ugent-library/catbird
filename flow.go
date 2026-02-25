@@ -36,6 +36,8 @@ type Step struct {
 	name                 string
 	dependencies         []string
 	optionalDependencies map[string]bool // tracks which dependencies are Optional[T]
+	isMapStep            bool
+	mapSource            string
 	condition            string
 	signal               bool
 	handler              func(context.Context, []byte, map[string][]byte, []byte) ([]byte, error)
@@ -64,8 +66,35 @@ func (s *Step) Signal(signal bool) *Step {
 	return s
 }
 
+func (s *Step) MapInput() *Step {
+	if s.isMapStep && s.mapSource != "" {
+		panic(fmt.Sprintf("step %s: map source already set to %q", s.name, s.mapSource))
+	}
+	s.isMapStep = true
+	s.mapSource = ""
+	return s
+}
+
+func (s *Step) Map(stepName string) *Step {
+	if strings.TrimSpace(stepName) == "" {
+		panic(fmt.Sprintf("step %s: map source step name must not be empty", s.name))
+	}
+	if s.isMapStep && s.mapSource != stepName {
+		panic(fmt.Sprintf("step %s: map source already set to %q", s.name, s.mapSource))
+	}
+	s.isMapStep = true
+	s.mapSource = stepName
+	for _, dep := range s.dependencies {
+		if dep == stepName {
+			return s
+		}
+	}
+	s.dependencies = append(s.dependencies, stepName)
+	return s
+}
+
 func (s *Step) Handler(fn any, opts ...HandlerOpts) *Step {
-	handler, optionalDeps, err := makeStepHandler(fn, s.name, s.dependencies, s.signal)
+	handler, optionalDeps, err := makeStepHandler(fn, s.name, s.dependencies, s.signal, s.isMapStep, s.mapSource)
 	if err != nil {
 		panic(err)
 	}
@@ -79,7 +108,7 @@ func (s *Step) Handler(fn any, opts ...HandlerOpts) *Step {
 // Step handler signature: (context.Context, In, [Signal if signal], [Dep1, Dep2, ...]) (Out, error)
 // Returns wrapper with signature: (context.Context, flowInputJSON []byte, depsJSON map[string][]byte, signalInputJSON []byte) ([]byte, error)
 // Also returns a map indicating which dependencies are Optional[T]
-func makeStepHandler(fn any, stepName string, dependencies []string, signal bool) (func(context.Context, []byte, map[string][]byte, []byte) ([]byte, error), map[string]bool, error) {
+func makeStepHandler(fn any, stepName string, dependencies []string, signal bool, isMapStep bool, mapSource string) (func(context.Context, []byte, map[string][]byte, []byte) ([]byte, error), map[string]bool, error) {
 	fnType := reflect.TypeOf(fn)
 	fnVal := reflect.ValueOf(fn)
 
@@ -156,31 +185,86 @@ func makeStepHandler(fn any, stepName string, dependencies []string, signal bool
 		optionalDepsMap[dependencies[i]] = isOptional
 	}
 
+	mapFromInput := isMapStep && mapSource == ""
+	mapDepIdx := -1
+	if isMapStep && !mapFromInput {
+		for i, depName := range dependencies {
+			if depName == mapSource {
+				mapDepIdx = i
+				break
+			}
+		}
+		if mapDepIdx == -1 {
+			return nil, nil, fmt.Errorf("step %s: map source dependency %q not found", stepName, mapSource)
+		}
+		if depIsOptional[mapDepIdx] {
+			return nil, nil, fmt.Errorf("step %s: map source dependency %q cannot be Optional[T]", stepName, mapSource)
+		}
+	}
+
 	// Return wrapper with all type info cached in closure
 	return func(ctx context.Context, flowInputJSON []byte, depsJSON map[string][]byte, signalInputJSON []byte) ([]byte, error) {
-		// Build arguments slice starting with context
-		args := []reflect.Value{reflect.ValueOf(ctx)}
+		buildAndCall := func(flowArg reflect.Value, depValues []reflect.Value, signalValue reflect.Value) (reflect.Value, error) {
+			args := []reflect.Value{reflect.ValueOf(ctx), flowArg}
+			if signal {
+				args = append(args, signalValue)
+			}
+			args = append(args, depValues...)
 
-		// 1. Unmarshal flow input using cached type
-		flowInputVal := reflect.New(flowInputType)
-		if err := json.Unmarshal(flowInputJSON, flowInputVal.Interface()); err != nil {
-			return nil, fmt.Errorf("unmarshal flow input: %w", err)
+			results := fnVal.Call(args)
+			if !results[1].IsNil() {
+				return reflect.Value{}, results[1].Interface().(error)
+			}
+			return results[0], nil
 		}
-		args = append(args, flowInputVal.Elem())
+
+		// 1. Unmarshal flow input using cached type (or []type for MapInput)
+		var flowInputVal reflect.Value
+		if mapFromInput {
+			flowInputSliceType := reflect.SliceOf(flowInputType)
+			flowInputSliceVal := reflect.New(flowInputSliceType)
+			if err := json.Unmarshal(flowInputJSON, flowInputSliceVal.Interface()); err != nil {
+				return nil, fmt.Errorf("unmarshal flow input: %w", err)
+			}
+			flowInputVal = flowInputSliceVal.Elem()
+		} else {
+			flowInputPtr := reflect.New(flowInputType)
+			if err := json.Unmarshal(flowInputJSON, flowInputPtr.Interface()); err != nil {
+				return nil, fmt.Errorf("unmarshal flow input: %w", err)
+			}
+			flowInputVal = flowInputPtr.Elem()
+		}
 
 		// 2. Unmarshal signal if present (uses cached signalType)
+		var signalVal reflect.Value
 		if signal {
-			signalVal := reflect.New(signalType)
+			signalValPtr := reflect.New(signalType)
 			if len(signalInputJSON) > 0 {
-				if err := json.Unmarshal(signalInputJSON, signalVal.Interface()); err != nil {
+				if err := json.Unmarshal(signalInputJSON, signalValPtr.Interface()); err != nil {
 					return nil, fmt.Errorf("unmarshal signal: %w", err)
 				}
 			}
-			args = append(args, signalVal.Elem())
+			signalVal = signalValPtr.Elem()
 		}
 
 		// 3. Unmarshal dependencies using cached depTypes
+		depVals := make([]reflect.Value, len(dependencies))
+		var mappedDepVals reflect.Value
 		for i, depName := range dependencies {
+			if i == mapDepIdx {
+				depSliceType := reflect.SliceOf(depTypes[i])
+				depSliceVal := reflect.New(depSliceType)
+				depJSON, ok := depsJSON[depName]
+				if !ok {
+					return nil, fmt.Errorf("missing required dependency: %s", depName)
+				}
+				if err := json.Unmarshal(depJSON, depSliceVal.Interface()); err != nil {
+					return nil, fmt.Errorf("unmarshal dependency %s: %w", depName, err)
+				}
+				mappedDepVals = depSliceVal.Elem()
+				continue
+			}
+
 			if depIsOptional[i] {
 				// Handle Optional[T] - construct directly
 				optVal := reflect.New(depTypes[i]).Elem()
@@ -196,7 +280,7 @@ func makeStepHandler(fn any, stepName string, dependencies []string, signal bool
 					valueField.Set(valuePtr.Elem())
 				}
 				// If not exists, optVal stays as Optional{IsSet: false}
-				args = append(args, optVal)
+				depVals[i] = optVal
 			} else {
 				// Handle required dependency
 				depVal := reflect.New(depTypes[i])
@@ -207,20 +291,46 @@ func makeStepHandler(fn any, stepName string, dependencies []string, signal bool
 				if err := json.Unmarshal(depJSON, depVal.Interface()); err != nil {
 					return nil, fmt.Errorf("unmarshal dependency %s: %w", depName, err)
 				}
-				args = append(args, depVal.Elem())
+				depVals[i] = depVal.Elem()
 			}
 		}
 
-		// 4. Call handler using cached fnVal (~0.5-1μs overhead)
-		results := fnVal.Call(args)
-
-		// 5. Check error
-		if !results[1].IsNil() {
-			return nil, results[1].Interface().(error)
+		if !isMapStep {
+			out, err := buildAndCall(flowInputVal, depVals, signalVal)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(out.Interface())
 		}
 
-		// 6. Marshal output (unavoidable cost)
-		return json.Marshal(results[0].Interface())
+		mapLen := 0
+		if mapFromInput {
+			mapLen = flowInputVal.Len()
+		} else {
+			mapLen = mappedDepVals.Len()
+		}
+
+		outSlice := reflect.MakeSlice(reflect.SliceOf(fnType.Out(0)), 0, mapLen)
+		for i := 0; i < mapLen; i++ {
+			depValsForCall := depVals
+			flowArg := flowInputVal
+
+			if mapFromInput {
+				flowArg = flowInputVal.Index(i)
+			} else {
+				depValsForCall = make([]reflect.Value, len(depVals))
+				copy(depValsForCall, depVals)
+				depValsForCall[mapDepIdx] = mappedDepVals.Index(i)
+			}
+
+			out, err := buildAndCall(flowArg, depValsForCall, signalVal)
+			if err != nil {
+				return nil, err
+			}
+			outSlice = reflect.Append(outSlice, out)
+		}
+
+		return json.Marshal(outSlice.Interface())
 	}, optionalDepsMap, nil
 }
 
@@ -244,6 +354,9 @@ type FlowScheduleInfo struct {
 
 type StepInfo struct {
 	Name      string               `json:"name"`
+	IsMapStep bool                 `json:"is_map_step,omitempty"`
+	MapSource string               `json:"map_source,omitempty"`
+	Signal    bool                 `json:"signal,omitempty"`
 	DependsOn []StepDependencyInfo `json:"depends_on,omitempty"`
 }
 
@@ -263,6 +376,44 @@ func validateFlowDependencies(flow *Flow) error {
 	steps := flow.steps
 	if len(steps) == 0 {
 		return fmt.Errorf("flow %q must have at least one step", flow.name)
+	}
+
+	stepNameSet := make(map[string]bool)
+	for _, step := range steps {
+		stepNameSet[step.name] = true
+	}
+
+	for _, step := range steps {
+		if !step.isMapStep {
+			continue
+		}
+
+		if step.mapSource == "" {
+			continue
+		}
+
+		if step.mapSource == step.name {
+			return fmt.Errorf("flow %q: step %q cannot map its own output", flow.name, step.name)
+		}
+
+		if !stepNameSet[step.mapSource] {
+			return fmt.Errorf("flow %q: step %q maps dependency %q which does not exist", flow.name, step.name, step.mapSource)
+		}
+
+		hasDependency := false
+		for _, depName := range step.dependencies {
+			if depName == step.mapSource {
+				hasDependency = true
+				break
+			}
+		}
+		if !hasDependency {
+			return fmt.Errorf("flow %q: step %q maps %q but does not depend on it", flow.name, step.name, step.mapSource)
+		}
+
+		if step.optionalDependencies[step.mapSource] {
+			return fmt.Errorf("flow %q: step %q cannot map optional dependency %q", flow.name, step.name, step.mapSource)
+		}
 	}
 
 	// Build set of conditional steps (steps that have a condition and may be skipped)
@@ -341,6 +492,8 @@ func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 		type serializableStep struct {
 			Name      string            `json:"name"`
 			Condition string            `json:"condition,omitempty"`
+			IsMapStep bool              `json:"is_map_step,omitempty"`
+			MapSource string            `json:"map_source,omitempty"`
 			Signal    bool              `json:"signal"`
 			DependsOn []*stepDependency `json:"depends_on,omitempty"`
 		}
@@ -357,6 +510,8 @@ func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 
 			serStep := serializableStep{
 				Name:      s.name,
+				IsMapStep: s.isMapStep,
+				MapSource: s.mapSource,
 				Signal:    s.signal,
 				DependsOn: deps,
 			}
