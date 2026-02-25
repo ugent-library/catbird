@@ -12,7 +12,7 @@
 - [ ] Versioning?
 - [ ] Fair queueing? (see https://docs.hatchet.run/blog/multi-tenant-queues)
 - [ ] Reuse queue topic bindings implementation for event triggered task execution?
-- [ ] Task coördination and dynamic tasks (see COORDINATION_PATTERNS.md)
+- [ ] Flow coördination and dynamic tasks (see REMAINING_PATTERNS.md)
 - [ ] Task cancellation and early exit
 - [ ] Description and other meta fields 
 - [ ] Metrics
