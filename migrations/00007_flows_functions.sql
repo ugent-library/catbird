@@ -1327,6 +1327,17 @@ $$;
 
 -- +goose down
 
+-- +goose statementbegin
+DO $$
+BEGIN
+  IF to_regclass('public.cb_flows') IS NOT NULL THEN
+    PERFORM cb_delete_flow(name)
+    FROM cb_flows;
+  END IF;
+END
+$$;
+-- +goose statementend
+
 DROP FUNCTION IF EXISTS cb_delete_flow(text);
 DROP FUNCTION IF EXISTS cb_wait_flow_output(text, bigint, int, int);
 DROP FUNCTION IF EXISTS cb_signal_flow(text, bigint, text, jsonb);

@@ -74,4 +74,4 @@ DROP FUNCTION IF EXISTS cb_table_name(text, text);
 DROP TABLE IF EXISTS cb_bindings;
 DROP TABLE IF EXISTS cb_queues;
 
-DROP TYPE IF EXISTS cb_message;
+DROP TYPE IF EXISTS cb_message CASCADE;

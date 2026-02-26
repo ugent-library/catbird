@@ -463,6 +463,17 @@ $$;
 
 -- +goose down
 
+-- +goose statementbegin
+DO $$
+BEGIN
+    IF to_regclass('public.cb_tasks') IS NOT NULL THEN
+        PERFORM cb_delete_task(name)
+        FROM cb_tasks;
+    END IF;
+END
+$$;
+-- +goose statementend
+
 DROP FUNCTION IF EXISTS cb_delete_task(text);
 DROP FUNCTION IF EXISTS cb_fail_task(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_task(text, bigint, jsonb);

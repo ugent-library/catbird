@@ -8,7 +8,7 @@
 
 ## Features
 
-- [ ] SendMany function
+- [ ] Data archival, cleanup
 - [ ] Versioning?
 - [ ] Fair queueing? (see https://docs.hatchet.run/blog/multi-tenant-queues)
 - [ ] Reuse queue topic bindings implementation for event triggered task execution?

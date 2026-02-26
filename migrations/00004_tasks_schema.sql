@@ -25,5 +25,5 @@ CREATE TABLE IF NOT EXISTS cb_tasks (
 
 -- +goose down
 
-DROP TABLE IF EXISTS cb_tasks;
-DROP TYPE IF EXISTS cb_task_claim;
+DROP TABLE IF EXISTS cb_tasks CASCADE;
+DROP TYPE IF EXISTS cb_task_claim CASCADE;

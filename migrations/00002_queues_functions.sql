@@ -591,7 +591,16 @@ $$ LANGUAGE plpgsql;
 
 -- +goose down
 
-SELECT cb_delete_queue(name) FROM cb_queues;
+-- +goose statementbegin
+DO $$
+BEGIN
+    IF to_regclass('public.cb_queues') IS NOT NULL THEN
+        PERFORM cb_delete_queue(name)
+        FROM cb_queues;
+    END IF;
+END
+$$;
+-- +goose statementend
 
 DROP FUNCTION IF EXISTS cb_unbind(text, text);
 DROP FUNCTION IF EXISTS cb_bind(text, text);

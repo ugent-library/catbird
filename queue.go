@@ -110,6 +110,47 @@ func SendQuery(queueName string, payload any, opts ...SendOpts) (string, []any, 
 	return q, args, nil
 }
 
+type SendManyOpts struct {
+	Topic           string
+	IdempotencyKeys []string
+	VisibleAt       time.Time
+}
+
+// SendMany enqueues multiple messages to the specified queue.
+// Pass no opts to use defaults.
+func SendMany(ctx context.Context, conn Conn, queueName string, payloads []any, opts ...SendManyOpts) error {
+	q, args, err := SendManyQuery(queueName, payloads, opts...)
+	if err != nil {
+		return err
+	}
+
+	_, err = conn.Exec(ctx, q, args...)
+	return err
+}
+
+// SendManyQuery builds the SQL query and args for a SendMany operation.
+// Pass no opts to use defaults.
+func SendManyQuery(queueName string, payloads []any, opts ...SendManyOpts) (string, []any, error) {
+	var resolved SendManyOpts
+	if len(opts) > 0 {
+		resolved = opts[0]
+	}
+
+	if payloads == nil {
+		payloads = []any{}
+	}
+
+	encodedPayloads, err := marshalPayloads(payloads)
+	if err != nil {
+		return "", nil, err
+	}
+
+	q := `SELECT cb_send(queue => $1, payloads => $2, topic => $3, idempotency_keys => $4, visible_at => $5);`
+	args := []any{queueName, encodedPayloads, ptrOrNil(resolved.Topic), resolved.IdempotencyKeys, ptrOrNil(resolved.VisibleAt)}
+
+	return q, args, nil
+}
+
 // Bind subscribes a queue to a topic pattern.
 // Pattern supports exact topics and wildcards: ? (single token), * (multi-token tail).
 // Examples: "foo.bar", "foo.?.bar", "foo.bar.*"
@@ -129,6 +170,11 @@ func Unbind(ctx context.Context, conn Conn, queueName string, pattern string) er
 type PublishOpts struct {
 	IdempotencyKey string
 	VisibleAt      *time.Time
+}
+
+type PublishManyOpts struct {
+	IdempotencyKeys []string
+	VisibleAt       time.Time
 }
 
 // Publish sends a message to topic-subscribed queues with options.
@@ -158,6 +204,41 @@ func PublishQuery(topic string, payload any, opts ...PublishOpts) (string, []any
 
 	q := `SELECT cb_publish(topic => $1, payload => $2, idempotency_key => $3, visible_at => $4);`
 	args := []any{topic, b, ptrOrNil(resolved.IdempotencyKey), ptrOrNil(resolved.VisibleAt)}
+
+	return q, args, nil
+}
+
+// PublishMany sends multiple messages to topic-subscribed queues with options.
+// Pass no opts to use defaults.
+func PublishMany(ctx context.Context, conn Conn, topic string, payloads []any, opts ...PublishManyOpts) error {
+	q, args, err := PublishManyQuery(topic, payloads, opts...)
+	if err != nil {
+		return err
+	}
+
+	_, err = conn.Exec(ctx, q, args...)
+	return err
+}
+
+// PublishManyQuery builds the SQL query and args for a PublishMany operation.
+// Pass no opts to use defaults.
+func PublishManyQuery(topic string, payloads []any, opts ...PublishManyOpts) (string, []any, error) {
+	var resolved PublishManyOpts
+	if len(opts) > 0 {
+		resolved = opts[0]
+	}
+
+	if payloads == nil {
+		payloads = []any{}
+	}
+
+	encodedPayloads, err := marshalPayloads(payloads)
+	if err != nil {
+		return "", nil, err
+	}
+
+	q := `SELECT cb_publish(topic => $1, payloads => $2, idempotency_keys => $3, visible_at => $4);`
+	args := []any{topic, encodedPayloads, resolved.IdempotencyKeys, ptrOrNil(resolved.VisibleAt)}
 
 	return q, args, nil
 }

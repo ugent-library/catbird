@@ -95,7 +95,7 @@ CREATE OR REPLACE VIEW cb_flow_info AS
 
 DROP VIEW IF EXISTS cb_flow_info;
 
-DROP TABLE IF EXISTS cb_step_dependencies;
-DROP TABLE IF EXISTS cb_steps;
-DROP TABLE IF EXISTS cb_flows;
-DROP TYPE IF EXISTS cb_step_claim;
+DROP TABLE IF EXISTS cb_step_dependencies CASCADE;
+DROP TABLE IF EXISTS cb_steps CASCADE;
+DROP TABLE IF EXISTS cb_flows CASCADE;
+DROP TYPE IF EXISTS cb_step_claim CASCADE;

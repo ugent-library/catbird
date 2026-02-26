@@ -43,6 +43,11 @@ func (c *Client) Send(ctx context.Context, queueName string, payload any, opts .
 	return Send(ctx, c.Conn, queueName, payload, opts...)
 }
 
+// SendMany enqueues multiple messages to the specified queue.
+func (c *Client) SendMany(ctx context.Context, queueName string, payloads []any, opts ...SendManyOpts) error {
+	return SendMany(ctx, c.Conn, queueName, payloads, opts...)
+}
+
 // Bind subscribes a queue to a topic pattern.
 // Pattern supports exact topics and wildcards: ? (single token), * (multi-token tail).
 // Examples: "foo.bar", "foo.?.bar", "foo.bar.*"
@@ -58,6 +63,11 @@ func (c *Client) Unbind(ctx context.Context, queueName string, pattern string) e
 // Publish sends a message to all queues subscribed to the specified topic.
 func (c *Client) Publish(ctx context.Context, topic string, payload any, opts ...PublishOpts) error {
 	return Publish(ctx, c.Conn, topic, payload, opts...)
+}
+
+// PublishMany sends multiple messages to all queues subscribed to the specified topic.
+func (c *Client) PublishMany(ctx context.Context, topic string, payloads []any, opts ...PublishManyOpts) error {
+	return PublishMany(ctx, c.Conn, topic, payloads, opts...)
 }
 
 // Read reads up to quantity messages from the queue, hiding them from other

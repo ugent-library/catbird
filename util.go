@@ -2,6 +2,7 @@ package catbird
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"math/rand"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const (
@@ -146,4 +148,17 @@ func queryWithRetry(ctx context.Context, conn Conn, sql string, arguments ...any
 		}
 	}
 	return nil, lastErr
+}
+
+func marshalPayloads(payloads []any) (pgtype.FlatArray[json.RawMessage], error) {
+	encodedPayloads := make(pgtype.FlatArray[json.RawMessage], 0, len(payloads))
+	for _, payload := range payloads {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		encodedPayloads = append(encodedPayloads, json.RawMessage(b))
+	}
+
+	return encodedPayloads, nil
 }

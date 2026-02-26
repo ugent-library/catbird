@@ -30,6 +30,6 @@ CREATE TABLE IF NOT EXISTS cb_step_handlers (
 
 -- +goose down
 
-DROP TABLE IF EXISTS cb_step_handlers;
-DROP TABLE IF EXISTS cb_task_handlers;
-DROP TABLE IF EXISTS cb_workers;
+DROP TABLE IF EXISTS cb_step_handlers CASCADE;
+DROP TABLE IF EXISTS cb_task_handlers CASCADE;
+DROP TABLE IF EXISTS cb_workers CASCADE;
