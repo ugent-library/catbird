@@ -38,7 +38,7 @@ check_docker() {
   if ! docker ps > /dev/null 2>&1; then
     die "Docker is not running. Please start Docker and try again."
   fi
-  
+
   if ! docker compose ps 2>/dev/null | grep -q "$CONTAINER_NAME"; then
     die "PostgreSQL container not running. Run 'docker compose up -d' first."
   fi
@@ -74,13 +74,13 @@ main() {
   wait_for_postgres
   drop_test_db
   create_test_db
-  
+
   info "Running tests..."
   info "Connection: $CONNECTION_STRING"
-  
+
   # Run tests with hardcoded connection
   CB_CONN="$CONNECTION_STRING" go test -v -timeout 30m "$@" ./...
-  
+
   success "Tests complete!"
 }
 

@@ -255,7 +255,7 @@ docker compose logs -f postgres
 - "Test retrieves wrong data" → Check deduplication keys; if hardcoded, old rows from previous runs may be returned
 - "Need clean slate" → `docker compose down -v && docker compose up -d` (removes volume)
 
-**Add migrations**: 
+**Add migrations**:
 1. Create new `.sql` file in `migrations/`, use goose syntax (`+goose up`/`+goose down`)
 2. Update `SchemaVersion` constant in `migrate.go` to match the new migration version number
 3. Migrations are embedded via `//go:embed migrations/*.sql` and use `goose.WithDisableVersioning(true)`

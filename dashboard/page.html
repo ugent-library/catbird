@@ -164,7 +164,7 @@
             }
           ]
         });
-        
+
         // Fit graph after a brief delay to ensure container has dimensions
         setTimeout(() => {
           cy.fit(20);
@@ -206,15 +206,15 @@
             'started': '▶',
             'created': '○'
           }[runInfo.status] || '○';
-          elements.push({ 
-            id: step.name, 
-            data: { 
-              id: step.name, 
+          elements.push({
+            id: step.name,
+            data: {
+              id: step.name,
               label: `${step.name}\n${statusBadge} ${runInfo.status}`,
               status: runInfo.status,
               output: runInfo.output,
               error_message: runInfo.error_message
-            } 
+            }
           });
           nodeIds.push(step.name);
           if (step.depends_on) {
@@ -314,7 +314,7 @@
               }
             ]
           });
-          
+
           cy.fit(20);
           cy.maxZoom(1.5);
           if (cy.zoom() > 1.5) {
@@ -326,7 +326,7 @@
           cy.on('mouseover', 'node', function(evt) {
             const node = evt.target;
             const error = node.data('error_message');
-            
+
             if (error) {
               tooltip.textContent = 'Error:\n' + error;
               tooltip.style.display = 'block';
@@ -343,7 +343,7 @@
           cy.on('mouseout', 'node', function(evt) {
             tooltip.style.display = 'none';
           });
-          
+
           // Remove event listener after first render
           modal.removeEventListener('shown.bs.modal', renderGraph);
         });

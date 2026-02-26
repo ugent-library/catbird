@@ -144,7 +144,7 @@ BEGIN
     FOR _dep IN SELECT jsonb_array_elements(coalesce(_step->'depends_on', '[]'::jsonb))
     LOOP
       _dep_name := _dep->>'name';
-      
+
       INSERT INTO cb_step_dependencies (flow_name, step_name, dependency_name, idx)
       VALUES (cb_create_flow.name, _step_name, _dep_name, _dep_idx);
       _dep_idx := _dep_idx + 1;
@@ -466,7 +466,7 @@ BEGIN
       WHERE sr.flow_run_id = $1
         AND sr.status = 'pending'
         AND sr.remaining_dependencies = 0
-        AND (NOT (SELECT has_signal FROM cb_steps WHERE flow_name = $3 AND name = sr.step_name) 
+        AND (NOT (SELECT has_signal FROM cb_steps WHERE flow_name = $3 AND name = sr.step_name)
              OR sr.signal_input IS NOT NULL)
       FOR UPDATE SKIP LOCKED
       $QUERY$,
@@ -481,7 +481,7 @@ BEGIN
       -- Build step_inputs: combine flow input, dependency outputs, and signal input
       -- Flow input accessible as input.*, dependency outputs as dependency_name.*, signal input as signal.*
       _step_inputs := jsonb_build_object('input', _flow_input);
-      
+
       IF _step_to_process.step_outputs IS NOT NULL THEN
         _step_inputs := _step_inputs || _step_to_process.step_outputs;
       END IF;
@@ -506,7 +506,7 @@ BEGIN
           _s_table
         )
         USING _step_to_process.id;
-        
+
         -- Decrement dependent steps' remaining_dependencies
         EXECUTE format(
           $QUERY$
@@ -530,9 +530,9 @@ BEGIN
           _f_table
         )
         USING cb_start_steps.flow_run_id;
-        
+
         _steps_processed_this_iteration := _steps_processed_this_iteration + 1;
-        
+
         -- Continue to next step
         CONTINUE;
       END IF;
@@ -613,7 +613,7 @@ BEGIN
 
     _steps_processed_this_iteration := _steps_processed_this_iteration + 1;
     END LOOP;
-    
+
     -- Exit outer loop if no steps were processed in this iteration
     EXIT WHEN _steps_processed_this_iteration = 0;
     END LOOP;

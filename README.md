@@ -498,7 +498,7 @@ Catbird is built on PostgreSQL functions, so you can use the API directly from a
 SELECT cb_create_queue(name => 'my_queue', expires_at => null, unlogged => false);
 
 -- Send a message
-SELECT cb_send(queue => 'my_queue', payload => '{"user_id": 123, "action": "process"}'::jsonb, 
+SELECT cb_send(queue => 'my_queue', payload => '{"user_id": 123, "action": "process"}'::jsonb,
                topic => null, idempotency_key => null, visible_at => null);
 
 -- Publish to topic-bound queues
@@ -523,7 +523,7 @@ SELECT cb_unbind(queue_name => 'user_events', pattern => 'events.user.*');
 SELECT cb_create_task(name => 'send_email');
 
 -- Run a task
-SELECT * FROM cb_run_task(name => 'send_email', input => '{"to": "user@example.com"}'::jsonb, 
+SELECT * FROM cb_run_task(name => 'send_email', input => '{"to": "user@example.com"}'::jsonb,
                           concurrency_key => null, idempotency_key => null, visible_at => null);
 ```
 
@@ -581,7 +581,7 @@ The dashboard is a standard `http.Handler` and can be embedded in any Go web app
 import (
     "log/slog"
     "net/http"
-    
+
     "github.com/ugent-library/catbird"
     "github.com/ugent-library/catbird/dashboard"
 )

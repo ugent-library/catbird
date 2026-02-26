@@ -38,7 +38,7 @@ BEGIN
             _op_idx := _op_idx - 1; -- Adjust for leading space we added
             EXIT;
         END IF;
-        
+
         -- Check at beginning: "operator "
         IF _expr LIKE _op || ' %' THEN
             _op_idx := 0;
@@ -184,7 +184,7 @@ BEGIN
     CASE _operator
         WHEN 'exists' THEN
             _result := _field_val IS NOT NULL;
-        
+
         WHEN 'eq' THEN
             -- Handle NULL: if field doesn't exist, return false
             IF _field_val IS NULL THEN
@@ -192,42 +192,42 @@ BEGIN
             ELSE
                 _result := _field_val = _value;
             END IF;
-        
+
         WHEN 'ne' THEN
             IF _field_val IS NULL THEN
                 _result := true; -- NULL != value
             ELSE
                 _result := _field_val <> _value;
             END IF;
-        
+
         WHEN 'gt' THEN
             IF _field_val IS NULL THEN
                 _result := false;
             ELSE
                 _result := (_field_val::text::numeric) > (_value::text::numeric);
             END IF;
-        
+
         WHEN 'gte' THEN
             IF _field_val IS NULL THEN
                 _result := false;
             ELSE
                 _result := (_field_val::text::numeric) >= (_value::text::numeric);
             END IF;
-        
+
         WHEN 'lt' THEN
             IF _field_val IS NULL THEN
                 _result := false;
             ELSE
                 _result := (_field_val::text::numeric) < (_value::text::numeric);
             END IF;
-        
+
         WHEN 'lte' THEN
             IF _field_val IS NULL THEN
                 _result := false;
             ELSE
                 _result := (_field_val::text::numeric) <= (_value::text::numeric);
             END IF;
-        
+
         WHEN 'in' THEN
             IF _field_val IS NULL THEN
                 _result := false;
@@ -235,7 +235,7 @@ BEGIN
                 -- Check if _field_val is in the array _value
                 _result := _field_val = ANY(jsonb_array_elements(_value));
             END IF;
-        
+
         WHEN 'contains' THEN
             IF _field_val IS NULL THEN
                 _result := false;
@@ -248,7 +248,7 @@ BEGIN
                     _result := _field_val @> _value;
                 END IF;
             END IF;
-        
+
         ELSE
             _result := false;
     END CASE;
@@ -282,7 +282,7 @@ BEGIN
 
     -- Split path by dots (simple split, doesn't handle complex escaping)
     _parts := string_to_array(field_path, '.');
-    
+
     FOREACH _part IN ARRAY _parts
     LOOP
         IF _current IS NULL THEN
@@ -323,7 +323,7 @@ BEGIN
 
     -- Parse the condition
     _parsed_condition := cb_parse_condition(condition_expr);
-    
+
     IF _parsed_condition IS NULL THEN
         RETURN false;
     END IF;

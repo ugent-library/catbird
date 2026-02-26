@@ -884,9 +884,9 @@ type StepRunInfo struct {
 func GetFlowRunSteps(ctx context.Context, conn Conn, flowName string, flowRunID int64) ([]*StepRunInfo, error) {
 	tableName := fmt.Sprintf("cb_s_%s", strings.ToLower(flowName))
 	query := fmt.Sprintf(`
-		SELECT id, step_name, status, output, error_message, started_at, completed_at, failed_at, skipped_at 
-		FROM %s 
-		WHERE flow_run_id = $1 
+		SELECT id, step_name, status, output, error_message, started_at, completed_at, failed_at, skipped_at
+		FROM %s
+		WHERE flow_run_id = $1
 		ORDER BY id;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query, flowRunID)
 	if err != nil {

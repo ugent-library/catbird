@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Format staged Go files and re-stage them.
+mapfile -d '' go_files < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.go')
+if ((${#go_files[@]} > 0)); then
+  gofmt -w "${go_files[@]}"
+  git add "${go_files[@]}"
+  echo "pre-commit: gofmt applied to staged Go files"
+fi
+
+# Reject trailing whitespace (and other git --check whitespace errors) in staged content.
+if ! git diff --cached --check --color=never; then
+  echo ""
+  echo "pre-commit: whitespace check failed"
+  echo "Fix the reported issues and re-commit."
+  exit 1
+fi
