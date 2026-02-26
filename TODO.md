@@ -11,7 +11,7 @@
 - [ ] Data archival, cleanup
 - [ ] Versioning?
 - [ ] Fair queueing? (see https://docs.hatchet.run/blog/multi-tenant-queues)
-- [ ] Reuse queue topic bindings implementation for event triggered task execution?
+- [ ] Event-triggered task/flow runs via queue bindings MVP (see EVENT_TRIGGER_MVP.md)
 - [ ] Flow coördination and dynamic tasks (see REMAINING_PATTERNS.md)
 - [ ] Task cancellation and early exit
 - [ ] Description and other meta fields 
