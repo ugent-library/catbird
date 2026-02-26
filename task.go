@@ -20,6 +20,20 @@ type Task struct {
 	condition   string
 	handler     func(context.Context, json.RawMessage) (json.RawMessage, error)
 	handlerOpts *HandlerOpts
+	onFail      func(context.Context, json.RawMessage, TaskFailure) error
+	onFailOpts  *HandlerOpts
+}
+
+type TaskFailure struct {
+	TaskName       string    `json:"task_name"`
+	TaskRunID      int64     `json:"task_run_id"`
+	ErrorMessage   string    `json:"error_message"`
+	Attempts       int       `json:"attempts"`
+	OnFailAttempts int       `json:"on_fail_attempts"`
+	StartedAt      time.Time `json:"started_at,omitzero"`
+	FailedAt       time.Time `json:"failed_at,omitzero"`
+	ConcurrencyKey string    `json:"concurrency_key,omitempty"`
+	IdempotencyKey string    `json:"idempotency_key,omitempty"`
 }
 
 // NewTask creates a new task definition with the given name.
@@ -44,6 +58,19 @@ func (t *Task) Handler(fn any, opts ...HandlerOpts) *Task {
 	}
 	t.handler = handler
 	t.handlerOpts = applyDefaultHandlerOpts(opts...)
+	return t
+}
+
+// OnFail sets a task failure handler and execution options.
+// fn must have signature (context.Context, In, TaskFailure) error.
+// If opts is omitted, defaults are used (concurrency: 1, batchSize: 10).
+func (t *Task) OnFail(fn any, opts ...HandlerOpts) *Task {
+	handler, err := makeTaskOnFailHandler(fn)
+	if err != nil {
+		panic(err)
+	}
+	t.onFail = handler
+	t.onFailOpts = applyDefaultHandlerOpts(opts...)
 	return t
 }
 
@@ -102,6 +129,46 @@ func makeTaskHandler(fn any, name string) (func(context.Context, json.RawMessage
 
 		// 5. Marshal output (unavoidable cost)
 		return json.Marshal(results[0].Interface())
+	}, nil
+}
+
+func makeTaskOnFailHandler(fn any) (func(context.Context, json.RawMessage, TaskFailure) error, error) {
+	fnType := reflect.TypeOf(fn)
+	fnVal := reflect.ValueOf(fn)
+
+	if fnType.Kind() != reflect.Func {
+		return nil, fmt.Errorf("on-fail handler must be a function")
+	}
+	if fnType.NumIn() != 3 || fnType.In(0) != reflect.TypeOf((*context.Context)(nil)).Elem() {
+		return nil, fmt.Errorf("on-fail handler must have signature (context.Context, In, TaskFailure) error")
+	}
+	if fnType.In(2) != reflect.TypeOf(TaskFailure{}) {
+		return nil, fmt.Errorf("on-fail handler third parameter must be TaskFailure")
+	}
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	if fnType.NumOut() != 1 || !fnType.Out(0).Implements(errorType) {
+		return nil, fmt.Errorf("on-fail handler must return error")
+	}
+
+	inputType := fnType.In(1)
+
+	return func(ctx context.Context, inputJSON json.RawMessage, failure TaskFailure) error {
+		inputVal := reflect.New(inputType)
+		if err := json.Unmarshal(inputJSON, inputVal.Interface()); err != nil {
+			return fmt.Errorf("unmarshal input: %w", err)
+		}
+
+		results := fnVal.Call([]reflect.Value{
+			reflect.ValueOf(ctx),
+			inputVal.Elem(),
+			reflect.ValueOf(failure),
+		})
+
+		if !results[0].IsNil() {
+			return results[0].Interface().(error)
+		}
+
+		return nil
 	}, nil
 }
 

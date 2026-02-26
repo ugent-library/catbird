@@ -182,6 +182,17 @@ BEGIN
       input jsonb NOT NULL,
       output jsonb,
       error_message text,
+      failed_step_name text,
+      failed_step_id bigint,
+      failed_step_input jsonb,
+      failed_step_signal_input jsonb,
+      failed_step_attempts int,
+      on_fail_status text,
+      on_fail_attempts int NOT NULL DEFAULT 0,
+      on_fail_visible_at timestamptz,
+      on_fail_error_message text,
+      on_fail_started_at timestamptz,
+      on_fail_completed_at timestamptz,
       started_at timestamptz NOT NULL DEFAULT now(),
       completed_at timestamptz,
       failed_at timestamptz,
@@ -191,7 +202,8 @@ BEGIN
       CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
       CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
       CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
-      CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = '')))
+      CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = ''))),
+      CONSTRAINT on_fail_status_valid CHECK (on_fail_status IS NULL OR on_fail_status IN ('queued', 'started', 'completed', 'failed'))
     )
     $QUERY$,
     _f_table
@@ -235,15 +247,6 @@ BEGIN
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, status);', _s_table || '_flow_run_id_status_idx', _s_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at);', _s_table || '_visible_at_idx', _s_table);
 
-    -- Reconcile existing step tables from older schema versions
-    EXECUTE format('UPDATE %I SET status = ''pending'' WHERE status = ''created'';', _s_table);
-    EXECUTE format('ALTER TABLE %I ALTER COLUMN status SET DEFAULT ''pending'';', _s_table);
-    EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS status_valid;', _s_table);
-    EXECUTE format(
-      'ALTER TABLE %I ADD CONSTRAINT status_valid CHECK (status IN (''pending'', ''queued'', ''started'', ''completed'', ''failed'', ''skipped''));',
-      _s_table
-    );
-
     -- Create map task table used by map steps for per-item coordination
     EXECUTE format(
     $QUERY$
@@ -275,14 +278,6 @@ BEGIN
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (step_name, status, visible_at);', _m_table || '_step_status_visible_idx', _m_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, step_name, status);', _m_table || '_flow_step_status_idx', _m_table);
 
-    -- Reconcile existing map tables from older schema versions
-    EXECUTE format('UPDATE %I SET status = ''queued'' WHERE status = ''created'';', _m_table);
-    EXECUTE format('ALTER TABLE %I ALTER COLUMN status SET DEFAULT ''queued'';', _m_table);
-    EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS status_valid;', _m_table);
-    EXECUTE format(
-      'ALTER TABLE %I ADD CONSTRAINT status_valid CHECK (status IN (''queued'', ''started'', ''completed'', ''failed''));',
-      _m_table
-    );
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -972,8 +967,10 @@ LANGUAGE plpgsql AS $$
 DECLARE
     _s_table text := cb_table_name(cb_fail_map_task.flow_name, 's');
     _m_table text := cb_table_name(cb_fail_map_task.flow_name, 'm');
+    _f_table text := cb_table_name(cb_fail_map_task.flow_name, 'f');
     _flow_run_id bigint;
     _step_id bigint;
+    _failed_item jsonb;
 BEGIN
     EXECUTE format(
       $QUERY$
@@ -983,12 +980,12 @@ BEGIN
           error_message = $2
       WHERE id = $1
         AND status IN ('queued', 'started')
-      RETURNING flow_run_id
+      RETURNING flow_run_id, item
       $QUERY$,
       _m_table
     )
     USING cb_fail_map_task.map_task_id, cb_fail_map_task.error_message
-    INTO _flow_run_id;
+    INTO _flow_run_id, _failed_item;
 
     IF _flow_run_id IS NULL THEN
       RETURN;
@@ -1002,6 +999,19 @@ BEGIN
     INTO _step_id;
 
     PERFORM cb_fail_step(cb_fail_map_task.flow_name, cb_fail_map_task.step_name, _step_id, cb_fail_map_task.error_message);
+
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I f
+      SET failed_step_input = $2
+      WHERE f.id = $1
+        AND f.status = 'failed'
+        AND f.failed_step_name = $3
+        AND f.failed_step_input = f.input
+      $QUERY$,
+      _f_table
+    )
+    USING _flow_run_id, _failed_item, cb_fail_map_task.step_name;
 END;
 $$;
 -- +goose statementend
@@ -1147,13 +1157,163 @@ BEGIN
     UPDATE %I
     SET status = 'failed',
         failed_at = now(),
-        error_message = $2
+        error_message = $2,
+        failed_step_name = $3,
+        failed_step_id = $4,
+        failed_step_input = (SELECT input FROM %I flow_input WHERE flow_input.id = $1),
+        failed_step_signal_input = (SELECT signal_input FROM %I step_run WHERE step_run.id = $4),
+        failed_step_attempts = (SELECT attempts FROM %I step_run WHERE step_run.id = $4),
+        on_fail_status = 'queued',
+        on_fail_visible_at = now(),
+        on_fail_error_message = NULL,
+        on_fail_started_at = NULL,
+        on_fail_completed_at = NULL
     WHERE id = $1
       AND status = 'started'
     $QUERY$,
-    _f_table
+    _f_table,
+    _f_table,
+    _s_table,
+    _s_table
     )
-    USING _flow_run_id, cb_fail_step.error_message;
+    USING _flow_run_id, cb_fail_step.error_message, cb_fail_step.step_name, cb_fail_step.step_id;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_poll_flow_on_fail: Claim failed flow runs for on-fail handling
+-- Parameters:
+--   name: Flow name
+--   quantity: Number of failed flow runs to claim (must be > 0)
+-- Returns: Flow runs claimed for on-fail processing with failure context
+CREATE OR REPLACE FUNCTION cb_poll_flow_on_fail(name text, quantity int)
+RETURNS TABLE(
+    id bigint,
+    input jsonb,
+    error_message text,
+    on_fail_attempts int,
+    started_at timestamptz,
+    failed_at timestamptz,
+    concurrency_key text,
+    idempotency_key text,
+    failed_step_name text,
+    failed_step_input jsonb,
+    failed_step_signal_input jsonb,
+    failed_step_attempts int,
+    completed_step_outputs jsonb
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    _f_table text := cb_table_name(cb_poll_flow_on_fail.name, 'f');
+    _s_table text := cb_table_name(cb_poll_flow_on_fail.name, 's');
+BEGIN
+    IF cb_poll_flow_on_fail.quantity <= 0 THEN
+        RAISE EXCEPTION 'cb: quantity must be greater than 0';
+    END IF;
+
+    RETURN QUERY EXECUTE format(
+      $QUERY$
+      WITH runs AS (
+        SELECT f.id
+        FROM %I f
+        WHERE f.status = 'failed'
+          AND f.on_fail_status IN ('queued', 'failed')
+          AND coalesce(f.on_fail_visible_at, clock_timestamp()) <= clock_timestamp()
+        ORDER BY f.id ASC
+        LIMIT $1
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE %I f
+      SET on_fail_status = 'started',
+          on_fail_started_at = clock_timestamp(),
+          on_fail_attempts = f.on_fail_attempts + 1
+      FROM runs
+      WHERE f.id = runs.id
+      RETURNING f.id,
+                f.input,
+                f.error_message,
+                f.on_fail_attempts,
+                f.started_at,
+                f.failed_at,
+                f.concurrency_key,
+                f.idempotency_key,
+                f.failed_step_name,
+                f.failed_step_input,
+                f.failed_step_signal_input,
+                f.failed_step_attempts,
+                (
+                  SELECT coalesce(jsonb_object_agg(s.step_name, s.output), '{}'::jsonb)
+                  FROM %I s
+                  WHERE s.flow_run_id = f.id
+                    AND s.status = 'completed'
+                )
+      $QUERY$,
+      _f_table,
+      _f_table,
+      _s_table
+    )
+    USING cb_poll_flow_on_fail.quantity;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_complete_flow_on_fail: Mark on-fail handling as completed for a flow run
+CREATE OR REPLACE FUNCTION cb_complete_flow_on_fail(name text, id bigint)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    _f_table text := cb_table_name(cb_complete_flow_on_fail.name, 'f');
+BEGIN
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET on_fail_status = 'completed',
+          on_fail_completed_at = clock_timestamp(),
+          on_fail_error_message = NULL
+      WHERE id = $1
+        AND on_fail_status = 'started'
+      $QUERY$,
+      _f_table
+    )
+    USING cb_complete_flow_on_fail.id;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_fail_flow_on_fail: Mark on-fail handling as failed and schedule retry
+CREATE OR REPLACE FUNCTION cb_fail_flow_on_fail(
+    name text,
+    id bigint,
+    error_message text,
+    retry_exhausted boolean,
+    retry_delay_ms bigint
+)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    _f_table text := cb_table_name(cb_fail_flow_on_fail.name, 'f');
+BEGIN
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET on_fail_status = 'failed',
+          on_fail_error_message = $2,
+          on_fail_visible_at = CASE
+            WHEN $3 THEN 'infinity'::timestamptz
+            ELSE clock_timestamp() + make_interval(secs => $4 / 1000.0)
+          END
+      WHERE id = $1
+        AND on_fail_status = 'started'
+      $QUERY$,
+      _f_table
+    )
+    USING cb_fail_flow_on_fail.id,
+          cb_fail_flow_on_fail.error_message,
+          cb_fail_flow_on_fail.retry_exhausted,
+          cb_fail_flow_on_fail.retry_delay_ms;
 END;
 $$;
 -- +goose statementend
@@ -1339,6 +1499,9 @@ $$;
 -- +goose statementend
 
 DROP FUNCTION IF EXISTS cb_delete_flow(text);
+DROP FUNCTION IF EXISTS cb_fail_flow_on_fail(text, bigint, text, boolean, bigint);
+DROP FUNCTION IF EXISTS cb_complete_flow_on_fail(text, bigint);
+DROP FUNCTION IF EXISTS cb_poll_flow_on_fail(text, int);
 DROP FUNCTION IF EXISTS cb_wait_flow_output(text, bigint, int, int);
 DROP FUNCTION IF EXISTS cb_signal_flow(text, bigint, text, jsonb);
 DROP FUNCTION IF EXISTS cb_fail_step(text, text, bigint, text);

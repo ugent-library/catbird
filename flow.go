@@ -19,8 +19,26 @@ type Optional[T any] struct {
 }
 
 type Flow struct {
-	name  string
-	steps []Step
+	name       string
+	steps      []Step
+	onFail     func(context.Context, json.RawMessage, FlowFailure) error
+	onFailOpts *HandlerOpts
+}
+
+type FlowFailure struct {
+	FlowName              string                     `json:"flow_name"`
+	FlowRunID             int64                      `json:"flow_run_id"`
+	FailedStepName        string                     `json:"failed_step_name,omitempty"`
+	ErrorMessage          string                     `json:"error_message"`
+	Attempts              int                        `json:"attempts"`
+	OnFailAttempts        int                        `json:"on_fail_attempts"`
+	StartedAt             time.Time                  `json:"started_at,omitzero"`
+	FailedAt              time.Time                  `json:"failed_at,omitzero"`
+	ConcurrencyKey        string                     `json:"concurrency_key,omitempty"`
+	IdempotencyKey        string                     `json:"idempotency_key,omitempty"`
+	CompletedStepOutputs  map[string]json.RawMessage `json:"completed_step_outputs,omitempty"`
+	FailedStepInput       json.RawMessage            `json:"failed_step_input,omitempty"`
+	FailedStepSignalInput json.RawMessage            `json:"failed_step_signal_input,omitempty"`
 }
 
 func NewFlow(name string) *Flow {
@@ -30,6 +48,74 @@ func NewFlow(name string) *Flow {
 func (f *Flow) AddStep(step *Step) *Flow {
 	f.steps = append(f.steps, *step)
 	return f
+}
+
+// OnFail sets a flow failure handler and execution options.
+// fn must have signature (context.Context, In, FlowFailure) error.
+// If opts is omitted, defaults are used (concurrency: 1, batchSize: 10).
+func (f *Flow) OnFail(fn any, opts ...HandlerOpts) *Flow {
+	handler, err := makeFlowOnFailHandler(fn)
+	if err != nil {
+		panic(err)
+	}
+	f.onFail = handler
+	f.onFailOpts = applyDefaultHandlerOpts(opts...)
+	return f
+}
+
+func (f FlowFailure) Output(step string) (json.RawMessage, error) {
+	if f.CompletedStepOutputs == nil {
+		return nil, ErrUnknownStepOutput
+	}
+	out, ok := f.CompletedStepOutputs[step]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrUnknownStepOutput, step)
+	}
+	return out, nil
+}
+
+func (f FlowFailure) OutputAs(step string, out any) error {
+	if out == nil {
+		return ErrInvalidDecodeTarget
+	}
+	v := reflect.ValueOf(out)
+	if v.Kind() != reflect.Ptr || v.IsNil() {
+		return ErrInvalidDecodeTarget
+	}
+
+	b, err := f.Output(step)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, out)
+}
+
+func (f FlowFailure) FailedStepInputAs(out any) error {
+	if out == nil {
+		return ErrInvalidDecodeTarget
+	}
+	v := reflect.ValueOf(out)
+	if v.Kind() != reflect.Ptr || v.IsNil() {
+		return ErrInvalidDecodeTarget
+	}
+	if len(f.FailedStepInput) == 0 {
+		return ErrNoFailedStepInput
+	}
+	return json.Unmarshal(f.FailedStepInput, out)
+}
+
+func (f FlowFailure) FailedStepSignalAs(out any) error {
+	if out == nil {
+		return ErrInvalidDecodeTarget
+	}
+	v := reflect.ValueOf(out)
+	if v.Kind() != reflect.Ptr || v.IsNil() {
+		return ErrInvalidDecodeTarget
+	}
+	if len(f.FailedStepSignalInput) == 0 {
+		return ErrNoFailedStepSignal
+	}
+	return json.Unmarshal(f.FailedStepSignalInput, out)
 }
 
 type Step struct {
@@ -332,6 +418,46 @@ func makeStepHandler(fn any, stepName string, dependencies []string, hasSignal b
 
 		return json.Marshal(outSlice.Interface())
 	}, optionalDepsMap, nil
+}
+
+func makeFlowOnFailHandler(fn any) (func(context.Context, json.RawMessage, FlowFailure) error, error) {
+	fnType := reflect.TypeOf(fn)
+	fnVal := reflect.ValueOf(fn)
+
+	if fnType.Kind() != reflect.Func {
+		return nil, fmt.Errorf("on-fail handler must be a function")
+	}
+	if fnType.NumIn() != 3 || fnType.In(0) != reflect.TypeOf((*context.Context)(nil)).Elem() {
+		return nil, fmt.Errorf("on-fail handler must have signature (context.Context, In, FlowFailure) error")
+	}
+	if fnType.In(2) != reflect.TypeOf(FlowFailure{}) {
+		return nil, fmt.Errorf("on-fail handler third parameter must be FlowFailure")
+	}
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	if fnType.NumOut() != 1 || !fnType.Out(0).Implements(errorType) {
+		return nil, fmt.Errorf("on-fail handler must return error")
+	}
+
+	inputType := fnType.In(1)
+
+	return func(ctx context.Context, inputJSON json.RawMessage, failure FlowFailure) error {
+		inputVal := reflect.New(inputType)
+		if err := json.Unmarshal(inputJSON, inputVal.Interface()); err != nil {
+			return fmt.Errorf("unmarshal input: %w", err)
+		}
+
+		results := fnVal.Call([]reflect.Value{
+			reflect.ValueOf(ctx),
+			inputVal.Elem(),
+			reflect.ValueOf(failure),
+		})
+
+		if !results[0].IsNil() {
+			return results[0].Interface().(error)
+		}
+
+		return nil
+	}, nil
 }
 
 type FlowInfo struct {

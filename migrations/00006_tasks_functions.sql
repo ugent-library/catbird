@@ -53,6 +53,12 @@ BEGIN
         input jsonb NOT NULL,
         output jsonb,
         error_message text,
+        on_fail_status text,
+        on_fail_attempts int NOT NULL DEFAULT 0,
+        on_fail_visible_at timestamptz,
+        on_fail_error_message text,
+        on_fail_started_at timestamptz,
+        on_fail_completed_at timestamptz,
         visible_at timestamptz NOT NULL DEFAULT now(),
         started_at timestamptz NOT NULL DEFAULT now(),
         completed_at timestamptz,
@@ -64,7 +70,8 @@ BEGIN
         CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
         CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
         CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
-        CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = '')))
+                CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = ''))),
+                CONSTRAINT on_fail_status_valid CHECK (on_fail_status IS NULL OR on_fail_status IN ('queued', 'started', 'completed', 'failed'))
       )
       $QUERY$,
       _t_table
@@ -341,7 +348,12 @@ BEGIN
       UPDATE %I t_r
       SET status = 'failed',
           failed_at = now(),
-          error_message = $2
+          error_message = $2,
+          on_fail_status = 'queued',
+          on_fail_visible_at = now(),
+          on_fail_error_message = NULL,
+          on_fail_started_at = NULL,
+          on_fail_completed_at = NULL
       WHERE t_r.id = $1
         AND t_r.status = 'started';
       $QUERY$,
@@ -349,6 +361,128 @@ BEGIN
     )
     USING cb_fail_task.id,
           cb_fail_task.error_message;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_poll_task_on_fail: Claim failed task runs for on-fail handling
+-- Parameters:
+--   name: Task name
+--   quantity: Number of failed task runs to claim (must be > 0)
+-- Returns: Task runs claimed for on-fail processing
+CREATE OR REPLACE FUNCTION cb_poll_task_on_fail(name text, quantity int)
+RETURNS TABLE(
+        id bigint,
+        input jsonb,
+        error_message text,
+        attempts int,
+        on_fail_attempts int,
+        started_at timestamptz,
+        failed_at timestamptz,
+        concurrency_key text,
+        idempotency_key text
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+        _t_table text := cb_table_name(cb_poll_task_on_fail.name, 't');
+BEGIN
+        IF cb_poll_task_on_fail.quantity <= 0 THEN
+                RAISE EXCEPTION 'cb: quantity must be greater than 0';
+        END IF;
+
+        RETURN QUERY EXECUTE format(
+            $QUERY$
+            WITH runs AS (
+                SELECT t.id
+                FROM %I t
+                WHERE t.status = 'failed'
+                    AND t.on_fail_status IN ('queued', 'failed')
+                    AND coalesce(t.on_fail_visible_at, clock_timestamp()) <= clock_timestamp()
+                ORDER BY t.id ASC
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE %I t
+            SET on_fail_status = 'started',
+                    on_fail_started_at = clock_timestamp(),
+                    on_fail_attempts = t.on_fail_attempts + 1
+            FROM runs
+            WHERE t.id = runs.id
+            RETURNING t.id,
+                                t.input,
+                                t.error_message,
+                                t.attempts,
+                                t.on_fail_attempts,
+                                t.started_at,
+                                t.failed_at,
+                                t.concurrency_key,
+                                t.idempotency_key
+            $QUERY$,
+            _t_table,
+            _t_table
+        )
+        USING cb_poll_task_on_fail.quantity;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_complete_task_on_fail: Mark on-fail handling as completed for a task run
+CREATE OR REPLACE FUNCTION cb_complete_task_on_fail(name text, id bigint)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+        _t_table text := cb_table_name(cb_complete_task_on_fail.name, 't');
+BEGIN
+        EXECUTE format(
+            $QUERY$
+            UPDATE %I
+            SET on_fail_status = 'completed',
+                    on_fail_completed_at = clock_timestamp(),
+                    on_fail_error_message = NULL
+            WHERE id = $1
+                AND on_fail_status = 'started'
+            $QUERY$,
+            _t_table
+        )
+        USING cb_complete_task_on_fail.id;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_fail_task_on_fail: Mark on-fail handling as failed and schedule retry
+CREATE OR REPLACE FUNCTION cb_fail_task_on_fail(
+        name text,
+        id bigint,
+        error_message text,
+        retry_exhausted boolean,
+        retry_delay_ms bigint
+)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+        _t_table text := cb_table_name(cb_fail_task_on_fail.name, 't');
+BEGIN
+        EXECUTE format(
+            $QUERY$
+            UPDATE %I
+            SET on_fail_status = 'failed',
+                    on_fail_error_message = $2,
+                    on_fail_visible_at = CASE
+                        WHEN $3 THEN 'infinity'::timestamptz
+                        ELSE clock_timestamp() + make_interval(secs => $4 / 1000.0)
+                    END
+            WHERE id = $1
+                AND on_fail_status = 'started'
+            $QUERY$,
+            _t_table
+        )
+        USING cb_fail_task_on_fail.id,
+                    cb_fail_task_on_fail.error_message,
+                    cb_fail_task_on_fail.retry_exhausted,
+                    cb_fail_task_on_fail.retry_delay_ms;
 END;
 $$;
 -- +goose statementend
@@ -475,6 +609,9 @@ $$;
 -- +goose statementend
 
 DROP FUNCTION IF EXISTS cb_delete_task(text);
+DROP FUNCTION IF EXISTS cb_fail_task_on_fail(text, bigint, text, boolean, bigint);
+DROP FUNCTION IF EXISTS cb_complete_task_on_fail(text, bigint);
+DROP FUNCTION IF EXISTS cb_poll_task_on_fail(text, int);
 DROP FUNCTION IF EXISTS cb_fail_task(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_task(text, bigint, jsonb);
 DROP FUNCTION IF EXISTS cb_wait_task_output(text, bigint, int, int);

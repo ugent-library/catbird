@@ -13,6 +13,14 @@ import (
 var (
 	// ErrRunFailed is returned when you try to unmarshal the output of a failed task or flow run
 	ErrRunFailed = fmt.Errorf("run failed")
+	// ErrUnknownStepOutput is returned when a requested step output is not present in completed outputs.
+	ErrUnknownStepOutput = fmt.Errorf("unknown step output")
+	// ErrNoFailedStepInput is returned when failed step input is not available.
+	ErrNoFailedStepInput = fmt.Errorf("failed step input not available")
+	// ErrNoFailedStepSignal is returned when failed step signal input is not available.
+	ErrNoFailedStepSignal = fmt.Errorf("failed step signal input not available")
+	// ErrInvalidDecodeTarget is returned when decode target is nil or not a pointer.
+	ErrInvalidDecodeTarget = fmt.Errorf("invalid decode target")
 )
 
 // Conn is an interface for database connections compatible with pgx.Conn and pgx.Pool

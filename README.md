@@ -197,6 +197,26 @@ var result EmailResponse
 err = handle.WaitForOutput(ctx, &result)
 ```
 
+## OnFail Handlers
+
+On-fail handlers run after a task reaches a failed state (after its own retries).
+They execute with their own `HandlerOpts` retry and backoff settings, and receive the
+original input plus rich failure context.
+
+```go
+task := catbird.NewTask("charge-payment").
+    Handler(func(ctx context.Context, input ChargeRequest) (ChargeResult, error) {
+        return ChargeResult{}, fmt.Errorf("gateway timeout")
+    }).
+    OnFail(func(ctx context.Context, input ChargeRequest, failure catbird.TaskFailure) error {
+        // Send alert, enqueue compensation, or record audit log.
+        return nil
+    }, catbird.HandlerOpts{
+        MaxRetries: 3,
+        Backoff:    catbird.NewFullJitterBackoff(200*time.Millisecond, 5*time.Second),
+    })
+```
+
 # Flow Execution
 
 A **flow** is a **directed acyclic graph (DAG)** of steps that execute when their dependencies are satisfied.
@@ -259,6 +279,33 @@ flow := catbird.NewFlow("order-processing").
 // Add flow
 worker.AddFlow(flow)
 go worker.Start(ctx)
+```
+
+## OnFail Handlers
+
+On-fail handlers run after a flow reaches a failed state (after its own retries).
+They execute with their own `HandlerOpts` retry and backoff settings, and receive the
+original input plus rich failure context.
+
+```go
+flow := catbird.NewFlow("order-processing").
+    AddStep(catbird.NewStep("charge").
+        Handler(func(ctx context.Context, order Order) (string, error) {
+            return "", fmt.Errorf("charge failed")
+        })).
+    OnFail(func(ctx context.Context, order Order, failure catbird.FlowFailure) error {
+        var failedInput Order
+        if err := failure.FailedStepInputAs(&failedInput); err == nil {
+            // failedInput has the step input that caused the error
+        }
+
+        var chargeResult ChargeResult
+        if err := failure.OutputAs("charge", &chargeResult); err == nil {
+            // access completed step output when available
+        }
+
+        return nil
+    })
 ```
 
 ## Example: Signals & Human-in-the-Loop

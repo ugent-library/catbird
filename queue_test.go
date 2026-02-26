@@ -2,6 +2,7 @@ package catbird
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -550,7 +551,7 @@ func TestQueueDelete(t *testing.T) {
 func TestQueueHide(t *testing.T) {
 	client := getTestClient(t)
 
-	queueName := "hide_queue"
+	queueName := fmt.Sprintf("hide_queue_%d", time.Now().UnixNano())
 	err := client.CreateQueue(t.Context(), queueName)
 	if err != nil {
 		t.Fatal(err)
@@ -590,7 +591,7 @@ func TestQueueHide(t *testing.T) {
 func TestQueueHideExpiry(t *testing.T) {
 	client := getTestClient(t)
 
-	queueName := "hide_expiry_queue"
+	queueName := fmt.Sprintf("hide_expiry_queue_%d", time.Now().UnixNano())
 	err := client.CreateQueue(t.Context(), queueName)
 	if err != nil {
 		t.Fatal(err)

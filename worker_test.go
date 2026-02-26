@@ -11,6 +11,21 @@ import (
 	"time"
 )
 
+type fixedBackoff struct {
+	delay time.Duration
+}
+
+func (b fixedBackoff) Validate() error {
+	if b.delay < 0 {
+		return fmt.Errorf("backoff delay cannot be negative")
+	}
+	return nil
+}
+
+func (b fixedBackoff) NextDelay(_ int) time.Duration {
+	return b.delay
+}
+
 func TestWorkerShutdownImmediateWhenNoTimeout(t *testing.T) {
 	t.Helper()
 
@@ -266,4 +281,473 @@ func TestTaskRetriesIntegration(t *testing.T) {
 			t.Fatalf("attempt %d: observed delay %v is less than expected jitter %v (with slack %v)", i, obs, jitter, slack)
 		}
 	}
+}
+
+func TestTaskOnFailIntegration(t *testing.T) {
+	client := getTestClient(t)
+
+	type Input struct {
+		OrderID string `json:"order_id"`
+	}
+
+	onFailCalled := make(chan TaskFailure, 1)
+
+	task := NewTask("task_on_fail").
+		Handler(func(_ context.Context, _ Input) (string, error) {
+			return "", fmt.Errorf("boom")
+		}, HandlerOpts{
+			Concurrency: 1,
+			BatchSize:   10,
+			MaxRetries:  0,
+		}).
+		OnFail(func(_ context.Context, in Input, failure TaskFailure) error {
+			if in.OrderID != "ord-1" {
+				return fmt.Errorf("unexpected input in on-fail: %+v", in)
+			}
+			onFailCalled <- failure
+			return nil
+		}, HandlerOpts{
+			Concurrency: 1,
+			BatchSize:   10,
+			MaxRetries:  0,
+		})
+
+	worker := client.NewWorker(t.Context()).AddTask(task)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunTask(t.Context(), "task_on_fail", Input{OrderID: "ord-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var out string
+	err = h.WaitForOutput(ctx, &out)
+	if err == nil {
+		t.Fatal("expected task to fail")
+	}
+
+	select {
+	case f := <-onFailCalled:
+		if f.TaskRunID <= 0 {
+			t.Fatalf("expected TaskRunID > 0, got %d", f.TaskRunID)
+		}
+		if f.TaskName != "task_on_fail" {
+			t.Fatalf("unexpected task name: %s", f.TaskName)
+		}
+		if f.ErrorMessage == "" {
+			t.Fatal("expected error message in task failure")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for task on-fail handler")
+	}
+}
+
+func TestTaskOnFailRetries(t *testing.T) {
+	client := getTestClient(t)
+
+	type Input struct {
+		OrderID string `json:"order_id"`
+	}
+
+	onFailCalled := make(chan TaskFailure, 1)
+	var attempts int32
+	var mu sync.Mutex
+	var seenAttempts []int
+
+	task := NewTask("task_on_fail_retry").
+		Handler(func(_ context.Context, _ Input) (string, error) {
+			return "", fmt.Errorf("boom")
+		}, HandlerOpts{
+			Concurrency: 1,
+			BatchSize:   10,
+			MaxRetries:  0,
+		}).
+		OnFail(func(_ context.Context, _ Input, failure TaskFailure) error {
+			attempt := int(atomic.AddInt32(&attempts, 1))
+			mu.Lock()
+			seenAttempts = append(seenAttempts, failure.OnFailAttempts)
+			mu.Unlock()
+			if attempt == 1 {
+				return fmt.Errorf("retry me")
+			}
+			onFailCalled <- failure
+			return nil
+		}, HandlerOpts{
+			Concurrency: 1,
+			BatchSize:   10,
+			MaxRetries:  1,
+			Backoff:     fixedBackoff{delay: 10 * time.Millisecond},
+		})
+
+	worker := client.NewWorker(t.Context()).AddTask(task)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunTask(t.Context(), "task_on_fail_retry", Input{OrderID: "ord-retry"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var out string
+	err = h.WaitForOutput(ctx, &out)
+	if err == nil {
+		t.Fatal("expected task to fail")
+	}
+
+	select {
+	case <-onFailCalled:
+		if atomic.LoadInt32(&attempts) != 2 {
+			t.Fatalf("expected 2 on-fail attempts, got %d", attempts)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(seenAttempts) != 2 {
+			t.Fatalf("expected 2 attempt values, got %d", len(seenAttempts))
+		}
+		if seenAttempts[0] != 1 || seenAttempts[1] != 2 {
+			t.Fatalf("unexpected attempt sequence: %v", seenAttempts)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for task on-fail retry")
+	}
+}
+
+func TestTaskOnFailMaxRetriesExhausted(t *testing.T) {
+	client := getTestClient(t)
+
+	type Input struct {
+		OrderID string `json:"order_id"`
+	}
+
+	onFailCalled := make(chan TaskFailure, 2)
+	var attempts int32
+
+	task := NewTask("task_on_fail_exhausted").
+		Handler(func(_ context.Context, _ Input) (string, error) {
+			return "", fmt.Errorf("boom")
+		}, HandlerOpts{
+			Concurrency: 1,
+			BatchSize:   10,
+			MaxRetries:  0,
+		}).
+		OnFail(func(_ context.Context, _ Input, _ TaskFailure) error {
+			atomic.AddInt32(&attempts, 1)
+			onFailCalled <- TaskFailure{}
+			return fmt.Errorf("still failing")
+		}, HandlerOpts{
+			Concurrency: 1,
+			BatchSize:   10,
+			MaxRetries:  0,
+		})
+
+	worker := client.NewWorker(t.Context()).AddTask(task)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunTask(t.Context(), "task_on_fail_exhausted", Input{OrderID: "ord-exhaust"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var out string
+	err = h.WaitForOutput(ctx, &out)
+	if err == nil {
+		t.Fatal("expected task to fail")
+	}
+
+	select {
+	case <-onFailCalled:
+		// First on-fail call captured.
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for task on-fail handler")
+	}
+
+	select {
+	case <-onFailCalled:
+		t.Fatal("unexpected on-fail retry after max retries exhausted")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	if atomic.LoadInt32(&attempts) != 1 {
+		t.Fatalf("expected 1 on-fail attempt, got %d", attempts)
+	}
+}
+
+func TestFlowOnFailIntegration(t *testing.T) {
+	client := getTestClient(t)
+
+	type Input struct {
+		OrderID string `json:"order_id"`
+	}
+
+	onFailCalled := make(chan FlowFailure, 1)
+
+	flow := NewFlow("flow_on_fail").
+		AddStep(NewStep("step1").
+			Handler(func(_ context.Context, _ Input) (string, error) {
+				return "", fmt.Errorf("step failed")
+			}, HandlerOpts{
+				Concurrency: 1,
+				BatchSize:   10,
+				MaxRetries:  0,
+			})).
+		OnFail(func(_ context.Context, in Input, failure FlowFailure) error {
+			if in.OrderID != "ord-2" {
+				return fmt.Errorf("unexpected flow input in on-fail: %+v", in)
+			}
+			onFailCalled <- failure
+			return nil
+		}, HandlerOpts{
+			Concurrency: 1,
+			BatchSize:   10,
+			MaxRetries:  0,
+		})
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), "flow_on_fail", Input{OrderID: "ord-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var out string
+	err = h.WaitForOutput(ctx, &out)
+	if err == nil {
+		t.Fatal("expected flow to fail")
+	}
+
+	select {
+	case f := <-onFailCalled:
+		if f.FlowRunID <= 0 {
+			t.Fatalf("expected FlowRunID > 0, got %d", f.FlowRunID)
+		}
+		if f.FlowName != "flow_on_fail" {
+			t.Fatalf("unexpected flow name: %s", f.FlowName)
+		}
+		if f.FailedStepName != "step1" {
+			t.Fatalf("unexpected failed step name: %s", f.FailedStepName)
+		}
+		if f.ErrorMessage == "" {
+			t.Fatal("expected error message in flow failure")
+		}
+		var decoded Input
+		if err := f.FailedStepInputAs(&decoded); err != nil {
+			t.Fatalf("expected failed step input to decode: %v", err)
+		}
+		if decoded.OrderID != "ord-2" {
+			t.Fatalf("unexpected failed step input: %+v", decoded)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for flow on-fail handler")
+	}
+}
+
+func TestFlowOnFailMapStepInputIntegration(t *testing.T) {
+	client := getTestClient(t)
+
+	type Item struct {
+		ID int `json:"id"`
+	}
+
+	onFailCalled := make(chan FlowFailure, 1)
+
+	flow := NewFlow("flow_on_fail_map_input").
+		AddStep(NewStep("map_fail").
+			MapInput().
+			Handler(func(_ context.Context, in Item) (string, error) {
+				return "", fmt.Errorf("map item failed: %d", in.ID)
+			}, HandlerOpts{
+				Concurrency: 1,
+				BatchSize:   10,
+				MaxRetries:  0,
+			})).
+		OnFail(func(_ context.Context, in []Item, failure FlowFailure) error {
+			onFailCalled <- failure
+			if len(in) != 2 {
+				return fmt.Errorf("unexpected flow input size: %d", len(in))
+			}
+			return nil
+		}, HandlerOpts{
+			Concurrency: 1,
+			BatchSize:   10,
+			MaxRetries:  0,
+		})
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), "flow_on_fail_map_input", []Item{{ID: 10}, {ID: 20}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var out string
+	err = h.WaitForOutput(ctx, &out)
+	if err == nil {
+		t.Fatal("expected flow to fail")
+	}
+
+	select {
+	case f := <-onFailCalled:
+		if f.FailedStepName != "map_fail" {
+			t.Fatalf("unexpected failed step name: %s", f.FailedStepName)
+		}
+		var item Item
+		if err := f.FailedStepInputAs(&item); err != nil {
+			t.Fatalf("expected failed map item input to decode: %v", err)
+		}
+		if item.ID != 10 {
+			t.Fatalf("unexpected failed map item input: %+v", item)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for flow on-fail handler")
+	}
+}
+
+func TestWorkerValidatesTaskHandlerOpts(t *testing.T) {
+	client := getTestClient(t)
+
+	// Test invalid concurrency
+	t.Run("negative_concurrency", func(t *testing.T) {
+		task := NewTask("invalid_task").Handler(func(_ context.Context, _ any) (any, error) {
+			return nil, nil
+		}, HandlerOpts{
+			Concurrency: -1,
+			BatchSize:   10,
+		})
+
+		worker := client.NewWorker(t.Context()).AddTask(task)
+		err := worker.Start(t.Context())
+		if err == nil {
+			t.Fatal("expected error for negative concurrency")
+		}
+		if err.Error() != `task "invalid_task" has invalid handler options: concurrency must be greater than zero` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	// Test invalid batch size
+	t.Run("negative_batch_size", func(t *testing.T) {
+		task := NewTask("invalid_task2").Handler(func(_ context.Context, _ any) (any, error) {
+			return nil, nil
+		}, HandlerOpts{
+			Concurrency: 1,
+			BatchSize:   -1,
+		})
+
+		worker := client.NewWorker(t.Context()).AddTask(task)
+		err := worker.Start(t.Context())
+		if err == nil {
+			t.Fatal("expected error for negative batch size")
+		}
+		if err.Error() != `task "invalid_task2" has invalid handler options: batch size must be greater than zero` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	// Test invalid backoff config
+	t.Run("invalid_backoff", func(t *testing.T) {
+		task := NewTask("invalid_task3").Handler(func(_ context.Context, _ any) (any, error) {
+			return nil, nil
+		}, HandlerOpts{
+			Concurrency: 1,
+			BatchSize:   10,
+			MaxRetries:  3,
+			Backoff:     NewFullJitterBackoff(time.Second, 500*time.Millisecond), // MaxDelay < MinDelay
+		})
+
+		worker := client.NewWorker(t.Context()).AddTask(task)
+		err := worker.Start(t.Context())
+		if err == nil {
+			t.Fatal("expected error for invalid backoff")
+		}
+		if err.Error() != `task "invalid_task3" has invalid handler options: backoff maximum delay must be greater than minimum delay` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestWorkerValidatesFlowStepHandlerOpts(t *testing.T) {
+	client := getTestClient(t)
+
+	// Test invalid concurrency in flow step
+	t.Run("negative_concurrency", func(t *testing.T) {
+		flow := NewFlow("invalid_flow").
+			AddStep(NewStep("step1").Handler(func(_ context.Context, _ any) (any, error) {
+				return nil, nil
+			}, HandlerOpts{
+				Concurrency: -1,
+				BatchSize:   10,
+			}))
+
+		worker := client.NewWorker(t.Context()).AddFlow(flow)
+		err := worker.Start(t.Context())
+		if err == nil {
+			t.Fatal("expected error for negative concurrency")
+		}
+		if err.Error() != `flow "invalid_flow" step "step1" has invalid handler options: concurrency must be greater than zero` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	// Test invalid batch size in flow step
+	t.Run("negative_batch_size", func(t *testing.T) {
+		flow := NewFlow("invalid_flow2").
+			AddStep(NewStep("step1").Handler(func(_ context.Context, _ any) (any, error) {
+				return nil, nil
+			}, HandlerOpts{
+				Concurrency: 1,
+				BatchSize:   -5, // Negative value
+			}))
+
+		worker := client.NewWorker(t.Context()).AddFlow(flow)
+		err := worker.Start(t.Context())
+		if err == nil {
+			t.Fatal("expected error for negative batch size")
+		}
+		if err.Error() != `flow "invalid_flow2" step "step1" has invalid handler options: batch size must be greater than zero` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	// Test invalid circuit breaker config in flow step
+	t.Run("invalid_circuit_breaker", func(t *testing.T) {
+		flow := NewFlow("invalid_flow3").
+			AddStep(NewStep("step1").Handler(func(_ context.Context, _ any) (any, error) {
+				return nil, nil
+			}, HandlerOpts{
+				Concurrency:    1,
+				BatchSize:      10,
+				CircuitBreaker: &CircuitBreaker{failureThreshold: 0}, // Invalid threshold
+			}))
+
+		worker := client.NewWorker(t.Context()).AddFlow(flow)
+		err := worker.Start(t.Context())
+		if err == nil {
+			t.Fatal("expected error for invalid circuit breaker")
+		}
+		// Should contain validation error for circuit breaker
+		if err.Error() != `flow "invalid_flow3" step "step1" has invalid handler options: circuit breaker failure threshold must be greater than zero` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
 }

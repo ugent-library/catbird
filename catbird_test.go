@@ -62,17 +62,17 @@ func startTestWorker(t *testing.T, worker *Worker) {
 	})
 }
 
-// requireSlowTests skips tests unless CATBIRD_SLOW_TESTS is enabled.
-// Set CATBIRD_SLOW_TESTS=1 (or true/yes) to run long-running stress/concurrency tests.
+// requireSlowTests skips tests unless CB_SLOW_TESTS is enabled.
+// Set CB_SLOW_TESTS=1 (or true/yes) to run long-running stress/concurrency tests.
 func requireSlowTests(t *testing.T) {
 	t.Helper()
 
-	v := strings.TrimSpace(strings.ToLower(os.Getenv("CATBIRD_SLOW_TESTS")))
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("CB_SLOW_TESTS")))
 	if v == "1" || v == "true" || v == "yes" {
 		return
 	}
 
-	t.Skip("slow test skipped; set CATBIRD_SLOW_TESTS=1 to include")
+	t.Skip("slow test skipped; set CB_SLOW_TESTS=1 to include")
 }
 
 // Hardcoded test database connection
