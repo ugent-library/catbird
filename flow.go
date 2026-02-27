@@ -122,6 +122,17 @@ type Step struct {
 	name                 string
 	dependencies         []string
 	optionalDependencies map[string]bool // tracks which dependencies are Optional[T]
+	isGenerator          bool
+	generatorFn          any
+	generatorHandler     any
+	generatorDepType     reflect.Type
+	generatorItemType    reflect.Type
+	generatorOutputType  reflect.Type
+	outputType           reflect.Type
+	reducerFn            any
+	reducerInit          []byte
+	reducerAcc           reflect.Type
+	reducerItem          reflect.Type
 	isMapStep            bool
 	mapSource            string
 	condition            string
@@ -135,6 +146,12 @@ func NewStep(name string) *Step {
 		name:                 name,
 		optionalDependencies: make(map[string]bool),
 	}
+}
+
+func NewGeneratorStep(name string) *Step {
+	s := NewStep(name)
+	s.isGenerator = true
+	return s
 }
 
 func (s *Step) DependsOn(deps ...string) *Step {
@@ -153,6 +170,9 @@ func (s *Step) Signal() *Step {
 }
 
 func (s *Step) MapInput() *Step {
+	if s.isGenerator {
+		panic(fmt.Sprintf("step %s: generator steps do not support MapInput()", s.name))
+	}
 	if s.isMapStep && s.mapSource != "" {
 		panic(fmt.Sprintf("step %s: map source already set to %q", s.name, s.mapSource))
 	}
@@ -162,6 +182,9 @@ func (s *Step) MapInput() *Step {
 }
 
 func (s *Step) Map(stepName string) *Step {
+	if s.isGenerator {
+		panic(fmt.Sprintf("step %s: generator steps do not support Map()", s.name))
+	}
 	if strings.TrimSpace(stepName) == "" {
 		panic(fmt.Sprintf("step %s: map source step name must not be empty", s.name))
 	}
@@ -179,7 +202,69 @@ func (s *Step) Map(stepName string) *Step {
 	return s
 }
 
+func (s *Step) Generator(fn any) *Step {
+	if !s.isGenerator {
+		panic(fmt.Sprintf("step %s: Generator() is only valid for NewGeneratorStep", s.name))
+	}
+
+	depType, itemType, err := parseGeneratorFn(fn, s.name)
+	if err != nil {
+		panic(err)
+	}
+
+	s.generatorFn = fn
+	s.generatorDepType = depType
+	s.generatorItemType = itemType
+
+	if s.generatorHandler != nil {
+		handlerItemType, handlerOutputType, handlerErr := parseGeneratorHandlerFn(s.generatorHandler, s.name)
+		if handlerErr != nil {
+			panic(handlerErr)
+		}
+		if handlerItemType != itemType {
+			panic(fmt.Sprintf("step %s: generator item type %v does not match handler item type %v", s.name, itemType, handlerItemType))
+		}
+		s.generatorOutputType = handlerOutputType
+		s.outputType = handlerOutputType
+		if s.reducerFn != nil && s.reducerItem != handlerOutputType {
+			panic(fmt.Sprintf("step %s: reducer item type %v does not match handler output type %v", s.name, s.reducerItem, handlerOutputType))
+		}
+	}
+
+	return s
+}
+
 func (s *Step) Handler(fn any, opts ...HandlerOpts) *Step {
+	if s.isGenerator {
+		itemType, outputType, err := parseGeneratorHandlerFn(fn, s.name)
+		if err != nil {
+			panic(err)
+		}
+		s.generatorHandler = fn
+		s.generatorOutputType = outputType
+		s.outputType = outputType
+		if s.generatorFn != nil && s.generatorItemType != nil && s.generatorItemType != itemType {
+			panic(fmt.Sprintf("step %s: generator item type %v does not match handler item type %v", s.name, s.generatorItemType, itemType))
+		}
+		if s.reducerFn != nil && s.reducerItem != outputType {
+			panic(fmt.Sprintf("step %s: reducer item type %v does not match handler output type %v", s.name, s.reducerItem, outputType))
+		}
+		s.handlerOpts = applyDefaultHandlerOpts(opts...)
+		return s
+	}
+
+	fnType := reflect.TypeOf(fn)
+	if fnType == nil || fnType.Kind() != reflect.Func {
+		panic(fmt.Sprintf("step %s: handler must be a function", s.name))
+	}
+	if fnType.NumOut() != 2 || !fnType.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+		panic(fmt.Sprintf("step %s: handler must return (Out, error)", s.name))
+	}
+	s.outputType = fnType.Out(0)
+	if s.reducerFn != nil && s.reducerItem != s.outputType {
+		panic(fmt.Sprintf("step %s: reducer item type %v does not match handler output type %v", s.name, s.reducerItem, s.outputType))
+	}
+
 	handler, optionalDeps, err := makeStepHandler(fn, s.name, s.dependencies, s.hasSignal, s.isMapStep, s.mapSource)
 	if err != nil {
 		panic(err)
@@ -188,6 +273,174 @@ func (s *Step) Handler(fn any, opts ...HandlerOpts) *Step {
 	s.optionalDependencies = optionalDeps
 	s.handlerOpts = applyDefaultHandlerOpts(opts...)
 	return s
+}
+
+func (s *Step) Reduce(initial any, fn any) *Step {
+	if !s.isGenerator && !s.isMapStep {
+		panic(fmt.Sprintf("step %s: Reduce() is only valid for generator or map steps", s.name))
+	}
+
+	accType, itemType, err := parseGeneratorReducerFn(fn, s.name)
+	if err != nil {
+		panic(err)
+	}
+
+	if initial == nil {
+		panic(fmt.Sprintf("step %s: reducer initial value must not be nil", s.name))
+	}
+
+	initType := reflect.TypeOf(initial)
+	if !initType.AssignableTo(accType) {
+		panic(fmt.Sprintf("step %s: reducer initial type %v is not assignable to accumulator type %v", s.name, initType, accType))
+	}
+
+	initJSON, err := json.Marshal(initial)
+	if err != nil {
+		panic(fmt.Sprintf("step %s: reducer initial value is not JSON serializable: %v", s.name, err))
+	}
+
+	s.reducerFn = fn
+	s.reducerInit = initJSON
+	s.reducerAcc = accType
+	s.reducerItem = itemType
+
+	if s.outputType != nil && s.outputType != itemType {
+		panic(fmt.Sprintf("step %s: reducer item type %v does not match handler output type %v", s.name, itemType, s.outputType))
+	}
+
+	return s
+}
+
+func parseGeneratorFn(fn any, stepName string) (reflect.Type, reflect.Type, error) {
+	fnType := reflect.TypeOf(fn)
+	if fnType == nil || fnType.Kind() != reflect.Func {
+		return nil, nil, fmt.Errorf("step %s: generator must be a function", stepName)
+	}
+
+	if fnType.NumIn() < 3 {
+		return nil, nil, fmt.Errorf("step %s: generator must have signature func(context.Context, In, ..., func(ItemType) error) error", stepName)
+	}
+
+	if fnType.In(0) != reflect.TypeOf((*context.Context)(nil)).Elem() {
+		return nil, nil, fmt.Errorf("step %s: generator first parameter must be context.Context", stepName)
+	}
+
+	yieldType := fnType.In(fnType.NumIn() - 1)
+	if yieldType.Kind() != reflect.Func || yieldType.NumIn() != 1 || yieldType.IsVariadic() {
+		return nil, nil, fmt.Errorf("step %s: generator last parameter must be func(ItemType) error", stepName)
+	}
+
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	if yieldType.NumOut() != 1 || !yieldType.Out(0).Implements(errorType) {
+		return nil, nil, fmt.Errorf("step %s: generator yield function must return error", stepName)
+	}
+
+	if fnType.NumOut() != 1 || !fnType.Out(0).Implements(errorType) {
+		return nil, nil, fmt.Errorf("step %s: generator must return error", stepName)
+	}
+
+	return fnType.In(1), yieldType.In(0), nil
+}
+
+func validateGeneratorFnForStep(step *Step, flowName string) error {
+	fnType := reflect.TypeOf(step.generatorFn)
+	if fnType == nil || fnType.Kind() != reflect.Func {
+		return fmt.Errorf("flow %q: step %q generator must be a function", flowName, step.name)
+	}
+
+	expectedInputs := 2 + len(step.dependencies) + 1 // context + flow input + dependencies + yield
+	if step.hasSignal {
+		expectedInputs++ // signal between flow input and dependencies
+	}
+
+	if fnType.NumIn() != expectedInputs {
+		return fmt.Errorf("flow %q: step %q generator must have signature func(context.Context, In%s%s, func(Item) error) error, got %d inputs",
+			flowName,
+			step.name,
+			func() string {
+				if step.hasSignal {
+					return ", Signal"
+				}
+				return ""
+			}(),
+			func() string {
+				if len(step.dependencies) > 0 {
+					return fmt.Sprintf(", %d dependencies", len(step.dependencies))
+				}
+				return ""
+			}(),
+			fnType.NumIn(),
+		)
+	}
+
+	if fnType.In(0) != reflect.TypeOf((*context.Context)(nil)).Elem() {
+		return fmt.Errorf("flow %q: step %q generator first parameter must be context.Context", flowName, step.name)
+	}
+
+	yieldType := fnType.In(fnType.NumIn() - 1)
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	if yieldType.Kind() != reflect.Func || yieldType.NumIn() != 1 || yieldType.IsVariadic() || yieldType.NumOut() != 1 || !yieldType.Out(0).Implements(errorType) {
+		return fmt.Errorf("flow %q: step %q generator last parameter must be func(ItemType) error", flowName, step.name)
+	}
+
+	if step.generatorItemType != nil && yieldType.In(0) != step.generatorItemType {
+		return fmt.Errorf("flow %q: step %q generator yield item type %v does not match handler item type %v", flowName, step.name, yieldType.In(0), step.generatorItemType)
+	}
+
+	if fnType.NumOut() != 1 || !fnType.Out(0).Implements(errorType) {
+		return fmt.Errorf("flow %q: step %q generator must return error", flowName, step.name)
+	}
+
+	return nil
+}
+
+func parseGeneratorHandlerFn(fn any, stepName string) (reflect.Type, reflect.Type, error) {
+	fnType := reflect.TypeOf(fn)
+	if fnType == nil || fnType.Kind() != reflect.Func {
+		return nil, nil, fmt.Errorf("step %s: generator handler must be a function", stepName)
+	}
+
+	if fnType.NumIn() != 2 {
+		return nil, nil, fmt.Errorf("step %s: generator handler must have signature func(context.Context, ItemType) (Out, error)", stepName)
+	}
+
+	if fnType.In(0) != reflect.TypeOf((*context.Context)(nil)).Elem() {
+		return nil, nil, fmt.Errorf("step %s: generator handler first parameter must be context.Context", stepName)
+	}
+
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	if fnType.NumOut() != 2 || !fnType.Out(1).Implements(errorType) {
+		return nil, nil, fmt.Errorf("step %s: generator handler must return (Out, error)", stepName)
+	}
+
+	return fnType.In(1), fnType.Out(0), nil
+}
+
+func parseGeneratorReducerFn(fn any, stepName string) (reflect.Type, reflect.Type, error) {
+	fnType := reflect.TypeOf(fn)
+	if fnType == nil || fnType.Kind() != reflect.Func {
+		return nil, nil, fmt.Errorf("step %s: reducer must be a function", stepName)
+	}
+
+	if fnType.NumIn() != 3 {
+		return nil, nil, fmt.Errorf("step %s: reducer must have signature func(context.Context, Acc, ItemOut) (Acc, error)", stepName)
+	}
+
+	if fnType.In(0) != reflect.TypeOf((*context.Context)(nil)).Elem() {
+		return nil, nil, fmt.Errorf("step %s: reducer first parameter must be context.Context", stepName)
+	}
+
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	if fnType.NumOut() != 2 || !fnType.Out(1).Implements(errorType) {
+		return nil, nil, fmt.Errorf("step %s: reducer must return (Acc, error)", stepName)
+	}
+
+	accType := fnType.In(1)
+	if fnType.Out(0) != accType {
+		return nil, nil, fmt.Errorf("step %s: reducer output accumulator type %v must match input accumulator type %v", stepName, fnType.Out(0), accType)
+	}
+
+	return accType, fnType.In(2), nil
 }
 
 // makeStepHandler uses reflection once to extract types and create cached wrapper for step handlers.
@@ -479,11 +732,12 @@ type FlowScheduleInfo struct {
 }
 
 type StepInfo struct {
-	Name      string               `json:"name"`
-	IsMapStep bool                 `json:"is_map_step,omitempty"`
-	MapSource string               `json:"map_source,omitempty"`
-	HasSignal bool                 `json:"has_signal,omitempty"`
-	DependsOn []StepDependencyInfo `json:"depends_on,omitempty"`
+	Name        string               `json:"name"`
+	IsGenerator bool                 `json:"is_generator,omitempty"`
+	IsMapStep   bool                 `json:"is_map_step,omitempty"`
+	MapSource   string               `json:"map_source,omitempty"`
+	HasSignal   bool                 `json:"has_signal,omitempty"`
+	DependsOn   []StepDependencyInfo `json:"depends_on,omitempty"`
 }
 
 type StepDependencyInfo struct {
@@ -510,6 +764,29 @@ func validateFlowDependencies(flow *Flow) error {
 	}
 
 	for _, step := range steps {
+		if step.isGenerator {
+			if step.isMapStep {
+				return fmt.Errorf("flow %q: step %q generator steps cannot use map mode", flow.name, step.name)
+			}
+			if step.generatorFn == nil {
+				return fmt.Errorf("flow %q: step %q generator step is missing Generator(fn)", flow.name, step.name)
+			}
+			if step.generatorHandler == nil {
+				return fmt.Errorf("flow %q: step %q generator step is missing Handler(fn)", flow.name, step.name)
+			}
+			if step.reducerFn != nil {
+				if step.reducerAcc == nil || len(step.reducerInit) == 0 || step.reducerItem == nil {
+					return fmt.Errorf("flow %q: step %q generator reducer is invalid", flow.name, step.name)
+				}
+				if step.outputType != nil && step.outputType != step.reducerItem {
+					return fmt.Errorf("flow %q: step %q reducer item type %v does not match handler output type %v", flow.name, step.name, step.reducerItem, step.outputType)
+				}
+			}
+			if err := validateGeneratorFnForStep(&step, flow.name); err != nil {
+				return err
+			}
+		}
+
 		if !step.isMapStep {
 			continue
 		}
@@ -539,6 +816,15 @@ func validateFlowDependencies(flow *Flow) error {
 
 		if step.optionalDependencies[step.mapSource] {
 			return fmt.Errorf("flow %q: step %q cannot map optional dependency %q", flow.name, step.name, step.mapSource)
+		}
+
+		if step.reducerFn != nil {
+			if step.reducerAcc == nil || len(step.reducerInit) == 0 || step.reducerItem == nil {
+				return fmt.Errorf("flow %q: step %q map reducer is invalid", flow.name, step.name)
+			}
+			if step.outputType != nil && step.outputType != step.reducerItem {
+				return fmt.Errorf("flow %q: step %q reducer item type %v does not match handler output type %v", flow.name, step.name, step.reducerItem, step.outputType)
+			}
 		}
 	}
 
@@ -616,12 +902,13 @@ func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 			Name string `json:"name"`
 		}
 		type serializableStep struct {
-			Name      string            `json:"name"`
-			Condition string            `json:"condition,omitempty"`
-			IsMapStep bool              `json:"is_map_step,omitempty"`
-			MapSource string            `json:"map_source,omitempty"`
-			HasSignal bool              `json:"has_signal"`
-			DependsOn []*stepDependency `json:"depends_on,omitempty"`
+			Name        string            `json:"name"`
+			Condition   string            `json:"condition,omitempty"`
+			IsGenerator bool              `json:"is_generator,omitempty"`
+			IsMapStep   bool              `json:"is_map_step,omitempty"`
+			MapSource   string            `json:"map_source,omitempty"`
+			HasSignal   bool              `json:"has_signal"`
+			DependsOn   []*stepDependency `json:"depends_on,omitempty"`
 		}
 
 		steps := flow.steps
@@ -635,11 +922,12 @@ func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 			}
 
 			serStep := serializableStep{
-				Name:      s.name,
-				IsMapStep: s.isMapStep,
-				MapSource: s.mapSource,
-				HasSignal: s.hasSignal,
-				DependsOn: deps,
+				Name:        s.name,
+				IsGenerator: s.isGenerator,
+				IsMapStep:   s.isMapStep,
+				MapSource:   s.mapSource,
+				HasSignal:   s.hasSignal,
+				DependsOn:   deps,
 			}
 			serStep.Condition = s.condition
 			serSteps[i] = serStep

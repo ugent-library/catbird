@@ -358,6 +358,58 @@ func TestFlowMapMetadataInInfo(t *testing.T) {
 	}
 }
 
+func TestMapStepReducerTypeMismatchPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic for map reducer item type mismatch")
+		}
+	}()
+
+	_ = NewStep("mapped").
+		MapInput().
+		Handler(func(ctx context.Context, n int) (int, error) {
+			return n * 2, nil
+		}).
+		Reduce(0, func(ctx context.Context, acc int, item string) (int, error) {
+			return acc, nil
+		})
+}
+
+func TestFlowMapStepReducerRuntime(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "map_reduce_runtime")
+
+	flow := NewFlow(flowName).
+		AddStep(NewStep("double").
+			MapInput().
+			Handler(func(ctx context.Context, n int) (int, error) {
+				return n * 2, nil
+			}).
+			Reduce(0, func(ctx context.Context, acc int, out int) (int, error) {
+				return acc + out, nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(120 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, []int{1, 2, 3, 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out int
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatalf("wait for map reduced flow output failed: %v", err)
+	}
+
+	if out != 20 {
+		t.Fatalf("unexpected map reduced flow output: got %d, want %d", out, 20)
+	}
+}
+
 func TestFlowMapSourceMustExist(t *testing.T) {
 	client := getTestClient(t)
 	flowName := testFlowName(t, "map_missing_source")
@@ -665,6 +717,326 @@ func TestStepMapModeConflictPanics(t *testing.T) {
 	}()
 
 	_ = NewStep("conflict").MapInput().Map("numbers")
+}
+
+func TestGeneratorStepYieldFunctionAccepted(t *testing.T) {
+	step := NewGeneratorStep("discover").
+		DependsOn("seed").
+		Generator(func(ctx context.Context, in string, seed string, yield func(int) error) error {
+			return yield(len(seed))
+		}).
+		Handler(func(ctx context.Context, item int) (string, error) {
+			return fmt.Sprintf("%d", item), nil
+		})
+
+	if !step.isGenerator {
+		t.Fatalf("expected step to be generator")
+	}
+	if step.generatorFn == nil {
+		t.Fatalf("expected generator function to be set")
+	}
+	if step.generatorHandler == nil {
+		t.Fatalf("expected generator handler to be set")
+	}
+
+	flow := NewFlow("generator_validate_ok").
+		AddStep(NewStep("seed").Handler(func(ctx context.Context, in string) (string, error) { return in, nil })).
+		AddStep(step)
+
+	if err := validateFlowDependencies(flow); err != nil {
+		t.Fatalf("expected valid generator flow, got error: %v", err)
+	}
+}
+
+func TestGeneratorStepChannelYieldRejected(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic for channel-based generator yield")
+		}
+	}()
+
+	_ = NewGeneratorStep("discover").
+		DependsOn("seed").
+		Generator(func(ctx context.Context, seed string, yield chan<- int) error {
+			return nil
+		})
+}
+
+func TestGeneratorStepReducerTypeMismatchPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic for reducer item type mismatch")
+		}
+	}()
+
+	_ = NewGeneratorStep("discover").
+		Generator(func(ctx context.Context, in int, yield func(int) error) error {
+			return nil
+		}).
+		Handler(func(ctx context.Context, item int) (int, error) {
+			return item, nil
+		}).
+		Reduce(0, func(ctx context.Context, acc int, item string) (int, error) {
+			return acc, nil
+		})
+}
+
+func TestFlowGeneratorStepRuntime(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "generator_runtime")
+
+	flow := NewFlow(flowName).
+		AddStep(NewStep("seed").Handler(func(ctx context.Context, in int) (int, error) {
+			return in, nil
+		})).
+		AddStep(NewGeneratorStep("generate").
+			DependsOn("seed").
+			Generator(func(ctx context.Context, in int, seed int, yield func(int) error) error {
+				for i := 0; i < seed; i++ {
+					if err := yield(i); err != nil {
+						return err
+					}
+				}
+				return nil
+			}).
+			Handler(func(ctx context.Context, item int) (int, error) {
+				return item * 2, nil
+			})).
+		AddStep(NewStep("sum").
+			DependsOn("generate").
+			Handler(func(ctx context.Context, in int, generated []int) (int, error) {
+				total := 0
+				for _, v := range generated {
+					total += v
+				}
+				return total, nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(120 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out int
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatalf("wait for generator flow output failed: %v", err)
+	}
+
+	if out != 20 {
+		t.Fatalf("unexpected generator flow output: got %d, want %d", out, 20)
+	}
+}
+
+func TestFlowGeneratorStepFailure(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "generator_failure")
+
+	flow := NewFlow(flowName).
+		AddStep(NewStep("seed").Handler(func(ctx context.Context, in int) (int, error) {
+			return in, nil
+		})).
+		AddStep(NewGeneratorStep("generate").
+			DependsOn("seed").
+			Generator(func(ctx context.Context, in int, seed int, yield func(int) error) error {
+				for i := 0; i < seed; i++ {
+					if err := yield(i); err != nil {
+						return err
+					}
+					if i == 1 {
+						return fmt.Errorf("generator stopped at %d", i)
+					}
+				}
+				return nil
+			}).
+			Handler(func(ctx context.Context, item int) (int, error) {
+				return item * 2, nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(120 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out []int
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+	err = h.WaitForOutput(ctx, &out)
+	if err == nil {
+		t.Fatalf("expected generator flow to fail")
+	}
+
+	runInfo, err := client.GetFlowRun(t.Context(), flowName, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runInfo.Status != "failed" {
+		t.Fatalf("expected failed flow status, got %s", runInfo.Status)
+	}
+	if !strings.Contains(runInfo.ErrorMessage, "generator stopped at 1") {
+		t.Fatalf("unexpected error message: %s", runInfo.ErrorMessage)
+	}
+}
+
+func TestFlowGeneratorStepNoDependencies(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "generator_no_deps")
+
+	flow := NewFlow(flowName).
+		AddStep(NewGeneratorStep("generate").
+			Generator(func(ctx context.Context, input int, yield func(int) error) error {
+				for i := 0; i < input; i++ {
+					if err := yield(i); err != nil {
+						return err
+					}
+				}
+				return nil
+			}).
+			Handler(func(ctx context.Context, item int) (int, error) {
+				return item + 1, nil
+			})).
+		AddStep(NewStep("sum").
+			DependsOn("generate").
+			Handler(func(ctx context.Context, in int, generated []int) (int, error) {
+				total := 0
+				for _, v := range generated {
+					total += v
+				}
+				return total, nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(120 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out int
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatalf("wait for generator no-deps flow output failed: %v", err)
+	}
+
+	if out != 15 {
+		t.Fatalf("unexpected generator no-deps flow output: got %d, want %d", out, 15)
+	}
+}
+
+func TestFlowGeneratorStepWithSignalAndDependency(t *testing.T) {
+	type approval struct {
+		Offset int `json:"offset"`
+	}
+
+	client := getTestClient(t)
+	flowName := testFlowName(t, "generator_signal_dep")
+
+	flow := NewFlow(flowName).
+		AddStep(NewStep("seed").Handler(func(ctx context.Context, in int) (int, error) {
+			return 3, nil
+		})).
+		AddStep(NewGeneratorStep("generate").
+			DependsOn("seed").
+			Signal().
+			Generator(func(ctx context.Context, in int, signal approval, seed int, yield func(int) error) error {
+				for i := 0; i < seed; i++ {
+					if err := yield(in + signal.Offset + i); err != nil {
+						return err
+					}
+				}
+				return nil
+			}).
+			Handler(func(ctx context.Context, item int) (int, error) {
+				return item, nil
+			})).
+		AddStep(NewStep("sum").
+			DependsOn("generate").
+			Handler(func(ctx context.Context, in int, generated []int) (int, error) {
+				total := 0
+				for _, v := range generated {
+					total += v
+				}
+				return total, nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(120 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = client.SignalFlow(t.Context(), flowName, h.ID, "generate", approval{Offset: 1})
+	if err != nil {
+		t.Fatalf("signal flow failed: %v", err)
+	}
+
+	var out int
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatalf("wait for generator signal/dep flow output failed: %v", err)
+	}
+
+	if out != 36 {
+		t.Fatalf("unexpected generator signal/dep flow output: got %d, want %d", out, 36)
+	}
+}
+
+func TestFlowGeneratorStepReducerRuntime(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "generator_reduce_runtime")
+
+	flow := NewFlow(flowName).
+		AddStep(NewGeneratorStep("generate").
+			Generator(func(ctx context.Context, input int, yield func(int) error) error {
+				for i := 0; i < input; i++ {
+					if err := yield(i); err != nil {
+						return err
+					}
+				}
+				return nil
+			}).
+			Handler(func(ctx context.Context, item int) (int, error) {
+				return item * 2, nil
+			}).
+			Reduce(0, func(ctx context.Context, acc int, out int) (int, error) {
+				return acc + out, nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(120 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out int
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatalf("wait for generator reduced flow output failed: %v", err)
+	}
+
+	if out != 20 {
+		t.Fatalf("unexpected generator reduced flow output: got %d, want %d", out, 20)
+	}
 }
 
 func TestFlowListFlows(t *testing.T) {

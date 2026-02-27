@@ -43,7 +43,7 @@ Examples:
 flow := NewFlow("discover-content").
     AddStep(NewGeneratorStep("discover").
         DependsOn("seed").
-        Generator(func(ctx context.Context, seed Seed, yield chan<- URL) error {
+        Generator(func(ctx context.Context, seed Seed, yield func(URL) error) error {
             // user loop; yield discovered URLs
             return nil
         }).
@@ -66,9 +66,9 @@ flow := NewFlow("discover-content").
 ## Minimal persisted state
 
 Add step-run metadata (dynamic step table `cb_s_{flow}`):
-- `generator_status` (`running`, `spawning_complete`, `failed`)
-- `tasks_spawned` (int)
-- `tasks_completed` (int)
+- `generator_status` (`started`, `complete`, `failed`)
+- `map_tasks_spawned` (int)
+- `map_tasks_completed` (int)
 
 ## Failure model
 
@@ -89,7 +89,7 @@ Add step-run metadata (dynamic step table `cb_s_{flow}`):
     - `.Generator(fn)`
     - `.Handler(fn, opts...)`
 3. Reflection validation rules at flow registration:
-    - generator signature: `func(context.Context, DepType, chan<- ItemType) error`
+    - generator signature: `func(context.Context, DepType, func(ItemType) error) error`
     - handler signature: `func(context.Context, ItemType) (ResultType, error)`
     - `ItemType` must match between generator and handler
 4. Reuse existing `HandlerOpts` validation for handler execution settings.
@@ -101,18 +101,18 @@ Add generator columns to dynamic step-run tables (`cb_s_{flow}`):
 ```sql
 ALTER TABLE cb_s_{flow}
      ADD COLUMN generator_status text,
-     ADD COLUMN tasks_spawned int NOT NULL DEFAULT 0,
-     ADD COLUMN tasks_completed int NOT NULL DEFAULT 0,
+    ADD COLUMN map_tasks_spawned int NOT NULL DEFAULT 0,
+    ADD COLUMN map_tasks_completed int NOT NULL DEFAULT 0,
      ADD COLUMN generator_error text;
 
 ALTER TABLE cb_s_{flow}
      ADD CONSTRAINT cb_s_generator_status_chk
      CHECK (
           generator_status IS NULL
-          OR generator_status IN ('running', 'spawning_complete', 'failed')
+        OR generator_status IN ('started', 'complete', 'failed')
      );
 
-CREATE INDEX cb_s_generator_running_idx
+CREATE INDEX cb_s_generator_started_idx
      ON cb_s_{flow}(status, generator_status)
      WHERE status IN ('created', 'started', 'aggregating');
 ```
@@ -128,22 +128,22 @@ Notes:
 1. Claim eligible generator step run (`created`, deps satisfied) with `FOR UPDATE SKIP LOCKED`.
 2. Transition:
     - `status='started'`
-    - `generator_status='running'`
+    - `generator_status='started'`
 3. Start generator goroutine with bounded channel buffer.
 4. Spawner loop:
     - read yielded items
     - batch into N items (configurable, default 100)
     - insert into task table `cb_t_{flow}`
-    - increment `tasks_spawned` by inserted rows
+    - increment `map_tasks_spawned` by inserted rows
 5. On generator completion:
-    - set `generator_status='spawning_complete'`
-    - if `tasks_completed == tasks_spawned`, complete step immediately
+    - set `generator_status='complete'`
+    - if `map_tasks_completed == map_tasks_spawned`, complete step immediately
 6. On generator error:
     - set `generator_status='failed'`
     - fail step run with error message
 7. Task completion hook:
-    - increment `tasks_completed`
-    - if `generator_status='spawning_complete'` and counts match, complete step
+    - increment `map_tasks_completed`
+    - if `generator_status='complete'` and counts match, complete step
 
 ### A4. SQL function sketches
 
@@ -172,7 +172,7 @@ Guidance:
 
 ### A5. Failure and recovery semantics
 
-- Generator worker crash before `spawning_complete`:
+- Generator worker crash before `complete`:
   - step can be reclaimed and generator re-run
   - users must ensure generator yields idempotent work items
 - Duplicate yielded work:
@@ -185,9 +185,9 @@ Guidance:
 
 Expose per generator step-run:
 - `generator_status`
-- `tasks_spawned`
-- `tasks_completed`
-- in-flight estimate (`tasks_spawned - tasks_completed`)
+- `map_tasks_spawned`
+- `map_tasks_completed`
+- in-flight estimate (`map_tasks_spawned - map_tasks_completed`)
 - last error
 
 ### A7. Test matrix

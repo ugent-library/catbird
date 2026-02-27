@@ -283,6 +283,11 @@ docker compose logs -f postgres
   - All functions created in `up` (DROP FUNCTION statements are usually in `down`)
   - Without proper cleanup, old tables persist when goose can't roll back partially-applied migrations
 - Use `-- +goose statementbegin` / `-- +goose statementend` to wrap multi-line SQL statements (especially PL/pgSQL functions)
+- **SQL indentation convention** (for all migration SQL):
+  - Use 4 spaces per indentation level (no tabs)
+  - Keep top-level SQL keywords (`CREATE`, `ALTER`, `SELECT`, `UPDATE`, `INSERT`, `DELETE`, `RETURNS`, `LANGUAGE`) left-aligned
+  - Inside `BEGIN ... END` blocks, indent statements by +4 spaces, and nested blocks by another +4
+  - Align wrapped column/value lists one level deeper than the clause line for readability
 - **For PL/pgSQL functions with `LANGUAGE ... AS $$` syntax**:
   - DO NOT use `$$ LANGUAGE plpgsql;` at the end (creates duplicate LANGUAGE clause)
   - Use `$$;` to terminate (language already specified in CREATE statement)

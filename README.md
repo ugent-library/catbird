@@ -350,6 +350,11 @@ Map steps fan out array processing into per-item SQL-coordinated work and aggreg
 - Use `MapInput()` to map over flow input (flow input must be a JSON array)
 - Use `Map("step_name")` to map over a dependency step output array
 - Each mapped item runs as its own task, so retries happen per item instead of rerunning the whole step.
+- Optionally fold mapped outputs with `Reduce(initial, fn)` using `func(context.Context, Acc, OutType) (Acc, error)`
+
+`Reduce(...)` runs as a finalization phase after all per-item handlers complete, with the same retry/failure semantics as the parent step handler.
+
+Retry order with `Reduce(...)`: per-item handler retries happen first (per map task), then reducer finalization retries at the parent step level.
 
 ### Map flow input
 
@@ -380,6 +385,97 @@ flow := catbird.NewFlow("double-numbers").
         Handler(func(ctx context.Context, _ string, n int) (int, error) {
             return n * 2, nil
         }))
+
+// Reduce mapped outputs without materializing []int on the step output
+flow = catbird.NewFlow("double-numbers-reduced").
+    AddStep(catbird.NewStep("numbers").
+        Handler(func(ctx context.Context, _ string) ([]int, error) {
+            return []int{1, 2, 3}, nil
+        })).
+    AddStep(catbird.NewStep("double").
+        Map("numbers").
+        Handler(func(ctx context.Context, _ string, n int) (int, error) {
+            return n * 2, nil
+        }).
+        Reduce(0, func(ctx context.Context, acc int, out int) (int, error) {
+            return acc + out, nil
+        }))
+```
+
+## Generator Steps
+
+Generator steps act like normal flow steps with an extra trailing `yield` callback for streaming items; yielded items are processed by a per-item handler.
+
+- Define the step with `NewGeneratorStep("name")`
+- Optionally add `DependsOn(...)` and/or `Signal()` like a normal step
+- Provide a generator with signature `func(context.Context, In[, Signal][, Dep1, Dep2, ...], func(ItemType) error) error`
+- Provide an item handler with signature `func(context.Context, ItemType) (OutType, error)`
+- Optionally fold item outputs with `Reduce(initial, fn)` using `func(context.Context, Acc, OutType) (Acc, error)`
+- Generator steps do not support `MapInput()` or `Map()`
+
+`Reduce(...)` runs as a finalization phase after all per-item handlers complete (it does not reduce per yielded item in-stream).
+
+Retry order with `Reduce(...)`: per-item handler retries happen first (per yielded item map task), then reducer finalization retries at the parent step level.
+
+```go
+flow := catbird.NewFlow("generate-double-sum").
+    AddStep(catbird.NewStep("seed").
+        Handler(func(ctx context.Context, in int) (int, error) {
+            return in, nil
+        })).
+    AddStep(catbird.NewGeneratorStep("generate").
+        DependsOn("seed").
+        Generator(func(ctx context.Context, in int, seed int, yield func(int) error) error {
+            for i := 0; i < seed; i++ {
+                if err := yield(i); err != nil {
+                    return err
+                }
+            }
+            return nil
+        }).
+        Handler(func(ctx context.Context, item int) (int, error) {
+            return item * 2, nil
+        })).
+    AddStep(catbird.NewStep("sum").
+        DependsOn("generate").
+        Handler(func(ctx context.Context, in int, generated []int) (int, error) {
+            total := 0
+            for _, v := range generated {
+                total += v
+            }
+            return total, nil
+        }))
+
+handle, _ := client.RunFlow(ctx, "generate-double-sum", 5)
+var out int
+_ = handle.WaitForOutput(ctx, &out)
+// out == 20
+```
+
+Use `Reduce(...)` when you want bounded generator output instead of storing all item outputs as `[]Out`:
+
+```go
+flow := catbird.NewFlow("generate-double-sum-reduced").
+    AddStep(catbird.NewGeneratorStep("generate").
+        Generator(func(ctx context.Context, input int, yield func(int) error) error {
+            for i := 0; i < input; i++ {
+                if err := yield(i); err != nil {
+                    return err
+                }
+            }
+            return nil
+        }).
+        Handler(func(ctx context.Context, item int) (int, error) {
+            return item * 2, nil
+        }).
+        Reduce(0, func(ctx context.Context, acc int, out int) (int, error) {
+            return acc + out, nil
+        }))
+
+handle, _ := client.RunFlow(ctx, "generate-double-sum-reduced", 5)
+var out int
+_ = handle.WaitForOutput(ctx, &out)
+// out == 20
 ```
 
 ## Status Values
@@ -458,6 +554,15 @@ flow := catbird.NewFlow("payment_processing").
 # Resiliency
 
 Catbird includes multiple resiliency layers for runtime failures. Handler-level retries are configured with `HandlerOpts` (`MaxRetries`, `Backoff`), and external calls can be protected with `HandlerOpts.CircuitBreaker` (typically created via `NewCircuitBreaker(...)`) to avoid cascading outages. In worker database paths, PostgreSQL reads/writes are retried with bounded attempts and full-jitter backoff; retries stop immediately on context cancellation or deadline expiry.
+
+`OnFail` semantics:
+- `OnFail` runs only after the main task/flow run reaches `failed` (after normal handler retries are exhausted).
+- `OnFail` has independent retry/backoff via its own `HandlerOpts`.
+- A successful `OnFail` marks on-fail handling complete, but the original run remains `failed`.
+- If `OnFail` retries are exhausted, on-fail handling remains failed and no further retries are scheduled.
+
+For `Reduce(...)` steps, retries are two-phase: item handlers retry first per item, then reducer finalization retries at the parent step.
+If retries are exhausted in either phase, the parent step fails and task/flow `OnFail` handlers run with the same terminal failure semantics as non-reduced steps.
 
 ## Be aware of side effects
 

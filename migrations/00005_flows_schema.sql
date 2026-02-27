@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS cb_steps (
     name text NOT NULL,
     idx int NOT NULL DEFAULT 0,
     dependency_count int NOT NULL DEFAULT 0,
+  is_generator boolean NOT NULL DEFAULT false,
     is_map_step boolean NOT NULL DEFAULT false,
     map_source text,
     has_signal boolean NOT NULL DEFAULT false,
@@ -76,6 +77,7 @@ CREATE OR REPLACE VIEW cb_flow_info AS
       s.flow_name,
       jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
         'name', s.name,
+        'is_generator', s.is_generator,
         'is_map_step', s.is_map_step,
         'map_source', s.map_source,
         'has_signal', s.has_signal,

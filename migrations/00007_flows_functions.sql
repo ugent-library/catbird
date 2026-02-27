@@ -29,6 +29,7 @@ DECLARE
     _dep jsonb;
     _step_name text;
     _dep_name text;
+    _is_generator boolean;
     _is_map_step boolean;
     _map_source text;
     _has_map_source_dependency boolean;
@@ -89,7 +90,12 @@ BEGIN
     END IF;
 
     _is_map_step := coalesce((_step->>'is_map_step')::boolean, false);
+    _is_generator := coalesce((_step->>'is_generator')::boolean, false);
     _map_source := nullif(_step->>'map_source', '');
+
+    IF _is_generator AND _is_map_step THEN
+      RAISE EXCEPTION 'cb: step "%" cannot be both generator and map step', _step_name;
+    END IF;
 
     IF NOT _is_map_step AND _map_source IS NOT NULL THEN
       RAISE EXCEPTION 'cb: step "%" has map_source but is_map_step is false', _step_name;
@@ -128,12 +134,13 @@ BEGIN
       _condition := cb_parse_condition(_step->>'condition');
     END IF;
 
-    INSERT INTO cb_steps (flow_name, name, idx, dependency_count, is_map_step, map_source, has_signal, condition)
+    INSERT INTO cb_steps (flow_name, name, idx, dependency_count, is_generator, is_map_step, map_source, has_signal, condition)
     VALUES (
       cb_create_flow.name,
       _step_name,
       _idx,
       jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb)),
+      _is_generator,
       _is_map_step,
       _map_source,
       coalesce((_step->>'has_signal')::boolean, false),
@@ -220,7 +227,19 @@ BEGIN
       id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
       flow_run_id bigint NOT NULL,
       step_name text NOT NULL,
+      flow_input jsonb NOT NULL DEFAULT '{}'::jsonb,
       status text NOT NULL DEFAULT 'pending',
+      condition jsonb,
+      is_generator boolean NOT NULL DEFAULT false,
+      is_map_step boolean NOT NULL DEFAULT false,
+      map_source text,
+      has_signal boolean NOT NULL DEFAULT false,
+      dependency_names text[] NOT NULL DEFAULT '{}'::text[],
+      dependent_step_names text[] NOT NULL DEFAULT '{}'::text[],
+      generator_status text,
+      map_tasks_spawned int NOT NULL DEFAULT 0,
+      map_tasks_completed int NOT NULL DEFAULT 0,
+      generator_error text,
       attempts int NOT NULL DEFAULT 0,
       output jsonb,
       error_message text,
@@ -235,6 +254,9 @@ BEGIN
       UNIQUE (flow_run_id, step_name),
       FOREIGN KEY (flow_run_id) REFERENCES %I (id),
       CONSTRAINT status_valid CHECK (status IN ('pending', 'queued', 'started', 'completed', 'failed', 'skipped')),
+      CONSTRAINT generator_status_valid CHECK (generator_status IS NULL OR generator_status IN ('started', 'complete', 'failed')),
+      CONSTRAINT map_tasks_spawned_valid CHECK (map_tasks_spawned >= 0),
+      CONSTRAINT map_tasks_completed_valid CHECK (map_tasks_completed >= 0 AND map_tasks_completed <= map_tasks_spawned),
       CONSTRAINT remaining_dependencies_valid CHECK (remaining_dependencies >= 0),
       CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
       CONSTRAINT skipped_and_completed_failed CHECK (NOT (skipped_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL))),
@@ -247,6 +269,24 @@ BEGIN
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, status);', _s_table || '_flow_run_id_status_idx', _s_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at);', _s_table || '_visible_at_idx', _s_table);
 
+    -- Backfill denormalized step metadata columns for pre-existing dynamic step tables.
+    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS flow_input jsonb NOT NULL DEFAULT ''{}''::jsonb;', _s_table);
+    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS condition jsonb;', _s_table);
+    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS is_generator boolean NOT NULL DEFAULT false;', _s_table);
+    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS is_map_step boolean NOT NULL DEFAULT false;', _s_table);
+    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS map_source text;', _s_table);
+    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS has_signal boolean NOT NULL DEFAULT false;', _s_table);
+    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS dependency_names text[] NOT NULL DEFAULT ''{}''::text[];', _s_table);
+    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS dependent_step_names text[] NOT NULL DEFAULT ''{}''::text[];', _s_table);
+
+    -- Backfill generator columns for pre-existing dynamic step tables created before generator support.
+    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS generator_status text;', _s_table);
+    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS map_tasks_spawned int NOT NULL DEFAULT 0;', _s_table);
+    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS map_tasks_completed int NOT NULL DEFAULT 0;', _s_table);
+    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS generator_error text;', _s_table);
+
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (status, generator_status) WHERE status IN (''pending'', ''started'');', _s_table || '_generator_status_idx', _s_table);
+
     -- Create map task table used by map steps for per-item coordination
     EXECUTE format(
     $QUERY$
@@ -255,7 +295,10 @@ BEGIN
       flow_run_id bigint NOT NULL,
       step_name text NOT NULL,
       item_idx int NOT NULL,
+      flow_input jsonb NOT NULL DEFAULT '{}'::jsonb,
       status text NOT NULL DEFAULT 'queued',
+      dependency_names text[] NOT NULL DEFAULT '{}'::text[],
+      signal_input jsonb,
       attempts int NOT NULL DEFAULT 0,
       item jsonb NOT NULL,
       output jsonb,
@@ -277,6 +320,11 @@ BEGIN
 
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (step_name, status, visible_at);', _m_table || '_step_status_visible_idx', _m_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, step_name, status);', _m_table || '_flow_step_status_idx', _m_table);
+
+    -- Backfill denormalized map-task columns for pre-existing dynamic map tables.
+    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS flow_input jsonb NOT NULL DEFAULT ''{}''::jsonb;', _m_table);
+    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS dependency_names text[] NOT NULL DEFAULT ''{}''::text[];', _m_table);
+    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS signal_input jsonb;', _m_table);
 
 END;
 $$ LANGUAGE plpgsql;
@@ -380,14 +428,54 @@ BEGIN
     -- Create step runs for all steps in a single INSERT
     EXECUTE format(
     $QUERY$
-    INSERT INTO %I (flow_run_id, step_name, status, remaining_dependencies)
-    SELECT %L, s.name, 'pending', s.dependency_count
+    INSERT INTO %I (
+      flow_run_id,
+      step_name,
+      flow_input,
+      status,
+      remaining_dependencies,
+      condition,
+      is_generator,
+      is_map_step,
+      map_source,
+      has_signal,
+      dependency_names,
+      dependent_step_names
+    )
+    SELECT
+      %L,
+      s.name,
+      %L,
+      'pending',
+      s.dependency_count,
+      s.condition,
+      s.is_generator,
+      s.is_map_step,
+      s.map_source,
+      s.has_signal,
+      coalesce(array(
+        SELECT d.dependency_name
+        FROM cb_step_dependencies d
+        WHERE d.flow_name = %L
+          AND d.step_name = s.name
+        ORDER BY d.idx
+      ), '{}'::text[]),
+      coalesce(array(
+        SELECT d.step_name
+        FROM cb_step_dependencies d
+        WHERE d.flow_name = %L
+          AND d.dependency_name = s.name
+        ORDER BY d.idx
+      ), '{}'::text[])
     FROM cb_steps s
     WHERE s.flow_name = %L
     ON CONFLICT (flow_run_id, step_name) DO NOTHING
     $QUERY$,
     _s_table,
     _id,
+    cb_run_flow.input,
+    cb_run_flow.name,
+    cb_run_flow.name,
     cb_run_flow.name
     );
 
@@ -447,32 +535,30 @@ BEGIN
     FOR _step_to_process IN
     EXECUTE format(
       $QUERY$
-      SELECT sr.id, sr.step_name, sr.remaining_dependencies,
+                  SELECT sr.id, sr.step_name, sr.remaining_dependencies,
+              sr.dependency_names,
+                    sr.dependent_step_names,
              (SELECT jsonb_object_agg(deps.step_name, deps.output)
               FROM %I deps
               WHERE deps.flow_run_id = $1
-                AND deps.step_name IN (
-                  SELECT dependency_name
-                  FROM cb_step_dependencies
-                  WHERE flow_name = $3 AND step_name = sr.step_name
-                )
+                AND deps.step_name = any(sr.dependency_names)
               AND deps.status = 'completed'
              ) AS step_outputs,
              sr.signal_input,
-             (SELECT condition FROM cb_steps WHERE flow_name = $3 AND name = sr.step_name) AS condition,
-             (SELECT is_map_step FROM cb_steps WHERE flow_name = $3 AND name = sr.step_name) AS is_map_step,
-             (SELECT map_source FROM cb_steps WHERE flow_name = $3 AND name = sr.step_name) AS map_source
+             sr.condition,
+             sr.is_generator,
+             sr.is_map_step,
+             sr.map_source
       FROM %I sr
       WHERE sr.flow_run_id = $1
         AND sr.status = 'pending'
         AND sr.remaining_dependencies = 0
-        AND (NOT (SELECT has_signal FROM cb_steps WHERE flow_name = $3 AND name = sr.step_name)
-             OR sr.signal_input IS NOT NULL)
+        AND (NOT sr.has_signal OR sr.signal_input IS NOT NULL)
       FOR UPDATE SKIP LOCKED
       $QUERY$,
       _s_table, _s_table
     )
-    USING cb_start_steps.flow_run_id, cb_start_steps.flow_run_id, cb_start_steps.flow_name
+    USING cb_start_steps.flow_run_id
     LOOP
     -- Check if step has a condition
     _step_condition := _step_to_process.condition;
@@ -513,12 +599,12 @@ BEGIN
           UPDATE %I
           SET remaining_dependencies = remaining_dependencies - 1
           WHERE flow_run_id = $1
-            AND step_name IN (SELECT step_name FROM cb_step_dependencies WHERE flow_name = $2 AND dependency_name = $3)
+            AND step_name = any($2)
             AND status = 'pending'
           $QUERY$,
           _s_table
         )
-        USING cb_start_steps.flow_run_id, cb_start_steps.flow_name, _step_to_process.step_name;
+        USING cb_start_steps.flow_run_id, _step_to_process.dependent_step_names;
 
         -- Decrement remaining_steps in flow run for skipped step
         EXECUTE format(
@@ -536,6 +622,27 @@ BEGIN
         -- Continue to next step
         CONTINUE;
       END IF;
+    END IF;
+
+    IF _step_to_process.is_generator THEN
+      EXECUTE format(
+        $QUERY$
+        UPDATE %I
+        SET status = 'queued',
+            started_at = NULL,
+            generator_status = 'started',
+            map_tasks_spawned = 0,
+            map_tasks_completed = 0,
+            generator_error = NULL,
+            visible_at = coalesce($2, now())
+        WHERE id = $1
+        $QUERY$,
+        _s_table
+      )
+      USING _step_to_process.id, cb_start_steps.initial_visible_at;
+
+      _steps_processed_this_iteration := _steps_processed_this_iteration + 1;
+      CONTINUE;
     END IF;
 
     -- Map-step activation: spawn item-level map tasks coordinated in SQL
@@ -565,29 +672,38 @@ BEGIN
         UPDATE %I
         SET status = 'started',
             started_at = coalesce(started_at, now()),
-            visible_at = coalesce($2, now())
+            visible_at = now() + interval '100 years'
         WHERE id = $1
         $QUERY$,
         _s_table
       )
-      USING _step_to_process.id, cb_start_steps.initial_visible_at;
+      USING _step_to_process.id;
 
       -- Spawn map tasks in deterministic order
       EXECUTE format(
         $QUERY$
-        INSERT INTO %I (flow_run_id, step_name, item_idx, status, item, visible_at)
+        INSERT INTO %I (flow_run_id, step_name, item_idx, flow_input, status, dependency_names, signal_input, item, visible_at)
         SELECT $1,
                $2,
                ordinality - 1,
-           'queued',
+               $4,
+               'queued',
+               $5,
+               $6,
                value,
                coalesce($3, now())
-        FROM jsonb_array_elements($4) WITH ORDINALITY
+        FROM jsonb_array_elements($7) WITH ORDINALITY
         ON CONFLICT (flow_run_id, step_name, item_idx) DO NOTHING
         $QUERY$,
         _m_table
       )
-      USING cb_start_steps.flow_run_id, _step_to_process.step_name, cb_start_steps.initial_visible_at, _map_items;
+      USING cb_start_steps.flow_run_id,
+            _step_to_process.step_name,
+            cb_start_steps.initial_visible_at,
+            _flow_input,
+            _step_to_process.dependency_names,
+            _step_to_process.signal_input,
+            _map_items;
 
       -- Empty map completes immediately with []
       IF _map_item_count = 0 THEN
@@ -646,7 +762,6 @@ DECLARE
     _sleep_for double precision;
     _stop_at timestamp;
     _q text;
-    _f_table text := cb_table_name(cb_poll_steps.flow_name, 'f');
     _s_table text := cb_table_name(cb_poll_steps.flow_name, 's');
 BEGIN
     IF cb_poll_steps.quantity <= 0 THEN
@@ -673,13 +788,11 @@ BEGIN
     _q := FORMAT(
         $QUERY$
         WITH runs AS (
-          SELECT m.id, m.flow_run_id
+          SELECT m.id
           FROM %I m
-          INNER JOIN %I f ON m.flow_run_id = f.id
           WHERE m.step_name = $1
             AND m.visible_at <= clock_timestamp()
             AND m.status IN ('queued', 'started')
-            AND f.status = 'started'
           ORDER BY m.id ASC
           LIMIT $2
           FOR UPDATE SKIP LOCKED
@@ -687,27 +800,22 @@ BEGIN
         UPDATE %I m
         SET status = 'started',
             attempts = attempts + 1,
-          started_at = clock_timestamp(),
+            started_at = clock_timestamp(),
             visible_at = clock_timestamp() + $3
         FROM runs
         WHERE m.id = runs.id
-          AND EXISTS (SELECT 1 FROM %I f WHERE f.id = runs.flow_run_id AND f.status = 'started')
         RETURNING m.id,
                   m.attempts,
-                  (SELECT input FROM %I f WHERE f.id = m.flow_run_id) AS input,
+                  m.flow_input AS input,
                   (SELECT jsonb_object_agg(deps.step_name, deps.output)
                    FROM %I deps
                    WHERE deps.flow_run_id = m.flow_run_id
-                     AND deps.step_name IN (
-                       SELECT dependency_name
-                       FROM cb_step_dependencies
-                       WHERE flow_name = $4 AND step_name = m.step_name
-                     )
+                     AND deps.step_name = any(m.dependency_names)
                      AND deps.status = 'completed'
                   ) AS step_outputs,
                   m.signal_input;
         $QUERY$,
-        _s_table, _f_table, _s_table, _f_table, _f_table, _s_table
+        _s_table, _s_table, _s_table
       );
 
     LOOP
@@ -716,7 +824,7 @@ BEGIN
       END IF;
 
       FOR _m IN
-        EXECUTE _q USING cb_poll_steps.step_name, cb_poll_steps.quantity, make_interval(secs => cb_poll_steps.hide_for / 1000.0), cb_poll_steps.flow_name
+        EXECUTE _q USING cb_poll_steps.step_name, cb_poll_steps.quantity, make_interval(secs => cb_poll_steps.hide_for / 1000.0)
       LOOP
         RETURN NEXT _m;
       END LOOP;
@@ -781,7 +889,6 @@ DECLARE
     _sleep_for double precision;
     _stop_at timestamp;
     _q text;
-    _f_table text := cb_table_name(cb_poll_map_tasks.flow_name, 'f');
     _s_table text := cb_table_name(cb_poll_map_tasks.flow_name, 's');
     _m_table text := cb_table_name(cb_poll_map_tasks.flow_name, 'm');
 BEGIN
@@ -810,13 +917,9 @@ BEGIN
       WITH runs AS (
         SELECT m.id, m.flow_run_id, m.item
         FROM %I m
-        INNER JOIN %I s ON s.flow_run_id = m.flow_run_id AND s.step_name = m.step_name
-        INNER JOIN %I f ON f.id = m.flow_run_id
         WHERE m.step_name = $1
           AND m.status IN ('queued', 'started')
           AND m.visible_at <= clock_timestamp()
-          AND s.status = 'started'
-          AND f.status = 'started'
         ORDER BY m.id ASC
         LIMIT $2
         FOR UPDATE SKIP LOCKED
@@ -830,21 +933,17 @@ BEGIN
       WHERE m.id = runs.id
       RETURNING m.id,
                 m.attempts,
-                (SELECT input FROM %I f WHERE f.id = m.flow_run_id) AS input,
+                m.flow_input AS input,
                 (SELECT jsonb_object_agg(deps.step_name, deps.output)
                  FROM %I deps
                  WHERE deps.flow_run_id = m.flow_run_id
-                   AND deps.step_name IN (
-                     SELECT dependency_name
-                     FROM cb_step_dependencies
-                     WHERE flow_name = $4 AND step_name = m.step_name
-                   )
+                   AND deps.step_name = any(m.dependency_names)
                    AND deps.status = 'completed'
                 ) AS step_outputs,
-                (SELECT signal_input FROM %I s WHERE s.flow_run_id = m.flow_run_id AND s.step_name = m.step_name) AS signal_input,
+                m.signal_input,
                 m.item;
       $QUERY$,
-      _m_table, _s_table, _f_table, _m_table, _f_table, _s_table, _s_table
+      _m_table, _m_table, _s_table
     );
 
     LOOP
@@ -855,8 +954,7 @@ BEGIN
       RETURN QUERY EXECUTE _q
         USING cb_poll_map_tasks.step_name,
               cb_poll_map_tasks.quantity,
-              make_interval(secs => cb_poll_map_tasks.hide_for / 1000.0),
-              cb_poll_map_tasks.flow_name;
+              make_interval(secs => cb_poll_map_tasks.hide_for / 1000.0);
 
       IF FOUND THEN
         RETURN;
@@ -898,6 +996,199 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_spawn_generator_map_tasks: Spawn map tasks for a generator step batch
+CREATE OR REPLACE FUNCTION cb_spawn_generator_map_tasks(
+    flow_name text,
+    step_name text,
+    step_id bigint,
+    items jsonb,
+    visible_at timestamptz DEFAULT NULL
+)
+RETURNS int
+LANGUAGE plpgsql AS $$
+DECLARE
+    _s_table text := cb_table_name(cb_spawn_generator_map_tasks.flow_name, 's');
+    _m_table text := cb_table_name(cb_spawn_generator_map_tasks.flow_name, 'm');
+    _flow_run_id bigint;
+    _spawn_offset int;
+    _flow_input jsonb;
+    _dependency_names text[];
+    _signal_input jsonb;
+    _spawned int := 0;
+BEGIN
+    IF cb_spawn_generator_map_tasks.items IS NULL OR jsonb_typeof(cb_spawn_generator_map_tasks.items) <> 'array' THEN
+        RAISE EXCEPTION 'cb: generator items must be a JSON array';
+    END IF;
+
+    IF jsonb_array_length(cb_spawn_generator_map_tasks.items) = 0 THEN
+        RETURN 0;
+    END IF;
+
+    EXECUTE format(
+      $QUERY$
+      SELECT flow_run_id, map_tasks_spawned, flow_input, dependency_names, signal_input
+      FROM %I
+      WHERE id = $1
+        AND step_name = $2
+        AND status = 'started'
+        AND generator_status = 'started'
+      FOR UPDATE
+      $QUERY$,
+      _s_table
+    )
+    USING cb_spawn_generator_map_tasks.step_id, cb_spawn_generator_map_tasks.step_name
+    INTO _flow_run_id, _spawn_offset, _flow_input, _dependency_names, _signal_input;
+
+    IF _flow_run_id IS NULL THEN
+        RETURN 0;
+    END IF;
+
+    EXECUTE format(
+      $QUERY$
+      WITH ins AS (
+        INSERT INTO %I (flow_run_id, step_name, item_idx, flow_input, status, dependency_names, signal_input, item, visible_at)
+        SELECT $1,
+               $2,
+               $3 + ordinality - 1,
+               $4,
+               'queued',
+               $5,
+               $6,
+               value,
+               coalesce($7, now())
+        FROM jsonb_array_elements($8) WITH ORDINALITY
+        ON CONFLICT (flow_run_id, step_name, item_idx) DO NOTHING
+        RETURNING 1
+      )
+      SELECT count(*)::int
+      FROM ins
+      $QUERY$,
+      _m_table
+    )
+    USING _flow_run_id,
+          cb_spawn_generator_map_tasks.step_name,
+          _spawn_offset,
+          _flow_input,
+          _dependency_names,
+          _signal_input,
+          cb_spawn_generator_map_tasks.visible_at,
+          cb_spawn_generator_map_tasks.items
+    INTO _spawned;
+
+    IF _spawned > 0 THEN
+      EXECUTE format(
+        $QUERY$
+        UPDATE %I
+        SET map_tasks_spawned = map_tasks_spawned + $2
+        WHERE id = $1
+          AND status = 'started'
+          AND generator_status = 'started'
+        $QUERY$,
+        _s_table
+      )
+      USING cb_spawn_generator_map_tasks.step_id, _spawned;
+    END IF;
+
+    RETURN coalesce(_spawned, 0);
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_mark_generator_complete: Mark generator as complete and finalize parent step if all map tasks are complete
+CREATE OR REPLACE FUNCTION cb_mark_generator_complete(flow_name text, step_name text, step_id bigint)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    _s_table text := cb_table_name(cb_mark_generator_complete.flow_name, 's');
+    _m_table text := cb_table_name(cb_mark_generator_complete.flow_name, 'm');
+    _flow_run_id bigint;
+    _spawned int;
+    _completed int;
+    _agg_output jsonb;
+BEGIN
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET generator_status = 'complete'
+      WHERE id = $1
+        AND step_name = $2
+        AND status = 'started'
+        AND generator_status = 'started'
+      RETURNING flow_run_id, map_tasks_spawned, map_tasks_completed
+      $QUERY$,
+      _s_table
+    )
+    USING cb_mark_generator_complete.step_id, cb_mark_generator_complete.step_name
+    INTO _flow_run_id, _spawned, _completed;
+
+    IF _flow_run_id IS NULL THEN
+      RETURN;
+    END IF;
+
+    IF _spawned <> _completed THEN
+      RETURN;
+    END IF;
+
+    EXECUTE format(
+      $QUERY$
+      SELECT coalesce(jsonb_agg(output ORDER BY item_idx), '[]'::jsonb)
+      FROM %I
+      WHERE flow_run_id = $1
+        AND step_name = $2
+        AND status = 'completed'
+      $QUERY$,
+      _m_table
+    )
+    USING _flow_run_id, cb_mark_generator_complete.step_name
+    INTO _agg_output;
+
+    PERFORM cb_complete_step(cb_mark_generator_complete.flow_name, cb_mark_generator_complete.step_name, cb_mark_generator_complete.step_id, _agg_output);
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_mark_generator_failed: Mark generator as failed and fail parent step/flow
+CREATE OR REPLACE FUNCTION cb_mark_generator_failed(flow_name text, step_name text, step_id bigint, error_message text)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    _s_table text := cb_table_name(cb_mark_generator_failed.flow_name, 's');
+    _updated boolean;
+BEGIN
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET generator_status = 'failed',
+          generator_error = $2
+      WHERE id = $1
+        AND step_name = $3
+        AND status IN ('queued', 'started')
+      RETURNING true
+      $QUERY$,
+      _s_table
+    )
+    USING cb_mark_generator_failed.step_id,
+          cb_mark_generator_failed.error_message,
+          cb_mark_generator_failed.step_name
+    INTO _updated;
+
+    IF _updated IS NULL THEN
+      RETURN;
+    END IF;
+
+    PERFORM cb_fail_step(
+      cb_mark_generator_failed.flow_name,
+      cb_mark_generator_failed.step_name,
+      cb_mark_generator_failed.step_id,
+      cb_mark_generator_failed.error_message
+    );
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
 -- cb_complete_map_task: Complete one map task and complete parent step when all items finish
 CREATE OR REPLACE FUNCTION cb_complete_map_task(flow_name text, step_name text, map_task_id bigint, output jsonb)
 RETURNS void
@@ -907,6 +1198,9 @@ DECLARE
     _m_table text := cb_table_name(cb_complete_map_task.flow_name, 'm');
     _flow_run_id bigint;
     _step_id bigint;
+    _generator_status text;
+    _spawned int;
+    _completed int;
     _agg_output jsonb;
     _has_pending boolean;
 BEGIN
@@ -930,6 +1224,44 @@ BEGIN
     END IF;
 
     EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET map_tasks_completed = CASE
+          WHEN generator_status IS NULL THEN map_tasks_completed
+          ELSE map_tasks_completed + 1
+      END
+      WHERE flow_run_id = $1
+        AND step_name = $2
+        AND status = 'started'
+      RETURNING id, generator_status, map_tasks_spawned, map_tasks_completed
+      $QUERY$,
+      _s_table
+    )
+    USING _flow_run_id, cb_complete_map_task.step_name
+    INTO _step_id, _generator_status, _spawned, _completed;
+
+    IF _step_id IS NULL THEN
+      RETURN;
+    END IF;
+
+    -- Generator parent steps complete only after generator_status='complete' and all spawned map tasks are completed.
+    IF _generator_status IS NOT NULL THEN
+      IF _generator_status <> 'complete' OR _completed <> _spawned THEN
+        RETURN;
+      END IF;
+
+      EXECUTE format(
+        'SELECT coalesce(jsonb_agg(output ORDER BY item_idx), ''[]''::jsonb) FROM %I WHERE flow_run_id = $1 AND step_name = $2 AND status = ''completed''',
+        _m_table
+      )
+      USING _flow_run_id, cb_complete_map_task.step_name
+      INTO _agg_output;
+
+      PERFORM cb_complete_step(cb_complete_map_task.flow_name, cb_complete_map_task.step_name, _step_id, _agg_output);
+      RETURN;
+    END IF;
+
+    EXECUTE format(
       'SELECT EXISTS (SELECT 1 FROM %I WHERE flow_run_id = $1 AND step_name = $2 AND status IN (''queued'', ''started''))',
       _m_table
     )
@@ -939,13 +1271,6 @@ BEGIN
     IF _has_pending THEN
       RETURN;
     END IF;
-
-    EXECUTE format(
-      'SELECT id FROM %I WHERE flow_run_id = $1 AND step_name = $2',
-      _s_table
-    )
-    USING _flow_run_id, cb_complete_map_task.step_name
-    INTO _step_id;
 
     EXECUTE format(
       'SELECT coalesce(jsonb_agg(output ORDER BY item_idx), ''[]''::jsonb) FROM %I WHERE flow_run_id = $1 AND step_name = $2 AND status = ''completed''',
@@ -1032,6 +1357,7 @@ DECLARE
     _f_table text := cb_table_name(cb_complete_step.flow_name, 'f');
     _s_table text := cb_table_name(cb_complete_step.flow_name, 's');
     _flow_run_id bigint;
+  _dependent_step_names text[];
     _remaining int;
 BEGIN
     -- Complete step run atomically - only succeeds if status='started'
@@ -1043,12 +1369,12 @@ BEGIN
         output = $2
     WHERE id = $1
       AND status = 'started'
-    RETURNING flow_run_id
+    RETURNING flow_run_id, dependent_step_names
     $QUERY$,
     _s_table
     )
     USING cb_complete_step.step_id, cb_complete_step.output
-    INTO _flow_run_id;
+    INTO _flow_run_id, _dependent_step_names;
 
     -- If step wasn't in 'started' status, return early (already completed or failed)
     IF _flow_run_id IS NULL THEN
@@ -1079,12 +1405,12 @@ BEGIN
     UPDATE %I
     SET remaining_dependencies = remaining_dependencies - 1
     WHERE flow_run_id = $1
-      AND step_name IN (SELECT step_name FROM cb_step_dependencies WHERE flow_name = $2 AND dependency_name = $3)
+      AND step_name = any($2)
       AND status = 'pending'
     $QUERY$,
     _s_table
     )
-    USING _flow_run_id, cb_complete_step.flow_name, cb_complete_step.step_name;
+    USING _flow_run_id, _dependent_step_names;
 
     -- Maybe complete flow run - only if remaining_steps reached 0
     IF _remaining = 0 THEN
@@ -1128,6 +1454,7 @@ LANGUAGE plpgsql AS $$
 DECLARE
     _f_table text := cb_table_name(cb_fail_step.flow_name, 'f');
     _s_table text := cb_table_name(cb_fail_step.flow_name, 's');
+  _m_table text := cb_table_name(cb_fail_step.flow_name, 'm');
     _flow_run_id bigint;
 BEGIN
     -- Fail step run atomically - only succeeds if status is 'pending', 'queued', or 'started'
@@ -1177,6 +1504,34 @@ BEGIN
     _s_table
     )
     USING _flow_run_id, cb_fail_step.error_message, cb_fail_step.step_name, cb_fail_step.step_id;
+
+    -- Propagate terminal failure to all remaining step runs for this flow run.
+    EXECUTE format(
+    $QUERY$
+    UPDATE %I
+    SET status = 'failed',
+        failed_at = coalesce(failed_at, now()),
+        error_message = coalesce(error_message, $2)
+    WHERE flow_run_id = $1
+      AND status IN ('pending', 'queued', 'started')
+    $QUERY$,
+    _s_table
+    )
+    USING _flow_run_id, cb_fail_step.error_message;
+
+    -- Propagate terminal failure to all remaining map task runs for this flow run.
+    EXECUTE format(
+    $QUERY$
+    UPDATE %I
+    SET status = 'failed',
+        failed_at = coalesce(failed_at, now()),
+        error_message = coalesce(error_message, $2)
+    WHERE flow_run_id = $1
+      AND status IN ('queued', 'started')
+    $QUERY$,
+    _m_table
+    )
+    USING _flow_run_id, cb_fail_step.error_message;
 END;
 $$;
 -- +goose statementend
@@ -1339,19 +1694,16 @@ BEGIN
     $QUERY$
     UPDATE %I sr
     SET signal_input = $3
-    FROM cb_steps s
     WHERE sr.flow_run_id = $1
       AND sr.step_name = $2
       AND sr.status = 'pending'
       AND sr.signal_input IS NULL
-      AND s.flow_name = $4
-      AND s.name = sr.step_name
-      AND s.has_signal = true
+      AND sr.has_signal = true
     RETURNING true
     $QUERY$,
     _s_table
     )
-    USING cb_signal_flow.flow_run_id, cb_signal_flow.step_name, cb_signal_flow.input, cb_signal_flow.flow_name
+    USING cb_signal_flow.flow_run_id, cb_signal_flow.step_name, cb_signal_flow.input
     INTO _updated;
 
     IF _updated IS NULL THEN
@@ -1508,6 +1860,9 @@ DROP FUNCTION IF EXISTS cb_fail_step(text, text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_step(text, text, bigint, jsonb);
 DROP FUNCTION IF EXISTS cb_fail_map_task(text, text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_map_task(text, text, bigint, jsonb);
+DROP FUNCTION IF EXISTS cb_mark_generator_failed(text, text, bigint, text);
+DROP FUNCTION IF EXISTS cb_mark_generator_complete(text, text, bigint);
+DROP FUNCTION IF EXISTS cb_spawn_generator_map_tasks(text, text, bigint, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_hide_map_tasks(text, text, bigint[], int);
 DROP FUNCTION IF EXISTS cb_poll_map_tasks(text, text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_hide_steps(text, text, bigint[], integer);
