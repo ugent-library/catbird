@@ -13,6 +13,12 @@ import (
 var (
 	// ErrRunFailed is returned when you try to unmarshal the output of a failed task or flow run
 	ErrRunFailed = fmt.Errorf("run failed")
+	// ErrRunCanceled is returned when you try to wait for output from a canceled task or flow run
+	ErrRunCanceled = fmt.Errorf("run canceled")
+	// ErrNotFound is returned when a requested run or resource cannot be found
+	ErrNotFound = fmt.Errorf("not found")
+	// ErrNoRunContext is returned when cancellation helpers are called outside handler run context
+	ErrNoRunContext = fmt.Errorf("no run context")
 	// ErrUnknownStepOutput is returned when a requested step output is not present in completed outputs.
 	ErrUnknownStepOutput = fmt.Errorf("unknown step output")
 	// ErrNoFailedStepInput is returned when failed step input is not available.

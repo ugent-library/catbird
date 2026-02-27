@@ -200,6 +200,10 @@
         flowSteps.forEach((step) => {
           const runInfo = stepRunMap[step.name] || { status: 'created', output: null, error_message: null };
           const statusBadge = {
+            'queued': '◷',
+            'pending': '⧖',
+            'canceling': '◌',
+            'canceled': '⊘',
             'completed': '✓',
             'failed': '✗',
             'skipped': '⊘',
@@ -266,6 +270,20 @@
                 }
               },
               {
+                selector: 'node[status="queued"]',
+                style: {
+                  'border-color': '#6f42c1',
+                  'border-width': '3px'
+                }
+              },
+              {
+                selector: 'node[status="pending"]',
+                style: {
+                  'border-color': '#495057',
+                  'border-width': '3px'
+                }
+              },
+              {
                 selector: 'node[status="completed"]',
                 style: {
                   'border-color': '#28a745',
@@ -283,6 +301,21 @@
                 selector: 'node[status="skipped"]',
                 style: {
                   'border-color': '#6c757d',
+                  'border-width': '3px',
+                  'background-color': '#1a202c'
+                }
+              },
+              {
+                selector: 'node[status="canceling"]',
+                style: {
+                  'border-color': '#ffc107',
+                  'border-width': '3px'
+                }
+              },
+              {
+                selector: 'node[status="canceled"]',
+                style: {
+                  'border-color': '#adb5bd',
                   'border-width': '3px',
                   'background-color': '#1a202c'
                 }

@@ -61,14 +61,19 @@ BEGIN
         on_fail_completed_at timestamptz,
         visible_at timestamptz NOT NULL DEFAULT now(),
         started_at timestamptz NOT NULL DEFAULT now(),
+        cancel_requested_at timestamptz,
         completed_at timestamptz,
         failed_at timestamptz,
         skipped_at timestamptz,
-        CONSTRAINT status_valid CHECK (status IN ('queued', 'started', 'completed', 'failed', 'skipped')),
+        canceled_at timestamptz,
+        cancel_reason text,
+        CONSTRAINT status_valid CHECK (status IN ('queued', 'started', 'canceling', 'completed', 'failed', 'skipped', 'canceled')),
         CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
-        CONSTRAINT skipped_and_completed_failed CHECK (NOT (skipped_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL))),
+        CONSTRAINT skipped_and_completed_failed CHECK (NOT (skipped_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL OR canceled_at IS NOT NULL))),
+        CONSTRAINT canceled_terminal_exclusive CHECK (NOT (canceled_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL OR skipped_at IS NOT NULL))),
         CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
         CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
+        CONSTRAINT canceled_at_is_after_started_at CHECK (canceled_at IS NULL OR canceled_at >= started_at),
         CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
                 CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = ''))),
                 CONSTRAINT on_fail_status_valid CHECK (on_fail_status IS NULL OR on_fail_status IN ('queued', 'started', 'completed', 'failed'))
@@ -80,6 +85,79 @@ BEGIN
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (concurrency_key) WHERE concurrency_key IS NOT NULL AND status IN (''queued'', ''started'')', _t_table || '_concurrency_key_idx', _t_table);
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN (''queued'', ''started'', ''completed'')', _t_table || '_idempotency_key_idx', _t_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at);', _t_table || '_visible_at_idx', _t_table);
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_request_task_cancellation(
+        name text,
+        run_id bigint,
+        reason text DEFAULT NULL
+)
+RETURNS TABLE(changed boolean, final_status text)
+LANGUAGE plpgsql AS $$
+DECLARE
+    _t_table text := cb_table_name(cb_request_task_cancellation.name, 't');
+        _status text;
+BEGIN
+        EXECUTE format(
+            $QUERY$
+            UPDATE %I
+            SET status = CASE
+                        WHEN status = 'queued' THEN 'canceled'
+                        WHEN status = 'started' THEN 'canceled'
+                        ELSE status
+                    END,
+                    cancel_requested_at = CASE
+                        WHEN status IN ('queued', 'started') THEN now()
+                        ELSE cancel_requested_at
+                    END,
+                    canceled_at = CASE
+                        WHEN status IN ('queued', 'started') THEN now()
+                        ELSE canceled_at
+                    END,
+                    cancel_reason = coalesce($2, cancel_reason)
+            WHERE id = $1
+            RETURNING status
+            $QUERY$,
+            _t_table
+        )
+        USING cb_request_task_cancellation.run_id, cb_request_task_cancellation.reason
+        INTO _status;
+
+        IF _status IS NULL THEN
+            EXECUTE format('SELECT status FROM %I WHERE id = $1', _t_table)
+            USING cb_request_task_cancellation.run_id
+            INTO _status;
+            IF _status IS NULL THEN
+                RETURN;
+            END IF;
+            RETURN QUERY SELECT false, _status;
+            RETURN;
+        END IF;
+
+        RETURN QUERY SELECT true, _status;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_task_cancel_requested(name text, run_id bigint)
+RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+    _t_table text := cb_table_name(cb_task_cancel_requested.name, 't');
+        _requested boolean;
+BEGIN
+        EXECUTE format(
+            'SELECT status IN (''canceling'', ''canceled'') FROM %I WHERE id = $1',
+            _t_table
+        )
+        USING cb_task_cancel_requested.run_id
+        INTO _requested;
+
+        RETURN coalesce(_requested, false);
 END;
 $$;
 -- +goose statementend
@@ -536,22 +614,22 @@ BEGIN
         _output := NULL;
         _error_message := NULL;
 
-        EXECUTE format(
-          $QUERY$
-          SELECT t.status, t.output, t.error_message
-          FROM %I t
-          WHERE t.id = $1
-          $QUERY$,
-          _t_table
-        )
-        USING cb_wait_task_output.run_id
-        INTO _status, _output, _error_message;
+                EXECUTE format(
+                    $QUERY$
+                    SELECT t.status, t.output, coalesce(t.error_message, t.cancel_reason)
+                    FROM %I t
+                    WHERE t.id = $1
+                    $QUERY$,
+                    _t_table
+                )
+                USING cb_wait_task_output.run_id
+                INTO _status, _output, _error_message;
 
         IF _status IS NULL THEN
             RAISE EXCEPTION 'cb: task run % not found for task %', cb_wait_task_output.run_id, cb_wait_task_output.task_name;
         END IF;
 
-        IF _status IN ('completed', 'failed', 'skipped') THEN
+        IF _status IN ('completed', 'failed', 'skipped', 'canceled') THEN
             status := _status;
             output := _output;
             error_message := _error_message;
@@ -609,6 +687,8 @@ $$;
 -- +goose statementend
 
 DROP FUNCTION IF EXISTS cb_delete_task(text);
+DROP FUNCTION IF EXISTS cb_task_cancel_requested(text, bigint);
+DROP FUNCTION IF EXISTS cb_request_task_cancellation(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_fail_task_on_fail(text, bigint, text, boolean, bigint);
 DROP FUNCTION IF EXISTS cb_complete_task_on_fail(text, bigint);
 DROP FUNCTION IF EXISTS cb_poll_task_on_fail(text, int);

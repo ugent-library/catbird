@@ -164,6 +164,8 @@ NewFlow("workflow").
 
 ## Key Conventions
 
+- **Idempotent API semantics**: For idempotent operations, if the requested effect is already true, return success (no-op) rather than an error. Reserve errors for invalid input, missing targets, or runtime/storage failures.
+
 - **Worker lifecycle**: `client.NewWorker(ctx, opts...)` followed by `.AddTask(task)` and `.AddFlow(flow)` builder methods, then `worker.Start(ctx)` (graceful shutdown with configurable timeout). Scheduling is decoupled: create schedules separately via `client.CreateTaskSchedule(ctx, name, cronSpec, opts...)` or `client.CreateFlowSchedule(ctx, name, cronSpec, opts...)` with optional `ScheduleOpts{Input: value}` for static input.
 - **HandlerOpts validation**: Worker validates all task and flow step HandlerOpts at initialization time. Invalid configs (negative concurrency/batch size, invalid backoff, invalid circuit breaker) are caught immediately with descriptive errors before reaching database operations. This ensures type safety at construction time.
 - **Options pattern**: HandlerOpts uses a public struct with public fields (Concurrency, BatchSize, Timeout, MaxRetries, Backoff, CircuitBreaker). WorkerOpts uses a config struct (Logger, ShutdownTimeout). ScheduleOpts uses public fields (Input for static JSON input).
@@ -307,10 +309,8 @@ docker compose logs -f postgres
 ## Critical Files
 
 - [catbird.go](../catbird.go): Message, Task, Flow, Step, Options definitions
-- [optional.go](../optional.go): Optional[T] generic type for conditional dependency outputs
 - [flow.go](../flow.go): Flow DSL, step constructors, dependency validation
 - [worker.go](../worker.go): Worker struct, task/flow execution, polling logic
-- [scheduler.go](../scheduler.go): Cron-based scheduling for tasks and flows
 - [client.go](../client.go): Public API (delegation layer)
 - [dashboard/handler.go](../dashboard/handler.go): HTTP routes & templating
 - [migrations/](../migrations/): Database schema (versioned)

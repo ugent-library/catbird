@@ -18,6 +18,11 @@ const (
 	defaultPollInterval = 200 * time.Millisecond
 )
 
+// CancelOpts configures cancellation behavior and metadata.
+type CancelOpts struct {
+	Reason string
+}
+
 // ScheduleOpts configures scheduled task/flow behavior.
 type ScheduleOpts struct {
 	Input any

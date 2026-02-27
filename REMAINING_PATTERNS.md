@@ -305,7 +305,10 @@ WaitForState(ctx context.Context, pred func(FlowStateReader) (bool, error), opts
 `WaitForState` options:
 - `PollInterval` (default 250ms)
 - `Timeout` (optional)
-- `StableChecks` (default 2)
+
+Design note:
+- No `StableChecks` option. Keep `WaitForState` as a single-threshold gate and rely on idempotent switch behavior, monotonic offsets, and retry-safe consumers.
+- First-class abort/error handling should reuse the run cancellation model in `CANCELLATION.md` (`canceling`/`canceled`) rather than introducing a second control-plane error primitive in FlowState.
 
 ### B2. Storage model
 
@@ -379,7 +382,7 @@ $$ LANGUAGE plpgsql;
 #### Step 4: switch-alias
 - wait until `coord.backfill_done == true`
 - capture topic head as `W` (`coord.target_watermark = W`)
-- wait until `coord.consumer_offset >= W` (with `StableChecks`)
+- wait until `coord.consumer_offset >= W`
 - atomically switch alias
 - `SetState(coord.switch_done, true)`
 
@@ -393,15 +396,19 @@ Use monotonic comparable offsets:
 Predicate:
 
 $$
-	ext{ready} \iff \text{consumer\_offset} \ge \text{target\_watermark}
+    ext{ready} \iff \text{consumer\_offset} \ge \text{target\_watermark}
 $$
 
-`StableChecks > 1` avoids switching on transient reads.
+Race posture without `StableChecks`:
+- Accept a small read race window around cutover as part of eventual convergence.
+- Mitigate with idempotent alias switch, external-versioned writes (`external_gte`), monotonic offset comparisons, and retry-safe consumer replay.
 
 ### B6. Failure handling
 
-- Any step may set `coord.error` and return error.
-- `WaitUntil` should abort early if `coord.error` is present.
+- First-class handling: use run cancellation as the authoritative abort mechanism (see `CANCELLATION.md`).
+- `WaitForState` should fail fast when the parent run is `canceling` or `canceled`.
+- KV role: `coord.error` remains optional diagnostic context, not the control-plane signal.
+- Any step may set `coord.error` details and then return error (or trigger cancellation) for observability.
 - `switch-alias` must be idempotent (safe if retried after partial failure).
 - `consume-changes` should commit offsets only after successful index write.
 

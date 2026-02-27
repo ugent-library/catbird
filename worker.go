@@ -32,6 +32,41 @@ type StepHandlerInfo struct {
 	StepName string `json:"step_name"`
 }
 
+type taskRunScope struct {
+	conn   Conn
+	name   string
+	runID  int64
+	cancel context.CancelFunc
+}
+
+type flowRunScope struct {
+	conn   Conn
+	name   string
+	runID  int64
+	cancel context.CancelFunc
+}
+
+type taskRunScopeContextKey struct{}
+type flowRunScopeContextKey struct{}
+
+func withTaskRunScope(ctx context.Context, conn Conn, taskName string, runID int64, cancel context.CancelFunc) context.Context {
+	return context.WithValue(ctx, taskRunScopeContextKey{}, &taskRunScope{
+		conn:   conn,
+		name:   taskName,
+		runID:  runID,
+		cancel: cancel,
+	})
+}
+
+func withFlowRunScope(ctx context.Context, conn Conn, flowName string, runID int64, cancel context.CancelFunc) context.Context {
+	return context.WithValue(ctx, flowRunScopeContextKey{}, &flowRunScope{
+		conn:   conn,
+		name:   flowName,
+		runID:  runID,
+		cancel: cancel,
+	})
+}
+
 // ListWorkers returns all registered workers.
 func ListWorkers(ctx context.Context, conn Conn) ([]*WorkerInfo, error) {
 	q := `SELECT id, started_at, last_heartbeat_at, task_handlers, step_handlers FROM cb_worker_info ORDER BY last_heartbeat_at DESC;`
@@ -415,9 +450,27 @@ func (w *taskWorker) pollClaims(ctx context.Context) ([]taskClaim, error) {
 func (w *taskWorker) handle(ctx context.Context, msg taskClaim) {
 	defer w.removeInFlight(msg.ID)
 
+	claimCtx, claimCancel := context.WithCancel(ctx)
+	defer claimCancel()
+
+	handlerCtx := withTaskRunScope(claimCtx, w.conn, w.task.name, msg.ID, claimCancel)
+
+	isCanceled := func() bool {
+		requested, err := isTaskCancelRequestedBestEffort(ctx, w.conn, w.task.name, msg.ID)
+		if err == nil && requested {
+			claimCancel()
+			return true
+		}
+		return false
+	}
+
 	h := w.task.handlerOpts
 	if h == nil {
 		w.logger.ErrorContext(ctx, "worker: failed", "task", w.task.name, "error", "no handler options (definition-only)")
+		return
+	}
+
+	if isCanceled() {
 		return
 	}
 
@@ -434,14 +487,14 @@ func (w *taskWorker) handle(ctx context.Context, msg taskClaim) {
 		}
 	}
 
-	w.logger.DebugContext(ctx, "worker: handleTask",
+	w.logger.DebugContext(handlerCtx, "worker: handleTask",
 		"task", w.task.name,
 		"id", msg.ID,
 		"attempts", msg.Attempts,
 		"input", string(msg.Input),
 	)
 
-	out, err := runWithTimeout(ctx, h.Timeout, func(fnCtx context.Context) ([]byte, error) {
+	out, err := runWithTimeout(handlerCtx, h.Timeout, func(fnCtx context.Context) ([]byte, error) {
 		return runSafely("task handler panic", func() ([]byte, error) {
 			inputJSON, marshalErr := json.Marshal(msg.Input)
 			if marshalErr != nil {
@@ -453,6 +506,10 @@ func (w *taskWorker) handle(ctx context.Context, msg taskClaim) {
 
 	// Handle result
 	if err != nil {
+		if cancelRequested, cancelErr := isTaskCancelRequestedBestEffort(ctx, w.conn, w.task.name, msg.ID); cancelErr == nil && cancelRequested {
+			return
+		}
+
 		if h.CircuitBreaker != nil {
 			h.CircuitBreaker.RecordFailure(time.Now())
 		}
@@ -465,6 +522,9 @@ func (w *taskWorker) handle(ctx context.Context, msg taskClaim) {
 			hideTaskRuns(ctx, w.conn, w.logger, w.task.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay next task run")
 		}
 	} else {
+		if isCanceled() {
+			return
+		}
 		if h.CircuitBreaker != nil {
 			h.CircuitBreaker.RecordSuccess()
 		}
@@ -546,7 +606,7 @@ func (w *stepWorker) hideInFlight(ctx context.Context) {
 func (w *stepWorker) pollClaims(ctx context.Context) ([]stepClaim, error) {
 	h := w.step.handlerOpts
 
-	q := `SELECT id, attempts, input, step_outputs, signal_input FROM cb_poll_steps(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
+	q := `SELECT id, flow_run_id, attempts, input, step_outputs, signal_input FROM cb_poll_steps(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
 
 	rows, err := queryWithRetry(ctx, w.conn, q, w.flowName, w.step.name, h.BatchSize, (10 * time.Minute).Milliseconds(), defaultPollFor.Milliseconds(), defaultPollInterval.Milliseconds())
 	if err != nil {
@@ -560,6 +620,24 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 	defer w.removeInFlight(msg.ID)
 
 	h := w.step.handlerOpts
+	flowRunID := msg.FlowRunID
+	cancelObserved := false
+
+	claimCtx, claimCancel := context.WithCancel(ctx)
+	defer claimCancel()
+
+	handlerCtx := withFlowRunScope(claimCtx, w.conn, w.flowName, flowRunID, claimCancel)
+	defer finalizeFlowCanceledIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, &cancelObserved)
+
+	cancelAndMark := func() bool {
+		return cancelFlowWorkIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, claimCancel, &cancelObserved, func() {
+			cancelStepRun(ctx, w.conn, w.logger, w.flowName, msg.ID)
+		})
+	}
+
+	if cancelAndMark() {
+		return
+	}
 
 	if h.CircuitBreaker != nil {
 		allowed, delay := h.CircuitBreaker.Allow(time.Now())
@@ -573,9 +651,9 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 		}
 	}
 
-	if w.logger.Enabled(ctx, slog.LevelDebug) {
+	if w.logger.Enabled(handlerCtx, slog.LevelDebug) {
 		stepOutputsJSON, _ := json.Marshal(msg.StepOutputs)
-		w.logger.DebugContext(ctx, "worker: handleStep",
+		w.logger.DebugContext(handlerCtx, "worker: handleStep",
 			"flow", w.flowName,
 			"step", w.step.name,
 			"id", msg.ID,
@@ -586,7 +664,11 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 	}
 
 	if w.step.isMapStep && w.step.reducerFn != nil {
-		err := runWithTimeoutErr(ctx, h.Timeout, func(fnCtx context.Context) error {
+		if cancelAndMark() {
+			return
+		}
+
+		err := runWithTimeoutErr(handlerCtx, h.Timeout, func(fnCtx context.Context) error {
 			_, reduceErr := runSafely("reducer panic", func() (struct{}, error) {
 				return struct{}{}, finalizeStepReduction(fnCtx, w.conn, w.logger, w.flowName, w.step, msg.ID)
 			})
@@ -594,6 +676,10 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 		})
 
 		if err != nil {
+			if cancelAndMark() {
+				return
+			}
+
 			if h.CircuitBreaker != nil {
 				h.CircuitBreaker.RecordFailure(time.Now())
 			}
@@ -614,6 +700,10 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 	}
 
 	if w.step.isGenerator {
+		if cancelAndMark() {
+			return
+		}
+
 		if w.step.reducerFn != nil {
 			reductionReady, reductionReadyErr := generatorReductionReady(ctx, w.conn, w.flowName, w.step.name, msg.ID)
 			if reductionReadyErr != nil {
@@ -658,7 +748,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 			}
 		}
 
-		err := runWithTimeoutErr(ctx, h.Timeout, func(fnCtx context.Context) error {
+		err := runWithTimeoutErr(handlerCtx, h.Timeout, func(fnCtx context.Context) error {
 			_, genErr := runSafely("generator handler panic", func() (struct{}, error) {
 				return struct{}{}, w.handleGeneratorClaim(fnCtx, msg)
 			})
@@ -666,6 +756,10 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 		})
 
 		if err != nil {
+			if cancelAndMark() {
+				return
+			}
+
 			if h.CircuitBreaker != nil {
 				h.CircuitBreaker.RecordFailure(time.Now())
 			}
@@ -686,7 +780,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 		return
 	}
 
-	out, err := runWithTimeout(ctx, h.Timeout, func(fnCtx context.Context) ([]byte, error) {
+	out, err := runWithTimeout(handlerCtx, h.Timeout, func(fnCtx context.Context) ([]byte, error) {
 		return runSafely("step handler panic", func() ([]byte, error) {
 			inputJSON, marshalErr := json.Marshal(msg.Input)
 			if marshalErr != nil {
@@ -713,6 +807,10 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 
 	// Handle result
 	if err != nil {
+		if cancelAndMark() {
+			return
+		}
+
 		if h.CircuitBreaker != nil {
 			h.CircuitBreaker.RecordFailure(time.Now())
 		}
@@ -725,6 +823,9 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 			hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay next step run")
 		}
 	} else {
+		if cancelAndMark() {
+			return
+		}
 		if h.CircuitBreaker != nil {
 			h.CircuitBreaker.RecordSuccess()
 		}
@@ -866,7 +967,7 @@ func (w *stepWorker) handleGeneratorClaim(ctx context.Context, msg stepClaim) er
 		return completeGeneratorStep(ctx, w.conn, w.flowName, w.step.name, msg.ID)
 	}
 
-	ready, err := markGeneratorCompletePending(ctx, w.conn, w.flowName, w.step.name, msg.ID)
+	ready, err := completeGeneratorStepOrQueueReduce(ctx, w.conn, w.flowName, w.step.name, msg.ID)
 	if err != nil {
 		return err
 	}
@@ -888,6 +989,7 @@ func scanStepClaim(row pgx.Row) (stepClaim, error) {
 
 	if err := row.Scan(
 		&rec.ID,
+		&rec.FlowRunID,
 		&rec.Attempts,
 		&rec.Input,
 		&stepOutputs,
@@ -905,6 +1007,7 @@ func scanStepClaim(row pgx.Row) (stepClaim, error) {
 
 type mapTaskClaim struct {
 	ID          int64                      `json:"id"`
+	FlowRunID   int64                      `json:"flow_run_id"`
 	Attempts    int                        `json:"attempts"`
 	Input       json.RawMessage            `json:"input"`
 	StepOutputs map[string]json.RawMessage `json:"step_outputs"`
@@ -965,7 +1068,7 @@ func (w *mapStepWorker) hideInFlight(ctx context.Context) {
 
 func (w *mapStepWorker) pollClaims(ctx context.Context) ([]mapTaskClaim, error) {
 	h := w.step.handlerOpts
-	q := `SELECT id, attempts, input, step_outputs, signal_input, item FROM cb_poll_map_tasks(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
+	q := `SELECT id, flow_run_id, attempts, input, step_outputs, signal_input, item FROM cb_poll_map_tasks(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
 
 	rows, err := queryWithRetry(ctx, w.conn, q, w.flowName, w.step.name, h.BatchSize, (10 * time.Minute).Milliseconds(), defaultPollFor.Milliseconds(), defaultPollInterval.Milliseconds())
 	if err != nil {
@@ -979,6 +1082,25 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 	defer w.removeInFlight(msg.ID)
 
 	h := w.step.handlerOpts
+	flowRunID := msg.FlowRunID
+	cancelObserved := false
+
+	claimCtx, claimCancel := context.WithCancel(ctx)
+	defer claimCancel()
+
+	handlerCtx := withFlowRunScope(claimCtx, w.conn, w.flowName, flowRunID, claimCancel)
+	defer finalizeFlowCanceledIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, &cancelObserved)
+
+	cancelAndMark := func() bool {
+		return cancelFlowWorkIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, claimCancel, &cancelObserved, func() {
+			cancelMapTaskRun(ctx, w.conn, w.logger, w.flowName, msg.ID)
+		})
+	}
+
+	if cancelAndMark() {
+		return
+	}
+
 	if h.CircuitBreaker != nil {
 		allowed, delay := h.CircuitBreaker.Allow(time.Now())
 		if !allowed {
@@ -990,7 +1112,7 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 		}
 	}
 
-	itemOutput, err := runWithTimeout(ctx, h.Timeout, func(fnCtx context.Context) (json.RawMessage, error) {
+	itemOutput, err := runWithTimeout(handlerCtx, h.Timeout, func(fnCtx context.Context) (json.RawMessage, error) {
 		return runSafely("step handler panic", func() (json.RawMessage, error) {
 			if w.step.isGenerator {
 				if w.step.generatorHandler == nil {
@@ -1070,6 +1192,10 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 	})
 
 	if err != nil {
+		if cancelAndMark() {
+			return
+		}
+
 		if h.CircuitBreaker != nil {
 			h.CircuitBreaker.RecordFailure(time.Now())
 		}
@@ -1087,8 +1213,12 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 		h.CircuitBreaker.RecordSuccess()
 	}
 
+	if cancelAndMark() {
+		return
+	}
+
 	if w.step.reducerFn != nil {
-		_, err := completeMapTaskPending(ctx, w.conn, w.flowName, w.step.name, msg.ID, itemOutput)
+		_, err := completeMapTaskOrQueueReduce(ctx, w.conn, w.flowName, w.step.name, msg.ID, itemOutput)
 		if err != nil {
 			w.logger.ErrorContext(ctx, "worker: cannot mark reduced map task as completed", "flow", w.flowName, "step", w.step.name, "error", err)
 		}
@@ -1108,6 +1238,7 @@ func scanMapTaskClaim(row pgx.Row) (mapTaskClaim, error) {
 
 	if err := row.Scan(
 		&rec.ID,
+		&rec.FlowRunID,
 		&rec.Attempts,
 		&rec.Input,
 		&stepOutputs,
@@ -1282,27 +1413,27 @@ func spawnGeneratorMapTasks(ctx context.Context, conn Conn, flowName, stepName s
 }
 
 func completeGeneratorStep(ctx context.Context, conn Conn, flowName, stepName string, stepID int64) error {
-	q := `SELECT * FROM cb_mark_generator_complete(flow_name => $1, step_name => $2, step_id => $3);`
+	q := `SELECT * FROM cb_complete_generator_step(flow_name => $1, step_name => $2, step_id => $3);`
 	if _, err := execWithRetry(ctx, conn, q, flowName, stepName, stepID); err != nil {
 		return fmt.Errorf("mark generator complete: %w", err)
 	}
 	return nil
 }
 
-func markGeneratorCompletePending(ctx context.Context, conn Conn, flowName, stepName string, stepID int64) (bool, error) {
-	q := `SELECT cb_mark_generator_complete_pending(flow_name => $1, step_name => $2, step_id => $3);`
+func completeGeneratorStepOrQueueReduce(ctx context.Context, conn Conn, flowName, stepName string, stepID int64) (bool, error) {
+	q := `SELECT cb_complete_generator_step_or_queue_reduce(flow_name => $1, step_name => $2, step_id => $3);`
 	var ready bool
 	if err := conn.QueryRow(ctx, q, flowName, stepName, stepID).Scan(&ready); err != nil {
-		return false, fmt.Errorf("mark generator complete pending: %w", err)
+		return false, fmt.Errorf("complete generator step or queue reduce: %w", err)
 	}
 	return ready, nil
 }
 
-func completeMapTaskPending(ctx context.Context, conn Conn, flowName, stepName string, mapTaskID int64, output []byte) (int64, error) {
-	q := `SELECT cb_complete_map_task_pending(flow_name => $1, step_name => $2, map_task_id => $3, output => $4);`
+func completeMapTaskOrQueueReduce(ctx context.Context, conn Conn, flowName, stepName string, mapTaskID int64, output []byte) (int64, error) {
+	q := `SELECT cb_complete_map_task_or_queue_reduce(flow_name => $1, step_name => $2, map_task_id => $3, output => $4);`
 	var stepID *int64
 	if err := conn.QueryRow(ctx, q, flowName, stepName, mapTaskID, output).Scan(&stepID); err != nil {
-		return 0, fmt.Errorf("complete map task pending: %w", err)
+		return 0, fmt.Errorf("complete map task or queue reduce: %w", err)
 	}
 	if stepID == nil {
 		return 0, nil
@@ -1404,7 +1535,7 @@ func generatorReductionReady(ctx context.Context, conn Conn, flowName, stepName 
 }
 
 func failGeneratorStep(ctx context.Context, conn Conn, logger *slog.Logger, flowName, stepName string, stepID int64, errorMessage string) {
-	q := `SELECT * FROM cb_mark_generator_failed(flow_name => $1, step_name => $2, step_id => $3, error_message => $4);`
+	q := `SELECT * FROM cb_fail_generator_step(flow_name => $1, step_name => $2, step_id => $3, error_message => $4);`
 	if _, err := execWithRetry(ctx, conn, q, flowName, stepName, stepID, errorMessage); err != nil {
 		logger.ErrorContext(ctx, "worker: cannot fail generator step", "flow", flowName, "step", stepName, "id", stepID, "error", err)
 	}
@@ -1434,6 +1565,116 @@ func failFlowOnFail(ctx context.Context, conn Conn, logger *slog.Logger, flowNam
 	}
 }
 
+func isTaskCancelRequested(ctx context.Context, conn Conn, taskName string, runID int64) (bool, error) {
+	var requested bool
+	err := conn.QueryRow(ctx, `SELECT cb_task_cancel_requested(name => $1, run_id => $2);`, taskName, runID).Scan(&requested)
+	if err != nil {
+		return false, err
+	}
+	return requested, nil
+}
+
+func isFlowCancelRequested(ctx context.Context, conn Conn, flowName string, runID int64) (bool, error) {
+	if runID == 0 {
+		return false, nil
+	}
+	var requested bool
+	err := conn.QueryRow(ctx, `SELECT cb_flow_cancel_requested(name => $1, run_id => $2);`, flowName, runID).Scan(&requested)
+	if err != nil {
+		return false, err
+	}
+	return requested, nil
+}
+
+func isTaskCancelRequestedBestEffort(ctx context.Context, conn Conn, taskName string, runID int64) (bool, error) {
+	requested, err := isTaskCancelRequested(ctx, conn, taskName, runID)
+	if err == nil || ctx == nil || ctx.Err() == nil {
+		return requested, err
+	}
+
+	retryCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return isTaskCancelRequested(retryCtx, conn, taskName, runID)
+}
+
+func isFlowCancelRequestedBestEffort(ctx context.Context, conn Conn, flowName string, runID int64) (bool, error) {
+	requested, err := isFlowCancelRequested(ctx, conn, flowName, runID)
+	if err == nil || ctx == nil || ctx.Err() == nil {
+		return requested, err
+	}
+
+	retryCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return isFlowCancelRequested(retryCtx, conn, flowName, runID)
+}
+
+func cancelFlowWorkIfRequested(
+	ctx context.Context,
+	conn Conn,
+	logger *slog.Logger,
+	flowName string,
+	flowRunID int64,
+	claimCancel context.CancelFunc,
+	cancelObserved *bool,
+	onCancel func(),
+) bool {
+	requested, err := isFlowCancelRequestedBestEffort(ctx, conn, flowName, flowRunID)
+	if err != nil || !requested {
+		return false
+	}
+
+	if cancelObserved != nil {
+		*cancelObserved = true
+	}
+	if claimCancel != nil {
+		claimCancel()
+	}
+	if onCancel != nil {
+		onCancel()
+	}
+	if logger != nil {
+		logger.DebugContext(ctx, "worker: flow cancellation observed", "flow", flowName, "flow_run_id", flowRunID)
+	}
+
+	return true
+}
+
+func finalizeFlowCanceled(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, runID int64) {
+	if runID == 0 {
+		return
+	}
+	if _, err := execWithRetry(ctx, conn, `SELECT cb_finalize_flow_cancellation(name => $1, run_id => $2);`, flowName, runID); err != nil {
+		logger.DebugContext(ctx, "worker: finalize flow canceled skipped", "flow", flowName, "id", runID, "error", err)
+	}
+}
+
+func finalizeFlowCanceledIfRequested(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, runID int64, cancelObserved *bool) {
+	if cancelObserved == nil || !*cancelObserved {
+		return
+	}
+
+	finalizeCtx := ctx
+	if ctx == nil || ctx.Err() != nil {
+		retryCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		finalizeCtx = retryCtx
+	}
+
+	finalizeFlowCanceled(finalizeCtx, conn, logger, flowName, runID)
+}
+
+func cancelStepRun(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, stepID int64) {
+	if _, err := execWithRetry(ctx, conn, `SELECT cb_cancel_step_run(flow_name => $1, step_id => $2);`, flowName, stepID); err != nil {
+		logger.DebugContext(ctx, "worker: cannot cancel step run", "flow", flowName, "step_id", stepID, "error", err)
+	}
+}
+
+func cancelMapTaskRun(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, mapTaskID int64) {
+	if _, err := execWithRetry(ctx, conn, `SELECT cb_cancel_map_task_run(flow_name => $1, map_task_id => $2);`, flowName, mapTaskID); err != nil {
+		logger.DebugContext(ctx, "worker: cannot cancel map task run", "flow", flowName, "map_task_id", mapTaskID, "error", err)
+	}
+}
+
 func runWithTimeout[T any](ctx context.Context, timeout time.Duration, fn func(context.Context) (T, error)) (T, error) {
 	if timeout <= 0 {
 		return fn(ctx)
@@ -1445,7 +1686,7 @@ func runWithTimeout[T any](ctx context.Context, timeout time.Duration, fn func(c
 }
 
 func runWithTimeoutErr(ctx context.Context, timeout time.Duration, fn func(context.Context) error) error {
-	_, err := runWithTimeout[struct{}](ctx, timeout, func(fnCtx context.Context) (struct{}, error) {
+	_, err := runWithTimeout(ctx, timeout, func(fnCtx context.Context) (struct{}, error) {
 		return struct{}{}, fn(fnCtx)
 	})
 	return err

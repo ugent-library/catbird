@@ -203,6 +203,12 @@ On-fail handlers run after a task reaches a failed state (after its own retries)
 They execute with their own `HandlerOpts` retry and backoff settings, and receive the
 original input plus rich failure context.
 
+`OnFail` semantics (tasks and flows):
+- `OnFail` runs only after the main task/flow run reaches `failed` (after normal handler retries are exhausted).
+- `OnFail` has independent retry/backoff via its own `HandlerOpts`.
+- A successful `OnFail` marks on-fail handling complete, but the original run remains `failed`.
+- If `OnFail` retries are exhausted, on-fail handling remains failed and no further retries are scheduled.
+
 ```go
 task := catbird.NewTask("charge-payment").
     Handler(func(ctx context.Context, input ChargeRequest) (ChargeResult, error) {
@@ -555,18 +561,58 @@ flow := catbird.NewFlow("payment_processing").
 
 Catbird includes multiple resiliency layers for runtime failures. Handler-level retries are configured with `HandlerOpts` (`MaxRetries`, `Backoff`), and external calls can be protected with `HandlerOpts.CircuitBreaker` (typically created via `NewCircuitBreaker(...)`) to avoid cascading outages. In worker database paths, PostgreSQL reads/writes are retried with bounded attempts and full-jitter backoff; retries stop immediately on context cancellation or deadline expiry.
 
-`OnFail` semantics:
-- `OnFail` runs only after the main task/flow run reaches `failed` (after normal handler retries are exhausted).
-- `OnFail` has independent retry/backoff via its own `HandlerOpts`.
-- A successful `OnFail` marks on-fail handling complete, but the original run remains `failed`.
-- If `OnFail` retries are exhausted, on-fail handling remains failed and no further retries are scheduled.
-
 For `Reduce(...)` steps, retries are two-phase: item handlers retry first per item, then reducer finalization retries at the parent step.
 If retries are exhausted in either phase, the parent step fails and task/flow `OnFail` handlers run with the same terminal failure semantics as non-reduced steps.
 
 ## Be aware of side effects
 
 Catbird deduplication (`ConcurrencyKey`/`IdempotencyKey`) controls duplicate run creation, while handler retries can still re-attempt the same run after transient failures. For non-repeatable side effects (payments, email, webhooks), use idempotent write patterns or upstream idempotency keys so retry attempts remain safe.
+
+# Cancellation
+
+`Cancellation` semantics:
+- Cancellation is a distinct terminal outcome (`canceled`), separate from `failed` and `completed`.
+- Once a run is in `canceling`/`canceled`, final state converges to `canceled`.
+- Cancellation requests are idempotent: repeated requests are successful no-ops.
+- If a cancellation request races with retry/on-fail enqueue, cancellation wins (no new retry/on-fail is queued).
+- If an `OnFail` handler is already running when cancellation is requested, it may finish, but the parent run still finalizes to `canceled`.
+
+External cancellation:
+
+```go
+taskHandle, _ := client.RunTask(ctx, "send-email", "hello")
+_ = client.CancelTaskRun(ctx, "send-email", taskHandle.ID, catbird.CancelOpts{Reason: "operator requested stop"})
+
+flowHandle, _ := client.RunFlow(ctx, "order-processing", map[string]any{"order_id": 123})
+_ = client.CancelFlowRun(ctx, "order-processing", flowHandle.ID, catbird.CancelOpts{Reason: "customer canceled order"})
+```
+
+Internal cancellation from handlers:
+
+```go
+task := catbird.NewTask("validate-order").
+    Handler(func(ctx context.Context, input Order) (string, error) {
+        if input.Amount <= 0 {
+            if err := catbird.CancelCurrentTaskRun(ctx, catbird.CancelOpts{Reason: "invalid amount"}); err != nil {
+                return "", err
+            }
+            return "", nil
+        }
+        return "ok", nil
+    })
+
+flow := catbird.NewFlow("order-processing").
+    AddStep(catbird.NewStep("guard").
+        Handler(func(ctx context.Context, input Order) (string, error) {
+            if input.Amount <= 0 {
+                if err := catbird.CancelCurrentFlowRun(ctx, catbird.CancelOpts{Reason: "invalid amount"}); err != nil {
+                    return "", err
+                }
+                return "", nil
+            }
+            return "proceed", nil
+        }))
+```
 
 # Naming Rules
 

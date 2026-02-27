@@ -2,6 +2,7 @@ package catbird
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -305,8 +306,9 @@ func waitForTaskRunStatus(t *testing.T, client *Client, taskName string, runID i
 
 func TestTaskConcurrencyKey(t *testing.T) {
 	client := getTestClient(t)
+	taskName := fmt.Sprintf("concurrent_task_%d", time.Now().UnixNano())
 
-	task := NewTask("concurrent_task").Handler(func(ctx context.Context, in int) (int, error) {
+	task := NewTask(taskName).Handler(func(ctx context.Context, in int) (int, error) {
 		time.Sleep(200 * time.Millisecond)
 		return in * 2, nil
 	})
@@ -315,14 +317,14 @@ func TestTaskConcurrencyKey(t *testing.T) {
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
-	h1, err := client.RunTask(t.Context(), "concurrent_task", 10, RunTaskOpts{ConcurrencyKey: "run-123"})
+	h1, err := client.RunTask(t.Context(), taskName, 10, RunTaskOpts{ConcurrencyKey: "run-123"})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(50 * time.Millisecond)
 
-	h2, err := client.RunTask(t.Context(), "concurrent_task", 20, RunTaskOpts{ConcurrencyKey: "run-123"})
+	h2, err := client.RunTask(t.Context(), taskName, 20, RunTaskOpts{ConcurrencyKey: "run-123"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +343,7 @@ func TestTaskConcurrencyKey(t *testing.T) {
 		t.Fatalf("expected 20, got %d", result1)
 	}
 
-	h3, err := client.RunTask(t.Context(), "concurrent_task", 30, RunTaskOpts{ConcurrencyKey: "run-123"})
+	h3, err := client.RunTask(t.Context(), taskName, 30, RunTaskOpts{ConcurrencyKey: "run-123"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,8 +364,9 @@ func TestTaskConcurrencyKey(t *testing.T) {
 
 func TestTaskIdempotencyKey(t *testing.T) {
 	client := getTestClient(t)
+	taskName := fmt.Sprintf("idempotent_task_%d", time.Now().UnixNano())
 
-	task := NewTask("idempotent_task").Handler(func(ctx context.Context, in int) (int, error) {
+	task := NewTask(taskName).Handler(func(ctx context.Context, in int) (int, error) {
 		time.Sleep(100 * time.Millisecond)
 		return in * 3, nil
 	})
@@ -372,7 +375,7 @@ func TestTaskIdempotencyKey(t *testing.T) {
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
-	h1, err := client.RunTask(t.Context(), "idempotent_task", 7, RunTaskOpts{IdempotencyKey: "payment-456"})
+	h1, err := client.RunTask(t.Context(), taskName, 7, RunTaskOpts{IdempotencyKey: "payment-456"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +383,7 @@ func TestTaskIdempotencyKey(t *testing.T) {
 		t.Fatal("expected first run to be created")
 	}
 
-	h2, err := client.RunTask(t.Context(), "idempotent_task", 8, RunTaskOpts{IdempotencyKey: "payment-456"})
+	h2, err := client.RunTask(t.Context(), taskName, 8, RunTaskOpts{IdempotencyKey: "payment-456"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +401,7 @@ func TestTaskIdempotencyKey(t *testing.T) {
 		t.Fatalf("expected 21, got %d", result1)
 	}
 
-	h3, err := client.RunTask(t.Context(), "idempotent_task", 9, RunTaskOpts{IdempotencyKey: "payment-456"})
+	h3, err := client.RunTask(t.Context(), taskName, 9, RunTaskOpts{IdempotencyKey: "payment-456"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +409,7 @@ func TestTaskIdempotencyKey(t *testing.T) {
 		t.Fatalf("expected duplicate run to return existing ID %d after completion, got %d", h1.ID, h3.ID)
 	}
 
-	h4, err := client.RunTask(t.Context(), "idempotent_task", 10, RunTaskOpts{IdempotencyKey: "payment-789"})
+	h4, err := client.RunTask(t.Context(), taskName, 10, RunTaskOpts{IdempotencyKey: "payment-789"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,8 +598,9 @@ func TestFlowIdempotencyKey(t *testing.T) {
 func TestTaskBothKeysRejected(t *testing.T) {
 	client := getTestClient(t)
 	var err error
+	taskName := fmt.Sprintf("both_keys_task_%d", time.Now().UnixNano())
 
-	task := NewTask("both_keys_task").Handler(func(ctx context.Context, in string) (string, error) {
+	task := NewTask(taskName).Handler(func(ctx context.Context, in string) (string, error) {
 		return in, nil
 	})
 
@@ -604,7 +608,7 @@ func TestTaskBothKeysRejected(t *testing.T) {
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
-	_, err = client.RunTask(t.Context(), "both_keys_task", "input", RunTaskOpts{
+	_, err = client.RunTask(t.Context(), taskName, "input", RunTaskOpts{
 		ConcurrencyKey: "key1",
 		IdempotencyKey: "key2",
 	})
@@ -632,5 +636,104 @@ func TestFlowBothKeysRejected(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error when both ConcurrencyKey and IdempotencyKey are provided")
+	}
+}
+
+func TestTaskCancelQueuedRun(t *testing.T) {
+	client := getTestClient(t)
+
+	taskName := fmt.Sprintf("cancel_queued_task_%d", time.Now().UnixNano())
+	task := NewTask(taskName).Handler(func(ctx context.Context, in string) (string, error) {
+		return in + " done", nil
+	})
+
+	if err := client.CreateTask(t.Context(), task); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := client.RunTask(t.Context(), taskName, "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.CancelTaskRun(t.Context(), taskName, h.ID, CancelOpts{Reason: "test cancel queued"}); err != nil {
+		t.Fatal(err)
+	}
+
+	run, err := client.GetTaskRun(t.Context(), taskName, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if run.Status != "canceled" {
+		t.Fatalf("expected canceled, got %s", run.Status)
+	}
+	if run.CancelReason == "" {
+		t.Fatal("expected cancel reason to be populated")
+	}
+}
+
+func TestTaskCancelStartedRun(t *testing.T) {
+	client := getTestClient(t)
+
+	taskName := fmt.Sprintf("cancel_started_task_%d", time.Now().UnixNano())
+	task := NewTask(taskName).Handler(func(ctx context.Context, in string) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+
+	worker := client.NewWorker(t.Context()).AddTask(task)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunTask(t.Context(), taskName, "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitForTaskRunStatus(t, client, taskName, h.ID, "started", 5*time.Second)
+
+	if err := client.CancelTaskRun(t.Context(), taskName, h.ID, CancelOpts{Reason: "test cancel started"}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForTaskRunStatus(t, client, taskName, h.ID, "canceled", 5*time.Second)
+}
+
+func TestTaskInternalCancelCurrentRun(t *testing.T) {
+	client := getTestClient(t)
+
+	taskName := fmt.Sprintf("cancel_internal_task_%d", time.Now().UnixNano())
+	task := NewTask(taskName).Handler(func(ctx context.Context, in string) (string, error) {
+		if err := CancelCurrentTaskRun(ctx, CancelOpts{Reason: "business early exit"}); err != nil {
+			return "", err
+		}
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+
+	worker := client.NewWorker(t.Context()).AddTask(task)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunTask(t.Context(), taskName, "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out string
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err = h.WaitForOutput(ctx, &out)
+	if !errors.Is(err, ErrRunCanceled) {
+		t.Fatalf("expected ErrRunCanceled, got %v", err)
+	}
+
+	run, err := client.GetTaskRun(t.Context(), taskName, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "canceled" {
+		t.Fatalf("expected canceled, got %s", run.Status)
 	}
 }

@@ -197,17 +197,20 @@ type TaskScheduleInfo struct {
 
 // TaskRunInfo represents the details of a task execution.
 type TaskRunInfo struct {
-	ID             int64           `json:"id"`
-	ConcurrencyKey string          `json:"concurrency_key,omitempty"`
-	IdempotencyKey string          `json:"idempotency_key,omitempty"`
-	Status         string          `json:"status"`
-	Input          json.RawMessage `json:"input,omitempty"`
-	Output         json.RawMessage `json:"output,omitempty"`
-	ErrorMessage   string          `json:"error_message,omitempty"`
-	StartedAt      time.Time       `json:"started_at,omitzero"`
-	CompletedAt    time.Time       `json:"completed_at,omitzero"`
-	FailedAt       time.Time       `json:"failed_at,omitzero"`
-	SkippedAt      time.Time       `json:"skipped_at,omitzero"`
+	ID                int64           `json:"id"`
+	ConcurrencyKey    string          `json:"concurrency_key,omitempty"`
+	IdempotencyKey    string          `json:"idempotency_key,omitempty"`
+	Status            string          `json:"status"`
+	Input             json.RawMessage `json:"input,omitempty"`
+	Output            json.RawMessage `json:"output,omitempty"`
+	ErrorMessage      string          `json:"error_message,omitempty"`
+	CancelReason      string          `json:"cancel_reason,omitempty"`
+	CancelRequestedAt time.Time       `json:"cancel_requested_at,omitzero"`
+	CanceledAt        time.Time       `json:"canceled_at,omitzero"`
+	StartedAt         time.Time       `json:"started_at,omitzero"`
+	CompletedAt       time.Time       `json:"completed_at,omitzero"`
+	FailedAt          time.Time       `json:"failed_at,omitzero"`
+	SkippedAt         time.Time       `json:"skipped_at,omitzero"`
 }
 
 // OutputAs unmarshals the output of a completed task run.
@@ -215,6 +218,9 @@ type TaskRunInfo struct {
 func (r *TaskRunInfo) OutputAs(out any) error {
 	if r.Status == "failed" {
 		return fmt.Errorf("%w: %s", ErrRunFailed, r.ErrorMessage)
+	}
+	if r.Status == "canceled" {
+		return canceledRunError(r.CancelReason)
 	}
 	if r.Status != "completed" {
 		return fmt.Errorf("run not completed: current status is %s", r.Status)
@@ -271,10 +277,70 @@ func (h *TaskHandle) WaitForOutput(ctx context.Context, out any, opts ...WaitOpt
 				return fmt.Errorf("%w: %s", ErrRunFailed, *errorMessage)
 			}
 			return ErrRunFailed
+		case "canceled":
+			if errorMessage != nil {
+				return canceledRunError(*errorMessage)
+			}
+			return ErrRunCanceled
 		case "skipped":
 			return fmt.Errorf("run skipped: condition not met")
 		}
 	}
+}
+
+// CancelTaskRun requests cancellation for a task run.
+// Returns nil for idempotent no-op when the run is already terminal.
+func CancelTaskRun(ctx context.Context, conn Conn, taskName string, runID int64, opts ...CancelOpts) error {
+	q := `SELECT changed, final_status FROM cb_request_task_cancellation(name => $1, run_id => $2, reason => $3);`
+	var changed bool
+	var finalStatus string
+	err := conn.QueryRow(ctx, q, taskName, runID, resolveCancelReason(opts...)).Scan(&changed, &finalStatus)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	_ = changed
+	_ = finalStatus
+	return nil
+}
+
+// CancelCurrentTaskRun requests cancellation for the current task run from inside a task handler.
+func CancelCurrentTaskRun(ctx context.Context, opts ...CancelOpts) error {
+	scope, _ := ctx.Value(taskRunScopeContextKey{}).(*taskRunScope)
+	if scope == nil || scope.conn == nil {
+		return ErrNoRunContext
+	}
+
+	if err := CancelTaskRun(ctx, scope.conn, scope.name, scope.runID, opts...); err != nil {
+		return err
+	}
+
+	if scope.cancel != nil {
+		scope.cancel()
+	}
+
+	return nil
+}
+
+func resolveCancelReason(opts ...CancelOpts) *string {
+	var resolved CancelOpts
+	if len(opts) > 0 {
+		resolved = opts[0]
+	}
+	if resolved.Reason == "" {
+		return nil
+	}
+	reason := resolved.Reason
+	return &reason
+}
+
+func canceledRunError(reason string) error {
+	if reason == "" {
+		return ErrRunCanceled
+	}
+	return fmt.Errorf("%w: %s", ErrRunCanceled, reason)
 }
 
 // CreateTask creates one or more task definitions.
@@ -358,14 +424,14 @@ func RunTaskQuery(taskName string, input any, opts ...RunTaskOpts) (string, []an
 // GetTaskRun retrieves a specific task run result by ID.
 func GetTaskRun(ctx context.Context, conn Conn, taskName string, taskRunID int64) (*TaskRunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(taskName))
-	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at, skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at, skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
 	return scanTaskRun(conn.QueryRow(ctx, query, taskRunID))
 }
 
 // ListTaskRuns returns recent task runs for the specified task.
 func ListTaskRuns(ctx context.Context, conn Conn, taskName string) ([]*TaskRunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(taskName))
-	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at, skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at, skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, err
@@ -385,6 +451,9 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 	var input *json.RawMessage
 	var output *json.RawMessage
 	var errorMessage *string
+	var cancelReason *string
+	var cancelRequestedAt *time.Time
+	var canceledAt *time.Time
 	var completedAt *time.Time
 	var failedAt *time.Time
 	var skippedAt *time.Time
@@ -397,6 +466,9 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 		&input,
 		&output,
 		&errorMessage,
+		&cancelReason,
+		&cancelRequestedAt,
+		&canceledAt,
 		&rec.StartedAt,
 		&completedAt,
 		&failedAt,
@@ -419,6 +491,15 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 	}
 	if errorMessage != nil {
 		rec.ErrorMessage = *errorMessage
+	}
+	if cancelReason != nil {
+		rec.CancelReason = *cancelReason
+	}
+	if cancelRequestedAt != nil {
+		rec.CancelRequestedAt = *cancelRequestedAt
+	}
+	if canceledAt != nil {
+		rec.CanceledAt = *canceledAt
 	}
 	if completedAt != nil {
 		rec.CompletedAt = *completedAt

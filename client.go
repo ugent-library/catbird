@@ -126,6 +126,11 @@ func (c *Client) RunTask(ctx context.Context, taskName string, input any, opts .
 	return RunTask(ctx, c.Conn, taskName, input, opts...)
 }
 
+// CancelTaskRun requests cancellation for a task run.
+func (c *Client) CancelTaskRun(ctx context.Context, taskName string, runID int64, opts ...CancelOpts) error {
+	return CancelTaskRun(ctx, c.Conn, taskName, runID, opts...)
+}
+
 // GetTaskRun retrieves a specific task run result by ID.
 func (c *Client) GetTaskRun(ctx context.Context, taskName string, taskRunID int64) (*TaskRunInfo, error) {
 	return GetTaskRun(ctx, c.Conn, taskName, taskRunID)
@@ -154,6 +159,11 @@ func (c *Client) ListFlows(ctx context.Context) ([]*FlowInfo, error) {
 // RunFlow enqueues a flow execution and returns a handle for monitoring.
 func (c *Client) RunFlow(ctx context.Context, flowName string, input any, opts ...RunFlowOpts) (*FlowHandle, error) {
 	return RunFlow(ctx, c.Conn, flowName, input, opts...)
+}
+
+// CancelFlowRun requests cancellation for a flow run.
+func (c *Client) CancelFlowRun(ctx context.Context, flowName string, runID int64, opts ...CancelOpts) error {
+	return CancelFlowRun(ctx, c.Conn, flowName, runID, opts...)
 }
 
 // GetFlowRun retrieves a specific flow run result by ID.

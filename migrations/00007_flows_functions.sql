@@ -201,13 +201,18 @@ BEGIN
       on_fail_started_at timestamptz,
       on_fail_completed_at timestamptz,
       started_at timestamptz NOT NULL DEFAULT now(),
+      cancel_requested_at timestamptz,
       completed_at timestamptz,
       failed_at timestamptz,
-      CONSTRAINT status_valid CHECK (status IN ('started', 'completed', 'failed')),
+      canceled_at timestamptz,
+      cancel_reason text,
+      CONSTRAINT status_valid CHECK (status IN ('started', 'canceling', 'completed', 'failed', 'canceled')),
       CONSTRAINT remaining_steps_valid CHECK (remaining_steps >= 0),
       CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
+      CONSTRAINT canceled_terminal_exclusive CHECK (NOT (canceled_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL))),
       CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
       CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
+      CONSTRAINT canceled_at_is_after_started_at CHECK (canceled_at IS NULL OR canceled_at >= started_at),
       CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
       CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = ''))),
       CONSTRAINT on_fail_status_valid CHECK (on_fail_status IS NULL OR on_fail_status IN ('queued', 'started', 'completed', 'failed'))
@@ -251,9 +256,10 @@ BEGIN
       completed_at timestamptz,
       failed_at timestamptz,
       skipped_at timestamptz,
+      canceled_at timestamptz,
       UNIQUE (flow_run_id, step_name),
       FOREIGN KEY (flow_run_id) REFERENCES %I (id),
-      CONSTRAINT status_valid CHECK (status IN ('pending', 'queued', 'started', 'completed', 'failed', 'skipped')),
+      CONSTRAINT status_valid CHECK (status IN ('pending', 'queued', 'started', 'completed', 'failed', 'skipped', 'canceled')),
       CONSTRAINT generator_status_valid CHECK (generator_status IS NULL OR generator_status IN ('started', 'complete', 'failed')),
       CONSTRAINT map_tasks_spawned_valid CHECK (map_tasks_spawned >= 0),
       CONSTRAINT map_tasks_completed_valid CHECK (map_tasks_completed >= 0 AND map_tasks_completed <= map_tasks_spawned),
@@ -268,22 +274,6 @@ BEGIN
 
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, status);', _s_table || '_flow_run_id_status_idx', _s_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at);', _s_table || '_visible_at_idx', _s_table);
-
-    -- Backfill denormalized step metadata columns for pre-existing dynamic step tables.
-    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS flow_input jsonb NOT NULL DEFAULT ''{}''::jsonb;', _s_table);
-    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS condition jsonb;', _s_table);
-    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS is_generator boolean NOT NULL DEFAULT false;', _s_table);
-    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS is_map_step boolean NOT NULL DEFAULT false;', _s_table);
-    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS map_source text;', _s_table);
-    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS has_signal boolean NOT NULL DEFAULT false;', _s_table);
-    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS dependency_names text[] NOT NULL DEFAULT ''{}''::text[];', _s_table);
-    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS dependent_step_names text[] NOT NULL DEFAULT ''{}''::text[];', _s_table);
-
-    -- Backfill generator columns for pre-existing dynamic step tables created before generator support.
-    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS generator_status text;', _s_table);
-    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS map_tasks_spawned int NOT NULL DEFAULT 0;', _s_table);
-    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS map_tasks_completed int NOT NULL DEFAULT 0;', _s_table);
-    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS generator_error text;', _s_table);
 
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (status, generator_status) WHERE status IN (''pending'', ''started'');', _s_table || '_generator_status_idx', _s_table);
 
@@ -308,9 +298,10 @@ BEGIN
       started_at timestamptz,
       completed_at timestamptz,
       failed_at timestamptz,
+      canceled_at timestamptz,
       UNIQUE (flow_run_id, step_name, item_idx),
       FOREIGN KEY (flow_run_id, step_name) REFERENCES %I (flow_run_id, step_name),
-      CONSTRAINT status_valid CHECK (status IN ('queued', 'started', 'completed', 'failed')),
+      CONSTRAINT status_valid CHECK (status IN ('queued', 'started', 'completed', 'failed', 'canceled')),
       CONSTRAINT item_idx_valid CHECK (item_idx >= 0),
       CONSTRAINT attempts_valid CHECK (attempts >= 0)
     )
@@ -320,11 +311,6 @@ BEGIN
 
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (step_name, status, visible_at);', _m_table || '_step_status_visible_idx', _m_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, step_name, status);', _m_table || '_flow_step_status_idx', _m_table);
-
-    -- Backfill denormalized map-task columns for pre-existing dynamic map tables.
-    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS flow_input jsonb NOT NULL DEFAULT ''{}''::jsonb;', _m_table);
-    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS dependency_names text[] NOT NULL DEFAULT ''{}''::text[];', _m_table);
-    EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS signal_input jsonb;', _m_table);
 
 END;
 $$ LANGUAGE plpgsql;
@@ -483,6 +469,229 @@ BEGIN
     PERFORM cb_start_steps(cb_run_flow.name, _id, cb_run_flow.visible_at);
 
     RETURN _id;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_maybe_finalize_flow_cancellation(name text, run_id bigint)
+RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+    _f_table text := cb_table_name(cb_maybe_finalize_flow_cancellation.name, 'f');
+    _s_table text := cb_table_name(cb_maybe_finalize_flow_cancellation.name, 's');
+    _m_table text := cb_table_name(cb_maybe_finalize_flow_cancellation.name, 'm');
+    _active_steps int;
+    _active_maps int;
+    _updated boolean;
+BEGIN
+    EXECUTE format(
+      'SELECT count(*) FROM %I WHERE flow_run_id = $1 AND status = ''started''',
+      _s_table
+    )
+    USING cb_maybe_finalize_flow_cancellation.run_id
+    INTO _active_steps;
+
+    EXECUTE format(
+      'SELECT count(*) FROM %I WHERE flow_run_id = $1 AND status = ''started''',
+      _m_table
+    )
+    USING cb_maybe_finalize_flow_cancellation.run_id
+    INTO _active_maps;
+
+    IF _active_steps > 0 OR _active_maps > 0 THEN
+      RETURN false;
+    END IF;
+
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET status = 'canceled',
+          canceled_at = coalesce(canceled_at, now())
+      WHERE id = $1
+        AND status = 'canceling'
+      RETURNING true
+      $QUERY$,
+      _f_table
+    )
+    USING cb_maybe_finalize_flow_cancellation.run_id
+    INTO _updated;
+
+    RETURN coalesce(_updated, false);
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_request_flow_cancellation(
+    name text,
+    run_id bigint,
+    reason text DEFAULT NULL
+)
+RETURNS TABLE(changed boolean, final_status text)
+LANGUAGE plpgsql AS $$
+DECLARE
+    _f_table text := cb_table_name(cb_request_flow_cancellation.name, 'f');
+    _s_table text := cb_table_name(cb_request_flow_cancellation.name, 's');
+    _m_table text := cb_table_name(cb_request_flow_cancellation.name, 'm');
+    _status text;
+BEGIN
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET status = CASE
+            WHEN status = 'started' THEN 'canceling'
+            ELSE status
+          END,
+          cancel_requested_at = CASE
+            WHEN status = 'started' THEN now()
+            ELSE cancel_requested_at
+          END,
+          cancel_reason = coalesce($2, cancel_reason)
+      WHERE id = $1
+      RETURNING status
+      $QUERY$,
+      _f_table
+    )
+    USING cb_request_flow_cancellation.run_id, cb_request_flow_cancellation.reason
+    INTO _status;
+
+    IF _status IS NULL THEN
+      EXECUTE format('SELECT status FROM %I WHERE id = $1', _f_table)
+      USING cb_request_flow_cancellation.run_id
+      INTO _status;
+      IF _status IS NULL THEN
+        RETURN;
+      END IF;
+      RETURN QUERY SELECT false, _status;
+      RETURN;
+    END IF;
+
+    -- Cancel non-started step runs
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET status = 'canceled',
+          canceled_at = now()
+      WHERE flow_run_id = $1
+        AND status IN ('pending', 'queued')
+      $QUERY$,
+      _s_table
+    )
+    USING cb_request_flow_cancellation.run_id;
+
+    -- Cancel non-started map tasks
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET status = 'canceled',
+          canceled_at = now()
+      WHERE flow_run_id = $1
+        AND status = 'queued'
+      $QUERY$,
+      _m_table
+    )
+    USING cb_request_flow_cancellation.run_id;
+
+    PERFORM cb_maybe_finalize_flow_cancellation(cb_request_flow_cancellation.name, cb_request_flow_cancellation.run_id);
+
+    EXECUTE format('SELECT status FROM %I WHERE id = $1', _f_table)
+    USING cb_request_flow_cancellation.run_id
+    INTO _status;
+
+    RETURN QUERY SELECT true, coalesce(_status, 'canceling');
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_finalize_flow_cancellation(name text, run_id bigint)
+RETURNS boolean
+LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN cb_maybe_finalize_flow_cancellation(cb_finalize_flow_cancellation.name, cb_finalize_flow_cancellation.run_id);
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_flow_cancel_requested(name text, run_id bigint)
+RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+  _f_table text := cb_table_name(cb_flow_cancel_requested.name, 'f');
+    _requested boolean;
+BEGIN
+    EXECUTE format(
+      'SELECT status IN (''canceling'', ''canceled'') FROM %I WHERE id = $1',
+      _f_table
+    )
+    USING cb_flow_cancel_requested.run_id
+    INTO _requested;
+
+    RETURN coalesce(_requested, false);
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_cancel_step_run(flow_name text, step_id bigint)
+RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+    _s_table text := cb_table_name(cb_cancel_step_run.flow_name, 's');
+    _flow_run_id bigint;
+BEGIN
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET status = 'canceled',
+          canceled_at = now()
+      WHERE id = $1
+        AND status IN ('pending', 'queued', 'started')
+      RETURNING flow_run_id
+      $QUERY$,
+      _s_table
+    )
+    USING cb_cancel_step_run.step_id
+    INTO _flow_run_id;
+
+    IF _flow_run_id IS NOT NULL THEN
+      PERFORM cb_maybe_finalize_flow_cancellation(cb_cancel_step_run.flow_name, _flow_run_id);
+    END IF;
+
+    RETURN _flow_run_id;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE OR REPLACE FUNCTION cb_cancel_map_task_run(flow_name text, map_task_id bigint)
+RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+    _m_table text := cb_table_name(cb_cancel_map_task_run.flow_name, 'm');
+    _flow_run_id bigint;
+BEGIN
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET status = 'canceled',
+          canceled_at = now()
+      WHERE id = $1
+        AND status IN ('queued', 'started')
+      RETURNING flow_run_id
+      $QUERY$,
+      _m_table
+    )
+    USING cb_cancel_map_task_run.map_task_id
+    INTO _flow_run_id;
+
+    IF _flow_run_id IS NOT NULL THEN
+      PERFORM cb_maybe_finalize_flow_cancellation(cb_cancel_map_task_run.flow_name, _flow_run_id);
+    END IF;
+
+    RETURN _flow_run_id;
 END;
 $$;
 -- +goose statementend
@@ -763,6 +972,7 @@ DECLARE
     _stop_at timestamp;
     _q text;
     _s_table text := cb_table_name(cb_poll_steps.flow_name, 's');
+  _f_table text := cb_table_name(cb_poll_steps.flow_name, 'f');
 BEGIN
     IF cb_poll_steps.quantity <= 0 THEN
         RAISE EXCEPTION 'cb: quantity must be greater than 0';
@@ -793,6 +1003,12 @@ BEGIN
           WHERE m.step_name = $1
             AND m.visible_at <= clock_timestamp()
             AND m.status IN ('queued', 'started')
+            AND EXISTS (
+                SELECT 1
+                FROM %I f
+                WHERE f.id = m.flow_run_id
+                  AND f.status = 'started'
+            )
           ORDER BY m.id ASC
           LIMIT $2
           FOR UPDATE SKIP LOCKED
@@ -805,6 +1021,7 @@ BEGIN
         FROM runs
         WHERE m.id = runs.id
         RETURNING m.id,
+                  m.flow_run_id,
                   m.attempts,
                   m.flow_input AS input,
                   (SELECT jsonb_object_agg(deps.step_name, deps.output)
@@ -815,7 +1032,7 @@ BEGIN
                   ) AS step_outputs,
                   m.signal_input;
         $QUERY$,
-        _s_table, _s_table, _s_table
+        _s_table, _f_table, _s_table, _s_table
       );
 
     LOOP
@@ -883,7 +1100,7 @@ CREATE OR REPLACE FUNCTION cb_poll_map_tasks(
     poll_for int,
     poll_interval int
 )
-RETURNS TABLE(id bigint, attempts int, input jsonb, step_outputs jsonb, signal_input jsonb, item jsonb)
+RETURNS TABLE(id bigint, flow_run_id bigint, attempts int, input jsonb, step_outputs jsonb, signal_input jsonb, item jsonb)
 LANGUAGE plpgsql AS $$
 DECLARE
     _sleep_for double precision;
@@ -891,6 +1108,7 @@ DECLARE
     _q text;
     _s_table text := cb_table_name(cb_poll_map_tasks.flow_name, 's');
     _m_table text := cb_table_name(cb_poll_map_tasks.flow_name, 'm');
+  _f_table text := cb_table_name(cb_poll_map_tasks.flow_name, 'f');
 BEGIN
     IF cb_poll_map_tasks.quantity <= 0 THEN
         RAISE EXCEPTION 'cb: quantity must be greater than 0';
@@ -920,6 +1138,12 @@ BEGIN
         WHERE m.step_name = $1
           AND m.status IN ('queued', 'started')
           AND m.visible_at <= clock_timestamp()
+          AND EXISTS (
+              SELECT 1
+              FROM %I f
+              WHERE f.id = m.flow_run_id
+                AND f.status = 'started'
+          )
         ORDER BY m.id ASC
         LIMIT $2
         FOR UPDATE SKIP LOCKED
@@ -932,6 +1156,7 @@ BEGIN
       FROM runs
       WHERE m.id = runs.id
       RETURNING m.id,
+                m.flow_run_id,
                 m.attempts,
                 m.flow_input AS input,
                 (SELECT jsonb_object_agg(deps.step_name, deps.output)
@@ -943,7 +1168,7 @@ BEGIN
                 m.signal_input,
                 m.item;
       $QUERY$,
-      _m_table, _m_table, _s_table
+      _m_table, _f_table, _m_table, _s_table
     );
 
     LOOP
@@ -1095,13 +1320,13 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- cb_mark_generator_complete: Mark generator as complete and finalize parent step if all map tasks are complete
-CREATE OR REPLACE FUNCTION cb_mark_generator_complete(flow_name text, step_name text, step_id bigint)
+-- cb_complete_generator_step: Mark generator as complete and finalize parent step if all map tasks are complete
+CREATE OR REPLACE FUNCTION cb_complete_generator_step(flow_name text, step_name text, step_id bigint)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-    _s_table text := cb_table_name(cb_mark_generator_complete.flow_name, 's');
-    _m_table text := cb_table_name(cb_mark_generator_complete.flow_name, 'm');
+  _s_table text := cb_table_name(cb_complete_generator_step.flow_name, 's');
+  _m_table text := cb_table_name(cb_complete_generator_step.flow_name, 'm');
     _flow_run_id bigint;
     _spawned int;
     _completed int;
@@ -1119,7 +1344,7 @@ BEGIN
       $QUERY$,
       _s_table
     )
-    USING cb_mark_generator_complete.step_id, cb_mark_generator_complete.step_name
+    USING cb_complete_generator_step.step_id, cb_complete_generator_step.step_name
     INTO _flow_run_id, _spawned, _completed;
 
     IF _flow_run_id IS NULL THEN
@@ -1140,21 +1365,21 @@ BEGIN
       $QUERY$,
       _m_table
     )
-    USING _flow_run_id, cb_mark_generator_complete.step_name
+    USING _flow_run_id, cb_complete_generator_step.step_name
     INTO _agg_output;
 
-    PERFORM cb_complete_step(cb_mark_generator_complete.flow_name, cb_mark_generator_complete.step_name, cb_mark_generator_complete.step_id, _agg_output);
+    PERFORM cb_complete_step(cb_complete_generator_step.flow_name, cb_complete_generator_step.step_name, cb_complete_generator_step.step_id, _agg_output);
 END;
 $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- cb_mark_generator_failed: Mark generator as failed and fail parent step/flow
-CREATE OR REPLACE FUNCTION cb_mark_generator_failed(flow_name text, step_name text, step_id bigint, error_message text)
+  -- cb_fail_generator_step: Mark generator as failed and fail parent step/flow
+  CREATE OR REPLACE FUNCTION cb_fail_generator_step(flow_name text, step_name text, step_id bigint, error_message text)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-    _s_table text := cb_table_name(cb_mark_generator_failed.flow_name, 's');
+    _s_table text := cb_table_name(cb_fail_generator_step.flow_name, 's');
     _updated boolean;
 BEGIN
     EXECUTE format(
@@ -1169,9 +1394,9 @@ BEGIN
       $QUERY$,
       _s_table
     )
-    USING cb_mark_generator_failed.step_id,
-          cb_mark_generator_failed.error_message,
-          cb_mark_generator_failed.step_name
+        USING cb_fail_generator_step.step_id,
+          cb_fail_generator_step.error_message,
+          cb_fail_generator_step.step_name
     INTO _updated;
 
     IF _updated IS NULL THEN
@@ -1179,10 +1404,10 @@ BEGIN
     END IF;
 
     PERFORM cb_fail_step(
-      cb_mark_generator_failed.flow_name,
-      cb_mark_generator_failed.step_name,
-      cb_mark_generator_failed.step_id,
-      cb_mark_generator_failed.error_message
+      cb_fail_generator_step.flow_name,
+      cb_fail_generator_step.step_name,
+      cb_fail_generator_step.step_id,
+      cb_fail_generator_step.error_message
     );
 END;
 $$;
@@ -1280,6 +1505,162 @@ BEGIN
     INTO _agg_output;
 
     PERFORM cb_complete_step(cb_complete_map_task.flow_name, cb_complete_map_task.step_name, _step_id, _agg_output);
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_complete_generator_step_or_queue_reduce: mark generator output production complete and queue reducer when ready
+CREATE OR REPLACE FUNCTION cb_complete_generator_step_or_queue_reduce(flow_name text, step_name text, step_id bigint)
+RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+    _s_table text := cb_table_name(cb_complete_generator_step_or_queue_reduce.flow_name, 's');
+    _spawned int;
+    _completed int;
+    _ready boolean;
+BEGIN
+    EXECUTE format(
+        $QUERY$
+        UPDATE %I
+        SET generator_status = 'complete'
+        WHERE id = $1
+          AND step_name = $2
+          AND status = 'started'
+          AND generator_status = 'started'
+        RETURNING map_tasks_spawned, map_tasks_completed
+        $QUERY$,
+        _s_table
+    )
+    USING cb_complete_generator_step_or_queue_reduce.step_id, cb_complete_generator_step_or_queue_reduce.step_name
+    INTO _spawned, _completed;
+
+    IF _spawned IS NULL THEN
+        RETURN false;
+    END IF;
+
+    _ready := _spawned = _completed;
+
+    IF _ready THEN
+        EXECUTE format(
+            $QUERY$
+            UPDATE %I
+            SET status = 'queued',
+                visible_at = now()
+            WHERE id = $1
+              AND step_name = $2
+              AND status = 'started'
+              AND generator_status = 'complete'
+            $QUERY$,
+            _s_table
+        )
+        USING cb_complete_generator_step_or_queue_reduce.step_id, cb_complete_generator_step_or_queue_reduce.step_name;
+    END IF;
+
+    RETURN _ready;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_complete_map_task_or_queue_reduce: complete one map item and queue reducer when all items are done
+CREATE OR REPLACE FUNCTION cb_complete_map_task_or_queue_reduce(flow_name text, step_name text, map_task_id bigint, output jsonb)
+RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+    _s_table text := cb_table_name(cb_complete_map_task_or_queue_reduce.flow_name, 's');
+    _m_table text := cb_table_name(cb_complete_map_task_or_queue_reduce.flow_name, 'm');
+    _flow_run_id bigint;
+    _step_id bigint;
+    _generator_status text;
+    _spawned int;
+    _completed int;
+    _has_pending boolean;
+BEGIN
+    EXECUTE format(
+        $QUERY$
+        UPDATE %I
+        SET status = 'completed',
+            completed_at = now(),
+            output = $2
+        WHERE id = $1
+          AND status = 'started'
+        RETURNING flow_run_id
+        $QUERY$,
+        _m_table
+    )
+    USING cb_complete_map_task_or_queue_reduce.map_task_id, cb_complete_map_task_or_queue_reduce.output
+    INTO _flow_run_id;
+
+    IF _flow_run_id IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    EXECUTE format(
+        $QUERY$
+        UPDATE %I
+        SET map_tasks_completed = CASE
+            WHEN generator_status IS NULL THEN map_tasks_completed
+            ELSE map_tasks_completed + 1
+        END
+        WHERE flow_run_id = $1
+          AND step_name = $2
+          AND status = 'started'
+        RETURNING id, generator_status, map_tasks_spawned, map_tasks_completed
+        $QUERY$,
+        _s_table
+    )
+    USING _flow_run_id, cb_complete_map_task_or_queue_reduce.step_name
+    INTO _step_id, _generator_status, _spawned, _completed;
+
+    IF _step_id IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    IF _generator_status IS NOT NULL THEN
+        IF _generator_status = 'complete' AND _completed = _spawned THEN
+            EXECUTE format(
+                $QUERY$
+                UPDATE %I
+                SET status = 'queued',
+                    visible_at = now()
+                WHERE id = $1
+                  AND status = 'started'
+                  AND generator_status = 'complete'
+                $QUERY$,
+                _s_table
+            )
+            USING _step_id;
+            RETURN _step_id;
+        END IF;
+        RETURN NULL;
+    END IF;
+
+    EXECUTE format(
+        'SELECT EXISTS (SELECT 1 FROM %I WHERE flow_run_id = $1 AND step_name = $2 AND status IN (''queued'', ''started''))',
+        _m_table
+    )
+    USING _flow_run_id, cb_complete_map_task_or_queue_reduce.step_name
+    INTO _has_pending;
+
+    IF _has_pending THEN
+        RETURN NULL;
+    END IF;
+
+    EXECUTE format(
+        $QUERY$
+        UPDATE %I
+        SET status = 'queued',
+            visible_at = now()
+        WHERE id = $1
+          AND status = 'started'
+          AND generator_status IS NULL
+        $QUERY$,
+        _s_table
+    )
+    USING _step_id;
+
+    RETURN _step_id;
 END;
 $$;
 -- +goose statementend
@@ -1769,7 +2150,7 @@ BEGIN
 
         EXECUTE format(
           $QUERY$
-          SELECT f.status, f.output, f.error_message
+          SELECT f.status, f.output, coalesce(f.error_message, f.cancel_reason)
           FROM %I f
           WHERE f.id = $1
           $QUERY$,
@@ -1782,10 +2163,10 @@ BEGIN
           RAISE EXCEPTION 'cb: flow run % not found for flow %', cb_wait_flow_output.run_id, cb_wait_flow_output.flow_name;
         END IF;
 
-        IF _status IN ('completed', 'failed') THEN
+        IF _status IN ('completed', 'failed', 'canceled') THEN
             status := _status;
             output := _output;
-            error_message := _error_message;
+          error_message := _error_message;
             RETURN NEXT;
             RETURN;
         END IF;
@@ -1851,6 +2232,12 @@ $$;
 -- +goose statementend
 
 DROP FUNCTION IF EXISTS cb_delete_flow(text);
+DROP FUNCTION IF EXISTS cb_cancel_map_task_run(text, bigint);
+DROP FUNCTION IF EXISTS cb_cancel_step_run(text, bigint);
+DROP FUNCTION IF EXISTS cb_flow_cancel_requested(text, bigint);
+DROP FUNCTION IF EXISTS cb_finalize_flow_cancellation(text, bigint);
+DROP FUNCTION IF EXISTS cb_maybe_finalize_flow_cancellation(text, bigint);
+DROP FUNCTION IF EXISTS cb_request_flow_cancellation(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_fail_flow_on_fail(text, bigint, text, boolean, bigint);
 DROP FUNCTION IF EXISTS cb_complete_flow_on_fail(text, bigint);
 DROP FUNCTION IF EXISTS cb_poll_flow_on_fail(text, int);
@@ -1860,8 +2247,10 @@ DROP FUNCTION IF EXISTS cb_fail_step(text, text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_step(text, text, bigint, jsonb);
 DROP FUNCTION IF EXISTS cb_fail_map_task(text, text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_map_task(text, text, bigint, jsonb);
-DROP FUNCTION IF EXISTS cb_mark_generator_failed(text, text, bigint, text);
-DROP FUNCTION IF EXISTS cb_mark_generator_complete(text, text, bigint);
+DROP FUNCTION IF EXISTS cb_complete_map_task_or_queue_reduce(text, text, bigint, jsonb);
+DROP FUNCTION IF EXISTS cb_fail_generator_step(text, text, bigint, text);
+DROP FUNCTION IF EXISTS cb_complete_generator_step(text, text, bigint);
+DROP FUNCTION IF EXISTS cb_complete_generator_step_or_queue_reduce(text, text, bigint);
 DROP FUNCTION IF EXISTS cb_spawn_generator_map_tasks(text, text, bigint, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_hide_map_tasks(text, text, bigint[], int);
 DROP FUNCTION IF EXISTS cb_poll_map_tasks(text, text, int, int, int, int);

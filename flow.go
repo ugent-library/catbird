@@ -746,6 +746,7 @@ type StepDependencyInfo struct {
 
 type stepClaim struct {
 	ID          int64                      `json:"id"`
+	FlowRunID   int64                      `json:"flow_run_id"`
 	Attempts    int                        `json:"attempts"`
 	Input       json.RawMessage            `json:"input"`
 	StepOutputs map[string]json.RawMessage `json:"step_outputs"`
@@ -971,16 +972,19 @@ type RunFlowOpts struct {
 
 // FlowRunInfo represents the details of a flow execution.
 type FlowRunInfo struct {
-	ID             int64           `json:"id"`
-	ConcurrencyKey string          `json:"concurrency_key,omitempty"`
-	IdempotencyKey string          `json:"idempotency_key,omitempty"`
-	Status         string          `json:"status"`
-	Input          json.RawMessage `json:"input,omitempty"`
-	Output         json.RawMessage `json:"output,omitempty"`
-	ErrorMessage   string          `json:"error_message,omitempty"`
-	StartedAt      time.Time       `json:"started_at,omitzero"`
-	CompletedAt    time.Time       `json:"completed_at,omitzero"`
-	FailedAt       time.Time       `json:"failed_at,omitzero"`
+	ID                int64           `json:"id"`
+	ConcurrencyKey    string          `json:"concurrency_key,omitempty"`
+	IdempotencyKey    string          `json:"idempotency_key,omitempty"`
+	Status            string          `json:"status"`
+	Input             json.RawMessage `json:"input,omitempty"`
+	Output            json.RawMessage `json:"output,omitempty"`
+	ErrorMessage      string          `json:"error_message,omitempty"`
+	CancelReason      string          `json:"cancel_reason,omitempty"`
+	CancelRequestedAt time.Time       `json:"cancel_requested_at,omitzero"`
+	CanceledAt        time.Time       `json:"canceled_at,omitzero"`
+	StartedAt         time.Time       `json:"started_at,omitzero"`
+	CompletedAt       time.Time       `json:"completed_at,omitzero"`
+	FailedAt          time.Time       `json:"failed_at,omitzero"`
 }
 
 // OutputAs unmarshals the output of a completed flow run.
@@ -988,6 +992,9 @@ type FlowRunInfo struct {
 func (r *FlowRunInfo) OutputAs(out any) error {
 	if r.Status == "failed" {
 		return fmt.Errorf("%w: %s", ErrRunFailed, r.ErrorMessage)
+	}
+	if r.Status == "canceled" {
+		return canceledRunError(r.CancelReason)
 	}
 	if r.Status != "completed" {
 		return fmt.Errorf("run not completed: current status is %s", r.Status)
@@ -1044,8 +1051,49 @@ func (h *FlowHandle) WaitForOutput(ctx context.Context, out any, opts ...WaitOpt
 				return fmt.Errorf("%w: %s", ErrRunFailed, *errorMessage)
 			}
 			return ErrRunFailed
+		case "canceled":
+			if errorMessage != nil {
+				return canceledRunError(*errorMessage)
+			}
+			return ErrRunCanceled
 		}
 	}
+}
+
+// CancelFlowRun requests cancellation for a flow run.
+// Returns nil for idempotent no-op when the run is already terminal.
+func CancelFlowRun(ctx context.Context, conn Conn, flowName string, runID int64, opts ...CancelOpts) error {
+	q := `SELECT changed, final_status FROM cb_request_flow_cancellation(name => $1, run_id => $2, reason => $3);`
+	var changed bool
+	var finalStatus string
+	err := conn.QueryRow(ctx, q, flowName, runID, resolveCancelReason(opts...)).Scan(&changed, &finalStatus)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	_ = changed
+	_ = finalStatus
+	return nil
+}
+
+// CancelCurrentFlowRun requests cancellation for the current flow run from inside a flow step handler.
+func CancelCurrentFlowRun(ctx context.Context, opts ...CancelOpts) error {
+	scope, _ := ctx.Value(flowRunScopeContextKey{}).(*flowRunScope)
+	if scope == nil || scope.conn == nil {
+		return ErrNoRunContext
+	}
+
+	if err := CancelFlowRun(ctx, scope.conn, scope.name, scope.runID, opts...); err != nil {
+		return err
+	}
+
+	if scope.cancel != nil {
+		scope.cancel()
+	}
+
+	return nil
 }
 
 // RunFlow enqueues a flow execution and returns a handle for monitoring.
@@ -1085,14 +1133,14 @@ func RunFlowQuery(flowName string, input any, opts ...RunFlowOpts) (string, []an
 // GetFlowRun retrieves a specific flow run result by ID.
 func GetFlowRun(ctx context.Context, conn Conn, flowName string, flowRunID int64) (*FlowRunInfo, error) {
 	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
-	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
 	return scanFlowRun(conn.QueryRow(ctx, query, flowRunID))
 }
 
 // ListFlowRuns returns recent flow runs for the specified flow.
 func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunInfo, error) {
 	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
-	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, err
@@ -1112,6 +1160,9 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 	var input *json.RawMessage
 	var output *json.RawMessage
 	var errorMessage *string
+	var cancelReason *string
+	var cancelRequestedAt *time.Time
+	var canceledAt *time.Time
 	var completedAt *time.Time
 	var failedAt *time.Time
 
@@ -1123,6 +1174,9 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 		&input,
 		&output,
 		&errorMessage,
+		&cancelReason,
+		&cancelRequestedAt,
+		&canceledAt,
 		&rec.StartedAt,
 		&completedAt,
 		&failedAt,
@@ -1145,6 +1199,15 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 	if errorMessage != nil {
 		rec.ErrorMessage = *errorMessage
 	}
+	if cancelReason != nil {
+		rec.CancelReason = *cancelReason
+	}
+	if cancelRequestedAt != nil {
+		rec.CancelRequestedAt = *cancelRequestedAt
+	}
+	if canceledAt != nil {
+		rec.CanceledAt = *canceledAt
+	}
 	if completedAt != nil {
 		rec.CompletedAt = *completedAt
 	}
@@ -1166,13 +1229,14 @@ type StepRunInfo struct {
 	CompletedAt  time.Time       `json:"completed_at,omitzero"`
 	FailedAt     time.Time       `json:"failed_at,omitzero"`
 	SkippedAt    time.Time       `json:"skipped_at,omitzero"`
+	CanceledAt   time.Time       `json:"canceled_at,omitzero"`
 }
 
 // GetFlowRunSteps retrieves all step runs for a specific flow run.
 func GetFlowRunSteps(ctx context.Context, conn Conn, flowName string, flowRunID int64) ([]*StepRunInfo, error) {
 	tableName := fmt.Sprintf("cb_s_%s", strings.ToLower(flowName))
 	query := fmt.Sprintf(`
-		SELECT id, step_name, status, output, error_message, started_at, completed_at, failed_at, skipped_at
+		SELECT id, step_name, status, output, error_message, started_at, completed_at, failed_at, skipped_at, canceled_at
 		FROM %s
 		WHERE flow_run_id = $1
 		ORDER BY id;`, pgx.Identifier{tableName}.Sanitize())
@@ -1184,7 +1248,7 @@ func GetFlowRunSteps(ctx context.Context, conn Conn, flowName string, flowRunID 
 		var s StepRunInfo
 		var output *json.RawMessage
 		var errorMessage *string
-		var startedAt, completedAt, failedAt, skippedAt *time.Time
+		var startedAt, completedAt, failedAt, skippedAt, canceledAt *time.Time
 
 		err := row.Scan(
 			&s.ID,
@@ -1196,6 +1260,7 @@ func GetFlowRunSteps(ctx context.Context, conn Conn, flowName string, flowRunID 
 			&completedAt,
 			&failedAt,
 			&skippedAt,
+			&canceledAt,
 		)
 		if err != nil {
 			return nil, err
@@ -1219,6 +1284,9 @@ func GetFlowRunSteps(ctx context.Context, conn Conn, flowName string, flowRunID 
 		}
 		if skippedAt != nil {
 			s.SkippedAt = *skippedAt
+		}
+		if canceledAt != nil {
+			s.CanceledAt = *canceledAt
 		}
 
 		return &s, nil

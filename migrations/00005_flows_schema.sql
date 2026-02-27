@@ -9,6 +9,7 @@ BEGIN
     DROP TYPE IF EXISTS cb_step_claim CASCADE;
     CREATE TYPE cb_step_claim AS (
         id bigint,
+      flow_run_id bigint,
         attempts int,
         input jsonb,
         step_outputs jsonb,

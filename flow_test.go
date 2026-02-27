@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -2122,5 +2123,90 @@ func TestFlowConditionalDependencyRequiresOptional(t *testing.T) {
 
 	if err := client.CreateFlow(t.Context(), flow); err == nil {
 		t.Fatalf("expected CreateFlow to fail when depending on conditional step without OptionalDependency")
+	}
+}
+
+func waitForFlowRunStatus(t *testing.T, client *Client, flowName string, runID int64, status string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		run, err := client.GetFlowRun(t.Context(), flowName, runID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if run.Status == status {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected flow run to reach status %s, last status: %s", status, run.Status)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestFlowCancelStartedRun(t *testing.T) {
+	client := getTestClient(t)
+
+	flowName := testFlowName(t, "cancel_started")
+	flow := NewFlow(flowName).
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
+			<-ctx.Done()
+			return "", ctx.Err()
+		}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitForFlowRunStatus(t, client, flowName, h.ID, "started", 5*time.Second)
+
+	if err := client.CancelFlowRun(t.Context(), flowName, h.ID, CancelOpts{Reason: "test flow cancel"}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForFlowRunStatus(t, client, flowName, h.ID, "canceled", 5*time.Second)
+}
+
+func TestFlowInternalCancelCurrentRun(t *testing.T) {
+	client := getTestClient(t)
+
+	flowName := testFlowName(t, "cancel_internal")
+	flow := NewFlow(flowName).
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
+			if err := CancelCurrentFlowRun(ctx, CancelOpts{Reason: "business early exit"}); err != nil {
+				return "", err
+			}
+			<-ctx.Done()
+			return "", ctx.Err()
+		}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out string
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err = h.WaitForOutput(ctx, &out)
+	if !errors.Is(err, ErrRunCanceled) {
+		t.Fatalf("expected ErrRunCanceled, got %v", err)
+	}
+
+	run, err := client.GetFlowRun(t.Context(), flowName, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "canceled" {
+		t.Fatalf("expected canceled, got %s", run.Status)
 	}
 }

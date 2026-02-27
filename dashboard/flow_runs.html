@@ -6,6 +6,8 @@
       <th scope="col">ID</th>
       <th scope="col">Status</th>
       <th scope="col">Started</th>
+      <th scope="col">Cancel requested</th>
+      <th scope="col">Canceled</th>
       <th scope="col">Completed</th>
       <th scope="col">Failed</th>
     </tr>
@@ -23,11 +25,17 @@
         <span class="badge text-bg-success">completed</span>
         {{ else if eq .Status "failed" }}
         <span class="badge text-bg-danger">failed</span>
+        {{ else if eq .Status "canceling" }}
+        <span class="badge text-bg-warning">canceling</span>
+        {{ else if eq .Status "canceled" }}
+        <span class="badge text-bg-secondary">canceled</span>
         {{ else if eq .Status "skipped" }}
         <span class="badge text-bg-secondary">skipped</span>
         {{ end }}
       </td>
       <td>{{ formatTime .StartedAt }}</td>
+      <td>{{ formatTime .CancelRequestedAt }}</td>
+      <td>{{ formatTime .CanceledAt }}</td>
       <td>{{ formatTime .CompletedAt }}</td>
       <td>{{ formatTime .FailedAt }}</td>
     </tr>
@@ -60,8 +68,16 @@
         {{ with .Output }}
         <pre><code class="language-json">{{ prettyJSON . }}</code></pre>
         {{ else }}
-        -
+        <p>-</p>
         {{ end }}
+        <h5>Error message</h5>
+        <p>{{ with .ErrorMessage }}{{ . }}{{ else }}-{{ end }}</p>
+        <h5>Cancel reason</h5>
+        <p>{{ with .CancelReason }}{{ . }}{{ else }}-{{ end }}</p>
+        <h5>Cancel requested at</h5>
+        <p>{{ formatTime .CancelRequestedAt }}</p>
+        <h5>Canceled at</h5>
+        <p>{{ formatTime .CanceledAt }}</p>
       </div>
       <div class="modal-footer">
         <button type="button" class="btn btn-link" data-bs-dismiss="modal">Close</button>
