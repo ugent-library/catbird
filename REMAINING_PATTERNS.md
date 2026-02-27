@@ -1,4 +1,4 @@
-# Remaining Patterns Design: GeneratorStep + Signal/Watermark Coordination
+# Remaining Patterns Design: GeneratorStep + Signal/FlowState Watermark Coordination
 
 This document defines the **final implementation scope** for Catbird coordination primitives, focused on simplicity.
 
@@ -7,7 +7,7 @@ This document defines the **final implementation scope** for Catbird coordinatio
 ### Implement now
 1. **GeneratorStep**
    - For streaming/pagination/agentic discovery where item count is unknown
-2. **Signal + Target Watermark coordination**
+2. **Signal + FlowState watermark coordination**
    - For simple multi-step coordination (e.g. zero-downtime index alias switch)
 
 ### Explicitly out of scope (for now)
@@ -24,6 +24,23 @@ This document defines the **final implementation scope** for Catbird coordinatio
 - Preserve PostgreSQL as source of truth for flow state
 - Require idempotent handlers for crash/retry safety
 - Support pragmatic correctness (eventual convergence), with optional strict gating via watermark waits
+
+---
+
+## Naming Decision (API-first)
+
+To avoid ambiguity between two different concepts, use distinct names:
+
+1. **External step gating input (existing feature, keep):**
+    - `Step.Signal()`
+    - `SignalFlow(...)`
+    - `has_signal` / `signal_input`
+
+2. **Cross-step coordination KV for watermark gates (new feature):**
+    - `SetState(...)`, `GetState(...)`, `WaitForState(...)`
+    - Reader type: `FlowStateReader`
+
+This keeps one-time step-unblocking input (`Signal`) and long-lived coordination state (`FlowState`) clearly separated.
 
 ---
 
@@ -202,7 +219,7 @@ Expose per generator step-run:
 
 ---
 
-## Pattern B: Signal + Target Watermark Coordination
+## Pattern B: Signal + FlowState Target Watermark Coordination
 
 ## Problem it solves
 Simple cross-step coordination without pool machinery.
@@ -213,7 +230,7 @@ Primary target use case:
 
 ## Proposed primitives
 
-### 1) Flow signals/state
+### 1) Flow state
 Per flow-run key/value coordination state:
 - `backfill_done` (bool)
 - `switch_done` (bool)
@@ -221,15 +238,15 @@ Per flow-run key/value coordination state:
 - `consumer_offset` (string/int64)
 - `error` (text, optional)
 
-### 2) Signal write
+### 2) State write
 ```go
-stepCtx.Signal(ctx, "backfill_done", true)
-stepCtx.Signal(ctx, "target_watermark", watermark)
+stepCtx.SetState(ctx, "backfill_done", true)
+stepCtx.SetState(ctx, "target_watermark", watermark)
 ```
 
 ### 3) Predicate wait
 ```go
-stepCtx.WaitUntil(ctx, func(s FlowSignals) bool {
+stepCtx.WaitForState(ctx, func(s FlowStateReader) bool {
     return s.BackfillDone && s.ConsumerOffset >= s.TargetWatermark
 })
 ```
@@ -238,14 +255,14 @@ stepCtx.WaitUntil(ctx, func(s FlowSignals) bool {
 
 ```text
 [create-index]
-   ├─> [backfill] -----------(signals backfill_done)
+    ├─> [backfill] -----------(sets state backfill_done)
    └─> [consume-changes] ----(updates consumer_offset continuously)
 
 [switch-alias] depends on [backfill]
   1) capture target_watermark
   2) wait consumer_offset >= target_watermark
   3) atomic alias switch
-  4) signal switch_done
+    4) set state switch_done
 
 [consume-changes] exits after switch_done + optional short post-switch drain
 ```
@@ -280,12 +297,12 @@ CREATE INDEX cb_flow_signals_run_idx
 Add to `StepContext`:
 
 ```go
-Signal(ctx context.Context, key string, value any) error
-GetSignal(ctx context.Context, key string, out any) (bool, error)
-WaitUntil(ctx context.Context, pred func(SignalReader) (bool, error), opts ...WaitOpt) error
+SetState(ctx context.Context, key string, value any) error
+GetState(ctx context.Context, key string, out any) (bool, error)
+WaitForState(ctx context.Context, pred func(FlowStateReader) (bool, error), opts ...WaitOpt) error
 ```
 
-`WaitUntil` options:
+`WaitForState` options:
 - `PollInterval` (default 250ms)
 - `Timeout` (optional)
 - `StableChecks` (default 2)
@@ -295,7 +312,7 @@ WaitUntil(ctx context.Context, pred func(SignalReader) (bool, error), opts ...Wa
 `cb_flow_signals` is sufficient as KV state per flow-run.
 
 Recommended conventions:
-- signal key namespace:
+- state key namespace:
     - `coord.backfill_done`
     - `coord.target_watermark`
     - `coord.consumer_offset`
@@ -306,8 +323,8 @@ Recommended conventions:
 ### B3. SQL functions
 
 ```sql
--- upsert signal
-CREATE OR REPLACE FUNCTION cb_signal_set(
+-- upsert state key
+CREATE OR REPLACE FUNCTION cb_state_set(
         p_flow_name text,
         p_flow_run_id bigint,
         p_key text,
@@ -321,8 +338,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- read signal
-CREATE OR REPLACE FUNCTION cb_signal_get(
+-- read state key
+CREATE OR REPLACE FUNCTION cb_state_get(
         p_flow_name text,
         p_flow_run_id bigint,
         p_key text
@@ -344,12 +361,12 @@ $$ LANGUAGE plpgsql;
 
 #### Step 1: create-index
 - create target index
-- signal optional metadata (`coord.target_index`)
+- set optional metadata state (`coord.target_index`)
 
 #### Step 2: backfill
 - scan source records
 - bulk index into target index with external versioning
-- `Signal(coord.backfill_done, true)`
+- `SetState(coord.backfill_done, true)`
 
 #### Step 3: consume-changes
 - subscribe to topic
@@ -364,7 +381,7 @@ $$ LANGUAGE plpgsql;
 - capture topic head as `W` (`coord.target_watermark = W`)
 - wait until `coord.consumer_offset >= W` (with `StableChecks`)
 - atomically switch alias
-- `Signal(coord.switch_done, true)`
+- `SetState(coord.switch_done, true)`
 
 ### B5. Watermark semantics
 
@@ -390,7 +407,7 @@ $$
 
 ### B7. Test matrix
 
-1. Signal upsert/read correctness.
+1. State upsert/read correctness.
 2. Wait predicate timeout/cancel behavior.
 3. Watermark gate correctness under concurrent updates.
 4. Alias switch idempotent retry.
@@ -408,9 +425,9 @@ $$
 
 ## Combined Delivery Plan
 
-### Milestone 1: Signal/Watermark primitives (fastest value)
+### Milestone 1: Signal/FlowState watermark primitives (fastest value)
 - `cb_flow_signals` storage
-- `Signal`, `GetSignal`, `WaitUntil`
+- `SetState`, `GetState`, `WaitForState`
 - end-to-end reindex sample using alias switch gate
 
 ### Milestone 2: GeneratorStep
