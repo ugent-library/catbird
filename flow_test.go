@@ -238,6 +238,131 @@ func TestFlowWithDependencies(t *testing.T) {
 	}
 }
 
+func TestFlowOutputPrioritySelection(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "output_priority")
+
+	flow := NewFlow(flowName).
+		Output("high", "low").
+		AddStep(NewStep("base").Handler(func(ctx context.Context, in int) (int, error) {
+			return in, nil
+		})).
+		AddStep(NewStep("low").
+			DependsOn("base").
+			Handler(func(ctx context.Context, in int, base int) (int, error) {
+				return base + 1, nil
+			})).
+		AddStep(NewStep("high").
+			DependsOn("base").
+			Handler(func(ctx context.Context, in int, base int) (int, error) {
+				return base + 100, nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out int
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	if out != 105 {
+		t.Fatalf("unexpected output: got %d, want %d", out, 105)
+	}
+}
+
+func TestFlowOutputDefaultPriorityUsesTerminalOrder(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "output_default_priority")
+
+	flow := NewFlow(flowName).
+		AddStep(NewStep("base").Handler(func(ctx context.Context, in int) (int, error) {
+			return in, nil
+		})).
+		AddStep(NewStep("first_terminal").
+			DependsOn("base").
+			Handler(func(ctx context.Context, in int, base int) (int, error) {
+				time.Sleep(120 * time.Millisecond)
+				return base + 1, nil
+			})).
+		AddStep(NewStep("second_terminal").
+			DependsOn("base").
+			Handler(func(ctx context.Context, in int, base int) (int, error) {
+				return base + 2, nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out int
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	if out != 11 {
+		t.Fatalf("unexpected output: got %d, want %d", out, 11)
+	}
+}
+
+func TestFlowFailsWhenNoOutputCandidateCompleted(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "output_no_candidate")
+	type gateOut struct {
+		Run bool `json:"run"`
+	}
+
+	flow := NewFlow(flowName).
+		Output("maybe").
+		AddStep(NewStep("gate").Handler(func(ctx context.Context, in string) (gateOut, error) {
+			return gateOut{Run: false}, nil
+		})).
+		AddStep(NewStep("maybe").
+			DependsOn("gate").
+			Condition("gate.run eq true").
+			Handler(func(ctx context.Context, in string, gate gateOut) (string, error) {
+				return "done", nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out string
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err = h.WaitForOutput(ctx, &out)
+	if err == nil {
+		t.Fatalf("expected flow to fail when no output candidate completed")
+	}
+	if !errors.Is(err, ErrRunFailed) {
+		t.Fatalf("expected ErrRunFailed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), ErrNoOutputCandidate.Error()) {
+		t.Fatalf("expected no-output-candidate error, got %v", err)
+	}
+}
+
 func TestFlowMapInput(t *testing.T) {
 	client := getTestClient(t)
 	flowName := testFlowName(t, "map_input_flow")

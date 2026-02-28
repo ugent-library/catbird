@@ -53,11 +53,11 @@ All runtime tables (messages, task runs, flow runs, step runs) are created dynam
 
 The function validates names (a-z, 0-9, _ only; max 58 chars) and returns `cb_{prefix}_{lowercased_name}`. When building queries that access these tables, always use the same construction pattern:
 ```go
+tableName := fmt.Sprintf("cb_q_%s", strings.ToLower(queueName)) // Queues
 tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(taskName))  // Tasks
 tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))  // Flows
 tableName := fmt.Sprintf("cb_s_%s", strings.ToLower(flowName))  // Steps
 tableName := fmt.Sprintf("cb_m_%s", strings.ToLower(flowName))  // Map tasks
-tableName := fmt.Sprintf("cb_q_%s", strings.ToLower(queueName)) // Queues
 ```
 
 ## Handler Pattern & Reflection-Based API

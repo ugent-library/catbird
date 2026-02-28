@@ -230,10 +230,10 @@ A **flow** is a **directed acyclic graph (DAG)** of steps that execute when thei
 ## Summary
 
 - Steps with no dependencies start immediately; independent branches run in parallel.
-- A flow has exactly one final step; the output of the final step is the output of the flow.
+- Flow output is selected by output priority (configured with `Output(...)` or inferred from terminal steps).
 - Conditions can skip steps; downstream handlers must accept `Optional[T]` for any conditional dependency.
 - A step with a signal waits for both its dependencies and the signal input.
-- `WaitForOutput()` returns the final step output once the flow completes.
+- `WaitForOutput()` returns the selected flow output once the flow completes.
 
 ## Examples: Workflows
 
@@ -281,10 +281,46 @@ flow := catbird.NewFlow("order-processing").
     client.CreateFlowSchedule(ctx, "order-processing", "0 2 * * *") // Daily at 2 AM
 
 // Create worker
-    worker := client.NewWorker(ctx)
+worker := client.NewWorker(ctx)
 // Add flow
 worker.AddFlow(flow)
 go worker.Start(ctx)
+```
+
+## Example: Multi-branch Output Ownership
+
+Flows can have multiple terminal steps.
+
+```go
+flow := catbird.NewFlow("approval-or-escalation").
+    Output("approve", "escalate").
+    AddStep(catbird.NewStep("validate").
+        Handler(func(ctx context.Context, req Request) (Validation, error) {
+            return Validation{Score: req.Score}, nil
+        })).
+    AddStep(catbird.NewStep("approve").
+        DependsOn("validate").
+        Condition("validate.score gte 80").
+        Handler(func(ctx context.Context, req Request, v Validation) (Decision, error) {
+            return Decision{Status: "approved"}, nil
+        })).
+    AddStep(catbird.NewStep("escalate").
+        DependsOn("validate").
+        Condition("validate.score lt 80").
+        Handler(func(ctx context.Context, req Request, v Validation) (Decision, error) {
+            return Decision{Status: "escalated"}, nil
+        }))
+```
+
+If you omit `Output(...)`, Catbird uses terminal steps in definition order as the default priority.
+
+```go
+flow := catbird.NewFlow("default-terminal-priority").
+    AddStep(catbird.NewStep("a").Handler(func(ctx context.Context, in int) (int, error) { return in, nil })).
+    AddStep(catbird.NewStep("left").DependsOn("a").Handler(func(ctx context.Context, in int, a int) (int, error) { return a + 1, nil })).
+    AddStep(catbird.NewStep("right").DependsOn("a").Handler(func(ctx context.Context, in int, a int) (int, error) { return a + 2, nil }))
+
+// Effective priority: left, then right.
 ```
 
 ## OnFail Handlers
@@ -541,16 +577,11 @@ flow := catbird.NewFlow("parallel_watch_flow").
             if !step.IsCompleted() {
                 return "", fmt.Errorf("long_job ended with status=%s", step.Status)
             }
-            return "watcher-stopped", nil
-        })).
-    AddStep(catbird.NewStep("finalize").
-        DependsOn("long_job", "watch_job").
-        Handler(func(ctx context.Context, in Order, job string, watch string) (string, error) {
-            return job + ":" + watch, nil
+            return "watcher-confirmed:" + step.Status, nil
         }))
 ```
 
-This runs two steps in parallel. `watch_job` blocks on `WaitForStep(...)` until `long_job` reaches a terminal state, then exits immediately when `long_job` finishes.
+This runs `long_job` and `watch_job` in parallel. `watch_job` blocks on `WaitForStep(...)` until `long_job` reaches a terminal state, then exits immediately.
 
 ```go
 flow := catbird.NewFlow("loop_until_peer_done").
@@ -576,11 +607,6 @@ flow := catbird.NewFlow("loop_until_peer_done").
                 case <-time.After(100 * time.Millisecond):
                 }
             }
-        })).
-    AddStep(catbird.NewStep("finalize").
-        DependsOn("controller", "worker_loop").
-        Handler(func(ctx context.Context, in string, control string, worker string) (string, error) {
-            return control + ":" + worker, nil
         }))
 ```
 
@@ -628,6 +654,7 @@ Flow steps can branch based on prior outputs. Use `Optional[T]` to handle skippe
 
 ```go
 flow := catbird.NewFlow("payment_processing").
+    Output("charge", "free_order").
     AddStep(catbird.NewStep("validate").
         Handler(func(ctx context.Context, order Order) (ValidationResult, error) {
             return ValidationResult{Valid: order.Amount > 0}, nil
@@ -635,15 +662,13 @@ flow := catbird.NewFlow("payment_processing").
     AddStep(catbird.NewStep("charge").
         DependsOn("validate").
         Condition("validate.valid").
-        Handler(func(ctx context.Context, order Order, validation ValidationResult) (ChargeResult, error) {
-            return ChargeResult{TransactionID: "txn-123"}, nil
+        Handler(func(ctx context.Context, order Order, validation ValidationResult) (FinalResult, error) {
+            return FinalResult{Status: "charged", TxnID: "txn-123"}, nil
         })).
-    AddStep(catbird.NewStep("finalize").
-        DependsOn("charge").
-        Handler(func(ctx context.Context, order Order, charge catbird.Optional[ChargeResult]) (FinalResult, error) {
-            if charge.IsSet {
-                return FinalResult{Status: "charged", TxnID: charge.Value.TransactionID}, nil
-            }
+    AddStep(catbird.NewStep("free_order").
+        DependsOn("validate").
+        Condition("not validate.valid").
+        Handler(func(ctx context.Context, order Order, validation ValidationResult) (FinalResult, error) {
             return FinalResult{Status: "free_order", TxnID: ""}, nil
         }))
 ```

@@ -134,6 +134,94 @@ func (w *Worker) AddFlow(f *Flow) *Worker {
 	return w
 }
 
+func (w *Worker) validateRegisteredHandlers() error {
+	for _, t := range w.tasks {
+		if t.handlerOpts != nil {
+			if err := t.handlerOpts.validate(); err != nil {
+				return fmt.Errorf("task %q has invalid handler options: %w", t.name, err)
+			}
+		}
+		if t.onFailOpts != nil {
+			if err := t.onFailOpts.validate(); err != nil {
+				return fmt.Errorf("task %q has invalid on-fail options: %w", t.name, err)
+			}
+		}
+	}
+
+	for _, f := range w.flows {
+		if f.onFailOpts != nil {
+			if err := f.onFailOpts.validate(); err != nil {
+				return fmt.Errorf("flow %q has invalid on-fail options: %w", f.name, err)
+			}
+		}
+		for _, s := range f.steps {
+			if s.handlerOpts != nil {
+				if err := s.handlerOpts.validate(); err != nil {
+					return fmt.Errorf("flow %q step %q has invalid handler options: %w", f.name, s.name, err)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func shouldStartStepWorker(step *Step) bool {
+	return step.isGenerator || (step.isMapStep && step.reducerFn != nil) || !step.isMapStep
+}
+
+func shouldStartMapStepWorker(step *Step) bool {
+	return step.isGenerator || step.isMapStep
+}
+
+func (w *Worker) startTaskWorkers(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup) []*TaskHandlerInfo {
+	taskHandlers := make([]*TaskHandlerInfo, 0)
+
+	for _, t := range w.tasks {
+		if t.handlerOpts != nil {
+			taskHandlers = append(taskHandlers, &TaskHandlerInfo{TaskName: t.name})
+			worker := newTaskWorker(w.conn, w.logger, t)
+			worker.start(shutdownCtx, handlerCtx, wg)
+		}
+
+		if t.onFailOpts != nil {
+			onFailWorker := newTaskOnFailWorker(w.conn, w.logger, t)
+			onFailWorker.start(shutdownCtx, handlerCtx, wg)
+		}
+	}
+
+	return taskHandlers
+}
+
+func (w *Worker) startFlowWorkers(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup) []*StepHandlerInfo {
+	stepHandlers := make([]*StepHandlerInfo, 0)
+
+	for _, f := range w.flows {
+		if f.onFailOpts != nil {
+			onFailWorker := newFlowOnFailWorker(w.conn, w.logger, f)
+			onFailWorker.start(shutdownCtx, handlerCtx, wg)
+		}
+
+		for _, s := range f.steps {
+			if s.handlerOpts == nil {
+				continue
+			}
+
+			stepHandlers = append(stepHandlers, &StepHandlerInfo{FlowName: f.name, StepName: s.name})
+
+			if shouldStartStepWorker(&s) {
+				newStepWorker(w.conn, w.logger, f.name, &s).start(shutdownCtx, handlerCtx, wg)
+			}
+
+			if shouldStartMapStepWorker(&s) {
+				newMapStepWorker(w.conn, w.logger, f.name, &s).start(shutdownCtx, handlerCtx, wg)
+			}
+		}
+	}
+
+	return stepHandlers
+}
+
 // Start begins processing tasks and flows.
 //
 // The worker will:
@@ -153,34 +241,8 @@ func (w *Worker) AddFlow(f *Flow) *Worker {
 //     the handler context is cancelled immediately once ctx is cancelled and
 //     Start returns after all goroutines finish
 func (w *Worker) Start(ctx context.Context) error {
-	// Validate HandlerOpts for all tasks
-	for _, t := range w.tasks {
-		if t.handlerOpts != nil {
-			if err := t.handlerOpts.validate(); err != nil {
-				return fmt.Errorf("task %q has invalid handler options: %w", t.name, err)
-			}
-		}
-		if t.onFailOpts != nil {
-			if err := t.onFailOpts.validate(); err != nil {
-				return fmt.Errorf("task %q has invalid on-fail options: %w", t.name, err)
-			}
-		}
-	}
-
-	// Validate HandlerOpts for all flow steps
-	for _, f := range w.flows {
-		if f.onFailOpts != nil {
-			if err := f.onFailOpts.validate(); err != nil {
-				return fmt.Errorf("flow %q has invalid on-fail options: %w", f.name, err)
-			}
-		}
-		for _, s := range f.steps {
-			if s.handlerOpts != nil {
-				if err := s.handlerOpts.validate(); err != nil {
-					return fmt.Errorf("flow %q step %q has invalid handler options: %w", f.name, s.name, err)
-				}
-			}
-		}
+	if err := w.validateRegisteredHandlers(); err != nil {
+		return err
 	}
 
 	// Create tasks in database
@@ -219,49 +281,8 @@ func (w *Worker) Start(ctx context.Context) error {
 		}
 	})
 
-	// Start task workers
-	for _, t := range w.tasks {
-		if t.handlerOpts != nil {
-			taskHandlers = append(taskHandlers, &TaskHandlerInfo{TaskName: t.name})
-			worker := newTaskWorker(w.conn, w.logger, t)
-			worker.start(ctx, handlerCtx, &wg)
-		}
-		if t.onFailOpts != nil {
-			onFailWorker := newTaskOnFailWorker(w.conn, w.logger, t)
-			onFailWorker.start(ctx, handlerCtx, &wg)
-		}
-	}
-
-	// Start step workers
-	for _, f := range w.flows {
-		if f.onFailOpts != nil {
-			onFailWorker := newFlowOnFailWorker(w.conn, w.logger, f)
-			onFailWorker.start(ctx, handlerCtx, &wg)
-		}
-		for _, s := range f.steps {
-			if s.handlerOpts != nil {
-				stepHandlers = append(stepHandlers, &StepHandlerInfo{FlowName: f.name, StepName: s.name})
-
-				if s.isGenerator {
-					newStepWorker(w.conn, w.logger, f.name, &s).start(ctx, handlerCtx, &wg)
-					newMapStepWorker(w.conn, w.logger, f.name, &s).start(ctx, handlerCtx, &wg)
-					continue
-				}
-
-				if s.isMapStep && s.reducerFn != nil {
-					newStepWorker(w.conn, w.logger, f.name, &s).start(ctx, handlerCtx, &wg)
-					newMapStepWorker(w.conn, w.logger, f.name, &s).start(ctx, handlerCtx, &wg)
-					continue
-				}
-
-				if s.isMapStep {
-					newMapStepWorker(w.conn, w.logger, f.name, &s).start(ctx, handlerCtx, &wg)
-				} else {
-					newStepWorker(w.conn, w.logger, f.name, &s).start(ctx, handlerCtx, &wg)
-				}
-			}
-		}
-	}
+	taskHandlers = w.startTaskWorkers(ctx, handlerCtx, &wg)
+	stepHandlers = w.startFlowWorkers(ctx, handlerCtx, &wg)
 
 	// Start schedule polling goroutine for all schedules (both tasks and flows)
 	wg.Go(func() {
@@ -631,20 +652,19 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 	handlerCtx := withFlowRunScope(claimCtx, w.conn, w.flowName, flowRunID, claimCancel)
 	defer finalizeFlowCancelIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, &cancelRequested)
 
-	stopIfRequested := func() bool {
-		if stopRequested.Load() {
-			return true
-		}
-
-		if stopFlowIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, claimCancel, &cancelRequested, func() {
+	stopIfRequested := newFlowStopChecker(
+		ctx,
+		w.conn,
+		w.logger,
+		w.flowName,
+		flowRunID,
+		claimCancel,
+		&cancelRequested,
+		&stopRequested,
+		func() {
 			cancelStepRun(ctx, w.conn, w.logger, w.flowName, msg.ID)
-		}) {
-			stopRequested.Store(true)
-			return true
-		}
-
-		return false
-	}
+		},
+	)
 
 	if stopIfRequested() {
 		return
@@ -1131,20 +1151,19 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 	handlerCtx := withFlowRunScope(claimCtx, w.conn, w.flowName, flowRunID, claimCancel)
 	defer finalizeFlowCancelIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, &cancelRequested)
 
-	stopIfRequested := func() bool {
-		if stopRequested.Load() {
-			return true
-		}
-
-		if stopFlowIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, claimCancel, &cancelRequested, func() {
+	stopIfRequested := newFlowStopChecker(
+		ctx,
+		w.conn,
+		w.logger,
+		w.flowName,
+		flowRunID,
+		claimCancel,
+		&cancelRequested,
+		&stopRequested,
+		func() {
 			cancelMapTaskRun(ctx, w.conn, w.logger, w.flowName, msg.ID)
-		}) {
-			stopRequested.Store(true)
-			return true
-		}
-
-		return false
-	}
+		},
+	)
 
 	if stopIfRequested() {
 		return
@@ -1752,6 +1771,33 @@ func stopFlowIfRequested(
 	}
 
 	return true
+}
+
+func newFlowStopChecker(
+	ctx context.Context,
+	conn Conn,
+	logger *slog.Logger,
+	flowName string,
+	flowRunID int64,
+	claimCancel context.CancelFunc,
+	cancelRequested *bool,
+	stopRequested *atomic.Bool,
+	onCancel func(),
+) func() bool {
+	return func() bool {
+		if stopRequested != nil && stopRequested.Load() {
+			return true
+		}
+
+		if stopFlowIfRequested(ctx, conn, logger, flowName, flowRunID, claimCancel, cancelRequested, onCancel) {
+			if stopRequested != nil {
+				stopRequested.Store(true)
+			}
+			return true
+		}
+
+		return false
+	}
 }
 
 func watchFlowStop(ctx context.Context, interval time.Duration, stopIfRequested func() bool) func() {

@@ -19,10 +19,12 @@ type Optional[T any] struct {
 }
 
 type Flow struct {
-	name       string
-	steps      []Step
-	onFail     func(context.Context, json.RawMessage, FlowFailure) error
-	onFailOpts *HandlerOpts
+	name             string
+	steps            []Step
+	outputPriority   []string
+	outputConfigured bool
+	onFail           func(context.Context, json.RawMessage, FlowFailure) error
+	onFailOpts       *HandlerOpts
 }
 
 type FlowFailure struct {
@@ -47,6 +49,12 @@ func NewFlow(name string) *Flow {
 
 func (f *Flow) AddStep(step *Step) *Flow {
 	f.steps = append(f.steps, *step)
+	return f
+}
+
+func (f *Flow) Output(stepNames ...string) *Flow {
+	f.outputConfigured = true
+	f.outputPriority = append([]string(nil), stepNames...)
 	return f
 }
 
@@ -714,9 +722,10 @@ func makeFlowOnFailHandler(fn any) (func(context.Context, json.RawMessage, FlowF
 }
 
 type FlowInfo struct {
-	Name      string     `json:"name"`
-	Steps     []StepInfo `json:"steps"`
-	CreatedAt time.Time  `json:"created_at"`
+	Name           string     `json:"name"`
+	Steps          []StepInfo `json:"steps"`
+	OutputPriority []string   `json:"output_priority,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
 }
 
 // FlowScheduleInfo contains metadata about a scheduled flow.
@@ -853,23 +862,34 @@ func validateFlowDependencies(flow *Flow) error {
 		}
 	}
 
-	// Enforce single final step constraint
+	// Validate structural terminal steps
 	if len(finalSteps) == 0 {
 		return fmt.Errorf("flow %q has no final step (circular dependency?)", flow.name)
 	}
 
-	if len(finalSteps) > 1 {
-		return fmt.Errorf("flow %q must have exactly one final step, found %d: %v. When conditional branching creates multiple potential terminal steps, add an explicit reconvergence step that depends on all branches using OptionalDependency() and Optional[T] parameters", flow.name, len(finalSteps), finalSteps)
-	}
+	if flow.outputConfigured {
+		if len(flow.outputPriority) == 0 {
+			return fmt.Errorf("flow %q: output priority must not be empty", flow.name)
+		}
 
-	// Enforce that final step cannot have a condition (must always execute)
-	finalStepName := finalSteps[0]
-	for _, step := range steps {
-		if step.name == finalStepName {
-			if strings.TrimSpace(step.condition) != "" {
-				return fmt.Errorf("flow %q: final step %q cannot have a condition - it must always execute to guarantee output availability", flow.name, finalStepName)
+		seenOutputSteps := make(map[string]bool, len(flow.outputPriority))
+		for i, outputStepName := range flow.outputPriority {
+			if strings.TrimSpace(outputStepName) == "" {
+				return fmt.Errorf("flow %q: output priority at index %d must not be empty", flow.name, i)
 			}
-			break
+			if !stepNameSet[outputStepName] {
+				return fmt.Errorf("flow %q: output priority references unknown step %q", flow.name, outputStepName)
+			}
+			if seenOutputSteps[outputStepName] {
+				return fmt.Errorf("flow %q: output priority contains duplicate step %q", flow.name, outputStepName)
+			}
+			seenOutputSteps[outputStepName] = true
+		}
+
+		for _, terminalStepName := range finalSteps {
+			if !seenOutputSteps[terminalStepName] {
+				return fmt.Errorf("flow %q: output priority must include structural terminal step %q", flow.name, terminalStepName)
+			}
 		}
 	}
 
@@ -891,7 +911,7 @@ func validateFlowDependencies(flow *Flow) error {
 
 // CreateFlow creates one or more flow definitions.
 func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
-	q := `SELECT * FROM cb_create_flow(name => $1, steps => $2);`
+	q := `SELECT * FROM cb_create_flow(name => $1, steps => $2, output_priority => $3);`
 	for _, flow := range flows {
 		if err := validateFlowDependencies(flow); err != nil {
 			return err
@@ -939,7 +959,12 @@ func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 			return err
 		}
 
-		_, err = conn.Exec(ctx, q, flow.name, b)
+		priority := flow.outputPriority
+		if !flow.outputConfigured {
+			priority = defaultFlowOutputPriority(flow)
+		}
+
+		_, err = conn.Exec(ctx, q, flow.name, b, priority)
 		if err != nil {
 			return err
 		}
@@ -1436,10 +1461,12 @@ func scanFlow(row pgx.Row) (*FlowInfo, error) {
 	rec := FlowInfo{}
 
 	var steps json.RawMessage
+	var outputPriority []string
 
 	if err := row.Scan(
 		&rec.Name,
 		&steps,
+		&outputPriority,
 		&rec.CreatedAt,
 	); err != nil {
 		return nil, err
@@ -1449,7 +1476,31 @@ func scanFlow(row pgx.Row) (*FlowInfo, error) {
 		return nil, err
 	}
 
+	rec.OutputPriority = outputPriority
+
 	return &rec, nil
+}
+
+func defaultFlowOutputPriority(flow *Flow) []string {
+	if len(flow.steps) == 0 {
+		return nil
+	}
+
+	hasDependent := make(map[string]bool, len(flow.steps))
+	for _, step := range flow.steps {
+		for _, depName := range step.dependencies {
+			hasDependent[depName] = true
+		}
+	}
+
+	priority := make([]string, 0, len(flow.steps))
+	for _, step := range flow.steps {
+		if !hasDependent[step.name] {
+			priority = append(priority, step.name)
+		}
+	}
+
+	return priority
 }
 
 // CreateFlowSchedule creates a cron-based schedule for a flow.

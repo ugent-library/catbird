@@ -20,8 +20,9 @@
 -- Parameters:
 --   name: Flow name (must be unique)
 --   steps: JSON array describing flow steps and their dependencies
+--   output_priority: Optional ordered array of step names for output ownership
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_create_flow(name text, steps jsonb)
+CREATE OR REPLACE FUNCTION cb_create_flow(name text, steps jsonb, output_priority text[] DEFAULT NULL)
 RETURNS void AS $$
 #variable_conflict use_column
 DECLARE
@@ -39,17 +40,33 @@ DECLARE
     _s_table text;
     _m_table text;
     _condition jsonb;
+    _output_priority text[];
+    _output_step text;
+    _terminal_step text;
+    _terminal_count int;
+    _priority_count int;
+    _priority_distinct_count int;
 BEGIN
     IF cb_create_flow.name IS NULL OR cb_create_flow.name = '' THEN
-    RAISE EXCEPTION 'cb: flow name must not be empty';
+        RAISE EXCEPTION 'cb: flow name must not be empty';
     END IF;
 
     IF NOT cb_create_flow.name ~ '^[a-z0-9_]+$' THEN
-    RAISE EXCEPTION 'cb: flow name "%" contains invalid characters, allowed: a-z, 0-9, _', cb_create_flow.name;
+        RAISE EXCEPTION 'cb: flow name "%" contains invalid characters, allowed: a-z, 0-9, _', cb_create_flow.name;
     END IF;
 
     IF length(cb_create_flow.name) >= 58 THEN
-    RAISE EXCEPTION 'cb: flow name "%" is too long, maximum length is 58', cb_create_flow.name;
+        RAISE EXCEPTION 'cb: flow name "%" is too long, maximum length is 58', cb_create_flow.name;
+    END IF;
+
+    IF cb_create_flow.output_priority IS NOT NULL THEN
+      IF cardinality(cb_create_flow.output_priority) = 0 THEN
+        RAISE EXCEPTION 'cb: output priority must not be empty';
+      END IF;
+
+      _output_priority := cb_create_flow.output_priority;
+    ELSE
+      _output_priority := NULL;
     END IF;
 
     _f_table := cb_table_name(cb_create_flow.name, 'f');
@@ -58,8 +75,11 @@ BEGIN
 
     PERFORM pg_advisory_xact_lock(hashtext(_f_table));
 
-    INSERT INTO cb_flows (name) VALUES (cb_create_flow.name)
-    ON CONFLICT (name) DO NOTHING;
+    INSERT INTO cb_flows (name, output_priority, step_count)
+    VALUES (cb_create_flow.name, coalesce(_output_priority, ARRAY['__pending_output_priority__']), 0)
+    ON CONFLICT (name) DO UPDATE
+    SET output_priority = coalesce(EXCLUDED.output_priority, ARRAY['__pending_output_priority__']),
+      step_count = 0;
 
     DELETE FROM cb_step_handlers WHERE flow_name = cb_create_flow.name;
     DELETE FROM cb_step_dependencies WHERE flow_name = cb_create_flow.name;
@@ -67,97 +87,97 @@ BEGIN
 
     FOR _step IN SELECT jsonb_array_elements(cb_create_flow.steps)
     LOOP
-    _step_name := _step->>'name';
+        _step_name := _step->>'name';
 
-    IF _step_name IS NULL OR _step_name = '' THEN
-      RAISE EXCEPTION 'cb: step name must not be empty';
-    END IF;
+        IF _step_name IS NULL OR _step_name = '' THEN
+            RAISE EXCEPTION 'cb: step name must not be empty';
+        END IF;
 
-    IF NOT _step_name ~ '^[a-z0-9_]+$' THEN
-      RAISE EXCEPTION 'cb: step name "%" contains invalid characters, allowed: a-z, 0-9, _', _step_name;
-    END IF;
+        IF NOT _step_name ~ '^[a-z0-9_]+$' THEN
+            RAISE EXCEPTION 'cb: step name "%" contains invalid characters, allowed: a-z, 0-9, _', _step_name;
+        END IF;
 
-    IF _step_name = 'input' THEN
-      RAISE EXCEPTION 'cb: step name "input" is reserved';
-    END IF;
+        IF _step_name = 'input' THEN
+            RAISE EXCEPTION 'cb: step name "input" is reserved';
+        END IF;
 
-    IF _step_name = 'signal' THEN
-      RAISE EXCEPTION 'cb: step name "signal" is reserved';
-    END IF;
+        IF _step_name = 'signal' THEN
+            RAISE EXCEPTION 'cb: step name "signal" is reserved';
+        END IF;
 
-    IF length(_step_name) >= 58 THEN
-      RAISE EXCEPTION 'cb: step name "%" is too long, maximum length is 58', _step_name;
-    END IF;
+        IF length(_step_name) >= 58 THEN
+            RAISE EXCEPTION 'cb: step name "%" is too long, maximum length is 58', _step_name;
+        END IF;
 
-    _is_map_step := coalesce((_step->>'is_map_step')::boolean, false);
-    _is_generator := coalesce((_step->>'is_generator')::boolean, false);
-    _map_source := nullif(_step->>'map_source', '');
+        _is_map_step := coalesce((_step->>'is_map_step')::boolean, false);
+        _is_generator := coalesce((_step->>'is_generator')::boolean, false);
+        _map_source := nullif(_step->>'map_source', '');
 
-    IF _is_generator AND _is_map_step THEN
-      RAISE EXCEPTION 'cb: step "%" cannot be both generator and map step', _step_name;
-    END IF;
+        IF _is_generator AND _is_map_step THEN
+            RAISE EXCEPTION 'cb: step "%" cannot be both generator and map step', _step_name;
+        END IF;
 
-    IF NOT _is_map_step AND _map_source IS NOT NULL THEN
-      RAISE EXCEPTION 'cb: step "%" has map_source but is_map_step is false', _step_name;
-    END IF;
+        IF NOT _is_map_step AND _map_source IS NOT NULL THEN
+            RAISE EXCEPTION 'cb: step "%" has map_source but is_map_step is false', _step_name;
+        END IF;
 
-    -- Map input mode: is_map_step=true and map_source omitted/null.
-    -- Map dependency mode: is_map_step=true and map_source set to a dependency step name.
-    IF _is_map_step AND _map_source IS NULL THEN
-      -- map-input mode, valid
-      NULL;
-    END IF;
+        -- Map input mode: is_map_step=true and map_source omitted/null.
+        -- Map dependency mode: is_map_step=true and map_source set to a dependency step name.
+        IF _is_map_step AND _map_source IS NULL THEN
+            -- map-input mode, valid
+            NULL;
+        END IF;
 
-    IF _is_map_step AND _map_source = _step_name THEN
-      RAISE EXCEPTION 'cb: step "%" cannot map its own output', _step_name;
-    END IF;
+        IF _is_map_step AND _map_source = _step_name THEN
+            RAISE EXCEPTION 'cb: step "%" cannot map its own output', _step_name;
+        END IF;
 
-    IF _map_source IS NOT NULL THEN
-      IF NOT _map_source ~ '^[a-z0-9_]+$' THEN
-        RAISE EXCEPTION 'cb: map source "%" contains invalid characters, allowed: a-z, 0-9, _', _map_source;
-      END IF;
+        IF _map_source IS NOT NULL THEN
+            IF NOT _map_source ~ '^[a-z0-9_]+$' THEN
+                RAISE EXCEPTION 'cb: map source "%" contains invalid characters, allowed: a-z, 0-9, _', _map_source;
+            END IF;
 
-      SELECT EXISTS(
-        SELECT 1
-        FROM jsonb_array_elements(coalesce(_step->'depends_on', '[]'::jsonb)) d
-        WHERE d->>'name' = _map_source
-      ) INTO _has_map_source_dependency;
+            SELECT EXISTS(
+                SELECT 1
+                FROM jsonb_array_elements(coalesce(_step->'depends_on', '[]'::jsonb)) d
+                WHERE d->>'name' = _map_source
+            ) INTO _has_map_source_dependency;
 
-      IF NOT _has_map_source_dependency THEN
-        RAISE EXCEPTION 'cb: step "%" maps "%" but does not depend on it', _step_name, _map_source;
-      END IF;
-    END IF;
+            IF NOT _has_map_source_dependency THEN
+                RAISE EXCEPTION 'cb: step "%" maps "%" but does not depend on it', _step_name, _map_source;
+            END IF;
+        END IF;
 
-    -- Extract condition from step if present
-    _condition := NULL;
-    IF _step ? 'condition' AND _step->>'condition' IS NOT NULL AND _step->>'condition' != '' THEN
-      _condition := cb_parse_condition(_step->>'condition');
-    END IF;
+        -- Extract condition from step if present
+        _condition := NULL;
+        IF _step ? 'condition' AND _step->>'condition' IS NOT NULL AND _step->>'condition' != '' THEN
+            _condition := cb_parse_condition(_step->>'condition');
+        END IF;
 
-    INSERT INTO cb_steps (flow_name, name, idx, dependency_count, is_generator, is_map_step, map_source, has_signal, condition)
-    VALUES (
-      cb_create_flow.name,
-      _step_name,
-      _idx,
-      jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb)),
-      _is_generator,
-      _is_map_step,
-      _map_source,
-      coalesce((_step->>'has_signal')::boolean, false),
-      _condition
-    );
+        INSERT INTO cb_steps (flow_name, name, idx, dependency_count, is_generator, is_map_step, map_source, has_signal, condition)
+        VALUES (
+            cb_create_flow.name,
+            _step_name,
+            _idx,
+            jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb)),
+            _is_generator,
+            _is_map_step,
+            _map_source,
+            coalesce((_step->>'has_signal')::boolean, false),
+            _condition
+        );
 
-    _dep_idx := 0;
-    FOR _dep IN SELECT jsonb_array_elements(coalesce(_step->'depends_on', '[]'::jsonb))
-    LOOP
-      _dep_name := _dep->>'name';
+        _dep_idx := 0;
+        FOR _dep IN SELECT jsonb_array_elements(coalesce(_step->'depends_on', '[]'::jsonb))
+        LOOP
+            _dep_name := _dep->>'name';
 
-      INSERT INTO cb_step_dependencies (flow_name, step_name, dependency_name, idx)
-      VALUES (cb_create_flow.name, _step_name, _dep_name, _dep_idx);
-      _dep_idx := _dep_idx + 1;
-    END LOOP;
+            INSERT INTO cb_step_dependencies (flow_name, step_name, dependency_name, idx)
+            VALUES (cb_create_flow.name, _step_name, _dep_name, _dep_idx);
+            _dep_idx := _dep_idx + 1;
+        END LOOP;
 
-    _idx := _idx + 1;
+        _idx := _idx + 1;
     END LOOP;
 
     -- SQL-level map-step validation (independent from Go-side builder checks)
@@ -178,6 +198,94 @@ BEGIN
       RAISE EXCEPTION 'cb: map step must depend on its map_source (flow=%)', cb_create_flow.name;
     END IF;
 
+    -- Output ownership validation
+    SELECT count(*)
+    INTO _terminal_count
+    FROM cb_steps s
+    WHERE s.flow_name = cb_create_flow.name
+      AND NOT EXISTS (
+        SELECT 1
+        FROM cb_step_dependencies d
+        WHERE d.flow_name = s.flow_name
+          AND d.dependency_name = s.name
+      );
+
+    IF _terminal_count = 0 THEN
+      RAISE EXCEPTION 'cb: flow % has no final step (circular dependency?)', cb_create_flow.name;
+    END IF;
+
+    IF _output_priority IS NULL THEN
+      SELECT array_agg(s.name ORDER BY s.idx)
+      INTO _output_priority
+      FROM cb_steps s
+      WHERE s.flow_name = cb_create_flow.name
+        AND NOT EXISTS (
+          SELECT 1
+          FROM cb_step_dependencies d
+          WHERE d.flow_name = s.flow_name
+            AND d.dependency_name = s.name
+        );
+    END IF;
+
+    SELECT value
+    INTO _output_step
+    FROM unnest(_output_priority) AS p(value)
+    WHERE value = ''
+    LIMIT 1;
+
+    IF _output_step IS NOT NULL THEN
+      RAISE EXCEPTION 'cb: output priority contains empty step name';
+    END IF;
+
+    SELECT value
+    INTO _output_step
+    FROM unnest(_output_priority) AS p(value)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM cb_steps s
+      WHERE s.flow_name = cb_create_flow.name
+        AND s.name = p.value
+    )
+    LIMIT 1;
+
+    IF _output_step IS NOT NULL THEN
+      RAISE EXCEPTION 'cb: output priority references unknown step "%"', _output_step;
+    END IF;
+
+    SELECT count(*), count(DISTINCT value)
+    INTO _priority_count, _priority_distinct_count
+    FROM unnest(_output_priority) AS p(value);
+
+    IF _priority_count <> _priority_distinct_count THEN
+      RAISE EXCEPTION 'cb: output priority contains duplicate step names';
+    END IF;
+
+    SELECT s.name
+    INTO _terminal_step
+    FROM cb_steps s
+    WHERE s.flow_name = cb_create_flow.name
+      AND NOT EXISTS (
+        SELECT 1
+        FROM cb_step_dependencies d
+        WHERE d.flow_name = s.flow_name
+          AND d.dependency_name = s.name
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM unnest(_output_priority) AS p(value)
+        WHERE p.value = s.name
+      )
+    LIMIT 1;
+
+    IF _terminal_step IS NOT NULL THEN
+      RAISE EXCEPTION 'cb: output priority must include structural terminal step "%"', _terminal_step;
+    END IF;
+
+    UPDATE cb_flows f
+    SET output_priority = _output_priority,
+      step_count = _idx
+    WHERE f.name = cb_create_flow.name;
+
     EXECUTE format(
     $QUERY$
     CREATE TABLE IF NOT EXISTS %I (
@@ -187,6 +295,7 @@ BEGIN
       status text NOT NULL DEFAULT 'started',
       remaining_steps int NOT NULL DEFAULT 0,
       input jsonb NOT NULL,
+      output_priority text[] NOT NULL,
       output jsonb,
       error_message text,
       failed_step_name text,
@@ -214,6 +323,7 @@ BEGIN
       CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
       CONSTRAINT canceled_at_is_after_started_at CHECK (canceled_at IS NULL OR canceled_at >= started_at),
       CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
+      CONSTRAINT output_priority_not_empty CHECK (cardinality(output_priority) > 0),
       CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = ''))),
       CONSTRAINT on_fail_status_valid CHECK (on_fail_status IS NULL OR on_fail_status IN ('queued', 'started', 'completed', 'failed'))
     )
@@ -340,16 +450,18 @@ DECLARE
     _s_table text := cb_table_name(cb_run_flow.name, 's');
     _id bigint;
     _remaining_steps int;
+    _output_priority text[];
 BEGIN
     -- Validate: both keys cannot be set simultaneously
     IF cb_run_flow.concurrency_key IS NOT NULL AND cb_run_flow.idempotency_key IS NOT NULL THEN
         RAISE EXCEPTION 'cb: cannot specify both concurrency_key and idempotency_key';
     END IF;
 
-    -- Count total steps
-    SELECT count(*) INTO _remaining_steps
-    FROM cb_steps s
-    WHERE s.flow_name = cb_run_flow.name;
+    -- Read run initialization metadata once.
+    SELECT f.step_count, f.output_priority
+    INTO _remaining_steps, _output_priority
+    FROM cb_flows f
+    WHERE f.name = cb_run_flow.name;
 
     -- Create flow run or get existing run with same key
     -- ON CONFLICT DO UPDATE with WHERE FALSE: atomic insert + return conflicting row ID.
@@ -360,8 +472,8 @@ BEGIN
         EXECUTE format(
             $QUERY$
             WITH ins AS (
-                INSERT INTO %I (concurrency_key, input, remaining_steps, status)
-                VALUES ($1, $2, $3, 'started')
+              INSERT INTO %I (concurrency_key, input, remaining_steps, output_priority, status)
+              VALUES ($1, $2, $3, $4, 'started')
                 ON CONFLICT (concurrency_key) WHERE concurrency_key IS NOT NULL AND status = 'started'
                 DO UPDATE SET status = EXCLUDED.status WHERE FALSE
                 RETURNING id
@@ -374,15 +486,15 @@ BEGIN
             $QUERY$,
             _f_table, _f_table
         )
-        USING cb_run_flow.concurrency_key, cb_run_flow.input, _remaining_steps
+        USING cb_run_flow.concurrency_key, cb_run_flow.input, _remaining_steps, _output_priority
         INTO _id;
     ELSIF cb_run_flow.idempotency_key IS NOT NULL THEN
         -- Idempotency: dedupe started/completed
         EXECUTE format(
             $QUERY$
             WITH ins AS (
-                INSERT INTO %I (idempotency_key, input, remaining_steps, status)
-                VALUES ($1, $2, $3, 'started')
+              INSERT INTO %I (idempotency_key, input, remaining_steps, output_priority, status)
+              VALUES ($1, $2, $3, $4, 'started')
                 ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('started', 'completed')
                 DO UPDATE SET status = EXCLUDED.status WHERE FALSE
                 RETURNING id
@@ -395,19 +507,19 @@ BEGIN
             $QUERY$,
             _f_table, _f_table
         )
-        USING cb_run_flow.idempotency_key, cb_run_flow.input, _remaining_steps
+        USING cb_run_flow.idempotency_key, cb_run_flow.input, _remaining_steps, _output_priority
         INTO _id;
     ELSE
         -- No deduplication
         EXECUTE format(
             $QUERY$
-            INSERT INTO %I (input, remaining_steps, status)
-            VALUES ($1, $2, 'started')
+          INSERT INTO %I (input, remaining_steps, output_priority, status)
+          VALUES ($1, $2, $3, 'started')
             RETURNING id
             $QUERY$,
             _f_table
         )
-        USING cb_run_flow.input, _remaining_steps
+        USING cb_run_flow.input, _remaining_steps, _output_priority
         INTO _id;
     END IF;
 
@@ -469,6 +581,80 @@ BEGIN
     PERFORM cb_start_steps(cb_run_flow.name, _id, cb_run_flow.visible_at);
 
     RETURN _id;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_early_exit_flow: complete a flow run early and cancel remaining work
+CREATE OR REPLACE FUNCTION cb_early_exit_flow(
+    flow_name text,
+    flow_run_id bigint,
+    step_name text,
+    output jsonb,
+    reason text DEFAULT NULL
+)
+RETURNS TABLE(changed boolean, status text)
+LANGUAGE plpgsql AS $$
+DECLARE
+    _f_table text := cb_table_name(cb_early_exit_flow.flow_name, 'f');
+    _s_table text := cb_table_name(cb_early_exit_flow.flow_name, 's');
+    _m_table text := cb_table_name(cb_early_exit_flow.flow_name, 'm');
+    _status text;
+BEGIN
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET status = 'completed',
+          completed_at = coalesce(completed_at, now()),
+          output = $2
+      WHERE id = $1
+        AND status = 'started'
+      RETURNING status
+      $QUERY$,
+      _f_table
+    )
+    USING cb_early_exit_flow.flow_run_id, cb_early_exit_flow.output
+    INTO _status;
+
+    IF _status IS NULL THEN
+      EXECUTE format('SELECT status FROM %I WHERE id = $1', _f_table)
+      USING cb_early_exit_flow.flow_run_id
+      INTO _status;
+
+      IF _status IS NULL THEN
+        RETURN;
+      END IF;
+
+      RETURN QUERY SELECT false, _status;
+      RETURN;
+    END IF;
+
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET status = 'canceled',
+          canceled_at = coalesce(canceled_at, now())
+      WHERE flow_run_id = $1
+        AND status IN ('pending', 'queued', 'started')
+      $QUERY$,
+      _s_table
+    )
+    USING cb_early_exit_flow.flow_run_id;
+
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET status = 'canceled',
+          canceled_at = coalesce(canceled_at, now())
+      WHERE flow_run_id = $1
+        AND status IN ('queued', 'started')
+      $QUERY$,
+      _m_table
+    )
+    USING cb_early_exit_flow.flow_run_id;
+
+    RETURN QUERY SELECT true, 'completed';
 END;
 $$;
 -- +goose statementend
@@ -619,7 +805,7 @@ CREATE OR REPLACE FUNCTION cb_flow_cancel_requested(name text, run_id bigint)
 RETURNS boolean
 LANGUAGE plpgsql AS $$
 DECLARE
-  _f_table text := cb_table_name(cb_flow_cancel_requested.name, 'f');
+    _f_table text := cb_table_name(cb_flow_cancel_requested.name, 'f');
     _requested boolean;
 BEGIN
     EXECUTE format(
@@ -718,17 +904,22 @@ DECLARE
     _map_items jsonb;
     _map_item_count int;
     _remaining int;
+    _output_priority text[];
+    _selected_output jsonb;
     _steps_processed_this_iteration int;
 BEGIN
     -- Get flow input
     EXECUTE format(
     $QUERY$
-    SELECT input FROM %I WHERE id = $1 AND status = 'started'
+    SELECT input, output_priority
+    FROM %I
+    WHERE id = $1
+      AND status = 'started'
     $QUERY$,
     _f_table
     )
     USING cb_start_steps.flow_run_id
-    INTO _flow_input;
+    INTO _flow_input, _output_priority;
 
     -- If flow not found or not started, return
     IF _flow_input IS NULL THEN
@@ -747,12 +938,16 @@ BEGIN
                   SELECT sr.id, sr.step_name, sr.remaining_dependencies,
               sr.dependency_names,
                     sr.dependent_step_names,
-             (SELECT jsonb_object_agg(deps.step_name, deps.output)
-              FROM %I deps
-              WHERE deps.flow_run_id = $1
-                AND deps.step_name = any(sr.dependency_names)
-              AND deps.status = 'completed'
-             ) AS step_outputs,
+             CASE
+               WHEN cardinality(sr.dependency_names) = 0 THEN NULL
+               ELSE (
+                 SELECT jsonb_object_agg(deps.step_name, deps.output)
+                 FROM %I deps
+                 WHERE deps.flow_run_id = $1
+                   AND deps.step_name = any(sr.dependency_names)
+                   AND deps.status = 'completed'
+               )
+             END AS step_outputs,
              sr.signal_input,
              sr.condition,
              sr.is_generator,
@@ -821,10 +1016,62 @@ BEGIN
           UPDATE %I
           SET remaining_steps = remaining_steps - 1
           WHERE id = $1 AND status = 'started'
+          RETURNING remaining_steps
           $QUERY$,
           _f_table
         )
-        USING cb_start_steps.flow_run_id;
+        USING cb_start_steps.flow_run_id
+        INTO _remaining;
+
+        IF _remaining = 0 THEN
+          EXECUTE format(
+            $QUERY$
+            SELECT s.output
+            FROM %I s
+            WHERE s.flow_run_id = $1
+              AND s.step_name = any($2)
+              AND s.status = 'completed'
+            ORDER BY array_position($2, s.step_name)
+            LIMIT 1
+            $QUERY$,
+            _s_table
+          )
+          USING cb_start_steps.flow_run_id, _output_priority
+          INTO _selected_output;
+
+          IF _selected_output IS NULL THEN
+            EXECUTE format(
+              $QUERY$
+              UPDATE %I
+              SET status = 'failed',
+                  failed_at = now(),
+                  error_message = $2,
+                  on_fail_status = 'queued',
+                  on_fail_visible_at = now(),
+                  on_fail_error_message = NULL,
+                  on_fail_started_at = NULL,
+                  on_fail_completed_at = NULL
+              WHERE id = $1
+                AND status = 'started'
+              $QUERY$,
+              _f_table
+            )
+            USING cb_start_steps.flow_run_id, 'no output candidate produced output';
+          ELSE
+            EXECUTE format(
+              $QUERY$
+              UPDATE %I
+              SET status = 'completed',
+                  completed_at = now(),
+                  output = $2
+              WHERE id = $1
+                AND status = 'started'
+              $QUERY$,
+              _f_table
+            )
+            USING cb_start_steps.flow_run_id, _selected_output;
+          END IF;
+        END IF;
 
         _steps_processed_this_iteration := _steps_processed_this_iteration + 1;
 
@@ -972,7 +1219,7 @@ DECLARE
     _stop_at timestamp;
     _q text;
     _s_table text := cb_table_name(cb_poll_steps.flow_name, 's');
-  _f_table text := cb_table_name(cb_poll_steps.flow_name, 'f');
+    _f_table text := cb_table_name(cb_poll_steps.flow_name, 'f');
 BEGIN
     IF cb_poll_steps.quantity <= 0 THEN
         RAISE EXCEPTION 'cb: quantity must be greater than 0';
@@ -1024,12 +1271,16 @@ BEGIN
                   m.flow_run_id,
                   m.attempts,
                   m.flow_input AS input,
-                  (SELECT jsonb_object_agg(deps.step_name, deps.output)
-                   FROM %I deps
-                   WHERE deps.flow_run_id = m.flow_run_id
-                     AND deps.step_name = any(m.dependency_names)
-                     AND deps.status = 'completed'
-                  ) AS step_outputs,
+                  CASE
+                    WHEN cardinality(m.dependency_names) = 0 THEN NULL
+                    ELSE (
+                      SELECT jsonb_object_agg(deps.step_name, deps.output)
+                      FROM %I deps
+                      WHERE deps.flow_run_id = m.flow_run_id
+                        AND deps.step_name = any(m.dependency_names)
+                        AND deps.status = 'completed'
+                    )
+                  END AS step_outputs,
                   m.signal_input;
         $QUERY$,
         _s_table, _f_table, _s_table, _s_table
@@ -1108,7 +1359,7 @@ DECLARE
     _q text;
     _s_table text := cb_table_name(cb_poll_map_tasks.flow_name, 's');
     _m_table text := cb_table_name(cb_poll_map_tasks.flow_name, 'm');
-  _f_table text := cb_table_name(cb_poll_map_tasks.flow_name, 'f');
+    _f_table text := cb_table_name(cb_poll_map_tasks.flow_name, 'f');
 BEGIN
     IF cb_poll_map_tasks.quantity <= 0 THEN
         RAISE EXCEPTION 'cb: quantity must be greater than 0';
@@ -1159,12 +1410,16 @@ BEGIN
                 m.flow_run_id,
                 m.attempts,
                 m.flow_input AS input,
-                (SELECT jsonb_object_agg(deps.step_name, deps.output)
-                 FROM %I deps
-                 WHERE deps.flow_run_id = m.flow_run_id
-                   AND deps.step_name = any(m.dependency_names)
-                   AND deps.status = 'completed'
-                ) AS step_outputs,
+                CASE
+                  WHEN cardinality(m.dependency_names) = 0 THEN NULL
+                  ELSE (
+                    SELECT jsonb_object_agg(deps.step_name, deps.output)
+                    FROM %I deps
+                    WHERE deps.flow_run_id = m.flow_run_id
+                      AND deps.step_name = any(m.dependency_names)
+                      AND deps.status = 'completed'
+                  )
+                END AS step_outputs,
                 m.signal_input,
                 m.item;
       $QUERY$,
@@ -1325,8 +1580,8 @@ CREATE OR REPLACE FUNCTION cb_complete_generator_step(flow_name text, step_name 
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-  _s_table text := cb_table_name(cb_complete_generator_step.flow_name, 's');
-  _m_table text := cb_table_name(cb_complete_generator_step.flow_name, 'm');
+    _s_table text := cb_table_name(cb_complete_generator_step.flow_name, 's');
+    _m_table text := cb_table_name(cb_complete_generator_step.flow_name, 'm');
     _flow_run_id bigint;
     _spawned int;
     _completed int;
@@ -1374,8 +1629,8 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
-  -- cb_fail_generator_step: Mark generator as failed and fail parent step/flow
-  CREATE OR REPLACE FUNCTION cb_fail_generator_step(flow_name text, step_name text, step_id bigint, error_message text)
+-- cb_fail_generator_step: Mark generator as failed and fail parent step/flow
+CREATE OR REPLACE FUNCTION cb_fail_generator_step(flow_name text, step_name text, step_id bigint, error_message text)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -1738,8 +1993,10 @@ DECLARE
     _f_table text := cb_table_name(cb_complete_step.flow_name, 'f');
     _s_table text := cb_table_name(cb_complete_step.flow_name, 's');
     _flow_run_id bigint;
-  _dependent_step_names text[];
+    _dependent_step_names text[];
     _remaining int;
+    _output_priority text[];
+    _selected_output jsonb;
 BEGIN
     -- Complete step run atomically - only succeeds if status='started'
     EXECUTE format(
@@ -1768,12 +2025,12 @@ BEGIN
     UPDATE %I
     SET remaining_steps = remaining_steps - 1
     WHERE id = $1 AND status = 'started'
-    RETURNING remaining_steps
+    RETURNING remaining_steps, output_priority
     $QUERY$,
     _f_table
     )
     USING _flow_run_id
-    INTO _remaining;
+    INTO _remaining, _output_priority;
 
     -- If flow already completed/failed, return early
     IF _remaining IS NULL THEN
@@ -1795,23 +2052,53 @@ BEGIN
 
     -- Maybe complete flow run - only if remaining_steps reached 0
     IF _remaining = 0 THEN
-    -- Get the final step output and set it directly
     EXECUTE format(
       $QUERY$
-      UPDATE %I flow_table
-      SET status = 'completed',
-          completed_at = now(),
-          output = (
-            SELECT step_table.output
-            FROM %I step_table
-            WHERE step_table.flow_run_id = %L AND step_table.status IN ('completed', 'skipped')
-            ORDER BY step_table.id DESC
-            LIMIT 1
-          )
-      WHERE flow_table.id = %L AND flow_table.status = 'started'
+      SELECT s.output
+      FROM %I s
+      WHERE s.flow_run_id = $1
+        AND s.step_name = any($2)
+        AND s.status = 'completed'
+      ORDER BY array_position($2, s.step_name)
+      LIMIT 1
       $QUERY$,
-      _f_table, _s_table, _flow_run_id, _flow_run_id
-    );
+      _s_table
+    )
+    USING _flow_run_id, _output_priority
+    INTO _selected_output;
+
+    IF _selected_output IS NULL THEN
+      EXECUTE format(
+        $QUERY$
+        UPDATE %I
+        SET status = 'failed',
+            failed_at = now(),
+            error_message = $2,
+            on_fail_status = 'queued',
+            on_fail_visible_at = now(),
+            on_fail_error_message = NULL,
+            on_fail_started_at = NULL,
+            on_fail_completed_at = NULL
+        WHERE id = $1
+          AND status = 'started'
+        $QUERY$,
+        _f_table
+      )
+      USING _flow_run_id, 'no output candidate produced output';
+    ELSE
+      EXECUTE format(
+        $QUERY$
+        UPDATE %I
+        SET status = 'completed',
+            completed_at = now(),
+            output = $2
+        WHERE id = $1
+          AND status = 'started'
+        $QUERY$,
+        _f_table
+      )
+      USING _flow_run_id, _selected_output;
+    END IF;
     END IF;
 
     -- Start steps with no dependencies
@@ -1835,7 +2122,7 @@ LANGUAGE plpgsql AS $$
 DECLARE
     _f_table text := cb_table_name(cb_fail_step.flow_name, 'f');
     _s_table text := cb_table_name(cb_fail_step.flow_name, 's');
-  _m_table text := cb_table_name(cb_fail_step.flow_name, 'm');
+    _m_table text := cb_table_name(cb_fail_step.flow_name, 'm');
     _flow_run_id bigint;
 BEGIN
     -- Fail step run atomically - only succeeds if status is 'pending', 'queued', or 'started'
@@ -2107,56 +2394,56 @@ $$;
 --   step_name: Step name within the flow
 -- Returns: step status details including attempts, timestamps, and output/error
 CREATE OR REPLACE FUNCTION cb_get_flow_step_status(
-  flow_name text,
-  run_id bigint,
-  step_name text
+    flow_name text,
+    run_id bigint,
+    step_name text
 )
 RETURNS TABLE(
-  id bigint,
-  status text,
-  attempts int,
-  output jsonb,
-  error_message text,
-  created_at timestamptz,
-  visible_at timestamptz,
-  started_at timestamptz,
-  completed_at timestamptz,
-  failed_at timestamptz,
-  skipped_at timestamptz,
-  canceled_at timestamptz
+    id bigint,
+    status text,
+    attempts int,
+    output jsonb,
+    error_message text,
+    created_at timestamptz,
+    visible_at timestamptz,
+    started_at timestamptz,
+    completed_at timestamptz,
+    failed_at timestamptz,
+    skipped_at timestamptz,
+    canceled_at timestamptz
 )
 LANGUAGE plpgsql AS $$
 DECLARE
-  _s_table text := cb_table_name(cb_get_flow_step_status.flow_name, 's');
+    _s_table text := cb_table_name(cb_get_flow_step_status.flow_name, 's');
 BEGIN
-  EXECUTE format(
-    $QUERY$
-     SELECT s.id,
-       s.status,
-       s.attempts,
-       s.output,
-       s.error_message,
-       s.created_at,
-       s.visible_at,
-       s.started_at,
-       s.completed_at,
-       s.failed_at,
-       s.skipped_at,
-       s.canceled_at
+    EXECUTE format(
+        $QUERY$
+        SELECT s.id,
+            s.status,
+            s.attempts,
+            s.output,
+            s.error_message,
+            s.created_at,
+            s.visible_at,
+            s.started_at,
+            s.completed_at,
+            s.failed_at,
+            s.skipped_at,
+            s.canceled_at
     FROM %I s
     WHERE s.flow_run_id = $1
     AND s.step_name = $2
-    $QUERY$,
-    _s_table
-  )
-  USING cb_get_flow_step_status.run_id, cb_get_flow_step_status.step_name
-  INTO id, status, attempts, output, error_message, created_at, visible_at, started_at, completed_at, failed_at, skipped_at, canceled_at;
+        $QUERY$,
+        _s_table
+    )
+    USING cb_get_flow_step_status.run_id, cb_get_flow_step_status.step_name
+    INTO id, status, attempts, output, error_message, created_at, visible_at, started_at, completed_at, failed_at, skipped_at, canceled_at;
 
-  IF id IS NULL THEN
-    RAISE EXCEPTION 'cb: step run not found for flow %, run %, step %', cb_get_flow_step_status.flow_name, cb_get_flow_step_status.run_id, cb_get_flow_step_status.step_name;
-  END IF;
+    IF id IS NULL THEN
+        RAISE EXCEPTION 'cb: step run not found for flow %, run %, step %', cb_get_flow_step_status.flow_name, cb_get_flow_step_status.run_id, cb_get_flow_step_status.step_name;
+    END IF;
 
-  RETURN NEXT;
+    RETURN NEXT;
 END;
 $$;
 -- +goose statementend
@@ -2171,73 +2458,73 @@ $$;
 --   poll_interval: Duration in milliseconds between poll attempts (must be > 0 and < poll_for)
 -- Returns: status/output/error_message once step reaches terminal state, or no rows on timeout
 CREATE OR REPLACE FUNCTION cb_wait_flow_step_output(
-  flow_name text,
-  run_id bigint,
-  step_name text,
-  poll_for int DEFAULT 5000,
-  poll_interval int DEFAULT 200
+    flow_name text,
+    run_id bigint,
+    step_name text,
+    poll_for int DEFAULT 5000,
+    poll_interval int DEFAULT 200
 )
 RETURNS TABLE(status text, output jsonb, error_message text)
 LANGUAGE plpgsql AS $$
 DECLARE
-  _s_table text := cb_table_name(cb_wait_flow_step_output.flow_name, 's');
-  _status text;
-  _output jsonb;
-  _error_message text;
-  _sleep_for double precision;
-  _stop_at timestamp;
+    _s_table text := cb_table_name(cb_wait_flow_step_output.flow_name, 's');
+    _status text;
+    _output jsonb;
+    _error_message text;
+    _sleep_for double precision;
+    _stop_at timestamp;
 BEGIN
-  IF cb_wait_flow_step_output.poll_for <= 0 THEN
-    RAISE EXCEPTION 'cb: poll_for must be greater than 0';
-  END IF;
-
-  IF cb_wait_flow_step_output.poll_interval <= 0 THEN
-    RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
-  END IF;
-
-  _sleep_for := cb_wait_flow_step_output.poll_interval / 1000.0;
-
-  IF _sleep_for >= cb_wait_flow_step_output.poll_for / 1000.0 THEN
-    RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
-  END IF;
-
-  _stop_at := clock_timestamp() + make_interval(secs => cb_wait_flow_step_output.poll_for / 1000.0);
-
-  LOOP
-    IF clock_timestamp() >= _stop_at THEN
-      RETURN;
+    IF cb_wait_flow_step_output.poll_for <= 0 THEN
+        RAISE EXCEPTION 'cb: poll_for must be greater than 0';
     END IF;
 
-    _status := NULL;
-    _output := NULL;
-    _error_message := NULL;
-
-    EXECUTE format(
-      $QUERY$
-      SELECT s.status, s.output, s.error_message
-      FROM %I s
-      WHERE s.flow_run_id = $1
-      AND s.step_name = $2
-      $QUERY$,
-      _s_table
-    )
-    USING cb_wait_flow_step_output.run_id, cb_wait_flow_step_output.step_name
-    INTO _status, _output, _error_message;
-
-    IF _status IS NULL THEN
-      RAISE EXCEPTION 'cb: step run not found for flow %, run %, step %', cb_wait_flow_step_output.flow_name, cb_wait_flow_step_output.run_id, cb_wait_flow_step_output.step_name;
+    IF cb_wait_flow_step_output.poll_interval <= 0 THEN
+        RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
     END IF;
 
-    IF _status IN ('completed', 'failed', 'skipped', 'canceled') THEN
-      status := _status;
-      output := _output;
-      error_message := _error_message;
-      RETURN NEXT;
-      RETURN;
+    _sleep_for := cb_wait_flow_step_output.poll_interval / 1000.0;
+
+    IF _sleep_for >= cb_wait_flow_step_output.poll_for / 1000.0 THEN
+        RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
     END IF;
 
-    PERFORM pg_sleep(_sleep_for);
-  END LOOP;
+    _stop_at := clock_timestamp() + make_interval(secs => cb_wait_flow_step_output.poll_for / 1000.0);
+
+    LOOP
+        IF clock_timestamp() >= _stop_at THEN
+            RETURN;
+        END IF;
+
+        _status := NULL;
+        _output := NULL;
+        _error_message := NULL;
+
+        EXECUTE format(
+            $QUERY$
+            SELECT s.status, s.output, s.error_message
+            FROM %I s
+            WHERE s.flow_run_id = $1
+            AND s.step_name = $2
+            $QUERY$,
+            _s_table
+        )
+        USING cb_wait_flow_step_output.run_id, cb_wait_flow_step_output.step_name
+        INTO _status, _output, _error_message;
+
+        IF _status IS NULL THEN
+            RAISE EXCEPTION 'cb: step run not found for flow %, run %, step %', cb_wait_flow_step_output.flow_name, cb_wait_flow_step_output.run_id, cb_wait_flow_step_output.step_name;
+        END IF;
+
+        IF _status IN ('completed', 'failed', 'skipped', 'canceled') THEN
+            status := _status;
+            output := _output;
+            error_message := _error_message;
+            RETURN NEXT;
+            RETURN;
+        END IF;
+
+        PERFORM pg_sleep(_sleep_for);
+    END LOOP;
 END;
 $$;
 -- +goose statementend
@@ -2366,10 +2653,10 @@ $$;
 -- +goose statementbegin
 DO $$
 BEGIN
-  IF to_regclass('public.cb_flows') IS NOT NULL THEN
-    PERFORM cb_delete_flow(name)
-    FROM cb_flows;
-  END IF;
+    IF to_regclass('public.cb_flows') IS NOT NULL THEN
+        PERFORM cb_delete_flow(name)
+        FROM cb_flows;
+    END IF;
 END
 $$;
 -- +goose statementend
@@ -2384,6 +2671,7 @@ DROP FUNCTION IF EXISTS cb_request_flow_cancellation(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_fail_flow_on_fail(text, bigint, text, boolean, bigint);
 DROP FUNCTION IF EXISTS cb_complete_flow_on_fail(text, bigint);
 DROP FUNCTION IF EXISTS cb_poll_flow_on_fail(text, int);
+DROP FUNCTION IF EXISTS cb_early_exit_flow(text, bigint, text, jsonb, text);
 DROP FUNCTION IF EXISTS cb_wait_flow_step_output(text, bigint, text, int, int);
 DROP FUNCTION IF EXISTS cb_get_flow_step_status(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_wait_flow_output(text, bigint, int, int);
@@ -2403,4 +2691,6 @@ DROP FUNCTION IF EXISTS cb_hide_steps(text, text, bigint[], integer);
 DROP FUNCTION IF EXISTS cb_poll_steps(text, text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_start_steps(text, bigint, timestamptz);
 DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text, text, timestamptz);
+DROP FUNCTION IF EXISTS cb_create_flow(text, jsonb, text[]);
+DROP FUNCTION IF EXISTS cb_create_flow(text, jsonb, jsonb);
 DROP FUNCTION IF EXISTS cb_create_flow(text, jsonb);

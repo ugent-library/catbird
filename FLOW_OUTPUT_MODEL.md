@@ -6,6 +6,50 @@ This document records the final output-selection model for Catbird flows.
 
 Catbird uses **priority-based output selection** with explicit early-completion override.
 
+## Go API (proposed)
+
+### Flow builder
+
+```go
+// Declares ordered output candidates.
+func (f *Flow) Output(stepNames ...string) *Flow
+```
+
+Semantics:
+
+- `Output(...)` defines ownership order for terminal output selection.
+- `Output()` (no step names) is invalid and fails at flow creation time.
+- If `Output(...)` is not set, structural terminal steps are used in flow definition order.
+
+### Early completion
+
+```go
+// Existing control signal API.
+func CompleteEarly(ctx context.Context, output any, reason string) error
+```
+
+Semantics:
+
+- Returning `CompleteEarly(...)` from a step handler writes final flow output immediately.
+- Early completion supersedes priority scanning for that run.
+
+### Validation/runtime errors
+
+```go
+var ErrNoOutputCandidate = errors.New("no output candidate produced output")
+```
+
+Creation-time validation errors include:
+
+- empty output priority,
+- unknown step references,
+- duplicate step names in priority,
+- missing structural terminal candidates in priority.
+
+Runtime behavior when no candidate produced output:
+
+- flow transitions to `failed` with `ErrNoOutputCandidate` semantics.
+
 ## Core semantics
 
 1. Flow definition declares `output_priority` (ordered step names).
@@ -37,8 +81,7 @@ Output policy is persisted with flow definition metadata in DB (language-agnosti
 
 Minimum metadata:
 
-- `output_mode = 'priority'`
-- `output_priority` (ordered JSON array)
+- `output_priority` (`text[]`, ordered step names)
 
 ## Early completion interaction
 
@@ -51,7 +94,6 @@ Minimum metadata:
 ### Phase 1
 
 - Add `output_priority` metadata + validation.
-- Keep strict reconvergence as compatibility mode while introducing priority mode.
 - Implement terminal output selection (first completed candidate wins; fail if none).
 - Keep early completion precedence.
 
@@ -61,6 +103,6 @@ Minimum metadata:
 - Validate output payloads at write points.
 - With schemas: null/empty validity follows schema rules.
 
-### Optional API sugar
+### API surface
 
-- `OutputFrom(step)` can be exposed as shorthand for single-entry `output_priority`.
+- Keep a single public method: `Output(stepNames ...string)`.

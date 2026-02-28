@@ -27,6 +27,8 @@ var (
 	ErrNoFailedStepSignal = fmt.Errorf("failed step signal input not available")
 	// ErrInvalidDecodeTarget is returned when decode target is nil or not a pointer.
 	ErrInvalidDecodeTarget = fmt.Errorf("invalid decode target")
+	// ErrNoOutputCandidate is returned when a flow completes without any configured output candidate producing output.
+	ErrNoOutputCandidate = fmt.Errorf("no output candidate produced output")
 )
 
 // Conn is an interface for database connections compatible with pgx.Conn and pgx.Pool
