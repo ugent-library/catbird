@@ -19,12 +19,14 @@ type Optional[T any] struct {
 }
 
 type Flow struct {
-	name             string
-	steps            []Step
-	outputPriority   []string
-	outputConfigured bool
-	onFail           func(context.Context, json.RawMessage, FlowFailure) error
-	onFailOpts       *HandlerOpts
+	name               string
+	steps              []Step
+	outputPriority     []string
+	outputStep         string
+	outputConfigured   bool
+	priorityConfigured bool
+	onFail             func(context.Context, json.RawMessage, FlowFailure) error
+	onFailOpts         *HandlerOpts
 }
 
 type FlowFailure struct {
@@ -52,8 +54,14 @@ func (f *Flow) AddStep(step *Step) *Flow {
 	return f
 }
 
-func (f *Flow) Output(stepNames ...string) *Flow {
+func (f *Flow) Output(stepName string) *Flow {
 	f.outputConfigured = true
+	f.outputStep = stepName
+	return f
+}
+
+func (f *Flow) OutputPriority(stepNames ...string) *Flow {
+	f.priorityConfigured = true
 	f.outputPriority = append([]string(nil), stepNames...)
 	return f
 }
@@ -867,7 +875,7 @@ func validateFlowDependencies(flow *Flow) error {
 		return fmt.Errorf("flow %q has no final step (circular dependency?)", flow.name)
 	}
 
-	if flow.outputConfigured {
+	if flow.priorityConfigured {
 		if len(flow.outputPriority) == 0 {
 			return fmt.Errorf("flow %q: output priority must not be empty", flow.name)
 		}
@@ -889,6 +897,32 @@ func validateFlowDependencies(flow *Flow) error {
 		for _, terminalStepName := range finalSteps {
 			if !seenOutputSteps[terminalStepName] {
 				return fmt.Errorf("flow %q: output priority must include structural terminal step %q", flow.name, terminalStepName)
+			}
+		}
+	}
+
+	if flow.outputConfigured {
+		if strings.TrimSpace(flow.outputStep) == "" {
+			return fmt.Errorf("flow %q: output step must not be empty", flow.name)
+		}
+		if !stepNameSet[flow.outputStep] {
+			return fmt.Errorf("flow %q: output references unknown step %q", flow.name, flow.outputStep)
+		}
+
+		isTerminal := false
+		for _, terminalStepName := range finalSteps {
+			if terminalStepName == flow.outputStep {
+				isTerminal = true
+				break
+			}
+		}
+		if !isTerminal {
+			return fmt.Errorf("flow %q: output step %q must be a structural terminal step", flow.name, flow.outputStep)
+		}
+
+		if flow.priorityConfigured {
+			if len(flow.outputPriority) == 0 || flow.outputPriority[0] != flow.outputStep {
+				return fmt.Errorf("flow %q: output step %q must be first in output priority", flow.name, flow.outputStep)
 			}
 		}
 	}
@@ -960,8 +994,11 @@ func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 		}
 
 		priority := flow.outputPriority
-		if !flow.outputConfigured {
+		if !flow.priorityConfigured {
 			priority = defaultFlowOutputPriority(flow)
+		}
+		if flow.outputConfigured {
+			priority = prioritizeOutputStep(priority, flow.outputStep)
 		}
 
 		_, err = conn.Exec(ctx, q, flow.name, b, priority)
@@ -1501,6 +1538,23 @@ func defaultFlowOutputPriority(flow *Flow) []string {
 	}
 
 	return priority
+}
+
+func prioritizeOutputStep(priority []string, outputStep string) []string {
+	if outputStep == "" {
+		return priority
+	}
+
+	ordered := make([]string, 0, len(priority))
+	ordered = append(ordered, outputStep)
+	for _, stepName := range priority {
+		if stepName == outputStep {
+			continue
+		}
+		ordered = append(ordered, stepName)
+	}
+
+	return ordered
 }
 
 // CreateFlowSchedule creates a cron-based schedule for a flow.

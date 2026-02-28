@@ -243,7 +243,8 @@ func TestFlowOutputPrioritySelection(t *testing.T) {
 	flowName := testFlowName(t, "output_priority")
 
 	flow := NewFlow(flowName).
-		Output("high", "low").
+		OutputPriority("high", "low").
+		Output("high").
 		AddStep(NewStep("base").Handler(func(ctx context.Context, in int) (int, error) {
 			return in, nil
 		})).

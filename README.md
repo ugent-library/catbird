@@ -230,7 +230,7 @@ A **flow** is a **directed acyclic graph (DAG)** of steps that execute when thei
 ## Summary
 
 - Steps with no dependencies start immediately; independent branches run in parallel.
-- Flow output is selected by output priority (configured with `Output(...)` or inferred from terminal steps).
+- Flow output is selected by output priority (configured with `OutputPriority(...)` or inferred from terminal steps).
 - Conditions can skip steps; downstream handlers must accept `Optional[T]` for any conditional dependency.
 - A step with a signal waits for both its dependencies and the signal input.
 - `WaitForOutput()` returns the selected flow output once the flow completes.
@@ -293,7 +293,8 @@ Flows can have multiple terminal steps.
 
 ```go
 flow := catbird.NewFlow("approval-or-escalation").
-    Output("approve", "escalate").
+    OutputPriority("approve", "escalate").
+    Output("approve").
     AddStep(catbird.NewStep("validate").
         Handler(func(ctx context.Context, req Request) (Validation, error) {
             return Validation{Score: req.Score}, nil
@@ -312,7 +313,7 @@ flow := catbird.NewFlow("approval-or-escalation").
         }))
 ```
 
-If you omit `Output(...)`, Catbird uses terminal steps in definition order as the default priority.
+If you omit `OutputPriority(...)`, Catbird uses terminal steps in definition order as the default priority.
 
 ```go
 flow := catbird.NewFlow("default-terminal-priority").
@@ -654,7 +655,8 @@ Flow steps can branch based on prior outputs. Use `Optional[T]` to handle skippe
 
 ```go
 flow := catbird.NewFlow("payment_processing").
-    Output("charge", "free_order").
+    OutputPriority("charge", "free_order").
+    Output("charge").
     AddStep(catbird.NewStep("validate").
         Handler(func(ctx context.Context, order Order) (ValidationResult, error) {
             return ValidationResult{Valid: order.Amount > 0}, nil
