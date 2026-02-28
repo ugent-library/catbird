@@ -349,6 +349,34 @@ flow := catbird.NewFlow("document_approval").
 
 A step with both dependencies and a signal waits for **both** conditions: all dependencies must complete **and** the signal must be delivered before the step executes.
 
+## Example: Early Completion
+
+Use `CompleteEarly(ctx, output, reason)` inside a flow step handler when you already have the final business output and want to stop remaining branches.
+
+```go
+flow := catbird.NewFlow("fraud-check").
+    AddStep(catbird.NewStep("quick_guard").
+        Handler(func(ctx context.Context, in Order) (string, error) {
+            if in.IsKnownSafe {
+                return "", catbird.CompleteEarly(ctx, Decision{Approved: true}, "known-safe fast path")
+            }
+            return "continue", nil
+        })).
+    AddStep(catbird.NewStep("slow_analysis").
+        Handler(func(ctx context.Context, in Order) (string, error) {
+            // potentially expensive work
+            time.Sleep(2 * time.Second)
+            return "done", nil
+        })).
+    AddStep(catbird.NewStep("final").
+        DependsOn("quick_guard", "slow_analysis").
+        Handler(func(ctx context.Context, in Order, guard string, analysis string) (Decision, error) {
+            return Decision{Approved: guard == "continue" && analysis == "done"}, nil
+        }))
+```
+
+When early completion wins the race, the flow run becomes `completed` with the provided output, and in-flight sibling work is stopped cooperatively.
+
 ## Map Steps
 
 Map steps fan out array processing into per-item SQL-coordinated work and aggregate results back in item order.

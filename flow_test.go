@@ -2233,6 +2233,130 @@ func TestFlowInternalCancelCurrentRun(t *testing.T) {
 	}
 }
 
+func TestFlowFailStopsInFlightParallelStep(t *testing.T) {
+	client := getTestClient(t)
+
+	flowName := testFlowName(t, "fail_stops_parallel")
+	longStarted := make(chan struct{}, 1)
+	longStopped := make(chan struct{}, 1)
+
+	flow := NewFlow(flowName).
+		AddStep(NewStep("long_running").Handler(func(ctx context.Context, in string) (string, error) {
+			longStarted <- struct{}{}
+
+			select {
+			case <-ctx.Done():
+				longStopped <- struct{}{}
+				return "", ctx.Err()
+			case <-time.After(5 * time.Second):
+				return "late-complete", nil
+			}
+		})).
+		AddStep(NewStep("fail_fast").Handler(func(ctx context.Context, in string) (string, error) {
+			select {
+			case <-longStarted:
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+			return "", fmt.Errorf("intentional failure")
+		})).
+		AddStep(NewStep("final").
+			DependsOn("long_running", "fail_fast").
+			Handler(func(ctx context.Context, in string, longOut string, failOut string) (string, error) {
+				return longOut + ":" + failOut, nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out string
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+	err = h.WaitForOutput(ctx, &out)
+	if !errors.Is(err, ErrRunFailed) {
+		t.Fatalf("expected ErrRunFailed, got %v", err)
+	}
+
+	select {
+	case <-longStopped:
+		// in-flight sibling observed cancellation after flow failure
+	case <-time.After(2 * time.Second):
+		stepInfo := waitForFlowStepFinished(t, client, flowName, h.ID, "long_running", 2*time.Second)
+		if stepInfo.Status == "completed" {
+			t.Fatalf("expected long_running not to complete after sibling failure, got status=%s", stepInfo.Status)
+		}
+	}
+}
+
+func TestFlowCompleteEarlyFromStep(t *testing.T) {
+	client := getTestClient(t)
+
+	flowName := testFlowName(t, "complete_early")
+	longStopped := make(chan struct{}, 1)
+
+	flow := NewFlow(flowName).
+		AddStep(NewStep("long_running").Handler(func(ctx context.Context, in string) (string, error) {
+			select {
+			case <-ctx.Done():
+				longStopped <- struct{}{}
+				return "", ctx.Err()
+			case <-time.After(5 * time.Second):
+				return "late-complete", nil
+			}
+		})).
+		AddStep(NewStep("fast_path").Handler(func(ctx context.Context, in string) (string, error) {
+			return "", CompleteEarly(ctx, "early-output", "fast-path")
+		})).
+		AddStep(NewStep("final").
+			DependsOn("long_running", "fast_path").
+			Handler(func(ctx context.Context, in string, longOut string, fastOut string) (string, error) {
+				return longOut + ":" + fastOut, nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out string
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out != "early-output" {
+		t.Fatalf("expected early output, got %q", out)
+	}
+
+	run, err := client.GetFlowRun(t.Context(), flowName, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "completed" {
+		t.Fatalf("expected completed, got %s", run.Status)
+	}
+
+	select {
+	case <-longStopped:
+		// in-flight sibling observed stop after early completion
+	case <-time.After(2 * time.Second):
+		stepInfo := waitForFlowStepFinished(t, client, flowName, h.ID, "long_running", 2*time.Second)
+		if stepInfo.Status == "completed" {
+			t.Fatalf("expected long_running not to complete after early completion, got status=%s", stepInfo.Status)
+		}
+	}
+}
+
 func TestStepCanCheckOtherStepFinishedFromHandler(t *testing.T) {
 	client := getTestClient(t)
 

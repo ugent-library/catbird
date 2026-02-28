@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -621,23 +622,36 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 
 	h := w.step.handlerOpts
 	flowRunID := msg.FlowRunID
-	cancelObserved := false
+	cancelRequested := false
+	var stopRequested atomic.Bool
 
 	claimCtx, claimCancel := context.WithCancel(ctx)
 	defer claimCancel()
 
 	handlerCtx := withFlowRunScope(claimCtx, w.conn, w.flowName, flowRunID, claimCancel)
-	defer finalizeFlowCanceledIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, &cancelObserved)
+	defer finalizeFlowCancelIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, &cancelRequested)
 
-	cancelAndMark := func() bool {
-		return cancelFlowWorkIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, claimCancel, &cancelObserved, func() {
+	stopIfRequested := func() bool {
+		if stopRequested.Load() {
+			return true
+		}
+
+		if stopFlowIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, claimCancel, &cancelRequested, func() {
 			cancelStepRun(ctx, w.conn, w.logger, w.flowName, msg.ID)
-		})
+		}) {
+			stopRequested.Store(true)
+			return true
+		}
+
+		return false
 	}
 
-	if cancelAndMark() {
+	if stopIfRequested() {
 		return
 	}
+
+	stopWatcher := watchFlowStop(claimCtx, 500*time.Millisecond, stopIfRequested)
+	defer stopWatcher()
 
 	if h.CircuitBreaker != nil {
 		allowed, delay := h.CircuitBreaker.Allow(time.Now())
@@ -664,7 +678,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 	}
 
 	if w.step.isMapStep && w.step.reducerFn != nil {
-		if cancelAndMark() {
+		if stopIfRequested() {
 			return
 		}
 
@@ -676,7 +690,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 		})
 
 		if err != nil {
-			if cancelAndMark() {
+			if stopIfRequested() {
 				return
 			}
 
@@ -700,7 +714,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 	}
 
 	if w.step.isGenerator {
-		if cancelAndMark() {
+		if stopIfRequested() {
 			return
 		}
 
@@ -756,7 +770,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 		})
 
 		if err != nil {
-			if cancelAndMark() {
+			if stopIfRequested() {
 				return
 			}
 
@@ -807,7 +821,32 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 
 	// Handle result
 	if err != nil {
-		if cancelAndMark() {
+		if completion, ok := asEarlyCompletion(err); ok {
+			if completion.flowName != w.flowName || completion.flowRunID != flowRunID {
+				w.logger.ErrorContext(ctx, "worker: early completion scope mismatch", "flow", w.flowName, "step", w.step.name)
+				return
+			}
+
+			changed, status, completeErr := completeFlowEarly(ctx, w.conn, w.flowName, flowRunID, w.step.name, completion.output, completion.reason)
+			if completeErr != nil {
+				w.logger.ErrorContext(ctx, "worker: cannot complete flow early", "flow", w.flowName, "step", w.step.name, "error", completeErr)
+				if msg.Attempts > h.MaxRetries {
+					failStepRun(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, completeErr.Error())
+				} else {
+					delay := nextRetryDelay(msg.Attempts-1, h.Backoff, 0, 0)
+					hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay step after early completion error")
+				}
+				return
+			}
+
+			if changed || status == "completed" {
+				stopRequested.Store(true)
+				claimCancel()
+			}
+			return
+		}
+
+		if stopIfRequested() {
 			return
 		}
 
@@ -823,7 +862,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 			hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay next step run")
 		}
 	} else {
-		if cancelAndMark() {
+		if stopIfRequested() {
 			return
 		}
 		if h.CircuitBreaker != nil {
@@ -1083,23 +1122,36 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 
 	h := w.step.handlerOpts
 	flowRunID := msg.FlowRunID
-	cancelObserved := false
+	cancelRequested := false
+	var stopRequested atomic.Bool
 
 	claimCtx, claimCancel := context.WithCancel(ctx)
 	defer claimCancel()
 
 	handlerCtx := withFlowRunScope(claimCtx, w.conn, w.flowName, flowRunID, claimCancel)
-	defer finalizeFlowCanceledIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, &cancelObserved)
+	defer finalizeFlowCancelIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, &cancelRequested)
 
-	cancelAndMark := func() bool {
-		return cancelFlowWorkIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, claimCancel, &cancelObserved, func() {
+	stopIfRequested := func() bool {
+		if stopRequested.Load() {
+			return true
+		}
+
+		if stopFlowIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, claimCancel, &cancelRequested, func() {
 			cancelMapTaskRun(ctx, w.conn, w.logger, w.flowName, msg.ID)
-		})
+		}) {
+			stopRequested.Store(true)
+			return true
+		}
+
+		return false
 	}
 
-	if cancelAndMark() {
+	if stopIfRequested() {
 		return
 	}
+
+	stopWatcher := watchFlowStop(claimCtx, 500*time.Millisecond, stopIfRequested)
+	defer stopWatcher()
 
 	if h.CircuitBreaker != nil {
 		allowed, delay := h.CircuitBreaker.Allow(time.Now())
@@ -1192,7 +1244,32 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 	})
 
 	if err != nil {
-		if cancelAndMark() {
+		if completion, ok := asEarlyCompletion(err); ok {
+			if completion.flowName != w.flowName || completion.flowRunID != flowRunID {
+				w.logger.ErrorContext(ctx, "worker: early completion scope mismatch", "flow", w.flowName, "step", w.step.name)
+				return
+			}
+
+			changed, status, completeErr := completeFlowEarly(ctx, w.conn, w.flowName, flowRunID, w.step.name, completion.output, completion.reason)
+			if completeErr != nil {
+				w.logger.ErrorContext(ctx, "worker: cannot complete flow early", "flow", w.flowName, "step", w.step.name, "error", completeErr)
+				if msg.Attempts > h.MaxRetries {
+					failMapTaskRun(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, completeErr.Error())
+				} else {
+					delay := nextRetryDelay(msg.Attempts-1, h.Backoff, 0, 0)
+					hideMapTaskRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay map task after early completion error")
+				}
+				return
+			}
+
+			if changed || status == "completed" {
+				stopRequested.Store(true)
+				claimCancel()
+			}
+			return
+		}
+
+		if stopIfRequested() {
 			return
 		}
 
@@ -1213,7 +1290,7 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 		h.CircuitBreaker.RecordSuccess()
 	}
 
-	if cancelAndMark() {
+	if stopIfRequested() {
 		return
 	}
 
@@ -1565,21 +1642,29 @@ func failFlowOnFail(ctx context.Context, conn Conn, logger *slog.Logger, flowNam
 	}
 }
 
+func completeFlowEarly(ctx context.Context, conn Conn, flowName string, runID int64, stepName string, output any, reason string) (bool, string, error) {
+	payload, err := json.Marshal(output)
+	if err != nil {
+		return false, "", fmt.Errorf("marshal early completion output: %w", err)
+	}
+
+	q := `SELECT changed, status FROM cb_early_exit_flow(flow_name => $1, flow_run_id => $2, step_name => $3, output => $4, reason => $5);`
+	var changed bool
+	var status string
+	err = conn.QueryRow(ctx, q, flowName, runID, stepName, payload, reason).Scan(&changed, &status)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, "", nil
+		}
+		return false, "", err
+	}
+
+	return changed, status, nil
+}
+
 func isTaskCancelRequested(ctx context.Context, conn Conn, taskName string, runID int64) (bool, error) {
 	var requested bool
 	err := conn.QueryRow(ctx, `SELECT cb_task_cancel_requested(name => $1, run_id => $2);`, taskName, runID).Scan(&requested)
-	if err != nil {
-		return false, err
-	}
-	return requested, nil
-}
-
-func isFlowCancelRequested(ctx context.Context, conn Conn, flowName string, runID int64) (bool, error) {
-	if runID == 0 {
-		return false, nil
-	}
-	var requested bool
-	err := conn.QueryRow(ctx, `SELECT cb_flow_cancel_requested(name => $1, run_id => $2);`, flowName, runID).Scan(&requested)
 	if err != nil {
 		return false, err
 	}
@@ -1597,49 +1682,108 @@ func isTaskCancelRequestedBestEffort(ctx context.Context, conn Conn, taskName st
 	return isTaskCancelRequested(retryCtx, conn, taskName, runID)
 }
 
-func isFlowCancelRequestedBestEffort(ctx context.Context, conn Conn, flowName string, runID int64) (bool, error) {
-	requested, err := isFlowCancelRequested(ctx, conn, flowName, runID)
+func getFlowStatus(ctx context.Context, conn Conn, flowName string, runID int64) (string, error) {
+	if runID == 0 {
+		return "", nil
+	}
+
+	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
+	query := fmt.Sprintf("SELECT status FROM %s WHERE id = $1", tableName)
+
+	var status string
+	err := conn.QueryRow(ctx, query, runID).Scan(&status)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+
+	return status, nil
+}
+
+func getFlowStatusBestEffort(ctx context.Context, conn Conn, flowName string, runID int64) (string, error) {
+	status, err := getFlowStatus(ctx, conn, flowName, runID)
 	if err == nil || ctx == nil || ctx.Err() == nil {
-		return requested, err
+		return status, err
 	}
 
 	retryCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	return isFlowCancelRequested(retryCtx, conn, flowName, runID)
+	return getFlowStatus(retryCtx, conn, flowName, runID)
 }
 
-func cancelFlowWorkIfRequested(
+func shouldStopFlow(status string) bool {
+	switch status {
+	case "canceling", "canceled", "failed", "completed":
+		return true
+	default:
+		return false
+	}
+}
+
+func stopFlowIfRequested(
 	ctx context.Context,
 	conn Conn,
 	logger *slog.Logger,
 	flowName string,
 	flowRunID int64,
 	claimCancel context.CancelFunc,
-	cancelObserved *bool,
+	cancelRequested *bool,
 	onCancel func(),
 ) bool {
-	requested, err := isFlowCancelRequestedBestEffort(ctx, conn, flowName, flowRunID)
-	if err != nil || !requested {
+	status, err := getFlowStatusBestEffort(ctx, conn, flowName, flowRunID)
+	if err != nil || !shouldStopFlow(status) {
 		return false
 	}
 
-	if cancelObserved != nil {
-		*cancelObserved = true
+	if cancelRequested != nil && (status == "canceling" || status == "canceled") {
+		*cancelRequested = true
 	}
+
 	if claimCancel != nil {
 		claimCancel()
 	}
-	if onCancel != nil {
+	if onCancel != nil && (status == "canceling" || status == "canceled") {
 		onCancel()
 	}
 	if logger != nil {
-		logger.DebugContext(ctx, "worker: flow cancellation observed", "flow", flowName, "flow_run_id", flowRunID)
+		logger.DebugContext(ctx, "worker: flow stop observed", "flow", flowName, "flow_run_id", flowRunID, "status", status)
 	}
 
 	return true
 }
 
-func finalizeFlowCanceled(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, runID int64) {
+func watchFlowStop(ctx context.Context, interval time.Duration, stopIfRequested func() bool) func() {
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				if stopIfRequested() {
+					return
+				}
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
+	}
+}
+
+func finalizeFlowCancel(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, runID int64) {
 	if runID == 0 {
 		return
 	}
@@ -1648,8 +1792,8 @@ func finalizeFlowCanceled(ctx context.Context, conn Conn, logger *slog.Logger, f
 	}
 }
 
-func finalizeFlowCanceledIfRequested(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, runID int64, cancelObserved *bool) {
-	if cancelObserved == nil || !*cancelObserved {
+func finalizeFlowCancelIfRequested(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, runID int64, cancelRequested *bool) {
+	if cancelRequested == nil || !*cancelRequested {
 		return
 	}
 
@@ -1660,7 +1804,7 @@ func finalizeFlowCanceledIfRequested(ctx context.Context, conn Conn, logger *slo
 		finalizeCtx = retryCtx
 	}
 
-	finalizeFlowCanceled(finalizeCtx, conn, logger, flowName, runID)
+	finalizeFlowCancel(finalizeCtx, conn, logger, flowName, runID)
 }
 
 func cancelStepRun(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, stepID int64) {
