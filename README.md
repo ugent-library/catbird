@@ -294,7 +294,6 @@ Flows can have multiple terminal steps.
 ```go
 flow := catbird.NewFlow("approval-or-escalation").
     OutputPriority("approve", "escalate").
-    Output("approve").
     AddStep(catbird.NewStep("validate").
         Handler(func(ctx context.Context, req Request) (Validation, error) {
             return Validation{Score: req.Score}, nil
@@ -656,7 +655,6 @@ Flow steps can branch based on prior outputs. Use `Optional[T]` to handle skippe
 ```go
 flow := catbird.NewFlow("payment_processing").
     OutputPriority("charge", "free_order").
-    Output("charge").
     AddStep(catbird.NewStep("validate").
         Handler(func(ctx context.Context, order Order) (ValidationResult, error) {
             return ValidationResult{Valid: order.Amount > 0}, nil
