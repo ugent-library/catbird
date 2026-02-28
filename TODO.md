@@ -1,8 +1,10 @@
 # Catbird TODO
 
-## API Improvements
+## Architecture
 
-### Naming & API Cleanup
+- [ ] Implement final flow output model (see FLOW_OUTPUT_MODEL.md)
+
+## API Improvements
 
 - [ ] Review sql function return values and use named constraints
 
@@ -15,6 +17,7 @@
 - [ ] Description and other meta fields
 - [ ] Metrics
 - [ ] Schemas for task/flow input/output? (see https://opensource.googleblog.com/2026/01/a-json-schema-package-for-go.html)
+- [ ] Relax strict flow reconvergence with explicit, non-ambiguous single-output ownership model (see FLOW_OUTPUT_MODELS.md)
 - [ ] Unlogged tasks and flows
 
 ## Client Implementations
