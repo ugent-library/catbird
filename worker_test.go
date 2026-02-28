@@ -686,7 +686,7 @@ func TestWorkerValidatesTaskHandlerOpts(t *testing.T) {
 	})
 }
 
-func TestWorkerValidatesFlowStepHandlerOpts(t *testing.T) {
+func TestWorkerValidatesStepHandlerOpts(t *testing.T) {
 	client := getTestClient(t)
 
 	// Test invalid concurrency in flow step

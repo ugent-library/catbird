@@ -987,6 +987,21 @@ type FlowRunInfo struct {
 	FailedAt          time.Time       `json:"failed_at,omitzero"`
 }
 
+// IsDone reports whether the flow run reached a terminal state.
+func (r *FlowRunInfo) IsDone() bool {
+	switch r.Status {
+	case "completed", "failed", "canceled":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsCompleted reports whether the flow run completed successfully.
+func (r *FlowRunInfo) IsCompleted() bool {
+	return r.Status == "completed"
+}
+
 // OutputAs unmarshals the output of a completed flow run.
 // Returns an error if the flow run has failed or is not completed yet.
 func (r *FlowRunInfo) OutputAs(out any) error {
@@ -1078,22 +1093,45 @@ func CancelFlowRun(ctx context.Context, conn Conn, flowName string, runID int64,
 	return nil
 }
 
-// CancelCurrentFlowRun requests cancellation for the current flow run from inside a flow step handler.
-func CancelCurrentFlowRun(ctx context.Context, opts ...CancelOpts) error {
+// GetStep retrieves status details for a step in the current flow run.
+// Intended for use inside flow step handlers.
+func GetStep(ctx context.Context, stepName string) (*StepRunInfo, error) {
 	scope, _ := ctx.Value(flowRunScopeContextKey{}).(*flowRunScope)
 	if scope == nil || scope.conn == nil {
-		return ErrNoRunContext
+		return nil, ErrNoRunContext
+	}
+	return getStepStatus(ctx, scope.conn, scope.name, scope.runID, stepName)
+}
+
+// WaitForStep blocks until the given step reaches a terminal state in the current flow run.
+// Pass optional WaitOpts to customize polling behavior; defaults are used when omitted.
+func WaitForStep(ctx context.Context, stepName string, opts ...WaitOpts) (*StepRunInfo, error) {
+	var pollFor time.Duration
+	var pollInterval time.Duration
+
+	if len(opts) > 0 {
+		pollFor = opts[0].PollFor
+		pollInterval = opts[0].PollInterval
 	}
 
-	if err := CancelFlowRun(ctx, scope.conn, scope.name, scope.runID, opts...); err != nil {
-		return err
-	}
+	_, pollIntervalMs := resolvePollDurations(defaultPollFor, defaultPollInterval, pollFor, pollInterval)
+	interval := time.Duration(pollIntervalMs) * time.Millisecond
 
-	if scope.cancel != nil {
-		scope.cancel()
-	}
+	for {
+		step, err := GetStep(ctx, stepName)
+		if err != nil {
+			return nil, err
+		}
+		if step.IsDone() {
+			return step, nil
+		}
 
-	return nil
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(interval):
+		}
+	}
 }
 
 // RunFlow enqueues a flow execution and returns a handle for monitoring.
@@ -1223,8 +1261,11 @@ type StepRunInfo struct {
 	ID           int64           `json:"id"`
 	StepName     string          `json:"step_name"`
 	Status       string          `json:"status"`
+	Attempts     int             `json:"attempts"`
 	Output       json.RawMessage `json:"output,omitempty"`
 	ErrorMessage string          `json:"error_message,omitempty"`
+	CreatedAt    time.Time       `json:"created_at,omitzero"`
+	VisibleAt    time.Time       `json:"visible_at,omitzero"`
 	StartedAt    time.Time       `json:"started_at,omitzero"`
 	CompletedAt  time.Time       `json:"completed_at,omitzero"`
 	FailedAt     time.Time       `json:"failed_at,omitzero"`
@@ -1232,11 +1273,81 @@ type StepRunInfo struct {
 	CanceledAt   time.Time       `json:"canceled_at,omitzero"`
 }
 
+// IsDone reports whether the step run reached a terminal state.
+func (r *StepRunInfo) IsDone() bool {
+	switch r.Status {
+	case "completed", "failed", "skipped", "canceled":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsCompleted reports whether the step run completed successfully.
+func (r *StepRunInfo) IsCompleted() bool {
+	return r.Status == "completed"
+}
+
+func getStepStatus(ctx context.Context, conn Conn, flowName string, flowRunID int64, stepName string) (*StepRunInfo, error) {
+	q := `
+		SELECT id, status, attempts, output, error_message, created_at, visible_at, started_at, completed_at, failed_at, skipped_at, canceled_at
+		FROM cb_get_flow_step_status(flow_name => $1, run_id => $2, step_name => $3);
+	`
+
+	var info StepRunInfo
+	info.StepName = stepName
+	var output *json.RawMessage
+	var errorMessage *string
+	var startedAt, completedAt, failedAt, skippedAt, canceledAt *time.Time
+
+	err := conn.QueryRow(ctx, q, flowName, flowRunID, stepName).Scan(
+		&info.ID,
+		&info.Status,
+		&info.Attempts,
+		&output,
+		&errorMessage,
+		&info.CreatedAt,
+		&info.VisibleAt,
+		&startedAt,
+		&completedAt,
+		&failedAt,
+		&skippedAt,
+		&canceledAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if output != nil {
+		info.Output = *output
+	}
+	if errorMessage != nil {
+		info.ErrorMessage = *errorMessage
+	}
+	if startedAt != nil {
+		info.StartedAt = *startedAt
+	}
+	if completedAt != nil {
+		info.CompletedAt = *completedAt
+	}
+	if failedAt != nil {
+		info.FailedAt = *failedAt
+	}
+	if skippedAt != nil {
+		info.SkippedAt = *skippedAt
+	}
+	if canceledAt != nil {
+		info.CanceledAt = *canceledAt
+	}
+
+	return &info, nil
+}
+
 // GetFlowRunSteps retrieves all step runs for a specific flow run.
 func GetFlowRunSteps(ctx context.Context, conn Conn, flowName string, flowRunID int64) ([]*StepRunInfo, error) {
 	tableName := fmt.Sprintf("cb_s_%s", strings.ToLower(flowName))
 	query := fmt.Sprintf(`
-		SELECT id, step_name, status, output, error_message, started_at, completed_at, failed_at, skipped_at, canceled_at
+		SELECT id, step_name, status, attempts, output, error_message, created_at, visible_at, started_at, completed_at, failed_at, skipped_at, canceled_at
 		FROM %s
 		WHERE flow_run_id = $1
 		ORDER BY id;`, pgx.Identifier{tableName}.Sanitize())
@@ -1254,8 +1365,11 @@ func GetFlowRunSteps(ctx context.Context, conn Conn, flowName string, flowRunID 
 			&s.ID,
 			&s.StepName,
 			&s.Status,
+			&s.Attempts,
 			&output,
 			&errorMessage,
+			&s.CreatedAt,
+			&s.VisibleAt,
 			&startedAt,
 			&completedAt,
 			&failedAt,

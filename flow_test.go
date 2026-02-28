@@ -1211,7 +1211,7 @@ func TestFlowComplexDependencies(t *testing.T) {
 	}
 }
 
-func TestFlowStepPanicRecovery(t *testing.T) {
+func TestStepPanicRecovery(t *testing.T) {
 	client := getTestClient(t)
 
 	flow := NewFlow("panic_flow").
@@ -2144,6 +2144,28 @@ func waitForFlowRunStatus(t *testing.T, client *Client, flowName string, runID i
 	}
 }
 
+func waitForFlowStepFinished(t *testing.T, client *Client, flowName string, runID int64, stepName string, timeout time.Duration) *StepRunInfo {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		steps, err := client.GetFlowRunSteps(t.Context(), flowName, runID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, step := range steps {
+			if step.StepName == stepName && step.IsDone() {
+				return step
+			}
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("expected step %s to reach a terminal state", stepName)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func TestFlowCancelStartedRun(t *testing.T) {
 	client := getTestClient(t)
 
@@ -2178,7 +2200,7 @@ func TestFlowInternalCancelCurrentRun(t *testing.T) {
 	flowName := testFlowName(t, "cancel_internal")
 	flow := NewFlow(flowName).
 		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
-			if err := CancelCurrentFlowRun(ctx, CancelOpts{Reason: "business early exit"}); err != nil {
+			if err := Cancel(ctx, CancelOpts{Reason: "business early exit"}); err != nil {
 				return "", err
 			}
 			<-ctx.Done()
@@ -2208,5 +2230,163 @@ func TestFlowInternalCancelCurrentRun(t *testing.T) {
 	}
 	if run.Status != "canceled" {
 		t.Fatalf("expected canceled, got %s", run.Status)
+	}
+}
+
+func TestStepCanCheckOtherStepFinishedFromHandler(t *testing.T) {
+	client := getTestClient(t)
+
+	flowName := testFlowName(t, "step_check_other_finished")
+	flow := NewFlow(flowName).
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
+			time.Sleep(180 * time.Millisecond)
+			return "step1-done", nil
+		})).
+		AddStep(NewStep("watch").Handler(func(ctx context.Context, in string) (string, error) {
+			status, err := WaitForStep(ctx, "step1", WaitOpts{PollInterval: 20 * time.Millisecond})
+			if err != nil {
+				return "", err
+			}
+			return "observed:" + status.Status, nil
+		})).
+		AddStep(NewStep("final").
+			DependsOn("step1", "watch").
+			Handler(func(ctx context.Context, in string, step1Out, watchOut string) (string, error) {
+				return step1Out + ":" + watchOut, nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out string
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	if out != "step1-done:observed:completed" {
+		t.Fatalf("unexpected output: %s", out)
+	}
+}
+
+func TestStepStatusAndWaitForOutput(t *testing.T) {
+	client := getTestClient(t)
+
+	flowName := testFlowName(t, "step_status_wait")
+	flow := NewFlow(flowName).
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
+			time.Sleep(120 * time.Millisecond)
+			return in + ":s1", nil
+		})).
+		AddStep(NewStep("step2").
+			DependsOn("step1").
+			Handler(func(ctx context.Context, in string, step1Out string) (string, error) {
+				return step1Out + ":s2", nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stepInfo := waitForFlowStepFinished(t, client, flowName, h.ID, "step1", 8*time.Second)
+
+	var step1Out string
+	if err := json.Unmarshal(stepInfo.Output, &step1Out); err != nil {
+		t.Fatal(err)
+	}
+	if step1Out != "input:s1" {
+		t.Fatalf("unexpected step1 output: %s", step1Out)
+	}
+
+	if stepInfo.Status != "completed" {
+		t.Fatalf("expected completed, got %s", stepInfo.Status)
+	}
+	if stepInfo.Attempts < 1 {
+		t.Fatalf("expected attempts >= 1, got %d", stepInfo.Attempts)
+	}
+	if stepInfo.CreatedAt.IsZero() || stepInfo.CompletedAt.IsZero() {
+		t.Fatalf("expected non-zero created/completed timestamps")
+	}
+	if !stepInfo.IsDone() {
+		t.Fatalf("expected step IsDone() to be true in terminal state")
+	}
+	if !stepInfo.IsCompleted() {
+		t.Fatalf("expected step IsCompleted() to be true in completed state")
+	}
+
+	var out string
+	ctxFlow, cancelFlow := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancelFlow()
+	if err := h.WaitForOutput(ctxFlow, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	run, err := client.GetFlowRun(t.Context(), flowName, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "completed" {
+		t.Fatalf("expected completed, got %s", run.Status)
+	}
+	if !run.IsDone() {
+		t.Fatalf("expected flow run IsDone() to be true in terminal state")
+	}
+	if !run.IsCompleted() {
+		t.Fatalf("expected flow run IsCompleted() to be true in completed state")
+	}
+}
+
+func TestStepWaitForOutputSkipped(t *testing.T) {
+	client := getTestClient(t)
+
+	type flowInput struct {
+		RunStep1 bool `json:"run_step1"`
+	}
+
+	flowName := testFlowName(t, "step_wait_skipped")
+	flow := NewFlow(flowName).
+		AddStep(NewStep("gate").
+			Handler(func(ctx context.Context, in flowInput) (bool, error) {
+				return in.RunStep1, nil
+			})).
+		AddStep(NewStep("step1").
+			DependsOn("gate").
+			Condition("gate eq true").
+			Handler(func(ctx context.Context, in flowInput, gate bool) (string, error) {
+				return "ran", nil
+			})).
+		AddStep(NewStep("step2").
+			DependsOn("step1").
+			Handler(func(ctx context.Context, in flowInput, step1Out Optional[string]) (string, error) {
+				if step1Out.IsSet {
+					return "unexpected", nil
+				}
+				return "done", nil
+			}))
+
+	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, flowInput{RunStep1: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stepInfo := waitForFlowStepFinished(t, client, flowName, h.ID, "step1", 8*time.Second)
+	if stepInfo.Status != "skipped" {
+		t.Fatalf("expected step1 status skipped, got %s", stepInfo.Status)
 	}
 }

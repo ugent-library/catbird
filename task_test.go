@@ -705,7 +705,7 @@ func TestTaskInternalCancelCurrentRun(t *testing.T) {
 
 	taskName := fmt.Sprintf("cancel_internal_task_%d", time.Now().UnixNano())
 	task := NewTask(taskName).Handler(func(ctx context.Context, in string) (string, error) {
-		if err := CancelCurrentTaskRun(ctx, CancelOpts{Reason: "business early exit"}); err != nil {
+		if err := Cancel(ctx, CancelOpts{Reason: "business early exit"}); err != nil {
 			return "", err
 		}
 		<-ctx.Done()
@@ -735,5 +735,61 @@ func TestTaskInternalCancelCurrentRun(t *testing.T) {
 	}
 	if run.Status != "canceled" {
 		t.Fatalf("expected canceled, got %s", run.Status)
+	}
+}
+
+func TestTaskHandleWaitForOutput(t *testing.T) {
+	client := getTestClient(t)
+
+	taskName := fmt.Sprintf("task_handle_finished_%d", time.Now().UnixNano())
+	task := NewTask(taskName).Handler(func(ctx context.Context, in string) (string, error) {
+		time.Sleep(150 * time.Millisecond)
+		return in + ":ok", nil
+	})
+
+	worker := client.NewWorker(t.Context()).AddTask(task)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunTask(t.Context(), taskName, "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out string
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out != "input:ok" {
+		t.Fatalf("unexpected output: %s", out)
+	}
+
+	run, err := client.GetTaskRun(t.Context(), taskName, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "completed" {
+		t.Fatalf("expected completed, got %s", run.Status)
+	}
+	if !run.IsDone() {
+		t.Fatalf("expected task run IsDone() to be true in terminal state")
+	}
+	if !run.IsCompleted() {
+		t.Fatalf("expected task run IsCompleted() to be true in completed state")
+	}
+}
+
+func TestTaskRunInfoOutputAsSkipped(t *testing.T) {
+	run := &TaskRunInfo{Status: "skipped"}
+
+	var out string
+	err := run.OutputAs(&out)
+	if err == nil {
+		t.Fatal("expected error for skipped task run")
+	}
+	if !strings.Contains(err.Error(), "run skipped") {
+		t.Fatalf("expected skipped error message, got %v", err)
 	}
 }

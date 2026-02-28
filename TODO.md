@@ -12,7 +12,6 @@
 - [ ] Versioning?
 - [ ] Fair queueing? (see https://docs.hatchet.run/blog/multi-tenant-queues)
 - [ ] Event-triggered task/flow runs via queue bindings MVP (see EVENT_TRIGGER.md)
-- [ ] Flow coördination and dynamic tasks (see REMAINING_PATTERNS.md)
 - [ ] Early completion (see EARLY_COMPLETION.md)
 - [ ] Description and other meta fields
 - [ ] Metrics

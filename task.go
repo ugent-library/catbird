@@ -213,6 +213,21 @@ type TaskRunInfo struct {
 	SkippedAt         time.Time       `json:"skipped_at,omitzero"`
 }
 
+// IsDone reports whether the task run reached a terminal state.
+func (r *TaskRunInfo) IsDone() bool {
+	switch r.Status {
+	case "completed", "failed", "skipped", "canceled":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsCompleted reports whether the task run completed successfully.
+func (r *TaskRunInfo) IsCompleted() bool {
+	return r.Status == "completed"
+}
+
 // OutputAs unmarshals the output of a completed task run.
 // Returns an error if the task run has failed or is not completed yet.
 func (r *TaskRunInfo) OutputAs(out any) error {
@@ -221,6 +236,9 @@ func (r *TaskRunInfo) OutputAs(out any) error {
 	}
 	if r.Status == "canceled" {
 		return canceledRunError(r.CancelReason)
+	}
+	if r.Status == "skipped" {
+		return fmt.Errorf("run skipped: condition not met")
 	}
 	if r.Status != "completed" {
 		return fmt.Errorf("run not completed: current status is %s", r.Status)
@@ -303,24 +321,6 @@ func CancelTaskRun(ctx context.Context, conn Conn, taskName string, runID int64,
 	}
 	_ = changed
 	_ = finalStatus
-	return nil
-}
-
-// CancelCurrentTaskRun requests cancellation for the current task run from inside a task handler.
-func CancelCurrentTaskRun(ctx context.Context, opts ...CancelOpts) error {
-	scope, _ := ctx.Value(taskRunScopeContextKey{}).(*taskRunScope)
-	if scope == nil || scope.conn == nil {
-		return ErrNoRunContext
-	}
-
-	if err := CancelTaskRun(ctx, scope.conn, scope.name, scope.runID, opts...); err != nil {
-		return err
-	}
-
-	if scope.cancel != nil {
-		scope.cancel()
-	}
-
 	return nil
 }
 

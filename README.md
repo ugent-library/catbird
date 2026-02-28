@@ -495,6 +495,69 @@ _ = handle.WaitForOutput(ctx, &out)
 | `failed` | Finished with an error | Task runs, flow runs, flow step runs, map item runs |
 | `skipped` | Intentionally skipped (typically due to a condition evaluating false) | Task runs, flow step runs |
 
+## Advanced: Step Communication at Runtime
+
+```go
+flow := catbird.NewFlow("parallel_watch_flow").
+    AddStep(catbird.NewStep("long_job").
+        Handler(func(ctx context.Context, in Order) (string, error) {
+            time.Sleep(500 * time.Millisecond)
+            return "job-finished", nil
+        })).
+    AddStep(catbird.NewStep("watch_job").
+        Handler(func(ctx context.Context, in Order) (string, error) {
+            step, err := catbird.WaitForStep(ctx, "long_job", catbird.WaitOpts{PollInterval: 25 * time.Millisecond})
+            if err != nil {
+                return "", err
+            }
+            if !step.IsCompleted() {
+                return "", fmt.Errorf("long_job ended with status=%s", step.Status)
+            }
+            return "watcher-stopped", nil
+        })).
+    AddStep(catbird.NewStep("finalize").
+        DependsOn("long_job", "watch_job").
+        Handler(func(ctx context.Context, in Order, job string, watch string) (string, error) {
+            return job + ":" + watch, nil
+        }))
+```
+
+This runs two steps in parallel. `watch_job` blocks on `WaitForStep(...)` until `long_job` reaches a terminal state, then exits immediately when `long_job` finishes.
+
+```go
+flow := catbird.NewFlow("loop_until_peer_done").
+    AddStep(catbird.NewStep("controller").
+        Handler(func(ctx context.Context, in string) (string, error) {
+            time.Sleep(2 * time.Second)
+            return "stop-now", nil
+        })).
+    AddStep(catbird.NewStep("worker_loop").
+        Handler(func(ctx context.Context, in string) (string, error) {
+            for {
+                controller, err := catbird.GetStep(ctx, "controller")
+                if err != nil {
+                    return "", err
+                }
+                if controller.IsDone() {
+                    return "loop-stopped:" + controller.Status, nil
+                }
+
+                select {
+                case <-ctx.Done():
+                    return "", ctx.Err()
+                case <-time.After(100 * time.Millisecond):
+                }
+            }
+        })).
+    AddStep(catbird.NewStep("finalize").
+        DependsOn("controller", "worker_loop").
+        Handler(func(ctx context.Context, in string, control string, worker string) (string, error) {
+            return control + ":" + worker, nil
+        }))
+```
+
+This pattern keeps `worker_loop` alive until `controller` reaches any terminal state, then exits cleanly.
+
 # Conditional Execution
 
 Both tasks and flow steps support conditional execution via `Condition` on the builder methods. If the condition evaluates to false (or a referenced field is missing), the task/step is marked `skipped` and its handler does not run.
@@ -593,7 +656,7 @@ Internal cancellation from handlers:
 task := catbird.NewTask("validate-order").
     Handler(func(ctx context.Context, input Order) (string, error) {
         if input.Amount <= 0 {
-            if err := catbird.CancelCurrentTaskRun(ctx, catbird.CancelOpts{Reason: "invalid amount"}); err != nil {
+            if err := catbird.Cancel(ctx, catbird.CancelOpts{Reason: "invalid amount"}); err != nil {
                 return "", err
             }
             return "", nil
@@ -605,7 +668,7 @@ flow := catbird.NewFlow("order-processing").
     AddStep(catbird.NewStep("guard").
         Handler(func(ctx context.Context, input Order) (string, error) {
             if input.Amount <= 0 {
-                if err := catbird.CancelCurrentFlowRun(ctx, catbird.CancelOpts{Reason: "invalid amount"}); err != nil {
+                if err := catbird.Cancel(ctx, catbird.CancelOpts{Reason: "invalid amount"}); err != nil {
                     return "", err
                 }
                 return "", nil

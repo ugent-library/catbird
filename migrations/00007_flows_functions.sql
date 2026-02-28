@@ -2100,6 +2100,149 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- cb_get_flow_step_status: Get status details for a single step run
+-- Parameters:
+--   flow_name: Flow name
+--   run_id: Flow run ID
+--   step_name: Step name within the flow
+-- Returns: step status details including attempts, timestamps, and output/error
+CREATE OR REPLACE FUNCTION cb_get_flow_step_status(
+  flow_name text,
+  run_id bigint,
+  step_name text
+)
+RETURNS TABLE(
+  id bigint,
+  status text,
+  attempts int,
+  output jsonb,
+  error_message text,
+  created_at timestamptz,
+  visible_at timestamptz,
+  started_at timestamptz,
+  completed_at timestamptz,
+  failed_at timestamptz,
+  skipped_at timestamptz,
+  canceled_at timestamptz
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+  _s_table text := cb_table_name(cb_get_flow_step_status.flow_name, 's');
+BEGIN
+  EXECUTE format(
+    $QUERY$
+     SELECT s.id,
+       s.status,
+       s.attempts,
+       s.output,
+       s.error_message,
+       s.created_at,
+       s.visible_at,
+       s.started_at,
+       s.completed_at,
+       s.failed_at,
+       s.skipped_at,
+       s.canceled_at
+    FROM %I s
+    WHERE s.flow_run_id = $1
+    AND s.step_name = $2
+    $QUERY$,
+    _s_table
+  )
+  USING cb_get_flow_step_status.run_id, cb_get_flow_step_status.step_name
+  INTO id, status, attempts, output, error_message, created_at, visible_at, started_at, completed_at, failed_at, skipped_at, canceled_at;
+
+  IF id IS NULL THEN
+    RAISE EXCEPTION 'cb: step run not found for flow %, run %, step %', cb_get_flow_step_status.flow_name, cb_get_flow_step_status.run_id, cb_get_flow_step_status.step_name;
+  END IF;
+
+  RETURN NEXT;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_wait_flow_step_output: Long-poll for a step reaching terminal state
+-- Parameters:
+--   flow_name: Flow name
+--   run_id: Flow run ID
+--   step_name: Step name within the flow
+--   poll_for: Total duration in milliseconds to poll before timing out (must be > 0)
+--   poll_interval: Duration in milliseconds between poll attempts (must be > 0 and < poll_for)
+-- Returns: status/output/error_message once step reaches terminal state, or no rows on timeout
+CREATE OR REPLACE FUNCTION cb_wait_flow_step_output(
+  flow_name text,
+  run_id bigint,
+  step_name text,
+  poll_for int DEFAULT 5000,
+  poll_interval int DEFAULT 200
+)
+RETURNS TABLE(status text, output jsonb, error_message text)
+LANGUAGE plpgsql AS $$
+DECLARE
+  _s_table text := cb_table_name(cb_wait_flow_step_output.flow_name, 's');
+  _status text;
+  _output jsonb;
+  _error_message text;
+  _sleep_for double precision;
+  _stop_at timestamp;
+BEGIN
+  IF cb_wait_flow_step_output.poll_for <= 0 THEN
+    RAISE EXCEPTION 'cb: poll_for must be greater than 0';
+  END IF;
+
+  IF cb_wait_flow_step_output.poll_interval <= 0 THEN
+    RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
+  END IF;
+
+  _sleep_for := cb_wait_flow_step_output.poll_interval / 1000.0;
+
+  IF _sleep_for >= cb_wait_flow_step_output.poll_for / 1000.0 THEN
+    RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
+  END IF;
+
+  _stop_at := clock_timestamp() + make_interval(secs => cb_wait_flow_step_output.poll_for / 1000.0);
+
+  LOOP
+    IF clock_timestamp() >= _stop_at THEN
+      RETURN;
+    END IF;
+
+    _status := NULL;
+    _output := NULL;
+    _error_message := NULL;
+
+    EXECUTE format(
+      $QUERY$
+      SELECT s.status, s.output, s.error_message
+      FROM %I s
+      WHERE s.flow_run_id = $1
+      AND s.step_name = $2
+      $QUERY$,
+      _s_table
+    )
+    USING cb_wait_flow_step_output.run_id, cb_wait_flow_step_output.step_name
+    INTO _status, _output, _error_message;
+
+    IF _status IS NULL THEN
+      RAISE EXCEPTION 'cb: step run not found for flow %, run %, step %', cb_wait_flow_step_output.flow_name, cb_wait_flow_step_output.run_id, cb_wait_flow_step_output.step_name;
+    END IF;
+
+    IF _status IN ('completed', 'failed', 'skipped', 'canceled') THEN
+      status := _status;
+      output := _output;
+      error_message := _error_message;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+
+    PERFORM pg_sleep(_sleep_for);
+  END LOOP;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
 -- cb_wait_flow_output: Long-poll for flow completion without client-side polling loops
 -- Parameters:
 --   name: Flow name
@@ -2241,6 +2384,8 @@ DROP FUNCTION IF EXISTS cb_request_flow_cancellation(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_fail_flow_on_fail(text, bigint, text, boolean, bigint);
 DROP FUNCTION IF EXISTS cb_complete_flow_on_fail(text, bigint);
 DROP FUNCTION IF EXISTS cb_poll_flow_on_fail(text, int);
+DROP FUNCTION IF EXISTS cb_wait_flow_step_output(text, bigint, text, int, int);
+DROP FUNCTION IF EXISTS cb_get_flow_step_status(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_wait_flow_output(text, bigint, int, int);
 DROP FUNCTION IF EXISTS cb_signal_flow(text, bigint, text, jsonb);
 DROP FUNCTION IF EXISTS cb_fail_step(text, text, bigint, text);
