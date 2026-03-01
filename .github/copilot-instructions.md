@@ -23,6 +23,7 @@ Catbird is a PostgreSQL-based message queue with task and workflow execution eng
 2. **Worker** (`worker.go`): Runs tasks and flows; initialized with `catbird.NewWorker(conn, opts...)` or `client.NewWorker(ctx, opts...)`. Multiple workers can run concurrently; DB ensures each message is processed exactly once.
 3. **Scheduler** (`scheduler.go`): Manages cron-based task and flow scheduling using robfig/cron; created internally by worker when registering tasks/flows with `Schedule` method. Can also be used standalone.
 4. **Dashboard** (`dashboard/`): Web UI for starting task/flow runs, monitoring progress in real-time, and viewing results; served via CLI `cb dashboard`
+5. **TUI** (`tui/`): Terminal UI built with Bubble Tea for read-only operational visibility (queues, tasks, flows, workers, and recent runs); launched via CLI `cb tui`
 
 **Two Independent Systems**:
 1. **Generic Message Queues**: `Send()`, `Publish()`, `Read()` operations similar to pgmq/SQS. Messages stored in queue tables; independent from tasks/flows. **Topic routing** via explicit bindings with wildcard support (`?` for single token, `*` for multi-token tail). Bindings stored in `cb_bindings` table with pattern type (exact/wildcard), prefix extraction for indexed filtering, and precompiled regexes.
@@ -186,6 +187,17 @@ NewFlow("workflow").
 
 ## Developer Workflows
 
+## TUI Development Notes
+
+- **Architecture**: The TUI uses Bubble Tea's model/update/view loop.
+  - `tui/model.go`: state model and view selection
+  - `tui/update.go`: input handling + periodic refresh/load
+  - `tui/view.go`: rendering for overview/list/detail panels
+- **Data source**: TUI reads from `catbird.Client` list/get APIs only (no direct SQL in TUI package).
+- **Refresh model**: polling refresh every 2 seconds (`refreshInterval`) with in-flight request coalescing (`pending` flag) to avoid thundering refreshes.
+- **Scope**: Keep TUI changes minimal and operationally focused. Prefer exposing existing metadata fields over introducing new interaction flows.
+- **Display parity**: When adding metadata fields to `QueueInfo` / `TaskInfo` / `FlowInfo`, update both list and detail renderers to keep TUI and dashboard visibility aligned.
+
 **Docker-Based Testing (Best Practice)**:
 
 The test setup uses Docker Compose to provide a clean, isolated PostgreSQL instance that's independent of your local environment. This prevents interference from previous runs and ensures consistency across machines.
@@ -312,6 +324,9 @@ docker compose logs -f postgres
 - [worker.go](../worker.go): Worker struct, task/flow execution, polling logic
 - [client.go](../client.go): Public API (delegation layer)
 - [dashboard/handler.go](../dashboard/handler.go): HTTP routes & templating
+- [tui/model.go](../tui/model.go): Bubble Tea state model and selection state
+- [tui/update.go](../tui/update.go): Key handling, loading, and refresh tick orchestration
+- [tui/view.go](../tui/view.go): TUI rendering for overview, list, and detail views
 - [migrations/](../migrations/): Database schema (versioned)
 
 ## Common Patterns to Replicate

@@ -100,6 +100,57 @@ func TestTaskCreate(t *testing.T) {
 	}
 }
 
+func TestTaskCreateUnlogged(t *testing.T) {
+	client := getTestClient(t)
+
+	taskName := fmt.Sprintf("unlogged_task_%d", time.Now().UnixNano())
+	task := NewTask(taskName).Unlogged(true)
+
+	if err := client.CreateTask(t.Context(), task); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := client.GetTask(t.Context(), taskName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Unlogged {
+		t.Fatalf("expected task %s to be unlogged", taskName)
+	}
+
+	tableName := fmt.Sprintf("cb_t_%s", taskName)
+	query := fmt.Sprintf(`SELECT relpersistence::text FROM pg_class WHERE oid = %s::regclass;`, pgQuoteLiteral(tableName))
+
+	var relpersistence string
+	if err := client.Conn.QueryRow(t.Context(), query).Scan(&relpersistence); err != nil {
+		t.Fatal(err)
+	}
+	if relpersistence != "u" {
+		t.Fatalf("expected unlogged task table relpersistence=u, got %q", relpersistence)
+	}
+}
+
+func TestTaskCreateUnloggedMismatchReturnsError(t *testing.T) {
+	client := getTestClient(t)
+
+	taskName := fmt.Sprintf("task_unlogged_mismatch_%d", time.Now().UnixNano())
+	if err := client.CreateTask(t.Context(), NewTask(taskName)); err != nil {
+		t.Fatal(err)
+	}
+
+	err := client.CreateTask(t.Context(), NewTask(taskName).Unlogged(true))
+	if err == nil {
+		t.Fatal("expected mismatch error, got nil")
+	}
+	if !strings.Contains(err.Error(), "already exists with unlogged=") {
+		t.Fatalf("unexpected mismatch error: %v", err)
+	}
+}
+
+func pgQuoteLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
 func TestTaskRunAndWait(t *testing.T) {
 	client := getTestClient(t)
 

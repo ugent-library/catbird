@@ -685,6 +685,31 @@ If retries are exhausted in either phase, the parent step fails and task/flow `O
 
 Catbird deduplication (`ConcurrencyKey`/`IdempotencyKey`) controls duplicate run creation, while handler retries can still re-attempt the same run after transient failures. For non-repeatable side effects (payments, email, webhooks), use idempotent write patterns or upstream idempotency keys so retry attempts remain safe.
 
+# Durability
+
+You can relax durability to gain throughput, but realize that unlogged mode is best reserved for workloads that are safe to replay (ephemeral, retryable, or recomputable jobs). Unlogged data can be lost on crash/restart and is not replicated via PostgreSQL streaming replication.
+
+Examples:
+
+```go
+err := client.CreateQueue(ctx, "fast-queue", catbird.QueueOpts{Unlogged: true})
+if err != nil {
+    return err
+}
+
+flow := catbird.NewFlow("fast-flow").
+    Unlogged(true).
+    AddStep(catbird.NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
+        return in, nil
+    }))
+
+if err := client.CreateFlow(ctx, flow); err != nil {
+    return err
+}
+```
+
+Definition mode is treated as part of identity for create operations. If a definition already exists as logged/unlogged and you create it again with the opposite mode, Catbird returns an error.
+
 # Cancellation
 
 `Cancellation` semantics:
@@ -763,57 +788,90 @@ Catbird is built on PostgreSQL functions, so you can use the API directly from a
 
 ```sql
 -- Create a queue
-SELECT cb_create_queue(name => 'my_queue', expires_at => null, unlogged => false);
+SELECT cb_create_queue(
+    name => 'my_queue'
+);
 
 -- Send a message
-SELECT cb_send(queue => 'my_queue', payload => '{"user_id": 123, "action": "process"}'::jsonb,
-               topic => null, idempotency_key => null, visible_at => null);
+SELECT cb_send(
+    queue => 'my_queue',
+    payload => '{"user_id": 123, "action": "process"}'::jsonb
+);
 
 -- Publish to topic-bound queues
-SELECT cb_publish(topic => 'events.user.created', payload => '{"user_id": 456}'::jsonb,
-                   idempotency_key => 'user-456-created', visible_at => null);
+SELECT cb_publish(
+    topic => 'events.user.created',
+    payload => '{"user_id": 456}'::jsonb,
+    idempotency_key => 'user-456-created'
+);
 
 -- Read messages (with 30 second visibility timeout)
-SELECT * FROM cb_read(queue => 'my_queue', quantity => 10, hide_for => 30000);
+SELECT * FROM cb_read(
+    queue => 'my_queue',
+    quantity => 10,
+    hide_for => 30000
+);
 
 -- Delete a message
-SELECT cb_delete(queue => 'my_queue', id => 1);
+SELECT cb_delete(
+    queue => 'my_queue',
+    id => 1
+);
 
 -- Bind queue to topic pattern
-SELECT cb_bind(queue_name => 'user_events', pattern => 'events.user.*');
-SELECT cb_unbind(queue_name => 'user_events', pattern => 'events.user.*');
+SELECT cb_bind(
+    queue_name => 'user_events',
+    pattern => 'events.user.*'
+);
+SELECT cb_unbind(
+    queue_name => 'user_events',
+    pattern => 'events.user.*'
+);
 ```
 
 ## Tasks
 
 ```sql
 -- Create a task definition
-SELECT cb_create_task(name => 'send_email');
+SELECT cb_create_task(
+    name => 'send_email',
+    unlogged => true
+);
 
 -- Run a task
-SELECT * FROM cb_run_task(name => 'send_email', input => '{"to": "user@example.com"}'::jsonb,
-                          concurrency_key => null, idempotency_key => null, visible_at => null);
+SELECT * FROM cb_run_task(
+    name => 'send_email',
+    input => '{"to": "user@example.com"}'::jsonb
+);
 ```
 
 ## Workflows
 
 ```sql
 -- Create a flow definition
-SELECT cb_create_flow(name => 'order_processing', steps => '[
-  {"name": "validate"},
-  {"name": "charge", "depends_on": [{"name": "validate"}]},
-  {"name": "ship", "depends_on": [{"name": "charge"}]}
-]'::jsonb);
+SELECT cb_create_flow(
+        name => 'order_processing',
+        steps => '[
+            {"name": "validate"},
+            {"name": "charge", "depends_on": [{"name": "validate"}]},
+            {"name": "ship", "depends_on": [{"name": "charge"}]}
+        ]'::jsonb
+);
 
 -- Create a flow with a map step
-SELECT cb_create_flow(name => 'map_example', steps => '[
-    {"name": "numbers"},
-    {"name": "double", "is_map_step": true, "map_source": "numbers", "depends_on": [{"name": "numbers"}]}
-]'::jsonb);
+SELECT cb_create_flow(
+        name => 'map_example',
+        steps => '[
+            {"name": "numbers"},
+            {"name": "double", "is_map_step": true, "map_source": "numbers", "depends_on": [{"name": "numbers"}]}
+        ]'::jsonb
+);
 
 -- Run a flow
-SELECT * FROM cb_run_flow(name => 'order_processing', input => '{"order_id": 123}'::jsonb,
-                          concurrency_key => null, idempotency_key => null, visible_at => null);
+SELECT * FROM cb_run_flow(
+        name => 'order_processing',
+        input => '{"order_id": 123}'::jsonb
+);
 ```
 
 ## Monitoring Task and Flow Runs
@@ -822,13 +880,33 @@ You can query task and flow run information directly:
 
 ```sql
 -- List recent task runs (replace send_email with your task name)
-SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at
+SELECT
+    id,
+    concurrency_key,
+    idempotency_key,
+    status,
+    input,
+    output,
+    error_message,
+    started_at,
+    completed_at,
+    failed_at
 FROM cb_t_send_email
 ORDER BY started_at DESC
 LIMIT 20;
 
 -- Get flow run (replace order_processing with your flow name)
-SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, started_at, completed_at, failed_at
+SELECT
+    id,
+    concurrency_key,
+    idempotency_key,
+    status,
+    input,
+    output,
+    error_message,
+    started_at,
+    completed_at,
+    failed_at
 FROM cb_f_order_processing
 WHERE id = $1;
 ```

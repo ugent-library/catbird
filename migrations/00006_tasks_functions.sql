@@ -20,18 +20,29 @@
 --   name: Task name (must be unique)
 --   description: Optional task description metadata
 --   condition: Optional condition expression for task execution
+--   unlogged: Whether task runs are stored in an unlogged table
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_create_task(name text, description text = null, condition text = null)
+CREATE OR REPLACE FUNCTION cb_create_task(name text, description text = null, condition text = null, unlogged boolean = false)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
     _t_table text := cb_table_name(cb_create_task.name, 't');
     _condition jsonb;
+    _existing_unlogged boolean;
+    _create_table_stmt text := 'CREATE TABLE';
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext(_t_table));
 
-    -- Return early if task already exists
-    IF EXISTS (SELECT 1 FROM cb_tasks WHERE cb_tasks.name = cb_create_task.name) THEN
+    SELECT t.unlogged
+    INTO _existing_unlogged
+    FROM cb_tasks t
+    WHERE t.name = cb_create_task.name;
+
+    IF _existing_unlogged IS NOT NULL THEN
+        IF _existing_unlogged <> cb_create_task.unlogged THEN
+            RAISE EXCEPTION 'cb: task % already exists with unlogged=%; requested unlogged=%', cb_create_task.name, _existing_unlogged, cb_create_task.unlogged;
+        END IF;
+
         RETURN;
     END IF;
 
@@ -45,51 +56,57 @@ BEGIN
         _condition := cb_parse_condition(cb_create_task.condition);
     END IF;
 
-    INSERT INTO cb_tasks (name, description, condition)
+    INSERT INTO cb_tasks (name, description, condition, unlogged)
     VALUES (
         cb_create_task.name,
         cb_create_task.description,
-        _condition
+        _condition,
+        cb_create_task.unlogged
     );
 
+    IF cb_create_task.unlogged THEN
+        _create_table_stmt := 'CREATE UNLOGGED TABLE';
+    END IF;
+
     EXECUTE format(
-      $QUERY$
-      CREATE TABLE IF NOT EXISTS %I (
-        id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
-        concurrency_key text,
-        idempotency_key text,
-        status text NOT NULL DEFAULT 'queued',
-        attempts int NOT NULL DEFAULT 0,
-        input jsonb NOT NULL,
-        output jsonb,
-        error_message text,
-        on_fail_status text,
-        on_fail_attempts int NOT NULL DEFAULT 0,
-        on_fail_visible_at timestamptz,
-        on_fail_error_message text,
-        on_fail_started_at timestamptz,
-        on_fail_completed_at timestamptz,
-        visible_at timestamptz NOT NULL DEFAULT now(),
-        started_at timestamptz NOT NULL DEFAULT now(),
-        cancel_requested_at timestamptz,
-        completed_at timestamptz,
-        failed_at timestamptz,
-        skipped_at timestamptz,
-        canceled_at timestamptz,
-        cancel_reason text,
-        CONSTRAINT status_valid CHECK (status IN ('queued', 'started', 'canceling', 'completed', 'failed', 'skipped', 'canceled')),
-        CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
-        CONSTRAINT skipped_and_completed_failed CHECK (NOT (skipped_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL OR canceled_at IS NOT NULL))),
-        CONSTRAINT canceled_terminal_exclusive CHECK (NOT (canceled_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL OR skipped_at IS NOT NULL))),
-        CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
-        CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
-        CONSTRAINT canceled_at_is_after_started_at CHECK (canceled_at IS NULL OR canceled_at >= started_at),
-        CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
-                CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = ''))),
-                CONSTRAINT on_fail_status_valid CHECK (on_fail_status IS NULL OR on_fail_status IN ('queued', 'started', 'completed', 'failed'))
-      )
-      $QUERY$,
-      _t_table
+        $QUERY$
+        %s IF NOT EXISTS %I (
+            id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+            concurrency_key text,
+            idempotency_key text,
+            status text NOT NULL DEFAULT 'queued',
+            attempts int NOT NULL DEFAULT 0,
+            input jsonb NOT NULL,
+            output jsonb,
+            error_message text,
+            on_fail_status text,
+            on_fail_attempts int NOT NULL DEFAULT 0,
+            on_fail_visible_at timestamptz,
+            on_fail_error_message text,
+            on_fail_started_at timestamptz,
+            on_fail_completed_at timestamptz,
+            visible_at timestamptz NOT NULL DEFAULT now(),
+            started_at timestamptz NOT NULL DEFAULT now(),
+            cancel_requested_at timestamptz,
+            completed_at timestamptz,
+            failed_at timestamptz,
+            skipped_at timestamptz,
+            canceled_at timestamptz,
+            cancel_reason text,
+            CONSTRAINT status_valid CHECK (status IN ('queued', 'started', 'canceling', 'completed', 'failed', 'skipped', 'canceled')),
+            CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
+            CONSTRAINT skipped_and_completed_failed CHECK (NOT (skipped_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL OR canceled_at IS NOT NULL))),
+            CONSTRAINT canceled_terminal_exclusive CHECK (NOT (canceled_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL OR skipped_at IS NOT NULL))),
+            CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
+            CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
+            CONSTRAINT canceled_at_is_after_started_at CHECK (canceled_at IS NULL OR canceled_at >= started_at),
+            CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
+            CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = ''))),
+            CONSTRAINT on_fail_status_valid CHECK (on_fail_status IS NULL OR on_fail_status IN ('queued', 'started', 'completed', 'failed'))
+        )
+        $QUERY$,
+        _create_table_stmt,
+        _t_table
     );
 
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (concurrency_key) WHERE concurrency_key IS NOT NULL AND status IN (''queued'', ''started'')', _t_table || '_concurrency_key_idx', _t_table);
@@ -705,4 +722,4 @@ DROP FUNCTION IF EXISTS cb_wait_task_output(text, bigint, int, int);
 DROP FUNCTION IF EXISTS cb_hide_tasks(text, bigint[], integer);
 DROP FUNCTION IF EXISTS cb_poll_tasks(text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text, text, timestamptz);
-DROP FUNCTION IF EXISTS cb_create_task(text, text, text);
+DROP FUNCTION IF EXISTS cb_create_task(text, text, text, boolean);

@@ -22,8 +22,9 @@
 --   description: Optional flow description metadata
 --   steps: JSON array describing flow steps and their dependencies
 --   output_priority: Optional ordered array of step names for output ownership
+--   unlogged: Whether flow runs and step/map run tables are unlogged
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_create_flow(name text, description text DEFAULT NULL, steps jsonb DEFAULT '[]'::jsonb, output_priority text[] DEFAULT NULL)
+CREATE OR REPLACE FUNCTION cb_create_flow(name text, description text DEFAULT NULL, steps jsonb DEFAULT '[]'::jsonb, output_priority text[] DEFAULT NULL, unlogged boolean DEFAULT false)
 RETURNS void AS $$
 #variable_conflict use_column
 DECLARE
@@ -47,6 +48,8 @@ DECLARE
     _terminal_count int;
     _priority_count int;
     _priority_distinct_count int;
+    _existing_unlogged boolean;
+    _create_table_stmt text;
 BEGIN
     IF cb_create_flow.name IS NULL OR cb_create_flow.name = '' THEN
         RAISE EXCEPTION 'cb: flow name must not be empty';
@@ -61,13 +64,13 @@ BEGIN
     END IF;
 
     IF cb_create_flow.output_priority IS NOT NULL THEN
-      IF cardinality(cb_create_flow.output_priority) = 0 THEN
-        RAISE EXCEPTION 'cb: output priority must not be empty';
-      END IF;
+        IF cardinality(cb_create_flow.output_priority) = 0 THEN
+            RAISE EXCEPTION 'cb: output priority must not be empty';
+        END IF;
 
-      _output_priority := cb_create_flow.output_priority;
+        _output_priority := cb_create_flow.output_priority;
     ELSE
-      _output_priority := NULL;
+        _output_priority := NULL;
     END IF;
 
     _f_table := cb_table_name(cb_create_flow.name, 'f');
@@ -76,12 +79,27 @@ BEGIN
 
     PERFORM pg_advisory_xact_lock(hashtext(_f_table));
 
-    INSERT INTO cb_flows (name, description, output_priority, step_count)
-    VALUES (cb_create_flow.name, cb_create_flow.description, coalesce(_output_priority, ARRAY['__pending_output_priority__']), 0)
+    SELECT f.unlogged
+    INTO _existing_unlogged
+    FROM cb_flows f
+    WHERE f.name = cb_create_flow.name;
+
+    IF _existing_unlogged IS NOT NULL AND _existing_unlogged <> cb_create_flow.unlogged THEN
+        RAISE EXCEPTION 'cb: flow % already exists with unlogged=%; requested unlogged=%', cb_create_flow.name, _existing_unlogged, cb_create_flow.unlogged;
+    END IF;
+
+    _create_table_stmt := 'CREATE TABLE';
+    IF cb_create_flow.unlogged THEN
+        _create_table_stmt := 'CREATE UNLOGGED TABLE';
+    END IF;
+
+    INSERT INTO cb_flows (name, description, unlogged, output_priority, step_count)
+    VALUES (cb_create_flow.name, cb_create_flow.description, cb_create_flow.unlogged, coalesce(_output_priority, ARRAY['__pending_output_priority__']), 0)
     ON CONFLICT (name) DO UPDATE
     SET description = EXCLUDED.description,
-      output_priority = coalesce(EXCLUDED.output_priority, ARRAY['__pending_output_priority__']),
-      step_count = 0;
+        unlogged = EXCLUDED.unlogged,
+        output_priority = coalesce(EXCLUDED.output_priority, ARRAY['__pending_output_priority__']),
+        step_count = 0;
 
     DELETE FROM cb_step_dependencies WHERE flow_name = cb_create_flow.name;
     DELETE FROM cb_steps WHERE flow_name = cb_create_flow.name;
@@ -159,7 +177,7 @@ BEGIN
         VALUES (
             cb_create_flow.name,
             _step_name,
-          nullif(_step->>'description', ''),
+            nullif(_step->>'description', ''),
             _idx,
             jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb)),
             _is_generator,
@@ -184,20 +202,20 @@ BEGIN
 
     -- SQL-level map-step validation (independent from Go-side builder checks)
     IF EXISTS (
-      SELECT 1
-      FROM cb_steps s
-      WHERE s.flow_name = cb_create_flow.name
-        AND s.is_map_step = true
-        AND s.map_source IS NOT NULL
-        AND NOT EXISTS (
-          SELECT 1
-          FROM cb_step_dependencies d
-          WHERE d.flow_name = s.flow_name
-            AND d.step_name = s.name
-            AND d.dependency_name = s.map_source
-        )
+        SELECT 1
+        FROM cb_steps s
+        WHERE s.flow_name = cb_create_flow.name
+            AND s.is_map_step = true
+            AND s.map_source IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1
+                FROM cb_step_dependencies d
+                WHERE d.flow_name = s.flow_name
+                    AND d.step_name = s.name
+                    AND d.dependency_name = s.map_source
+            )
     ) THEN
-      RAISE EXCEPTION 'cb: map step must depend on its map_source (flow=%)', cb_create_flow.name;
+        RAISE EXCEPTION 'cb: map step must depend on its map_source (flow=%)', cb_create_flow.name;
     END IF;
 
     -- Output ownership validation
@@ -213,20 +231,20 @@ BEGIN
       );
 
     IF _terminal_count = 0 THEN
-      RAISE EXCEPTION 'cb: flow % has no final step (circular dependency?)', cb_create_flow.name;
+        RAISE EXCEPTION 'cb: flow % has no final step (circular dependency?)', cb_create_flow.name;
     END IF;
 
     IF _output_priority IS NULL THEN
-      SELECT array_agg(s.name ORDER BY s.idx)
-      INTO _output_priority
-      FROM cb_steps s
-      WHERE s.flow_name = cb_create_flow.name
-        AND NOT EXISTS (
-          SELECT 1
-          FROM cb_step_dependencies d
-          WHERE d.flow_name = s.flow_name
-            AND d.dependency_name = s.name
-        );
+        SELECT array_agg(s.name ORDER BY s.idx)
+        INTO _output_priority
+        FROM cb_steps s
+        WHERE s.flow_name = cb_create_flow.name
+            AND NOT EXISTS (
+                SELECT 1
+                FROM cb_step_dependencies d
+                WHERE d.flow_name = s.flow_name
+                    AND d.dependency_name = s.name
+            );
     END IF;
 
     SELECT value
@@ -236,22 +254,22 @@ BEGIN
     LIMIT 1;
 
     IF _output_step IS NOT NULL THEN
-      RAISE EXCEPTION 'cb: output priority contains empty step name';
+        RAISE EXCEPTION 'cb: output priority contains empty step name';
     END IF;
 
     SELECT value
     INTO _output_step
     FROM unnest(_output_priority) AS p(value)
     WHERE NOT EXISTS (
-      SELECT 1
-      FROM cb_steps s
-      WHERE s.flow_name = cb_create_flow.name
-        AND s.name = p.value
+        SELECT 1
+        FROM cb_steps s
+        WHERE s.flow_name = cb_create_flow.name
+            AND s.name = p.value
     )
     LIMIT 1;
 
     IF _output_step IS NOT NULL THEN
-      RAISE EXCEPTION 'cb: output priority references unknown step "%"', _output_step;
+        RAISE EXCEPTION 'cb: output priority references unknown step "%"', _output_step;
     END IF;
 
     SELECT count(*), count(DISTINCT value)
@@ -259,38 +277,38 @@ BEGIN
     FROM unnest(_output_priority) AS p(value);
 
     IF _priority_count <> _priority_distinct_count THEN
-      RAISE EXCEPTION 'cb: output priority contains duplicate step names';
+        RAISE EXCEPTION 'cb: output priority contains duplicate step names';
     END IF;
 
     SELECT s.name
     INTO _terminal_step
     FROM cb_steps s
     WHERE s.flow_name = cb_create_flow.name
-      AND NOT EXISTS (
-        SELECT 1
-        FROM cb_step_dependencies d
-        WHERE d.flow_name = s.flow_name
-          AND d.dependency_name = s.name
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM unnest(_output_priority) AS p(value)
-        WHERE p.value = s.name
-      )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM cb_step_dependencies d
+            WHERE d.flow_name = s.flow_name
+                AND d.dependency_name = s.name
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM unnest(_output_priority) AS p(value)
+            WHERE p.value = s.name
+        )
     LIMIT 1;
 
     IF _terminal_step IS NOT NULL THEN
-      RAISE EXCEPTION 'cb: output priority must include structural terminal step "%"', _terminal_step;
+        RAISE EXCEPTION 'cb: output priority must include structural terminal step "%"', _terminal_step;
     END IF;
 
     UPDATE cb_flows f
     SET output_priority = _output_priority,
-      step_count = _idx
+        step_count = _idx
     WHERE f.name = cb_create_flow.name;
 
     EXECUTE format(
     $QUERY$
-    CREATE TABLE IF NOT EXISTS %I (
+    %s IF NOT EXISTS %I (
       id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
       concurrency_key text,
       idempotency_key text,
@@ -330,6 +348,7 @@ BEGIN
       CONSTRAINT on_fail_status_valid CHECK (on_fail_status IS NULL OR on_fail_status IN ('queued', 'started', 'completed', 'failed'))
     )
     $QUERY$,
+    _create_table_stmt,
     _f_table
     );
 
@@ -340,7 +359,7 @@ BEGIN
     -- Create step runs table - includes 'skipped' in status constraint
     EXECUTE format(
     $QUERY$
-    CREATE TABLE IF NOT EXISTS %I (
+    %s IF NOT EXISTS %I (
       id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
       flow_run_id bigint NOT NULL,
       step_name text NOT NULL,
@@ -381,7 +400,7 @@ BEGIN
       CONSTRAINT attempts_valid CHECK (attempts >= 0)
     )
     $QUERY$,
-    _s_table, _f_table
+    _create_table_stmt, _s_table, _f_table
     );
 
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, status);', _s_table || '_flow_run_id_status_idx', _s_table);
@@ -392,7 +411,7 @@ BEGIN
     -- Create map task table used by map steps for per-item coordination
     EXECUTE format(
     $QUERY$
-    CREATE TABLE IF NOT EXISTS %I (
+    %s IF NOT EXISTS %I (
       id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
       flow_run_id bigint NOT NULL,
       step_name text NOT NULL,
@@ -418,7 +437,7 @@ BEGIN
       CONSTRAINT attempts_valid CHECK (attempts >= 0)
     )
     $QUERY$,
-    _m_table, _s_table
+    _create_table_stmt, _m_table, _s_table
     );
 
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (step_name, status, visible_at);', _m_table || '_step_status_visible_idx', _m_table);
@@ -2690,4 +2709,4 @@ DROP FUNCTION IF EXISTS cb_hide_steps(text, text, bigint[], integer);
 DROP FUNCTION IF EXISTS cb_poll_steps(text, text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_start_steps(text, bigint, timestamptz);
 DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text, text, timestamptz);
-DROP FUNCTION IF EXISTS cb_create_flow(text, text, jsonb, text[]);
+DROP FUNCTION IF EXISTS cb_create_flow(text, text, jsonb, text[], boolean);

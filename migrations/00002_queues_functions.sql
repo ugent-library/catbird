@@ -37,40 +37,29 @@ RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
     _q_table text := cb_table_name(cb_create_queue.name, 'q');
+    _create_table_stmt text := 'CREATE TABLE';
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext(_q_table));
 
     IF cb_create_queue.unlogged THEN
-        EXECUTE format(
-            $QUERY$
-            CREATE UNLOGGED TABLE IF NOT EXISTS %I (
-                id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
-                idempotency_key text,
-                topic text,
-                payload jsonb NOT NULL,
-                deliveries int NOT NULL DEFAULT 0,
-                created_at timestamptz NOT NULL DEFAULT now(),
-                visible_at timestamptz NOT NULL DEFAULT now()
-            )
-            $QUERY$,
-            _q_table
-        );
-    ELSE
-        EXECUTE format(
-            $QUERY$
-            CREATE TABLE IF NOT EXISTS %I (
-                id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
-                idempotency_key text,
-                topic text,
-                payload jsonb NOT NULL,
-                deliveries int NOT NULL DEFAULT 0,
-                created_at timestamptz NOT NULL DEFAULT now(),
-                visible_at timestamptz NOT NULL DEFAULT now()
-            )
-            $QUERY$,
-            _q_table
-        );
+        _create_table_stmt := 'CREATE UNLOGGED TABLE';
     END IF;
+
+    EXECUTE format(
+        $QUERY$
+        %s IF NOT EXISTS %I (
+            id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+            idempotency_key text,
+            topic text,
+            payload jsonb NOT NULL,
+            deliveries int NOT NULL DEFAULT 0,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            visible_at timestamptz NOT NULL DEFAULT now()
+        )
+        $QUERY$,
+        _create_table_stmt,
+        _q_table
+    );
 
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (idempotency_key);', _q_table || '_idempotency_key_idx', _q_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at);', _q_table || '_visible_at_idx', _q_table);

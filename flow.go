@@ -21,6 +21,7 @@ type Optional[T any] struct {
 type Flow struct {
 	name               string
 	description        string
+	unlogged           bool
 	steps              []Step
 	outputPriority     []string
 	priorityConfigured bool
@@ -55,6 +56,12 @@ func (f *Flow) AddStep(step *Step) *Flow {
 
 func (f *Flow) Description(description string) *Flow {
 	f.description = description
+	return f
+}
+
+// Unlogged sets whether flow run, step run, and map run rows are stored in unlogged tables.
+func (f *Flow) Unlogged(unlogged bool) *Flow {
+	f.unlogged = unlogged
 	return f
 }
 
@@ -743,6 +750,7 @@ type FlowInfo struct {
 	Name           string     `json:"name"`
 	Description    string     `json:"description,omitempty"`
 	Steps          []StepInfo `json:"steps"`
+	Unlogged       bool       `json:"unlogged"`
 	OutputPriority []string   `json:"output_priority,omitempty"`
 	CreatedAt      time.Time  `json:"created_at"`
 }
@@ -931,7 +939,7 @@ func validateFlowDependencies(flow *Flow) error {
 
 // CreateFlow creates one or more flow definitions.
 func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
-	q := `SELECT * FROM cb_create_flow(name => $1, description => $2, steps => $3, output_priority => $4);`
+	q := `SELECT * FROM cb_create_flow(name => $1, description => $2, steps => $3, output_priority => $4, unlogged => $5);`
 	for _, flow := range flows {
 		if err := validateFlowDependencies(flow); err != nil {
 			return err
@@ -986,7 +994,7 @@ func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 			priority = defaultFlowOutputPriority(flow)
 		}
 
-		_, err = conn.Exec(ctx, q, flow.name, ptrOrNil(flow.description), b, priority)
+		_, err = conn.Exec(ctx, q, flow.name, ptrOrNil(flow.description), b, priority, flow.unlogged)
 		if err != nil {
 			return err
 		}
@@ -1490,6 +1498,7 @@ func scanFlow(row pgx.Row) (*FlowInfo, error) {
 		&rec.Name,
 		&description,
 		&steps,
+		&rec.Unlogged,
 		&outputPriority,
 		&rec.CreatedAt,
 	); err != nil {

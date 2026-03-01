@@ -118,6 +118,73 @@ func TestFlowCreate(t *testing.T) {
 	}
 }
 
+func TestFlowCreateUnlogged(t *testing.T) {
+	client := getTestClient(t)
+
+	flowName := testFlowName(t, "unlogged_flow")
+	flow := NewFlow(flowName).
+		Unlogged(true).
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
+			return in + " processed", nil
+		}))
+
+	if err := client.CreateFlow(t.Context(), flow); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := client.GetFlow(t.Context(), flowName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Unlogged {
+		t.Fatalf("expected flow %s to be unlogged", flowName)
+	}
+
+	tables := []string{
+		fmt.Sprintf("cb_f_%s", flowName),
+		fmt.Sprintf("cb_s_%s", flowName),
+		fmt.Sprintf("cb_m_%s", flowName),
+	}
+	for _, tableName := range tables {
+		query := fmt.Sprintf(`SELECT relpersistence::text FROM pg_class WHERE oid = %s::regclass;`, pgQuoteLiteral(tableName))
+		var relpersistence string
+		if err := client.Conn.QueryRow(t.Context(), query).Scan(&relpersistence); err != nil {
+			t.Fatal(err)
+		}
+		if relpersistence != "u" {
+			t.Fatalf("expected unlogged table %s relpersistence=u, got %q", tableName, relpersistence)
+		}
+	}
+}
+
+func TestFlowCreateUnloggedMismatchReturnsError(t *testing.T) {
+	client := getTestClient(t)
+
+	flowName := testFlowName(t, "flow_unlogged_mismatch")
+	baseFlow := NewFlow(flowName).
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
+			return in, nil
+		}))
+
+	if err := client.CreateFlow(t.Context(), baseFlow); err != nil {
+		t.Fatal(err)
+	}
+
+	mismatchFlow := NewFlow(flowName).
+		Unlogged(true).
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
+			return in, nil
+		}))
+
+	err := client.CreateFlow(t.Context(), mismatchFlow)
+	if err == nil {
+		t.Fatal("expected mismatch error, got nil")
+	}
+	if !strings.Contains(err.Error(), "already exists with unlogged=") {
+		t.Fatalf("unexpected mismatch error: %v", err)
+	}
+}
+
 func TestFlowSingleStep(t *testing.T) {
 	client := getTestClient(t)
 
