@@ -83,7 +83,6 @@ BEGIN
       output_priority = coalesce(EXCLUDED.output_priority, ARRAY['__pending_output_priority__']),
       step_count = 0;
 
-    DELETE FROM cb_step_handlers WHERE flow_name = cb_create_flow.name;
     DELETE FROM cb_step_dependencies WHERE flow_name = cb_create_flow.name;
     DELETE FROM cb_steps WHERE flow_name = cb_create_flow.name;
 
@@ -2627,9 +2626,6 @@ DECLARE
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext(_f_table));
 
-    DELETE FROM cb_step_handlers h
-    WHERE h.flow_name = cb_delete_flow.name;
-
     DELETE FROM cb_step_dependencies d
     WHERE d.flow_name = cb_delete_flow.name;
 
@@ -2657,8 +2653,8 @@ $$;
 DO $$
 BEGIN
     IF to_regclass('public.cb_flows') IS NOT NULL THEN
-        PERFORM cb_delete_flow(name)
-        FROM cb_flows;
+    PERFORM cb_delete_flow(name)
+    FROM cb_flows;
     END IF;
 END
 $$;

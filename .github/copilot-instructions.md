@@ -42,7 +42,7 @@ All schema is version-controlled in `migrations/` (goose-managed):
 - **Workers Schema** (v9): `cb_workers` table + `cb_task_handlers` and `cb_step_handlers` tables (worker-to-task and worker-to-step mappings; depends on workers/tasks/flows)
 - **Workers Functions** (v10): Worker management (`cb_worker_started`, `cb_worker_heartbeat`) and `cb_worker_info` view
 
-Key: Migrations use goose with `DisableVersioning` + embedded FS. Current schema version = 10.
+Key: Migrations use goose with a namespaced version table (`cb_goose_db_version`) + embedded FS. Current schema version = 13.
 
 **Table Name Construction**:
 All runtime tables (messages, task runs, flow runs, step runs) are created dynamically using the `cb_table_name(name, prefix)` function:
@@ -260,15 +260,14 @@ docker compose logs -f postgres
 **Add migrations**:
 1. Create new `.sql` file in `migrations/`, use goose syntax (`+goose up`/`+goose down`)
 2. Update `SchemaVersion` constant in `migrate.go` to match the new migration version number
-3. Migrations are embedded via `//go:embed migrations/*.sql` and use `goose.WithDisableVersioning(true)`
+3. Migrations are embedded via `//go:embed migrations/*.sql` and use `goose.WithTableName("cb_goose_db_version")`
 
 **CRITICAL: Migration Versioning System**:
-- Catbird uses goose with `DisableVersioning(true)` - there is **NO goose version table** in the database
-- Goose tracks which migrations have run by executing them in order; state is NOT persisted
+- Catbird uses goose with a dedicated version table `cb_goose_db_version`
+- Goose persists applied migration state in that table
 - This means:
-  - Migrations run exactly once when first applied during test initialization
-  - In test harness, `testOnce.Do()` in `catbird_test.go` ensures migrations run only on first test in suite
-  - **OLD DATABASE STATE PERSISTS BETWEEN TEST RUNS** - If you change a migration, old data in dynamic tables (e.g., `cb_f_myflow`, `cb_s_myflow`) remains until explicitly dropped
+  - In test harness, `testOnce.Do()` in `catbird_test.go` still controls one-time migration setup per test process
+  - **OLD DATABASE STATE PERSISTS BETWEEN TEST RUNS** unless the database is reset; if you change a migration, old data in dynamic tables (e.g., `cb_f_myflow`, `cb_s_myflow`) remains until explicitly dropped
   - Problem: Test may retrieve old rows from previous runs with outdated schemas/formats
   - Solution: Either (a) Use unique test identifiers to avoid hitting old data, or (b) Drop tables explicitly in `-- +goose down` sections
 

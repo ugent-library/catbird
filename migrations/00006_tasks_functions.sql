@@ -655,7 +655,7 @@ $$;
 
 -- +goose statementbegin
 -- cb_delete_task: Delete a task definition and all its runs
--- Removes the task metadata, handlers, and drops the associated queue table
+-- Removes the task metadata and drops the associated queue table
 -- Parameters:
 --   name: Task name
 -- Returns: boolean - true if task was deleted, false if not found
@@ -669,9 +669,6 @@ BEGIN
     PERFORM pg_advisory_xact_lock(hashtext(_t_table));
 
     EXECUTE format('DROP TABLE IF EXISTS %I;', _t_table);
-
-    DELETE FROM cb_task_handlers t
-    WHERE t.task_name = cb_delete_task.name;
 
     DELETE FROM cb_tasks t
     WHERE t.name = cb_delete_task.name

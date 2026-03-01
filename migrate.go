@@ -10,6 +10,7 @@ import (
 )
 
 const SchemaVersion = 13
+const gooseVersionTable = "cb_goose_db_version"
 
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
@@ -25,7 +26,7 @@ func newMigrationProvider(db *sql.DB) (*goose.Provider, error) {
 		db,
 		fs,
 		goose.WithDisableGlobalRegistry(true),
-		goose.WithDisableVersioning(true),
+		goose.WithTableName(gooseVersionTable),
 	)
 	if err != nil {
 		return nil, err

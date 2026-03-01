@@ -205,7 +205,7 @@ Migrations are automatically applied during test setup via `getTestClient()`:
 
 **Migration Process**:
 1. Read embedded migrations from `migrations/*.sql`
-2. Use goose with `DisableVersioning: true`
+2. Use goose with version tracking table `cb_goose_db_version`
 3. Each migration file has `-- +goose up` / `-- +goose down` markers
 4. Multi-statement SQL wrapped in `-- +goose statementbegin/end`
 
