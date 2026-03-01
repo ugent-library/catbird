@@ -129,7 +129,7 @@ Expose counters (log/metrics):
    - duplicate dispatch attempts with same derived key
    - only one effective run
 5. **Wildcard bindings**
-   - `?` and `*` patterns trigger correctly
+   - `*` and `#` patterns trigger correctly
 
 ## Future upgrades (post-MVP)
 

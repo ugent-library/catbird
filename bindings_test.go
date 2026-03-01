@@ -74,8 +74,8 @@ func TestBindSingleTokenWildcard(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Bind with ? wildcard (single token)
-	if err := client.Bind(ctx, q, "events.?.created"); err != nil {
+	// Bind with * wildcard (single token)
+	if err := client.Bind(ctx, q, "events.*.created"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -138,22 +138,22 @@ func TestBindMultiTokenWildcard(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Bind with * wildcard (multi-token tail)
-	if err := client.Bind(ctx, q, "events.user.*"); err != nil {
+	// Bind with # wildcard (multi-token tail)
+	if err := client.Bind(ctx, q, "events.user.#"); err != nil {
 		t.Fatal(err)
 	}
 
-	// Should match: events.user.<anything>
+	// Should match: events.user and events.user.<anything>
 	testCases := []struct {
 		topic       string
 		shouldMatch bool
 	}{
+		{"events.user", true},
 		{"events.user.created", true},
 		{"events.user.updated", true},
 		{"events.user.deleted", true},
 		{"events.user.profile.updated", true}, // multiple tokens after
 		{"events.order.created", false},       // wrong prefix
-		{"events.user", false},                // no tail (exact match fails)
 	}
 
 	for _, tc := range testCases {
@@ -191,8 +191,8 @@ func TestBindMultiplePatterns(t *testing.T) {
 	// Bind to multiple patterns
 	patterns := []string{
 		"events.user.created",
-		"events.order.*",
-		"logs.?.error",
+		"events.order.#",
+		"logs.*.error",
 	}
 
 	for _, pattern := range patterns {
@@ -206,13 +206,14 @@ func TestBindMultiplePatterns(t *testing.T) {
 		shouldMatch bool
 	}{
 		{"events.user.created", true},  // exact match
-		{"events.order.created", true}, // * wildcard
-		{"events.order.updated", true}, // * wildcard
-		{"logs.app.error", true},       // ? wildcard
-		{"logs.db.error", true},        // ? wildcard
+		{"events.order", true},         // # wildcard with zero trailing tokens
+		{"events.order.created", true}, // # wildcard
+		{"events.order.updated", true}, // # wildcard
+		{"logs.app.error", true},       // * wildcard
+		{"logs.db.error", true},        // * wildcard
 		{"events.user.deleted", false}, // no match
 		{"logs.app.info", false},       // wrong last token
-		{"logs.app.db.error", false},   // too many tokens for ? pattern
+		{"logs.app.db.error", false},   // too many tokens for * pattern
 	}
 
 	for _, tc := range testCases {
@@ -341,15 +342,19 @@ func TestBindInvalidPatterns(t *testing.T) {
 	}
 
 	invalidPatterns := []string{
-		"foo.*.bar",     // * not at end
-		"*.foo",         // * not after dot
-		"foo*",          // * not after dot
+		"foo*",          // * must occupy whole token
+		"foo*bar",       // * must occupy whole token
+		"foo#bar",       // # must occupy whole token
+		"foo.#.bar",     // # must be final token
+		"#.foo",         // # must be final token
+		"foo.bar.#.baz", // # must be final token
 		"foo..bar",      // double dots
 		"foo.bar.",      // trailing dot
 		".foo.bar",      // leading dot
 		"foo bar",       // space
 		"foo@bar",       // invalid char
-		"foo.bar.*.baz", // * not at end
+		"foo.?.bar",     // unsupported wildcard char
+		"foo.>",         // unsupported wildcard char
 	}
 
 	for _, pattern := range invalidPatterns {
@@ -373,9 +378,10 @@ func TestBindValidPatterns(t *testing.T) {
 		"foo",
 		"foo.bar",
 		"foo.bar.baz",
-		"foo.?.bar",
-		"foo.?.?.bar",
-		"foo.bar.*",
+		"foo.*.bar",
+		"foo.*.*.bar",
+		"foo.bar.#",
+		"#",
 		"foo-bar.baz_qux",
 		"FOO.Bar.123",
 	}
@@ -408,7 +414,12 @@ func TestBindPrefixOptimization(t *testing.T) {
 	}
 
 	// Bind with long prefix before wildcard
-	if err := client.Bind(ctx, q, "very.long.prefix.path.to.resource.*"); err != nil {
+	if err := client.Bind(ctx, q, "very.long.prefix.path.to.resource.#"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should match zero-token tail case too
+	if err := client.Publish(ctx, "very.long.prefix.path.to.resource", "match-zero"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -427,8 +438,8 @@ func TestBindPrefixOptimization(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(msgs) != 1 {
-		t.Fatalf("expected 1 message (prefix optimization), got %d", len(msgs))
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages (prefix optimization), got %d", len(msgs))
 	}
 }
 
@@ -444,8 +455,8 @@ func TestBindCaseSensitivity(t *testing.T) {
 	// Bind to patterns with uppercase and mixed case
 	patterns := []string{
 		"Events.User.Created",
-		"API.?.Response",
-		"LogEvents.*",
+		"API.*.Response",
+		"LogEvents.#",
 	}
 
 	for _, pattern := range patterns {
@@ -458,6 +469,7 @@ func TestBindCaseSensitivity(t *testing.T) {
 		topic       string
 		shouldMatch bool
 	}{
+		{"LogEvents", true},
 		{"Events.User.Created", true},       // Exact match with uppercase
 		{"events.user.created", false},      // Case mismatch
 		{"API.v1.Response", true},           // Wildcard with mixed case
@@ -500,7 +512,7 @@ func TestBindOrderIndependence(t *testing.T) {
 	}
 
 	// Bind in one order
-	patterns := []string{"a.b.c", "x.y.*", "p.?.q"}
+	patterns := []string{"a.b.c", "x.y.#", "p.*.q"}
 	for _, p := range patterns {
 		if err := client.Bind(ctx, q, p); err != nil {
 			t.Fatal(err)
@@ -508,7 +520,7 @@ func TestBindOrderIndependence(t *testing.T) {
 	}
 
 	// Dispatch messages
-	topics := []string{"a.b.c", "x.y.z", "p.m.q"}
+	topics := []string{"a.b.c", "x.y", "x.y.z", "p.m.q"}
 	for _, topic := range topics {
 		if err := client.Publish(ctx, topic, "test"); err != nil {
 			t.Fatal(err)
@@ -520,8 +532,8 @@ func TestBindOrderIndependence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(msgs) != 3 {
-		t.Fatalf("expected 3 messages, got %d", len(msgs))
+	if len(msgs) != 4 {
+		t.Fatalf("expected 4 messages, got %d", len(msgs))
 	}
 
 	// Verify we got all expected topics
@@ -585,7 +597,7 @@ func TestBindEmptyPrefix(t *testing.T) {
 
 	// Pattern with no prefix before wildcard should still work
 	// This tests edge case of empty prefix extraction
-	if err := client.Bind(ctx, q, "?.bar"); err != nil {
+	if err := client.Bind(ctx, q, "*.bar"); err != nil {
 		t.Fatal(err)
 	}
 

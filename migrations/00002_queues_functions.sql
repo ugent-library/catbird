@@ -176,10 +176,10 @@ $$;
 
 -- +goose statementbegin
 -- cb_bind: Subscribe a queue to a topic pattern
--- Supports exact topics and wildcards (? for single token, * for multi-token tail)
+-- Supports exact topics and wildcards (* for single token, # for multi-token tail)
 -- Parameters:
 --   queue_name: Name of the queue to bind
---   pattern: Topic pattern (e.g., 'foo.bar', 'foo.?.bar', 'foo.bar.*')
+--   pattern: Topic pattern (e.g., 'foo.bar', 'foo.*.bar', 'foo.bar.#')
 -- Returns: void
 CREATE OR REPLACE FUNCTION cb_bind(queue_name text, pattern text)
 RETURNS void
@@ -189,11 +189,16 @@ DECLARE
     p_type text;
     p_prefix text;
     p_regex text;
+    base_pattern text;
     test_result boolean;
+    token text;
+    tokens text[];
+    token_count integer;
+    i integer;
 BEGIN
     -- Validate pattern contains only allowed characters
-    IF cb_bind.pattern !~ '^[a-zA-Z0-9._?*-]+$' THEN
-        RAISE EXCEPTION 'cb: pattern can only contain: a-z, A-Z, 0-9, ., _, -, ?, *';
+    IF cb_bind.pattern !~ '^[a-zA-Z0-9._#*-]+$' THEN
+        RAISE EXCEPTION 'cb: pattern can only contain: a-z, A-Z, 0-9, ., _, -, *, #';
     END IF;
 
     -- Validate no double dots, leading or trailing dots
@@ -201,8 +206,35 @@ BEGIN
         RAISE EXCEPTION 'cb: pattern cannot contain double dots (..), or start/end with a dot';
     END IF;
 
+    -- Validate wildcard placement by token
+    tokens := string_to_array(cb_bind.pattern, '.');
+    token_count := array_length(tokens, 1);
+
+    FOR i IN 1..token_count LOOP
+        token := tokens[i];
+
+        IF token = '*' THEN
+            CONTINUE;
+        END IF;
+
+        IF token = '#' THEN
+            IF i <> token_count THEN
+                RAISE EXCEPTION 'cb: # wildcard must be the final token';
+            END IF;
+            CONTINUE;
+        END IF;
+
+        IF token LIKE '%*%' THEN
+            RAISE EXCEPTION 'cb: * wildcard must occupy an entire token';
+        END IF;
+
+        IF token LIKE '%#%' THEN
+            RAISE EXCEPTION 'cb: # wildcard must occupy an entire token';
+        END IF;
+    END LOOP;
+
     -- Check if pattern has wildcards
-    IF cb_bind.pattern !~ '[?*]' THEN
+    IF cb_bind.pattern !~ '[*#]' THEN
         -- Exact match
         p_type := 'exact';
         p_prefix := NULL;
@@ -211,27 +243,38 @@ BEGIN
         -- Wildcard match
         p_type := 'wildcard';
 
-        -- Validate * only appears at end after a dot
-        IF cb_bind.pattern ~ '\*' AND cb_bind.pattern !~ '\.\*$' THEN
-            RAISE EXCEPTION 'cb: * wildcard must be at the end after a dot (e.g., "foo.bar.*")';
-        END IF;
-
         -- Extract literal prefix before first wildcard
-        p_prefix := substring(cb_bind.pattern FROM '^([^?*]+)');
+        p_prefix := substring(cb_bind.pattern FROM '^([^*#]+)');
 
         -- If no prefix (pattern starts with wildcard), set to empty for matching
         IF p_prefix IS NULL OR p_prefix = '' THEN
             p_prefix := '';
         END IF;
 
+        -- If pattern ends in .#, trim trailing dot so prefix filter keeps
+        -- matching the zero-token tail case (e.g., events.# matches events)
+        IF cb_bind.pattern ~ E'\\.\\#$' AND p_prefix <> '' AND right(p_prefix, 1) = '.' THEN
+            p_prefix := left(p_prefix, length(p_prefix) - 1);
+        END IF;
+
         -- Precompile regex pattern
-        -- ? -> [a-zA-Z0-9_-]+ (single token matching allowed characters)
-        -- .* -> (\.[a-zA-Z0-9_-]+)+ (one or more dot-separated tokens)
-        p_regex := '^' ||
-            regexp_replace(
-                regexp_replace(cb_bind.pattern, E'\\.\\*$', '(\\.[a-zA-Z0-9_-]+)+'),
-                E'\\?', '[a-zA-Z0-9_-]+', 'g'
-            ) || '$';
+        -- *  -> [a-zA-Z0-9_-]+ (single token)
+        -- .# -> (\.[a-zA-Z0-9_-]+)* (zero or more trailing tokens)
+        base_pattern := cb_bind.pattern;
+        IF cb_bind.pattern ~ E'\\.\\#$' THEN
+            base_pattern := regexp_replace(base_pattern, E'\\.\\#$', '');
+        END IF;
+
+        p_regex := regexp_replace(base_pattern, E'\\.', E'\\\\.', 'g');
+        p_regex := regexp_replace(p_regex, E'\\*', '[a-zA-Z0-9_-]+', 'g');
+
+        IF cb_bind.pattern = '#' THEN
+            p_regex := E'^[a-zA-Z0-9_-]+(?:\\.[a-zA-Z0-9_-]+)*$';
+        ELSIF cb_bind.pattern ~ E'\\.\\#$' THEN
+            p_regex := '^' || p_regex || E'(?:\\.[a-zA-Z0-9_-]+)*$';
+        ELSE
+            p_regex := '^' || p_regex || '$';
+        END IF;
 
         -- Validate regex compiles correctly by testing it
         BEGIN

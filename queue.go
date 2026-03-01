@@ -151,8 +151,8 @@ func SendManyQuery(queueName string, payloads []any, opts ...SendManyOpts) (stri
 }
 
 // Bind subscribes a queue to a topic pattern.
-// Pattern supports exact topics and wildcards: ? (single token), * (multi-token tail).
-// Examples: "foo.bar", "foo.?.bar", "foo.bar.*"
+// Pattern supports exact topics and wildcards: * (single token), # (multi-token tail).
+// Examples: "foo.bar", "foo.*.bar", "foo.bar.#"
 func Bind(ctx context.Context, conn Conn, queueName string, pattern string) error {
 	q := `SELECT cb_bind(queue_name => $1, pattern => $2);`
 	_, err := conn.Exec(ctx, q, queueName, pattern)

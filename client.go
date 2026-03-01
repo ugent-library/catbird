@@ -49,8 +49,8 @@ func (c *Client) SendMany(ctx context.Context, queueName string, payloads []any,
 }
 
 // Bind subscribes a queue to a topic pattern.
-// Pattern supports exact topics and wildcards: ? (single token), * (multi-token tail).
-// Examples: "foo.bar", "foo.?.bar", "foo.bar.*"
+// Pattern supports exact topics and wildcards: * (single token), # (multi-token tail).
+// Examples: "foo.bar", "foo.*.bar", "foo.bar.#"
 func (c *Client) Bind(ctx context.Context, queueName string, pattern string) error {
 	return Bind(ctx, c.Conn, queueName, pattern)
 }
