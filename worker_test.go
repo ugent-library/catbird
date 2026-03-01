@@ -148,12 +148,13 @@ func TestHandlerOpts_WithRetriesAndBackoff(t *testing.T) {
 
 	// Just verify that task can be created with these options
 	// Internal fields are not exposed via interface
-	task := NewTask("test").Handler(func(_ context.Context, _ any) (any, error) { return nil, nil }, HandlerOpts{
-		Concurrency: 1,
-		BatchSize:   10,
-		MaxRetries:  3,
-		Backoff:     NewFullJitterBackoff(min, max),
-	})
+	task := NewTask("test").Handler(
+		func(_ context.Context, _ any) (any, error) { return nil, nil },
+		WithConcurrency(1),
+		WithBatchSize(10),
+		WithMaxRetries(3),
+		WithFullJitterBackoff(min, max),
+	)
 
 	if task == nil {
 		t.Fatal("expected task to be created")
@@ -218,12 +219,12 @@ func TestTaskRetriesIntegration(t *testing.T) {
 			return "", fmt.Errorf("intentional failure %d", n)
 		}
 		return fmt.Sprintf("success at %d", n), nil
-	}, HandlerOpts{
-		Concurrency: 1,
-		BatchSize:   10,
-		MaxRetries:  3,
-		Backoff:     NewFullJitterBackoff(minDelay, maxDelay),
-	})
+	},
+		WithConcurrency(1),
+		WithBatchSize(10),
+		WithMaxRetries(3),
+		WithFullJitterBackoff(minDelay, maxDelay),
+	)
 
 	worker := client.NewWorker(t.Context()).AddTask(task)
 
@@ -295,22 +296,22 @@ func TestTaskOnFailIntegration(t *testing.T) {
 	task := NewTask("task_on_fail").
 		Handler(func(_ context.Context, _ Input) (string, error) {
 			return "", fmt.Errorf("boom")
-		}, HandlerOpts{
-			Concurrency: 1,
-			BatchSize:   10,
-			MaxRetries:  0,
-		}).
+		},
+			WithConcurrency(1),
+			WithBatchSize(10),
+			WithMaxRetries(0),
+		).
 		OnFail(func(_ context.Context, in Input, failure TaskFailure) error {
 			if in.OrderID != "ord-1" {
 				return fmt.Errorf("unexpected input in on-fail: %+v", in)
 			}
 			onFailCalled <- failure
 			return nil
-		}, HandlerOpts{
-			Concurrency: 1,
-			BatchSize:   10,
-			MaxRetries:  0,
-		})
+		},
+			WithConcurrency(1),
+			WithBatchSize(10),
+			WithMaxRetries(0),
+		)
 
 	worker := client.NewWorker(t.Context()).AddTask(task)
 	startTestWorker(t, worker)
@@ -361,11 +362,11 @@ func TestTaskOnFailRetries(t *testing.T) {
 	task := NewTask("task_on_fail_retry").
 		Handler(func(_ context.Context, _ Input) (string, error) {
 			return "", fmt.Errorf("boom")
-		}, HandlerOpts{
-			Concurrency: 1,
-			BatchSize:   10,
-			MaxRetries:  0,
-		}).
+		},
+			WithConcurrency(1),
+			WithBatchSize(10),
+			WithMaxRetries(0),
+		).
 		OnFail(func(_ context.Context, _ Input, failure TaskFailure) error {
 			attempt := int(atomic.AddInt32(&attempts, 1))
 			mu.Lock()
@@ -376,12 +377,12 @@ func TestTaskOnFailRetries(t *testing.T) {
 			}
 			onFailCalled <- failure
 			return nil
-		}, HandlerOpts{
-			Concurrency: 1,
-			BatchSize:   10,
-			MaxRetries:  1,
-			Backoff:     fixedBackoff{delay: 10 * time.Millisecond},
-		})
+		},
+			WithConcurrency(1),
+			WithBatchSize(10),
+			WithMaxRetries(1),
+			WithFullJitterBackoff(10*time.Millisecond, 20*time.Millisecond),
+		)
 
 	worker := client.NewWorker(t.Context()).AddTask(task)
 	startTestWorker(t, worker)
@@ -432,20 +433,20 @@ func TestTaskOnFailMaxRetriesExhausted(t *testing.T) {
 	task := NewTask("task_on_fail_exhausted").
 		Handler(func(_ context.Context, _ Input) (string, error) {
 			return "", fmt.Errorf("boom")
-		}, HandlerOpts{
-			Concurrency: 1,
-			BatchSize:   10,
-			MaxRetries:  0,
-		}).
+		},
+			WithConcurrency(1),
+			WithBatchSize(10),
+			WithMaxRetries(0),
+		).
 		OnFail(func(_ context.Context, _ Input, _ TaskFailure) error {
 			atomic.AddInt32(&attempts, 1)
 			onFailCalled <- TaskFailure{}
 			return fmt.Errorf("still failing")
-		}, HandlerOpts{
-			Concurrency: 1,
-			BatchSize:   10,
-			MaxRetries:  0,
-		})
+		},
+			WithConcurrency(1),
+			WithBatchSize(10),
+			WithMaxRetries(0),
+		)
 
 	worker := client.NewWorker(t.Context()).AddTask(task)
 	startTestWorker(t, worker)
@@ -496,22 +497,22 @@ func TestFlowOnFailIntegration(t *testing.T) {
 		AddStep(NewStep("step1").
 			Handler(func(_ context.Context, _ Input) (string, error) {
 				return "", fmt.Errorf("step failed")
-			}, HandlerOpts{
-				Concurrency: 1,
-				BatchSize:   10,
-				MaxRetries:  0,
-			})).
+			},
+				WithConcurrency(1),
+				WithBatchSize(10),
+				WithMaxRetries(0),
+			)).
 		OnFail(func(_ context.Context, in Input, failure FlowFailure) error {
 			if in.OrderID != "ord-2" {
 				return fmt.Errorf("unexpected flow input in on-fail: %+v", in)
 			}
 			onFailCalled <- failure
 			return nil
-		}, HandlerOpts{
-			Concurrency: 1,
-			BatchSize:   10,
-			MaxRetries:  0,
-		})
+		},
+			WithConcurrency(1),
+			WithBatchSize(10),
+			WithMaxRetries(0),
+		)
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -571,22 +572,22 @@ func TestFlowOnFailMapStepInputIntegration(t *testing.T) {
 			MapInput().
 			Handler(func(_ context.Context, in Item) (string, error) {
 				return "", fmt.Errorf("map item failed: %d", in.ID)
-			}, HandlerOpts{
-				Concurrency: 1,
-				BatchSize:   10,
-				MaxRetries:  0,
-			})).
+			},
+				WithConcurrency(1),
+				WithBatchSize(10),
+				WithMaxRetries(0),
+			)).
 		OnFail(func(_ context.Context, in []Item, failure FlowFailure) error {
 			onFailCalled <- failure
 			if len(in) != 2 {
 				return fmt.Errorf("unexpected flow input size: %d", len(in))
 			}
 			return nil
-		}, HandlerOpts{
-			Concurrency: 1,
-			BatchSize:   10,
-			MaxRetries:  0,
-		})
+		},
+			WithConcurrency(1),
+			WithBatchSize(10),
+			WithMaxRetries(0),
+		)
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -630,10 +631,10 @@ func TestWorkerValidatesTaskHandlerOpts(t *testing.T) {
 	t.Run("negative_concurrency", func(t *testing.T) {
 		task := NewTask("invalid_task").Handler(func(_ context.Context, _ any) (any, error) {
 			return nil, nil
-		}, HandlerOpts{
-			Concurrency: -1,
-			BatchSize:   10,
-		})
+		},
+			WithConcurrency(-1),
+			WithBatchSize(10),
+		)
 
 		worker := client.NewWorker(t.Context()).AddTask(task)
 		err := worker.Start(t.Context())
@@ -649,10 +650,10 @@ func TestWorkerValidatesTaskHandlerOpts(t *testing.T) {
 	t.Run("negative_batch_size", func(t *testing.T) {
 		task := NewTask("invalid_task2").Handler(func(_ context.Context, _ any) (any, error) {
 			return nil, nil
-		}, HandlerOpts{
-			Concurrency: 1,
-			BatchSize:   -1,
-		})
+		},
+			WithConcurrency(1),
+			WithBatchSize(-1),
+		)
 
 		worker := client.NewWorker(t.Context()).AddTask(task)
 		err := worker.Start(t.Context())
@@ -668,12 +669,12 @@ func TestWorkerValidatesTaskHandlerOpts(t *testing.T) {
 	t.Run("invalid_backoff", func(t *testing.T) {
 		task := NewTask("invalid_task3").Handler(func(_ context.Context, _ any) (any, error) {
 			return nil, nil
-		}, HandlerOpts{
-			Concurrency: 1,
-			BatchSize:   10,
-			MaxRetries:  3,
-			Backoff:     NewFullJitterBackoff(time.Second, 500*time.Millisecond), // MaxDelay < MinDelay
-		})
+		},
+			WithConcurrency(1),
+			WithBatchSize(10),
+			WithMaxRetries(3),
+			WithFullJitterBackoff(time.Second, 500*time.Millisecond), // MaxDelay < MinDelay
+		)
 
 		worker := client.NewWorker(t.Context()).AddTask(task)
 		err := worker.Start(t.Context())
@@ -694,10 +695,10 @@ func TestWorkerValidatesStepHandlerOpts(t *testing.T) {
 		flow := NewFlow("invalid_flow").
 			AddStep(NewStep("step1").Handler(func(_ context.Context, _ any) (any, error) {
 				return nil, nil
-			}, HandlerOpts{
-				Concurrency: -1,
-				BatchSize:   10,
-			}))
+			},
+				WithConcurrency(-1),
+				WithBatchSize(10),
+			))
 
 		worker := client.NewWorker(t.Context()).AddFlow(flow)
 		err := worker.Start(t.Context())
@@ -714,10 +715,10 @@ func TestWorkerValidatesStepHandlerOpts(t *testing.T) {
 		flow := NewFlow("invalid_flow2").
 			AddStep(NewStep("step1").Handler(func(_ context.Context, _ any) (any, error) {
 				return nil, nil
-			}, HandlerOpts{
-				Concurrency: 1,
-				BatchSize:   -5, // Negative value
-			}))
+			},
+				WithConcurrency(1),
+				WithBatchSize(-5), // Negative value
+			))
 
 		worker := client.NewWorker(t.Context()).AddFlow(flow)
 		err := worker.Start(t.Context())
@@ -734,11 +735,11 @@ func TestWorkerValidatesStepHandlerOpts(t *testing.T) {
 		flow := NewFlow("invalid_flow3").
 			AddStep(NewStep("step1").Handler(func(_ context.Context, _ any) (any, error) {
 				return nil, nil
-			}, HandlerOpts{
-				Concurrency:    1,
-				BatchSize:      10,
-				CircuitBreaker: &CircuitBreaker{failureThreshold: 0}, // Invalid threshold
-			}))
+			},
+				WithConcurrency(1),
+				WithBatchSize(10),
+				WithCircuitBreaker(0, time.Second), // Invalid threshold
+			))
 
 		worker := client.NewWorker(t.Context()).AddFlow(flow)
 		err := worker.Start(t.Context())

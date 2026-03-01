@@ -108,20 +108,6 @@ func newUIStyles(colorEnabled bool) uiStyles {
 	}
 }
 
-func padToHeight(content string, width, height int) string {
-	if height <= 0 {
-		return content
-	}
-	currentLines := strings.Count(content, "\n") + 1
-	if currentLines >= height {
-		return content
-	}
-
-	padLine := theme.app.Width(max(0, width)).Render("")
-	padding := strings.Repeat(padLine+"\n", height-currentLines)
-	return content + "\n" + strings.TrimRight(padding, "\n")
-}
-
 func styleBodyLines(text string, width int) string {
 	if strings.TrimSpace(text) == "" {
 		return text

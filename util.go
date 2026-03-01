@@ -23,9 +23,26 @@ type CancelOpts struct {
 	Reason string
 }
 
-// ScheduleOpts configures scheduled task/flow behavior.
-type ScheduleOpts struct {
-	Input any
+type scheduleOpts struct {
+	input any
+}
+
+// ScheduleOpt configures scheduled task/flow behavior.
+type ScheduleOpt func(*scheduleOpts)
+
+// WithInput sets static input payload for scheduled task/flow runs.
+func WithInput(input any) ScheduleOpt {
+	return func(opts *scheduleOpts) {
+		opts.input = input
+	}
+}
+
+func applyDefaultScheduleOpts(opts ...ScheduleOpt) *scheduleOpts {
+	resolved := scheduleOpts{}
+	for _, opt := range opts {
+		opt(&resolved)
+	}
+	return &resolved
 }
 
 // WaitOpts configures WaitForOutput polling behavior.

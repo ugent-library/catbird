@@ -20,7 +20,7 @@ Catbird is a PostgreSQL-based message queue with task and workflow execution eng
 
 **Main Components**:
 1. **Client** (`client.go`): Facade delegating to standalone functions; call `catbird.New(conn)` to create
-2. **Worker** (`worker.go`): Runs tasks and flows; initialized with `catbird.NewWorker(conn, opts...)` or `client.NewWorker(ctx, opts...)`. Multiple workers can run concurrently; DB ensures each message is processed exactly once.
+2. **Worker** (`worker.go`): Runs tasks and flows; initialized with `catbird.NewWorker(conn)` or `client.NewWorker(ctx)`, then configured via builder methods (e.g., `.Logger(...)`, `.ShutdownTimeout(...)`, `.AddTask(...)`, `.AddFlow(...)`). Multiple workers can run concurrently; DB ensures each message is processed exactly once.
 3. **Scheduler** (`scheduler.go`): Manages cron-based task and flow scheduling using robfig/cron; created internally by worker when registering tasks/flows with `Schedule` method. Can also be used standalone.
 4. **Dashboard** (`dashboard/`): Web UI for starting task/flow runs, monitoring progress in real-time, and viewing results; served via CLI `cb dashboard`
 5. **TUI** (`tui/`): Terminal UI built with Bubble Tea for read-only operational visibility (queues, tasks, flows, workers, and recent runs); launched via CLI `cb tui`
@@ -69,19 +69,19 @@ tableName := fmt.Sprintf("cb_m_%s", strings.ToLower(flowName))  // Map tasks
 task := catbird.NewTask("my_task").
   Handler(func(ctx context.Context, input MyInput) (MyOutput, error) {
     return MyOutput{}, nil
-  }, catbird.HandlerOpts{
-    Concurrency: 5,
-    MaxRetries:  3,
-    Backoff:     catbird.NewFullJitterBackoff(500*time.Millisecond, 10*time.Second),
-    CircuitBreaker: catbird.NewCircuitBreaker(5, 30*time.Second),
-  })
+  },
+    catbird.WithConcurrency(5),
+    catbird.WithMaxRetries(3),
+    catbird.WithFullJitterBackoff(500*time.Millisecond, 10*time.Second),
+    catbird.WithCircuitBreaker(5, 30*time.Second),
+  )
 ```
 
 **Key characteristics**:
 - **No type parameters**: Input/output types are discovered at runtime via reflection (handlers receive `[]byte` payloads internally)
 - **Builder pattern**: Construction via method chaining: `NewTask(name).Condition(...).Handler(fn, opts...)`
-- **Execution options**: Applied via `HandlerOpts` struct with public fields (Concurrency, MaxRetries, Backoff, CircuitBreaker, BatchSize, Timeout)
-- **HandlerOpts validation**: Worker validates all task and flow step HandlerOpts at initialization time, catching configuration errors early before database operations
+- **Execution options**: Applied via functional `HandlerOpt` values (e.g., `WithConcurrency`, `WithBatchSize`, `WithTimeout`, `WithMaxRetries`, `WithFullJitterBackoff`, `WithCircuitBreaker`)
+- **Handler options validation**: Worker validates all task and flow step handler options at initialization time, catching configuration errors early before database operations
 - **Task/step metadata**: Conditions applied via `.Condition(expr)` method chain
 
 **Flows**: Multi-step DAGs with dependencies using builder pattern:
@@ -167,12 +167,12 @@ NewFlow("workflow").
 
 - **Idempotent API semantics**: For idempotent operations, if the requested effect is already true, return success (no-op) rather than an error. Reserve errors for invalid input, missing targets, or runtime/storage failures.
 
-- **Worker lifecycle**: `client.NewWorker(ctx, opts...)` followed by `.AddTask(task)` and `.AddFlow(flow)` builder methods, then `worker.Start(ctx)` (graceful shutdown with configurable timeout). Scheduling is decoupled: create schedules separately via `client.CreateTaskSchedule(ctx, name, cronSpec, opts...)` or `client.CreateFlowSchedule(ctx, name, cronSpec, opts...)` with optional `ScheduleOpts{Input: value}` for static input.
-- **HandlerOpts validation**: Worker validates all task and flow step HandlerOpts at initialization time. Invalid configs (negative concurrency/batch size, invalid backoff, invalid circuit breaker) are caught immediately with descriptive errors before reaching database operations. This ensures type safety at construction time.
-- **Options pattern**: HandlerOpts uses a public struct with public fields (Concurrency, BatchSize, Timeout, MaxRetries, Backoff, CircuitBreaker). WorkerOpts uses a config struct (Logger, ShutdownTimeout). ScheduleOpts uses public fields (Input for static JSON input).
+- **Worker lifecycle**: `client.NewWorker(ctx)` followed by builder methods like `.Logger(...)`, `.ShutdownTimeout(...)`, `.AddTask(task)`, and `.AddFlow(flow)`, then `worker.Start(ctx)` (graceful shutdown with configurable timeout). Scheduling is decoupled: create schedules separately via `client.CreateTaskSchedule(ctx, name, cronSpec, scheduleOpts...)` or `client.CreateFlowSchedule(ctx, name, cronSpec, scheduleOpts...)`.
+- **Handler options validation**: Worker validates all task and flow step handler options at initialization time. Invalid configs (negative concurrency/batch size, invalid backoff, invalid circuit breaker) are caught immediately with descriptive errors before reaching database operations. This ensures type safety at construction time.
+- **Options pattern**: Handler execution uses functional `HandlerOpt` values (e.g., `WithConcurrency`, `WithBatchSize`, `WithMaxRetries`, `WithFullJitterBackoff`, `WithCircuitBreaker`). Worker configuration uses builder methods on `Worker` (`Logger`, `ShutdownTimeout`). Scheduling uses functional `ScheduleOpt` values (e.g., `WithScheduleInput`).
 - **Conn interface**: Abstracts pgx; accepts `*pgxpool.Pool`, `*pgx.Conn` or `pgx.Tx`
-- **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `WorkerOpts.Logger` field
-- **Scheduled tasks/flows**: Decoupled from task/flow definitions. Create via `client.CreateTaskSchedule(ctx, taskName, cronSpec, opts...)` and `client.CreateFlowSchedule(ctx, flowName, cronSpec, opts...)`. Pass optional `ScheduleOpts{Input: value}` for static JSON input (defaults to `{}`). Example: `client.CreateTaskSchedule(ctx, "mytask", "@hourly", ScheduleOpts{Input: MyInput{...}})`. Worker polls for due schedules automatically and enqueues them with idempotency deduplication.
+- **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `worker.Logger(...)`
+- **Scheduled tasks/flows**: Decoupled from task/flow definitions. Create via `client.CreateTaskSchedule(ctx, taskName, cronSpec, opts...)` and `client.CreateFlowSchedule(ctx, flowName, cronSpec, opts...)`. Pass optional `WithScheduleInput(value)` for static JSON input (defaults to `{}`). Example: `client.CreateTaskSchedule(ctx, "mytask", "@hourly", WithScheduleInput(MyInput{...}))`. Worker polls for due schedules automatically and enqueues them with idempotency deduplication.
 - **Automatic garbage collection**: Worker heartbeats (every 10 seconds) opportunistically clean up stale workers and expired queues; no configuration needed. Manual cleanup available via `client.GC(ctx)` for deployments without workers.
 - **Deduplication strategies**: Two strategies available:
   - **ConcurrencyKey**: Prevents concurrent/overlapping runs (deduplicates `queued`/`started` status). After completion or failure, same key can be used again.
@@ -335,8 +335,8 @@ docker compose logs -f postgres
 2. **Context propagation**: All DB ops accept `context.Context` first param
 3. **JSON payloads**: Custom types → JSON via handler reflection; validation happens in handler
 4. **Retries**: Built-in with configurable exponential backoff with full jitter (see `NewFullJitterBackoff(min, max)`)
-5. **Circuit breaker**: Optional per-handler protection for external dependencies (see `NewCircuitBreaker(failures, openTimeout)`)
-6. **Concurrency**: Default 1 per handler; set `HandlerOpts.Concurrency`
+5. **Circuit breaker**: Optional per-handler protection for external dependencies (configure with `WithCircuitBreaker(failures, openTimeout)`)
+6. **Concurrency**: Default 1 per handler; set via `WithConcurrency(...)`
 7. **Conditional execution**: Use `.Condition("expression")` on tasks/steps. Tasks use `input.field` syntax (e.g., `"input.is_premium"`), flow steps use `step_name.field` syntax (e.g., `"validate.score gte 50"`)
 8. **Optional dependencies**: Use `Optional[T]` + `OptionalDependency()` pair when depending on conditional steps. Validation at flow construction time enforces type safety.
 9. **SQL parameter/column conflicts**: Use `#variable_conflict use_column` directive in PL/pgSQL when parameter names match column names (prevents "column ambiguous" errors)

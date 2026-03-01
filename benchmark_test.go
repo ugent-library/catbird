@@ -14,9 +14,9 @@ const benchmarkPipelineBatchSize = 64
 const benchmarkQueueBatchSize = 256
 const benchmarkTunedPipelineBatchSize = 512
 
-var benchmarkTunedHandlerOpts = HandlerOpts{
-	Concurrency: 32,
-	BatchSize:   256,
+var benchmarkTunedHandlerOpts = []HandlerOpt{
+	WithConcurrency(32),
+	WithBatchSize(256),
 }
 
 func minInt(a, b int) int {
@@ -363,7 +363,7 @@ func BenchmarkTaskThroughputPipelinedTuned(b *testing.B) {
 	taskName := fmt.Sprintf("bench_task_pipelined_tuned_%d", time.Now().UnixNano())
 	task := NewTask(taskName).Handler(func(ctx context.Context, in int) (int, error) {
 		return in + 1, nil
-	}, benchmarkTunedHandlerOpts)
+	}, benchmarkTunedHandlerOpts...)
 
 	worker := client.NewWorker(ctx).AddTask(task)
 	startBenchmarkWorker(b, worker)
@@ -412,7 +412,7 @@ func BenchmarkTaskEngineThroughputTuned(b *testing.B) {
 	taskName := fmt.Sprintf("bench_task_engine_tuned_%d", time.Now().UnixNano())
 	task := NewTask(taskName).Handler(func(ctx context.Context, in int) (int, error) {
 		return in + 1, nil
-	}, benchmarkTunedHandlerOpts)
+	}, benchmarkTunedHandlerOpts...)
 
 	worker := client.NewWorker(ctx).AddTask(task)
 	startBenchmarkWorker(b, worker)
@@ -446,7 +446,7 @@ func BenchmarkFlowThroughputPipelinedTuned(b *testing.B) {
 	flow := NewFlow(flowName).
 		AddStep(NewStep("step1").Handler(func(ctx context.Context, in int) (int, error) {
 			return in + 1, nil
-		}, benchmarkTunedHandlerOpts))
+		}, benchmarkTunedHandlerOpts...))
 
 	worker := client.NewWorker(ctx).AddFlow(flow)
 	startBenchmarkWorker(b, worker)

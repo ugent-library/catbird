@@ -108,10 +108,6 @@ func TestTaskCreate(t *testing.T) {
 	}
 }
 
-func pgQuoteLiteral(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
-}
-
 func TestTaskRunAndWait(t *testing.T) {
 	client := getTestClient(t)
 
@@ -296,13 +292,13 @@ func TestTaskCircuitBreaker(t *testing.T) {
 			return "", fmt.Errorf("intentional failure")
 		}
 		return "ok", nil
-	}, HandlerOpts{
-		Concurrency:    1,
-		BatchSize:      10,
-		MaxRetries:     2,
-		Backoff:        NewFullJitterBackoff(minBackoff, maxBackoff),
-		CircuitBreaker: NewCircuitBreaker(1, openTimeout),
-	})
+	},
+		WithConcurrency(1),
+		WithBatchSize(10),
+		WithMaxRetries(2),
+		WithFullJitterBackoff(minBackoff, maxBackoff),
+		WithCircuitBreaker(1, openTimeout),
+	)
 
 	worker := client.NewWorker(t.Context()).AddTask(task)
 

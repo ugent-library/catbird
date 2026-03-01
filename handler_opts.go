@@ -28,13 +28,57 @@ type CircuitBreakerStrategy interface {
 	RecordFailure(now time.Time)
 }
 
-type HandlerOpts struct {
-	Concurrency    int
-	BatchSize      int
-	Timeout        time.Duration
-	MaxRetries     int
-	Backoff        BackoffStrategy
-	CircuitBreaker CircuitBreakerStrategy
+type handlerOpts struct {
+	concurrency    int
+	batchSize      int
+	timeout        time.Duration
+	maxRetries     int
+	backoff        BackoffStrategy
+	circuitBreaker CircuitBreakerStrategy
+}
+
+type HandlerOpt func(*handlerOpts)
+
+// WithConcurrency sets maximum concurrent handler executions.
+func WithConcurrency(concurrency int) HandlerOpt {
+	return func(opts *handlerOpts) {
+		opts.concurrency = concurrency
+	}
+}
+
+// WithBatchSize sets how many claims are fetched per poll.
+func WithBatchSize(batchSize int) HandlerOpt {
+	return func(opts *handlerOpts) {
+		opts.batchSize = batchSize
+	}
+}
+
+// WithTimeout sets per-handler execution timeout.
+func WithTimeout(timeout time.Duration) HandlerOpt {
+	return func(opts *handlerOpts) {
+		opts.timeout = timeout
+	}
+}
+
+// WithMaxRetries sets retry attempts for handler failures.
+func WithMaxRetries(maxRetries int) HandlerOpt {
+	return func(opts *handlerOpts) {
+		opts.maxRetries = maxRetries
+	}
+}
+
+// WithFullJitterBackoff sets full-jitter retry backoff strategy.
+func WithFullJitterBackoff(minDelay, maxDelay time.Duration) HandlerOpt {
+	return func(opts *handlerOpts) {
+		opts.backoff = NewFullJitterBackoff(minDelay, maxDelay)
+	}
+}
+
+// WithCircuitBreaker sets optional circuit breaker strategy.
+func WithCircuitBreaker(failureThreshold int, openTimeout time.Duration) HandlerOpt {
+	return func(opts *handlerOpts) {
+		opts.circuitBreaker = NewCircuitBreaker(failureThreshold, openTimeout)
+	}
 }
 
 const (
@@ -47,52 +91,50 @@ const (
 var defaultHandlerBackoff = NewFullJitterBackoff(100*time.Millisecond, 2*time.Second)
 
 // applyDefaultHandlerOpts sets default values for handler options.
-func applyDefaultHandlerOpts(opts ...HandlerOpts) *HandlerOpts {
-	var resolved HandlerOpts
-	hasOpts := len(opts) > 0
-	if hasOpts {
-		resolved = opts[0]
+func applyDefaultHandlerOpts(opts ...HandlerOpt) *handlerOpts {
+	resolved := handlerOpts{
+		concurrency: defaultHandlerConcurrency,
+		batchSize:   defaultHandlerBatchSize,
+		timeout:     defaultHandlerTimeout,
+		maxRetries:  defaultHandlerMaxRetries,
+		backoff:     defaultHandlerBackoff,
 	}
 
-	if !hasOpts {
-		resolved.Timeout = defaultHandlerTimeout
-		resolved.MaxRetries = defaultHandlerMaxRetries
-		resolved.Backoff = defaultHandlerBackoff
+	for _, opt := range opts {
+		opt(&resolved)
 	}
 
-	if resolved.Concurrency == 0 {
-		resolved.Concurrency = defaultHandlerConcurrency
+	if resolved.maxRetries == 0 {
+		resolved.backoff = nil
 	}
-	if resolved.BatchSize == 0 {
-		resolved.BatchSize = defaultHandlerBatchSize
-	}
+
 	return &resolved
 }
 
 // validate checks handler options for consistency.
-func (h *HandlerOpts) validate() error {
-	if h.Concurrency <= 0 {
+func (h *handlerOpts) validate() error {
+	if h.concurrency <= 0 {
 		return fmt.Errorf("concurrency must be greater than zero")
 	}
-	if h.BatchSize <= 0 {
+	if h.batchSize <= 0 {
 		return fmt.Errorf("batch size must be greater than zero")
 	}
-	if h.Timeout < 0 {
+	if h.timeout < 0 {
 		return fmt.Errorf("timeout cannot be negative")
 	}
-	if h.MaxRetries < 0 {
+	if h.maxRetries < 0 {
 		return fmt.Errorf("max retries cannot be negative")
 	}
-	if h.MaxRetries == 0 && h.Backoff != nil {
-		return fmt.Errorf("backoff configured but max retries is zero")
+	if h.maxRetries == 0 {
+		h.backoff = nil
 	}
-	if h.Backoff != nil {
-		if err := h.Backoff.Validate(); err != nil {
+	if h.backoff != nil {
+		if err := h.backoff.Validate(); err != nil {
 			return err
 		}
 	}
-	if h.CircuitBreaker != nil {
-		if err := h.CircuitBreaker.Validate(); err != nil {
+	if h.circuitBreaker != nil {
+		if err := h.circuitBreaker.Validate(); err != nil {
 			return err
 		}
 	}

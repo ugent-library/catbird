@@ -158,20 +158,23 @@ Wildcard rules:
 task := catbird.NewTask("send-email").
     Handler(func(ctx context.Context, input EmailRequest) (EmailResponse, error) {
         return EmailResponse{SentAt: time.Now()}, nil
-    }, catbird.HandlerOpts{
-        Concurrency: 5,
-        MaxRetries:  3,
-        Backoff:     catbird.NewFullJitterBackoff(500*time.Millisecond, 10*time.Second),
-        CircuitBreaker: catbird.NewCircuitBreaker(5, 30*time.Second),
-    })
+    },
+        catbird.WithConcurrency(5),
+        catbird.WithMaxRetries(3),
+        catbird.WithFullJitterBackoff(500*time.Millisecond, 10*time.Second),
+        catbird.WithCircuitBreaker(5, 30*time.Second),
+    )
 
 // Create a schedule for the task (optional; can run manually via RunTask)
 client.CreateTaskSchedule(ctx, "send-email", "@hourly")
 
 // Or with static input
-client.CreateTaskSchedule(ctx, "send-report", "@hourly", catbird.ScheduleOpts{
-    Input: EmailRequest{To: "ops@example.com", Subject: "Hourly report"},
-})
+client.CreateTaskSchedule(
+    ctx,
+    "send-report",
+    "@hourly",
+    catbird.WithScheduleInput(EmailRequest{To: "ops@example.com", Subject: "Hourly report"}),
+)
 
 // Define a task with a condition (skipped when condition is false)
 conditionalTask := catbird.NewTask("premium-processing").
@@ -181,7 +184,9 @@ conditionalTask := catbird.NewTask("premium-processing").
     })
 
 // Create worker
-worker := client.NewWorker(ctx)
+worker := client.NewWorker(ctx).
+    Logger(slog.Default()).
+    ShutdownTimeout(10 * time.Second)
 // Add tasks
 worker.AddTask(task)
 worker.AddTask(conditionalTask)
@@ -201,12 +206,12 @@ err = handle.WaitForOutput(ctx, &result)
 ## OnFail Handlers
 
 On-fail handlers run after a task reaches a failed state (after its own retries).
-They execute with their own `HandlerOpts` retry and backoff settings, and receive the
+They execute with their own `HandlerOpt` retry and backoff settings, and receive the
 original input plus rich failure context.
 
 `OnFail` semantics (tasks and flows):
 - `OnFail` runs only after the main task/flow run reaches `failed` (after normal handler retries are exhausted).
-- `OnFail` has independent retry/backoff via its own `HandlerOpts`.
+- `OnFail` has independent retry/backoff via its own `HandlerOpt` values.
 - A successful `OnFail` marks on-fail handling complete, but the original run remains `failed`.
 - If `OnFail` retries are exhausted, on-fail handling remains failed and no further retries are scheduled.
 
@@ -218,10 +223,10 @@ task := catbird.NewTask("charge-payment").
     OnFail(func(ctx context.Context, input ChargeRequest, failure catbird.TaskFailure) error {
         // Send alert, enqueue compensation, or record audit log.
         return nil
-    }, catbird.HandlerOpts{
-        MaxRetries: 3,
-        Backoff:    catbird.NewFullJitterBackoff(200*time.Millisecond, 5*time.Second),
-    })
+    },
+        catbird.WithMaxRetries(3),
+        catbird.WithFullJitterBackoff(200*time.Millisecond, 5*time.Second),
+    )
 ```
 
 # Flow Execution
@@ -327,7 +332,7 @@ flow := catbird.NewFlow("default-terminal-priority").
 ## OnFail Handlers
 
 On-fail handlers run after a flow reaches a failed state (after its own retries).
-They execute with their own `HandlerOpts` retry and backoff settings, and receive the
+They execute with their own `HandlerOpt` retry and backoff settings, and receive the
 original input plus rich failure context.
 
 ```go
@@ -676,7 +681,7 @@ flow := catbird.NewFlow("payment_processing").
 
 # Resiliency
 
-Catbird includes multiple resiliency layers for runtime failures. Handler-level retries are configured with `HandlerOpts` (`MaxRetries`, `Backoff`), and external calls can be protected with `HandlerOpts.CircuitBreaker` (typically created via `NewCircuitBreaker(...)`) to avoid cascading outages. In worker database paths, PostgreSQL reads/writes are retried with bounded attempts and full-jitter backoff; retries stop immediately on context cancellation or deadline expiry.
+Catbird includes multiple resiliency layers for runtime failures. Handler-level retries are configured with `HandlerOpt` values such as `WithMaxRetries(...)` and `WithFullJitterBackoff(...)`, and external calls can be protected with `WithCircuitBreaker(failureThreshold, openTimeout)` to avoid cascading outages. In worker database paths, PostgreSQL reads/writes are retried with bounded attempts and full-jitter backoff; retries stop immediately on context cancellation or deadline expiry.
 
 For `Reduce(...)` steps, retries are two-phase: item handlers retry first per item, then reducer finalization retries at the parent step.
 If retries are exhausted in either phase, the parent step fails and task/flow `OnFail` handlers run with the same terminal failure semantics as non-reduced steps.

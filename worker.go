@@ -89,37 +89,33 @@ type Worker struct {
 	shutdownTimeout time.Duration
 }
 
-// WorkerOpts is a configuration struct for creating workers
-type WorkerOpts struct {
-	Logger          *slog.Logger
-	ShutdownTimeout time.Duration
-}
-
-// NewWorker creates a new worker with the given connection and configuration.
+// NewWorker creates a new worker with the given connection.
 // Use builder methods (AddTask, AddFlow, etc.) to configure the worker.
 // Call Start(ctx) to begin processing tasks and flows.
-func NewWorker(conn Conn, opts ...WorkerOpts) *Worker {
-	var resolved WorkerOpts
-	if len(opts) > 0 {
-		resolved = opts[0]
-	}
-
-	logger := resolved.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-
-	shutdownTimeout := resolved.ShutdownTimeout
-	if shutdownTimeout == 0 {
-		shutdownTimeout = 5 * time.Second
-	}
-
+func NewWorker(conn Conn) *Worker {
 	return &Worker{
 		id:              uuid.NewString(),
 		conn:            conn,
-		logger:          logger,
-		shutdownTimeout: shutdownTimeout,
+		logger:          slog.Default(),
+		shutdownTimeout: 5 * time.Second,
 	}
+}
+
+// Logger sets the worker logger.
+func (w *Worker) Logger(logger *slog.Logger) *Worker {
+	if logger == nil {
+		w.logger = slog.Default()
+		return w
+	}
+	w.logger = logger
+	return w
+}
+
+// ShutdownTimeout sets the graceful shutdown timeout.
+// A value <= 0 disables graceful waiting and cancels handlers immediately.
+func (w *Worker) ShutdownTimeout(timeout time.Duration) *Worker {
+	w.shutdownTimeout = timeout
+	return w
 }
 
 // AddTask registers a task with the worker.
@@ -427,7 +423,7 @@ func (w *taskWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 	}
 
 	runClaimLoop(shutdownCtx, handlerCtx, wg, claimLoopConfig[taskClaim]{
-		concurrency: h.Concurrency,
+		concurrency: h.concurrency,
 		pollClaims:  w.pollClaims,
 		handleClaim: w.handle,
 		onPolled:    w.markInFlight,
@@ -461,7 +457,7 @@ func (w *taskWorker) pollClaims(ctx context.Context) ([]taskClaim, error) {
 
 	q := `SELECT id, attempts, input FROM cb_poll_tasks(name => $1, quantity => $2, hide_for => $3, poll_for => $4, poll_interval => $5);`
 
-	rows, err := queryWithRetry(ctx, w.conn, q, w.task.name, h.BatchSize, (10 * time.Minute).Milliseconds(), defaultPollFor.Milliseconds(), defaultPollInterval.Milliseconds())
+	rows, err := queryWithRetry(ctx, w.conn, q, w.task.name, h.batchSize, (10 * time.Minute).Milliseconds(), defaultPollFor.Milliseconds(), defaultPollInterval.Milliseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -496,8 +492,8 @@ func (w *taskWorker) handle(ctx context.Context, msg taskClaim) {
 		return
 	}
 
-	if h.CircuitBreaker != nil {
-		allowed, delay := h.CircuitBreaker.Allow(time.Now())
+	if h.circuitBreaker != nil {
+		allowed, delay := h.circuitBreaker.Allow(time.Now())
 		if !allowed {
 			if delay <= 0 {
 				delay = time.Second
@@ -516,7 +512,7 @@ func (w *taskWorker) handle(ctx context.Context, msg taskClaim) {
 		"input", string(msg.Input),
 	)
 
-	out, err := runWithTimeout(handlerCtx, h.Timeout, func(fnCtx context.Context) ([]byte, error) {
+	out, err := runWithTimeout(handlerCtx, h.timeout, func(fnCtx context.Context) ([]byte, error) {
 		return runSafely("task handler panic", func() ([]byte, error) {
 			inputJSON, marshalErr := json.Marshal(msg.Input)
 			if marshalErr != nil {
@@ -532,23 +528,23 @@ func (w *taskWorker) handle(ctx context.Context, msg taskClaim) {
 			return
 		}
 
-		if h.CircuitBreaker != nil {
-			h.CircuitBreaker.RecordFailure(time.Now())
+		if h.circuitBreaker != nil {
+			h.circuitBreaker.RecordFailure(time.Now())
 		}
 		w.logger.ErrorContext(ctx, "worker: failed", "task", w.task.name, "error", err)
 
-		if msg.Attempts > h.MaxRetries {
+		if msg.Attempts > h.maxRetries {
 			failTaskRun(ctx, w.conn, w.logger, w.task.name, msg.ID, err.Error())
 		} else {
-			delay := nextRetryDelay(msg.Attempts-1, h.Backoff, 0, 0)
+			delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
 			hideTaskRuns(ctx, w.conn, w.logger, w.task.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay next task run")
 		}
 	} else {
 		if isCanceled() {
 			return
 		}
-		if h.CircuitBreaker != nil {
-			h.CircuitBreaker.RecordSuccess()
+		if h.circuitBreaker != nil {
+			h.circuitBreaker.RecordSuccess()
 		}
 		completeTaskRun(ctx, w.conn, w.logger, w.task.name, msg.ID, out)
 	}
@@ -599,7 +595,7 @@ func (w *stepWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.Wai
 	h := w.step.handlerOpts
 
 	runClaimLoop(shutdownCtx, handlerCtx, wg, claimLoopConfig[stepClaim]{
-		concurrency: h.Concurrency,
+		concurrency: h.concurrency,
 		pollClaims:  w.pollClaims,
 		handleClaim: w.handle,
 		onPolled:    w.markInFlight,
@@ -630,7 +626,7 @@ func (w *stepWorker) pollClaims(ctx context.Context) ([]stepClaim, error) {
 
 	q := `SELECT id, flow_run_id, attempts, input, step_outputs, signal_input FROM cb_poll_steps(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
 
-	rows, err := queryWithRetry(ctx, w.conn, q, w.flowName, w.step.name, h.BatchSize, (10 * time.Minute).Milliseconds(), defaultPollFor.Milliseconds(), defaultPollInterval.Milliseconds())
+	rows, err := queryWithRetry(ctx, w.conn, q, w.flowName, w.step.name, h.batchSize, (10 * time.Minute).Milliseconds(), defaultPollFor.Milliseconds(), defaultPollInterval.Milliseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -673,8 +669,8 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 	stopWatcher := watchFlowStop(claimCtx, 500*time.Millisecond, stopIfRequested)
 	defer stopWatcher()
 
-	if h.CircuitBreaker != nil {
-		allowed, delay := h.CircuitBreaker.Allow(time.Now())
+	if h.circuitBreaker != nil {
+		allowed, delay := h.circuitBreaker.Allow(time.Now())
 		if !allowed {
 			if delay <= 0 {
 				delay = time.Second
@@ -702,7 +698,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 			return
 		}
 
-		err := runWithTimeoutErr(handlerCtx, h.Timeout, func(fnCtx context.Context) error {
+		err := runWithTimeoutErr(handlerCtx, h.timeout, func(fnCtx context.Context) error {
 			_, reduceErr := runSafely("reducer panic", func() (struct{}, error) {
 				return struct{}{}, finalizeStepReduction(fnCtx, w.conn, w.logger, w.flowName, w.step, msg.ID)
 			})
@@ -714,21 +710,21 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 				return
 			}
 
-			if h.CircuitBreaker != nil {
-				h.CircuitBreaker.RecordFailure(time.Now())
+			if h.circuitBreaker != nil {
+				h.circuitBreaker.RecordFailure(time.Now())
 			}
 
-			if msg.Attempts > h.MaxRetries {
+			if msg.Attempts > h.maxRetries {
 				failStepRun(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, err.Error())
 			} else {
-				delay := nextRetryDelay(msg.Attempts-1, h.Backoff, 0, 0)
+				delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
 				hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay reduced map step retry")
 			}
 			return
 		}
 
-		if h.CircuitBreaker != nil {
-			h.CircuitBreaker.RecordSuccess()
+		if h.circuitBreaker != nil {
+			h.circuitBreaker.RecordSuccess()
 		}
 		return
 	}
@@ -741,21 +737,21 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 		if w.step.reducerFn != nil {
 			reductionReady, reductionReadyErr := generatorReductionReady(ctx, w.conn, w.flowName, w.step.name, msg.ID)
 			if reductionReadyErr != nil {
-				if h.CircuitBreaker != nil {
-					h.CircuitBreaker.RecordFailure(time.Now())
+				if h.circuitBreaker != nil {
+					h.circuitBreaker.RecordFailure(time.Now())
 				}
 				w.logger.ErrorContext(ctx, "worker: reducer readiness check failed", "flow", w.flowName, "step", w.step.name, "error", reductionReadyErr)
-				if msg.Attempts > h.MaxRetries {
+				if msg.Attempts > h.maxRetries {
 					failGeneratorStep(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, reductionReadyErr.Error())
 				} else {
-					delay := nextRetryDelay(msg.Attempts-1, h.Backoff, 0, 0)
+					delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
 					hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay reducer readiness retry")
 				}
 				return
 			}
 
 			if reductionReady {
-				err := runWithTimeoutErr(ctx, h.Timeout, func(fnCtx context.Context) error {
+				err := runWithTimeoutErr(ctx, h.timeout, func(fnCtx context.Context) error {
 					_, reduceErr := runSafely("reducer panic", func() (struct{}, error) {
 						return struct{}{}, finalizeStepReduction(fnCtx, w.conn, w.logger, w.flowName, w.step, msg.ID)
 					})
@@ -763,26 +759,26 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 				})
 
 				if err != nil {
-					if h.CircuitBreaker != nil {
-						h.CircuitBreaker.RecordFailure(time.Now())
+					if h.circuitBreaker != nil {
+						h.circuitBreaker.RecordFailure(time.Now())
 					}
-					if msg.Attempts > h.MaxRetries {
+					if msg.Attempts > h.maxRetries {
 						failGeneratorStep(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, err.Error())
 					} else {
-						delay := nextRetryDelay(msg.Attempts-1, h.Backoff, 0, 0)
+						delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
 						hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay reduced generator step retry")
 					}
 					return
 				}
 
-				if h.CircuitBreaker != nil {
-					h.CircuitBreaker.RecordSuccess()
+				if h.circuitBreaker != nil {
+					h.circuitBreaker.RecordSuccess()
 				}
 				return
 			}
 		}
 
-		err := runWithTimeoutErr(handlerCtx, h.Timeout, func(fnCtx context.Context) error {
+		err := runWithTimeoutErr(handlerCtx, h.timeout, func(fnCtx context.Context) error {
 			_, genErr := runSafely("generator handler panic", func() (struct{}, error) {
 				return struct{}{}, w.handleGeneratorClaim(fnCtx, msg)
 			})
@@ -794,27 +790,27 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 				return
 			}
 
-			if h.CircuitBreaker != nil {
-				h.CircuitBreaker.RecordFailure(time.Now())
+			if h.circuitBreaker != nil {
+				h.circuitBreaker.RecordFailure(time.Now())
 			}
 			w.logger.ErrorContext(ctx, "worker: generator failed", "flow", w.flowName, "step", w.step.name, "error", err)
 
-			if msg.Attempts > h.MaxRetries {
+			if msg.Attempts > h.maxRetries {
 				failGeneratorStep(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, err.Error())
 			} else {
-				delay := nextRetryDelay(msg.Attempts-1, h.Backoff, 0, 0)
+				delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
 				hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay generator step retry")
 			}
 			return
 		}
 
-		if h.CircuitBreaker != nil {
-			h.CircuitBreaker.RecordSuccess()
+		if h.circuitBreaker != nil {
+			h.circuitBreaker.RecordSuccess()
 		}
 		return
 	}
 
-	out, err := runWithTimeout(handlerCtx, h.Timeout, func(fnCtx context.Context) ([]byte, error) {
+	out, err := runWithTimeout(handlerCtx, h.timeout, func(fnCtx context.Context) ([]byte, error) {
 		return runSafely("step handler panic", func() ([]byte, error) {
 			inputJSON, marshalErr := json.Marshal(msg.Input)
 			if marshalErr != nil {
@@ -850,10 +846,10 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 			changed, status, completeErr := completeFlowEarly(ctx, w.conn, w.flowName, flowRunID, w.step.name, completion.output, completion.reason)
 			if completeErr != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot complete flow early", "flow", w.flowName, "step", w.step.name, "error", completeErr)
-				if msg.Attempts > h.MaxRetries {
+				if msg.Attempts > h.maxRetries {
 					failStepRun(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, completeErr.Error())
 				} else {
-					delay := nextRetryDelay(msg.Attempts-1, h.Backoff, 0, 0)
+					delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
 					hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay step after early completion error")
 				}
 				return
@@ -870,23 +866,23 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 			return
 		}
 
-		if h.CircuitBreaker != nil {
-			h.CircuitBreaker.RecordFailure(time.Now())
+		if h.circuitBreaker != nil {
+			h.circuitBreaker.RecordFailure(time.Now())
 		}
 		w.logger.ErrorContext(ctx, "worker: failed", "flow", w.flowName, "step", w.step.name, "error", err)
 
-		if msg.Attempts > h.MaxRetries {
+		if msg.Attempts > h.maxRetries {
 			failStepRun(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, err.Error())
 		} else {
-			delay := nextRetryDelay(msg.Attempts-1, h.Backoff, 0, 0)
+			delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
 			hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay next step run")
 		}
 	} else {
 		if stopIfRequested() {
 			return
 		}
-		if h.CircuitBreaker != nil {
-			h.CircuitBreaker.RecordSuccess()
+		if h.circuitBreaker != nil {
+			h.circuitBreaker.RecordSuccess()
 		}
 		completeStepRun(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, out)
 	}
@@ -959,7 +955,7 @@ func (w *stepWorker) handleGeneratorClaim(ctx context.Context, msg stepClaim) er
 		args = append(args, depPtr.Elem())
 	}
 
-	batchSize := w.step.handlerOpts.BatchSize
+	batchSize := w.step.handlerOpts.batchSize
 	if batchSize <= 0 {
 		batchSize = 100
 	}
@@ -1099,7 +1095,7 @@ func (w *mapStepWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.
 	h := w.step.handlerOpts
 
 	runClaimLoop(shutdownCtx, handlerCtx, wg, claimLoopConfig[mapTaskClaim]{
-		concurrency: h.Concurrency,
+		concurrency: h.concurrency,
 		pollClaims:  w.pollClaims,
 		handleClaim: w.handle,
 		onPolled:    w.markInFlight,
@@ -1129,7 +1125,7 @@ func (w *mapStepWorker) pollClaims(ctx context.Context) ([]mapTaskClaim, error) 
 	h := w.step.handlerOpts
 	q := `SELECT id, flow_run_id, attempts, input, step_outputs, signal_input, item FROM cb_poll_map_tasks(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4, poll_for => $5, poll_interval => $6);`
 
-	rows, err := queryWithRetry(ctx, w.conn, q, w.flowName, w.step.name, h.BatchSize, (10 * time.Minute).Milliseconds(), defaultPollFor.Milliseconds(), defaultPollInterval.Milliseconds())
+	rows, err := queryWithRetry(ctx, w.conn, q, w.flowName, w.step.name, h.batchSize, (10 * time.Minute).Milliseconds(), defaultPollFor.Milliseconds(), defaultPollInterval.Milliseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -1172,8 +1168,8 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 	stopWatcher := watchFlowStop(claimCtx, 500*time.Millisecond, stopIfRequested)
 	defer stopWatcher()
 
-	if h.CircuitBreaker != nil {
-		allowed, delay := h.CircuitBreaker.Allow(time.Now())
+	if h.circuitBreaker != nil {
+		allowed, delay := h.circuitBreaker.Allow(time.Now())
 		if !allowed {
 			if delay <= 0 {
 				delay = time.Second
@@ -1183,7 +1179,7 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 		}
 	}
 
-	itemOutput, err := runWithTimeout(handlerCtx, h.Timeout, func(fnCtx context.Context) (json.RawMessage, error) {
+	itemOutput, err := runWithTimeout(handlerCtx, h.timeout, func(fnCtx context.Context) (json.RawMessage, error) {
 		return runSafely("step handler panic", func() (json.RawMessage, error) {
 			if w.step.isGenerator {
 				if w.step.generatorHandler == nil {
@@ -1272,10 +1268,10 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 			changed, status, completeErr := completeFlowEarly(ctx, w.conn, w.flowName, flowRunID, w.step.name, completion.output, completion.reason)
 			if completeErr != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot complete flow early", "flow", w.flowName, "step", w.step.name, "error", completeErr)
-				if msg.Attempts > h.MaxRetries {
+				if msg.Attempts > h.maxRetries {
 					failMapTaskRun(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, completeErr.Error())
 				} else {
-					delay := nextRetryDelay(msg.Attempts-1, h.Backoff, 0, 0)
+					delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
 					hideMapTaskRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay map task after early completion error")
 				}
 				return
@@ -1292,21 +1288,21 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 			return
 		}
 
-		if h.CircuitBreaker != nil {
-			h.CircuitBreaker.RecordFailure(time.Now())
+		if h.circuitBreaker != nil {
+			h.circuitBreaker.RecordFailure(time.Now())
 		}
 
-		if msg.Attempts > h.MaxRetries {
+		if msg.Attempts > h.maxRetries {
 			failMapTaskRun(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, err.Error())
 		} else {
-			delay := nextRetryDelay(msg.Attempts-1, h.Backoff, 0, 0)
+			delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
 			hideMapTaskRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay map task retry")
 		}
 		return
 	}
 
-	if h.CircuitBreaker != nil {
-		h.CircuitBreaker.RecordSuccess()
+	if h.circuitBreaker != nil {
+		h.circuitBreaker.RecordSuccess()
 	}
 
 	if stopIfRequested() {
@@ -1987,7 +1983,7 @@ func (w *taskOnFailWorker) start(shutdownCtx, handlerCtx context.Context, wg *sy
 	h := w.task.onFailOpts
 
 	runClaimLoop(shutdownCtx, handlerCtx, wg, claimLoopConfig[taskOnFailClaim]{
-		concurrency:    h.Concurrency,
+		concurrency:    h.concurrency,
 		pollClaims:     w.pollClaims,
 		handleClaim:    w.handle,
 		emptyPollDelay: 500 * time.Millisecond,
@@ -2001,7 +1997,7 @@ func (w *taskOnFailWorker) pollClaims(ctx context.Context) ([]taskOnFailClaim, e
 	h := w.task.onFailOpts
 	q := `SELECT * FROM cb_poll_task_on_fail($1, $2);`
 
-	rows, err := queryWithRetry(ctx, w.conn, q, w.task.name, h.BatchSize)
+	rows, err := queryWithRetry(ctx, w.conn, q, w.task.name, h.batchSize)
 	if err != nil {
 		return nil, err
 	}
@@ -2024,7 +2020,7 @@ func (w *taskOnFailWorker) handle(ctx context.Context, claim taskOnFailClaim) {
 		IdempotencyKey: claim.IdempotencyKey,
 	}
 
-	err := runWithTimeoutErr(ctx, h.Timeout, func(fnCtx context.Context) error {
+	err := runWithTimeoutErr(ctx, h.timeout, func(fnCtx context.Context) error {
 		return w.task.onFail(fnCtx, claim.Input, failure)
 	})
 
@@ -2033,8 +2029,8 @@ func (w *taskOnFailWorker) handle(ctx context.Context, claim taskOnFailClaim) {
 		return
 	}
 
-	exhausted := claim.OnFailAttempts > h.MaxRetries
-	delay := nextRetryDelay(claim.OnFailAttempts-1, h.Backoff, 250*time.Millisecond, 5*time.Second)
+	exhausted := claim.OnFailAttempts > h.maxRetries
+	delay := nextRetryDelay(claim.OnFailAttempts-1, h.backoff, 250*time.Millisecond, 5*time.Second)
 	failTaskOnFail(ctx, w.conn, w.logger, w.task.name, claim.ID, err.Error(), exhausted, delay.Milliseconds())
 }
 
@@ -2109,7 +2105,7 @@ func (w *flowOnFailWorker) start(shutdownCtx, handlerCtx context.Context, wg *sy
 	h := w.flow.onFailOpts
 
 	runClaimLoop(shutdownCtx, handlerCtx, wg, claimLoopConfig[flowOnFailClaim]{
-		concurrency:    h.Concurrency,
+		concurrency:    h.concurrency,
 		pollClaims:     w.pollClaims,
 		handleClaim:    w.handle,
 		emptyPollDelay: 500 * time.Millisecond,
@@ -2123,7 +2119,7 @@ func (w *flowOnFailWorker) pollClaims(ctx context.Context) ([]flowOnFailClaim, e
 	h := w.flow.onFailOpts
 	q := `SELECT * FROM cb_poll_flow_on_fail($1, $2);`
 
-	rows, err := queryWithRetry(ctx, w.conn, q, w.flow.name, h.BatchSize)
+	rows, err := queryWithRetry(ctx, w.conn, q, w.flow.name, h.batchSize)
 	if err != nil {
 		return nil, err
 	}
@@ -2158,7 +2154,7 @@ func (w *flowOnFailWorker) handle(ctx context.Context, claim flowOnFailClaim) {
 		}
 	}
 
-	err := runWithTimeoutErr(ctx, h.Timeout, func(fnCtx context.Context) error {
+	err := runWithTimeoutErr(ctx, h.timeout, func(fnCtx context.Context) error {
 		return w.flow.onFail(fnCtx, claim.Input, failure)
 	})
 
@@ -2167,8 +2163,8 @@ func (w *flowOnFailWorker) handle(ctx context.Context, claim flowOnFailClaim) {
 		return
 	}
 
-	exhausted := claim.OnFailAttempts > h.MaxRetries
-	delay := nextRetryDelay(claim.OnFailAttempts-1, h.Backoff, 250*time.Millisecond, 5*time.Second)
+	exhausted := claim.OnFailAttempts > h.maxRetries
+	delay := nextRetryDelay(claim.OnFailAttempts-1, h.backoff, 250*time.Millisecond, 5*time.Second)
 	failFlowOnFail(ctx, w.conn, w.logger, w.flow.name, claim.ID, err.Error(), exhausted, delay.Milliseconds())
 }
 

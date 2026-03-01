@@ -20,9 +20,9 @@ type Task struct {
 	description string
 	condition   string
 	handler     func(context.Context, json.RawMessage) (json.RawMessage, error)
-	handlerOpts *HandlerOpts
+	handlerOpts *handlerOpts
 	onFail      func(context.Context, json.RawMessage, TaskFailure) error
-	onFailOpts  *HandlerOpts
+	onFailOpts  *handlerOpts
 }
 
 type TaskFailure struct {
@@ -58,7 +58,7 @@ func (t *Task) Description(description string) *Task {
 // Handler sets the task handler function and execution options.
 // fn must have signature (context.Context, In) (Out, error).
 // If opts is omitted, defaults are used (concurrency: 4, batchSize: 64, timeout: 30s, maxRetries: 2 with full-jitter backoff 100ms-2s).
-func (t *Task) Handler(fn any, opts ...HandlerOpts) *Task {
+func (t *Task) Handler(fn any, opts ...HandlerOpt) *Task {
 	handler, err := makeTaskHandler(fn, t.name)
 	if err != nil {
 		panic(err)
@@ -71,7 +71,7 @@ func (t *Task) Handler(fn any, opts ...HandlerOpts) *Task {
 // OnFail sets a task failure handler and execution options.
 // fn must have signature (context.Context, In, TaskFailure) error.
 // If opts is omitted, defaults are used (concurrency: 4, batchSize: 64, timeout: 30s, maxRetries: 2 with full-jitter backoff 100ms-2s).
-func (t *Task) OnFail(fn any, opts ...HandlerOpts) *Task {
+func (t *Task) OnFail(fn any, opts ...HandlerOpt) *Task {
 	handler, err := makeTaskOnFailHandler(fn)
 	if err != nil {
 		panic(err)
@@ -79,20 +79,6 @@ func (t *Task) OnFail(fn any, opts ...HandlerOpts) *Task {
 	t.onFail = handler
 	t.onFailOpts = applyDefaultHandlerOpts(opts...)
 	return t
-}
-
-// MarshalJSON serializes the task for JSON output
-func (t *Task) MarshalJSON() ([]byte, error) {
-	type serializableTask struct {
-		Name        string `json:"name"`
-		Description string `json:"description,omitempty"`
-		Condition   string `json:"condition,omitempty"`
-	}
-	return json.Marshal(serializableTask{
-		Name:        t.name,
-		Description: t.description,
-		Condition:   t.condition,
-	})
 }
 
 // makeTaskHandler uses reflection once to extract types and create cached wrapper
@@ -552,19 +538,16 @@ func scanTask(row pgx.Row) (*TaskInfo, error) {
 }
 
 // CreateTaskSchedule creates a cron-based schedule for a task.
-func CreateTaskSchedule(ctx context.Context, conn Conn, taskName, cronSpec string, opts ...ScheduleOpts) error {
+func CreateTaskSchedule(ctx context.Context, conn Conn, taskName, cronSpec string, opts ...ScheduleOpt) error {
 	var inputJSON []byte
 	var err error
 
-	var resolved ScheduleOpts
-	if len(opts) > 0 {
-		resolved = opts[0]
-	}
+	resolved := applyDefaultScheduleOpts(opts...)
 
-	if resolved.Input == nil {
+	if resolved.input == nil {
 		inputJSON = []byte("{}")
 	} else {
-		inputJSON, err = json.Marshal(resolved.Input)
+		inputJSON, err = json.Marshal(resolved.input)
 		if err != nil {
 			return fmt.Errorf("failed to marshal task schedule input: %w", err)
 		}

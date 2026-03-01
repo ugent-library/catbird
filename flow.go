@@ -25,7 +25,7 @@ type Flow struct {
 	outputPriority     []string
 	priorityConfigured bool
 	onFail             func(context.Context, json.RawMessage, FlowFailure) error
-	onFailOpts         *HandlerOpts
+	onFailOpts         *handlerOpts
 }
 
 type FlowFailure struct {
@@ -73,7 +73,7 @@ func (f *Flow) OutputPriority(stepNames ...string) *Flow {
 // OnFail sets a flow failure handler and execution options.
 // fn must have signature (context.Context, In, FlowFailure) error.
 // If opts is omitted, defaults are used (concurrency: 4, batchSize: 64, timeout: 30s, maxRetries: 2 with full-jitter backoff 100ms-2s).
-func (f *Flow) OnFail(fn any, opts ...HandlerOpts) *Flow {
+func (f *Flow) OnFail(fn any, opts ...HandlerOpt) *Flow {
 	handler, err := makeFlowOnFailHandler(fn)
 	if err != nil {
 		panic(err)
@@ -159,7 +159,7 @@ type Step struct {
 	condition            string
 	hasSignal            bool
 	handler              func(context.Context, []byte, map[string][]byte, []byte) ([]byte, error)
-	handlerOpts          *HandlerOpts
+	handlerOpts          *handlerOpts
 }
 
 func NewStep(name string) *Step {
@@ -260,7 +260,7 @@ func (s *Step) Generator(fn any) *Step {
 	return s
 }
 
-func (s *Step) Handler(fn any, opts ...HandlerOpts) *Step {
+func (s *Step) Handler(fn any, opts ...HandlerOpt) *Step {
 	if s.isGenerator {
 		itemType, outputType, err := parseGeneratorHandlerFn(fn, s.name)
 		if err != nil {
@@ -1466,7 +1466,7 @@ func GetFlowRunSteps(ctx context.Context, conn Conn, flowName string, flowRunID 
 }
 
 // SignalFlow delivers a signal to a waiting step in a flow run.
-// The step must have been defined with a signal variant (e.g., NewStepWithSignal, NewStepWithSignalAndDependency).
+// The step must have been defined with `.Signal()`.
 // Signals enable human-in-the-loop workflows where a step waits for external input before executing.
 // Returns an error if the signal was already delivered or the step doesn't require a signal.
 func SignalFlow(ctx context.Context, conn Conn, flowName string, flowRunID int64, stepName string, input any) error {
@@ -1543,19 +1543,16 @@ func defaultFlowOutputPriority(flow *Flow) []string {
 }
 
 // CreateFlowSchedule creates a cron-based schedule for a flow.
-func CreateFlowSchedule(ctx context.Context, conn Conn, flowName, cronSpec string, opts ...ScheduleOpts) error {
+func CreateFlowSchedule(ctx context.Context, conn Conn, flowName, cronSpec string, opts ...ScheduleOpt) error {
 	var inputJSON []byte
 	var err error
 
-	var resolved ScheduleOpts
-	if len(opts) > 0 {
-		resolved = opts[0]
-	}
+	resolved := applyDefaultScheduleOpts(opts...)
 
-	if resolved.Input == nil {
+	if resolved.input == nil {
 		inputJSON = []byte("{}")
 	} else {
-		inputJSON, err = json.Marshal(resolved.Input)
+		inputJSON, err = json.Marshal(resolved.input)
 		if err != nil {
 			return fmt.Errorf("failed to marshal flow schedule input: %w", err)
 		}

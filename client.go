@@ -191,8 +191,8 @@ func (c *Client) SignalFlow(ctx context.Context, flowName string, flowRunID int6
 // NewWorker creates a new worker that processes task and flow executions.
 // Use the builder pattern methods (AddTask, AddFlow, etc.) to configure,
 // then call Start(ctx) to begin processing.
-func (c *Client) NewWorker(ctx context.Context, opts ...WorkerOpts) *Worker {
-	return NewWorker(c.Conn, opts...)
+func (c *Client) NewWorker(ctx context.Context) *Worker {
+	return NewWorker(c.Conn)
 }
 
 // ListWorkers returns all registered workers.
@@ -202,15 +202,15 @@ func (c *Client) ListWorkers(ctx context.Context) ([]*WorkerInfo, error) {
 
 // CreateTaskSchedule creates a cron-based schedule for a task.
 // cronSpec should be in 5-field format (min hour day month dow) or descriptors like @hourly, @daily.
-// opts is optional ScheduleOpts configuring the schedule (Input field for static input).
-func (c *Client) CreateTaskSchedule(ctx context.Context, taskName, cronSpec string, opts ...ScheduleOpts) error {
+// opts are optional ScheduleOpt values configuring the schedule.
+func (c *Client) CreateTaskSchedule(ctx context.Context, taskName, cronSpec string, opts ...ScheduleOpt) error {
 	return CreateTaskSchedule(ctx, c.Conn, taskName, cronSpec, opts...)
 }
 
 // CreateFlowSchedule creates a cron-based schedule for a flow.
 // cronSpec should be in 5-field format (min hour day month dow) or descriptors like @hourly, @daily.
-// opts is optional ScheduleOpts configuring the schedule (Input field for static input).
-func (c *Client) CreateFlowSchedule(ctx context.Context, flowName, cronSpec string, opts ...ScheduleOpts) error {
+// opts are optional ScheduleOpt values configuring the schedule.
+func (c *Client) CreateFlowSchedule(ctx context.Context, flowName, cronSpec string, opts ...ScheduleOpt) error {
 	return CreateFlowSchedule(ctx, c.Conn, flowName, cronSpec, opts...)
 }
 

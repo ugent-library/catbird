@@ -904,7 +904,9 @@ func TestFlowMapStepConcurrentWorkersSlow(t *testing.T) {
 
 	// Start multiple workers for same flow to stress DB claim concurrency.
 	for i := 0; i < 4; i++ {
-		worker := client.NewWorker(t.Context(), WorkerOpts{Logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))}).AddFlow(flow)
+		worker := client.NewWorker(t.Context()).
+			Logger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))).
+			AddFlow(flow)
 		startTestWorker(t, worker)
 	}
 
@@ -1408,7 +1410,8 @@ func TestFlowComplexDependencies(t *testing.T) {
 	}
 
 	// Start worker to execute flow
-	worker := client.NewWorker(t.Context(), WorkerOpts{Logger: logger}).
+	worker := client.NewWorker(t.Context()).
+		Logger(logger).
 		AddFlow(flow)
 
 	startTestWorker(t, worker)
@@ -1501,11 +1504,11 @@ func TestStepCircuitBreaker(t *testing.T) {
 					return "", fmt.Errorf("intentional failure")
 				}
 				return "ok", nil
-			}, HandlerOpts{
-				MaxRetries:     2,
-				Backoff:        NewFullJitterBackoff(minBackoff, maxBackoff),
-				CircuitBreaker: &CircuitBreaker{failureThreshold: 1, openTimeout: openTimeout},
-			}))
+			},
+			WithMaxRetries(2),
+			WithFullJitterBackoff(minBackoff, maxBackoff),
+			WithCircuitBreaker(1, openTimeout),
+		))
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 
@@ -2483,7 +2486,7 @@ func TestFlowFailStopsInFlightParallelStep(t *testing.T) {
 				return "", ctx.Err()
 			}
 			return "", fmt.Errorf("intentional failure")
-		})).
+		}, WithMaxRetries(0))).
 		AddStep(NewStep("final").
 			DependsOn("long_running", "fail_fast").
 			Handler(func(ctx context.Context, in string, longOut string, failOut string) (string, error) {
