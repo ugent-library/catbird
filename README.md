@@ -17,7 +17,7 @@ A PostgreSQL-powered message queue and task execution engine. Catbird brings rel
 - **Workflows as DAGs**: dependencies, branching, and data passing between steps.
 - **Persistence and auditability**: queues, runs, and results live in PostgreSQL.
 - **Resiliency baked in**: retries, backoff, optional circuit breakers.
-- **Operational UX**: web dashboard for runs, queues, and workers.
+- **Operational UX**: web dashboard and tui for runs, queues, and workers.
 
 <p align="center">
   <img src="assets/screenshots/dashboard-flows.png" alt="Flow Visualization" width="800" />
