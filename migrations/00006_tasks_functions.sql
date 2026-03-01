@@ -77,6 +77,7 @@ BEGIN
             status text NOT NULL DEFAULT 'queued',
             attempts int NOT NULL DEFAULT 0,
             input jsonb NOT NULL,
+            headers jsonb,
             output jsonb,
             error_message text,
             on_fail_status text,
@@ -102,7 +103,8 @@ BEGIN
             CONSTRAINT canceled_at_is_after_started_at CHECK (canceled_at IS NULL OR canceled_at >= started_at),
             CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
             CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = ''))),
-            CONSTRAINT on_fail_status_valid CHECK (on_fail_status IS NULL OR on_fail_status IN ('queued', 'started', 'completed', 'failed'))
+            CONSTRAINT on_fail_status_valid CHECK (on_fail_status IS NULL OR on_fail_status IN ('queued', 'started', 'completed', 'failed')),
+            CONSTRAINT headers_is_object CHECK (headers IS NULL OR jsonb_typeof(headers) = 'object')
         )
         $QUERY$,
         _create_table_stmt,
@@ -202,6 +204,7 @@ CREATE OR REPLACE FUNCTION cb_run_task(
     input jsonb,
     concurrency_key text = NULL,
     idempotency_key text = NULL,
+    headers jsonb = NULL,
     visible_at timestamptz = NULL
 )
 RETURNS bigint
@@ -216,6 +219,10 @@ BEGIN
         RAISE EXCEPTION 'cb: cannot specify both concurrency_key and idempotency_key';
     END IF;
 
+    IF cb_run_task.headers IS NOT NULL AND jsonb_typeof(cb_run_task.headers) <> 'object' THEN
+        RAISE EXCEPTION 'cb: headers must be a JSON object';
+    END IF;
+
     -- ON CONFLICT DO UPDATE with WHERE FALSE: atomic insert + return conflicting row ID.
     -- WHERE FALSE prevents the update from executing, but RETURNING still returns the conflict row.
     -- Use UNION ALL to handle both INSERT success and conflict cases atomically.
@@ -225,8 +232,8 @@ BEGIN
         EXECUTE format(
             $QUERY$
             WITH ins AS (
-                INSERT INTO %I (input, concurrency_key, visible_at)
-                VALUES ($1, $2, $3)
+                INSERT INTO %I (input, concurrency_key, headers, visible_at)
+                VALUES ($1, $2, $3, $4)
                 ON CONFLICT (concurrency_key) WHERE concurrency_key IS NOT NULL AND status IN ('queued', 'started')
                 DO UPDATE SET status = EXCLUDED.status WHERE FALSE
                 RETURNING id
@@ -239,15 +246,15 @@ BEGIN
             $QUERY$,
             _t_table, _t_table
         )
-        USING cb_run_task.input, cb_run_task.concurrency_key, coalesce(cb_run_task.visible_at, now())
+        USING cb_run_task.input, cb_run_task.concurrency_key, cb_run_task.headers, coalesce(cb_run_task.visible_at, now())
         INTO _id;
     ELSIF cb_run_task.idempotency_key IS NOT NULL THEN
         -- Idempotency: dedupe queued/started/completed
         EXECUTE format(
             $QUERY$
             WITH ins AS (
-                INSERT INTO %I (input, idempotency_key, visible_at)
-                VALUES ($1, $2, $3)
+                INSERT INTO %I (input, idempotency_key, headers, visible_at)
+                VALUES ($1, $2, $3, $4)
                 ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('queued', 'started', 'completed')
                 DO UPDATE SET status = EXCLUDED.status WHERE FALSE
                 RETURNING id
@@ -260,19 +267,19 @@ BEGIN
             $QUERY$,
             _t_table, _t_table
         )
-        USING cb_run_task.input, cb_run_task.idempotency_key, coalesce(cb_run_task.visible_at, now())
+        USING cb_run_task.input, cb_run_task.idempotency_key, cb_run_task.headers, coalesce(cb_run_task.visible_at, now())
         INTO _id;
     ELSE
         -- No deduplication
         EXECUTE format(
             $QUERY$
-            INSERT INTO %I (input, visible_at)
-            VALUES ($1, $2)
+            INSERT INTO %I (input, headers, visible_at)
+            VALUES ($1, $2, $3)
             RETURNING id
             $QUERY$,
             _t_table
         )
-        USING cb_run_task.input, coalesce(cb_run_task.visible_at, now())
+        USING cb_run_task.input, cb_run_task.headers, coalesce(cb_run_task.visible_at, now())
         INTO _id;
     END IF;
 
@@ -721,5 +728,5 @@ DROP FUNCTION IF EXISTS cb_complete_task(text, bigint, jsonb);
 DROP FUNCTION IF EXISTS cb_wait_task_output(text, bigint, int, int);
 DROP FUNCTION IF EXISTS cb_hide_tasks(text, bigint[], integer);
 DROP FUNCTION IF EXISTS cb_poll_tasks(text, int, int, int, int);
-DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text, text, timestamptz);
+DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text, text, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_create_task(text, text, text, boolean);

@@ -35,13 +35,13 @@ func TestRunFlowQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedQuery := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, visible_at => $5);`
+	expectedQuery := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, headers => $5, visible_at => $6);`
 	if query != expectedQuery {
 		t.Fatalf("unexpected query: %s", query)
 	}
 
-	if len(args) != 5 {
-		t.Fatalf("expected 5 args, got %d", len(args))
+	if len(args) != 6 {
+		t.Fatalf("expected 6 args, got %d", len(args))
 	}
 
 	if gotName, ok := args[0].(string); !ok || gotName != "test_flow" {
@@ -60,16 +60,20 @@ func TestRunFlowQuery(t *testing.T) {
 		t.Fatalf("unexpected idempotency key arg: %#v", args[3])
 	}
 
-	if gotVisibleAt, ok := args[4].(*time.Time); !ok || gotVisibleAt == nil || !gotVisibleAt.Equal(time.Unix(1700000300, 0).UTC()) {
-		t.Fatalf("unexpected visible_at arg: %#v", args[4])
+	if gotHeaders, ok := args[4].(json.RawMessage); !ok || gotHeaders != nil {
+		t.Fatalf("expected nil headers arg: %#v", args[4])
+	}
+
+	if gotVisibleAt, ok := args[5].(*time.Time); !ok || gotVisibleAt == nil || !gotVisibleAt.Equal(time.Unix(1700000300, 0).UTC()) {
+		t.Fatalf("unexpected visible_at arg: %#v", args[5])
 	}
 
 	_, nilArgs, err := RunFlowQuery("test_flow", input{Value: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nilArgs) != 5 {
-		t.Fatalf("expected 5 args for nil opts, got %d", len(nilArgs))
+	if len(nilArgs) != 6 {
+		t.Fatalf("expected 6 args for nil opts, got %d", len(nilArgs))
 	}
 	if gotConcurrencyKey, ok := nilArgs[2].(*string); !ok || gotConcurrencyKey != nil {
 		t.Fatalf("expected nil *string concurrency key arg for nil opts, got %#v", nilArgs[2])
@@ -77,8 +81,11 @@ func TestRunFlowQuery(t *testing.T) {
 	if gotIdempotencyKey, ok := nilArgs[3].(*string); !ok || gotIdempotencyKey != nil {
 		t.Fatalf("expected nil *string idempotency key arg for nil opts, got %#v", nilArgs[3])
 	}
-	if gotVisibleAt, ok := nilArgs[4].(*time.Time); !ok || gotVisibleAt != nil {
-		t.Fatalf("expected nil *time.Time visible_at arg for nil opts, got %#v", nilArgs[4])
+	if gotHeaders, ok := nilArgs[4].(json.RawMessage); !ok || gotHeaders != nil {
+		t.Fatalf("expected nil headers arg for nil opts, got %#v", nilArgs[4])
+	}
+	if gotVisibleAt, ok := nilArgs[5].(*time.Time); !ok || gotVisibleAt != nil {
+		t.Fatalf("expected nil *time.Time visible_at arg for nil opts, got %#v", nilArgs[5])
 	}
 }
 
@@ -256,6 +263,80 @@ func TestFlowRunDelayedVisibleAt(t *testing.T) {
 	}
 	if out != "input processed" {
 		t.Fatalf("unexpected output: %s", out)
+	}
+}
+
+func TestFlowRunHeadersRoundTrip(t *testing.T) {
+	client := getTestClient(t)
+
+	flowName := testFlowName(t, "flow_headers_roundtrip")
+	flow := NewFlow(flowName).
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
+			return in, nil
+		}))
+
+	if err := client.CreateFlow(t.Context(), flow); err != nil {
+		t.Fatal(err)
+	}
+
+	headers := map[string]any{
+		"trace_id": "trc-flow-1",
+		"source":   "scheduler",
+	}
+
+	h, err := client.RunFlow(t.Context(), flowName, "input", RunFlowOpts{
+		Headers:   headers,
+		VisibleAt: time.Now().Add(3 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runInfo, err := client.GetFlowRun(t.Context(), flowName, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(runInfo.Headers) == 0 {
+		t.Fatal("expected flow run headers to be present")
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(runInfo.Headers, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got["trace_id"] != "trc-flow-1" {
+		t.Fatalf("unexpected trace_id header: %#v", got["trace_id"])
+	}
+	if got["source"] != "scheduler" {
+		t.Fatalf("unexpected source header: %#v", got["source"])
+	}
+}
+
+func TestFlowRunHeadersMustBeJSONObject(t *testing.T) {
+	client := getTestClient(t)
+
+	flowName := testFlowName(t, "headers_validation_flow")
+	flow := NewFlow(flowName).
+		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
+			return in, nil
+		}))
+
+	if err := client.CreateFlow(t.Context(), flow); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := client.Conn.Exec(
+		t.Context(),
+		`SELECT cb_run_flow(name => $1, input => '{}'::jsonb, headers => '[]'::jsonb);`,
+		flowName,
+	)
+	if err == nil {
+		t.Fatal("expected cb_run_flow to reject non-object headers")
+	}
+	if !strings.Contains(err.Error(), "headers must be a JSON object") {
+		t.Fatalf("unexpected cb_run_flow error: %v", err)
 	}
 }
 

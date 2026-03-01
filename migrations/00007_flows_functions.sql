@@ -315,6 +315,7 @@ BEGIN
       status text NOT NULL DEFAULT 'started',
       remaining_steps int NOT NULL DEFAULT 0,
       input jsonb NOT NULL,
+      headers jsonb,
       output_priority text[] NOT NULL,
       output jsonb,
       error_message text,
@@ -345,7 +346,8 @@ BEGIN
       CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
       CONSTRAINT output_priority_not_empty CHECK (cardinality(output_priority) > 0),
       CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = ''))),
-      CONSTRAINT on_fail_status_valid CHECK (on_fail_status IS NULL OR on_fail_status IN ('queued', 'started', 'completed', 'failed'))
+      CONSTRAINT on_fail_status_valid CHECK (on_fail_status IS NULL OR on_fail_status IN ('queued', 'started', 'completed', 'failed')),
+      CONSTRAINT headers_is_object CHECK (headers IS NULL OR jsonb_typeof(headers) = 'object')
     )
     $QUERY$,
     _create_table_stmt,
@@ -461,6 +463,7 @@ CREATE OR REPLACE FUNCTION cb_run_flow(
     input jsonb,
     concurrency_key text = NULL,
     idempotency_key text = NULL,
+  headers jsonb = NULL,
     visible_at timestamptz = NULL
 )
 RETURNS bigint
@@ -478,6 +481,10 @@ BEGIN
         RAISE EXCEPTION 'cb: cannot specify both concurrency_key and idempotency_key';
     END IF;
 
+    IF cb_run_flow.headers IS NOT NULL AND jsonb_typeof(cb_run_flow.headers) <> 'object' THEN
+      RAISE EXCEPTION 'cb: headers must be a JSON object';
+    END IF;
+
     -- Read run initialization metadata once.
     SELECT f.step_count, f.output_priority
     INTO _remaining_steps, _output_priority
@@ -493,8 +500,8 @@ BEGIN
         EXECUTE format(
             $QUERY$
             WITH ins AS (
-              INSERT INTO %I (concurrency_key, input, remaining_steps, output_priority, status)
-              VALUES ($1, $2, $3, $4, 'started')
+              INSERT INTO %I (concurrency_key, input, headers, remaining_steps, output_priority, status)
+              VALUES ($1, $2, $3, $4, $5, 'started')
                 ON CONFLICT (concurrency_key) WHERE concurrency_key IS NOT NULL AND status = 'started'
                 DO UPDATE SET status = EXCLUDED.status WHERE FALSE
                 RETURNING id
@@ -507,15 +514,15 @@ BEGIN
             $QUERY$,
             _f_table, _f_table
         )
-        USING cb_run_flow.concurrency_key, cb_run_flow.input, _remaining_steps, _output_priority
+        USING cb_run_flow.concurrency_key, cb_run_flow.input, cb_run_flow.headers, _remaining_steps, _output_priority
         INTO _id;
     ELSIF cb_run_flow.idempotency_key IS NOT NULL THEN
         -- Idempotency: dedupe started/completed
         EXECUTE format(
             $QUERY$
             WITH ins AS (
-              INSERT INTO %I (idempotency_key, input, remaining_steps, output_priority, status)
-              VALUES ($1, $2, $3, $4, 'started')
+              INSERT INTO %I (idempotency_key, input, headers, remaining_steps, output_priority, status)
+              VALUES ($1, $2, $3, $4, $5, 'started')
                 ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('started', 'completed')
                 DO UPDATE SET status = EXCLUDED.status WHERE FALSE
                 RETURNING id
@@ -528,19 +535,19 @@ BEGIN
             $QUERY$,
             _f_table, _f_table
         )
-        USING cb_run_flow.idempotency_key, cb_run_flow.input, _remaining_steps, _output_priority
+        USING cb_run_flow.idempotency_key, cb_run_flow.input, cb_run_flow.headers, _remaining_steps, _output_priority
         INTO _id;
     ELSE
         -- No deduplication
         EXECUTE format(
             $QUERY$
-          INSERT INTO %I (input, remaining_steps, output_priority, status)
-          VALUES ($1, $2, $3, 'started')
+          INSERT INTO %I (input, headers, remaining_steps, output_priority, status)
+          VALUES ($1, $2, $3, $4, 'started')
             RETURNING id
             $QUERY$,
             _f_table
         )
-        USING cb_run_flow.input, _remaining_steps, _output_priority
+        USING cb_run_flow.input, cb_run_flow.headers, _remaining_steps, _output_priority
         INTO _id;
     END IF;
 
@@ -2708,5 +2715,5 @@ DROP FUNCTION IF EXISTS cb_poll_map_tasks(text, text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_hide_steps(text, text, bigint[], integer);
 DROP FUNCTION IF EXISTS cb_poll_steps(text, text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_start_steps(text, bigint, timestamptz);
-DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text, text, timestamptz);
+DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text, text, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_create_flow(text, text, jsonb, text[], boolean);

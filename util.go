@@ -167,3 +167,42 @@ func marshalPayloads(payloads []any) (pgtype.FlatArray[json.RawMessage], error) 
 
 	return encodedPayloads, nil
 }
+
+// marshalOptionalHeaders marshals an optional headers object to JSON.
+// Nil input maps to SQL NULL.
+func marshalOptionalHeaders(headers map[string]any) (json.RawMessage, error) {
+	if headers == nil {
+		return nil, nil
+	}
+
+	b, err := json.Marshal(headers)
+	if err != nil {
+		return nil, err
+	}
+
+	return json.RawMessage(b), nil
+}
+
+// marshalOptionalHeadersArray marshals optional per-message headers to JSON.
+// Nil input maps to SQL NULL, and nil entries map to NULL headers for corresponding messages.
+func marshalOptionalHeadersArray(headers []map[string]any) (pgtype.FlatArray[json.RawMessage], error) {
+	if headers == nil {
+		return nil, nil
+	}
+
+	encodedHeaders := make(pgtype.FlatArray[json.RawMessage], 0, len(headers))
+	for _, header := range headers {
+		if header == nil {
+			encodedHeaders = append(encodedHeaders, nil)
+			continue
+		}
+
+		b, err := json.Marshal(header)
+		if err != nil {
+			return nil, err
+		}
+		encodedHeaders = append(encodedHeaders, json.RawMessage(b))
+	}
+
+	return encodedHeaders, nil
+}

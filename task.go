@@ -222,6 +222,7 @@ type TaskRunInfo struct {
 	IdempotencyKey    string          `json:"idempotency_key,omitempty"`
 	Status            string          `json:"status"`
 	Input             json.RawMessage `json:"input,omitempty"`
+	Headers           json.RawMessage `json:"headers,omitempty"`
 	Output            json.RawMessage `json:"output,omitempty"`
 	ErrorMessage      string          `json:"error_message,omitempty"`
 	CancelReason      string          `json:"cancel_reason,omitempty"`
@@ -395,6 +396,7 @@ func ListTasks(ctx context.Context, conn Conn) ([]*TaskInfo, error) {
 type RunTaskOpts struct {
 	ConcurrencyKey string // Prevents overlapping runs; allows reruns after completion
 	IdempotencyKey string // Prevents all duplicate runs; permanent across all statuses
+	Headers        map[string]any
 	VisibleAt      time.Time
 }
 
@@ -427,9 +429,13 @@ func RunTaskQuery(taskName string, input any, opts ...RunTaskOpts) (string, []an
 	if err != nil {
 		return "", nil, err
 	}
+	headers, err := marshalOptionalHeaders(resolved.Headers)
+	if err != nil {
+		return "", nil, err
+	}
 
-	q := `SELECT * FROM cb_run_task(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, visible_at => $5);`
-	args := []any{taskName, b, ptrOrNil(resolved.ConcurrencyKey), ptrOrNil(resolved.IdempotencyKey), ptrOrNil(resolved.VisibleAt)}
+	q := `SELECT * FROM cb_run_task(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, headers => $5, visible_at => $6);`
+	args := []any{taskName, b, ptrOrNil(resolved.ConcurrencyKey), ptrOrNil(resolved.IdempotencyKey), headers, ptrOrNil(resolved.VisibleAt)}
 
 	return q, args, nil
 }
@@ -437,14 +443,14 @@ func RunTaskQuery(taskName string, input any, opts ...RunTaskOpts) (string, []an
 // GetTaskRun retrieves a specific task run result by ID.
 func GetTaskRun(ctx context.Context, conn Conn, taskName string, taskRunID int64) (*TaskRunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(taskName))
-	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at, skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at, skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
 	return scanTaskRun(conn.QueryRow(ctx, query, taskRunID))
 }
 
 // ListTaskRuns returns recent task runs for the specified task.
 func ListTaskRuns(ctx context.Context, conn Conn, taskName string) ([]*TaskRunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(taskName))
-	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at, skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at, skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, err
@@ -462,6 +468,7 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 	var concurrencyKey *string
 	var idempotencyKey *string
 	var input *json.RawMessage
+	var headers *json.RawMessage
 	var output *json.RawMessage
 	var errorMessage *string
 	var cancelReason *string
@@ -477,6 +484,7 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 		&idempotencyKey,
 		&rec.Status,
 		&input,
+		&headers,
 		&output,
 		&errorMessage,
 		&cancelReason,
@@ -498,6 +506,9 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 	}
 	if input != nil {
 		rec.Input = *input
+	}
+	if headers != nil {
+		rec.Headers = *headers
 	}
 	if output != nil {
 		rec.Output = *output

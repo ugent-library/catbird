@@ -12,6 +12,7 @@ BEGIN
         idempotency_key text,
         topic text,
         payload jsonb,
+        headers jsonb,
         deliveries int,
         created_at timestamptz,
         visible_at timestamptz

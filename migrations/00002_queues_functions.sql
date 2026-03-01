@@ -18,6 +18,9 @@
 
 -- +goose up
 
+DROP FUNCTION IF EXISTS cb_send(text, jsonb[], text, text[], jsonb, timestamptz);
+DROP FUNCTION IF EXISTS cb_publish(text, jsonb[], text[], jsonb, timestamptz);
+
 -- +goose statementbegin
 -- cb_create_queue: Create a queue definition
 -- Creates the queue metadata and associated message table for enqueued messages
@@ -52,9 +55,11 @@ BEGIN
             idempotency_key text,
             topic text,
             payload jsonb NOT NULL,
+            headers jsonb,
             deliveries int NOT NULL DEFAULT 0,
             created_at timestamptz NOT NULL DEFAULT now(),
-            visible_at timestamptz NOT NULL DEFAULT now()
+            visible_at timestamptz NOT NULL DEFAULT now(),
+            CONSTRAINT headers_is_object CHECK (headers IS NULL OR jsonb_typeof(headers) = 'object')
         )
         $QUERY$,
         _create_table_stmt,
@@ -117,6 +122,7 @@ CREATE OR REPLACE FUNCTION cb_publish(
     topic text,
     payload jsonb,
     idempotency_key text = null,
+    headers jsonb = null,
     visible_at timestamptz = null
 )
 RETURNS void
@@ -126,6 +132,10 @@ DECLARE
     _rec record;
     _q_table text;
 BEGIN
+    IF cb_publish.headers IS NOT NULL AND jsonb_typeof(cb_publish.headers) <> 'object' THEN
+        RAISE EXCEPTION 'cb: headers must be a JSON object';
+    END IF;
+
     -- Find all matching queues via bindings (exact + wildcard patterns)
     FOR _rec IN
         SELECT DISTINCT queue_name AS name
@@ -144,8 +154,8 @@ BEGIN
         BEGIN
             EXECUTE format(
                 $QUERY$
-                INSERT INTO %I (topic, payload, idempotency_key, visible_at)
-                VALUES ($1, $2, $3, $4)
+                                INSERT INTO %I (topic, payload, idempotency_key, headers, visible_at)
+                                VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (idempotency_key) DO NOTHING;
                 $QUERY$,
                 _q_table
@@ -153,6 +163,7 @@ BEGIN
             USING cb_publish.topic,
                 cb_publish.payload,
                 cb_publish.idempotency_key,
+                                cb_publish.headers,
                   _visible_at;
         EXCEPTION WHEN undefined_table THEN
             -- Queue was deleted between SELECT and INSERT, skip it
@@ -317,6 +328,7 @@ CREATE OR REPLACE FUNCTION cb_send(
     payload jsonb,
     topic text = null,
     idempotency_key text = null,
+    headers jsonb = null,
     visible_at timestamptz = null
 )
 RETURNS bigint
@@ -326,14 +338,18 @@ DECLARE
     _q_table text := cb_table_name(cb_send.queue, 'q');
     _id bigint;
 BEGIN
+    IF cb_send.headers IS NOT NULL AND jsonb_typeof(cb_send.headers) <> 'object' THEN
+        RAISE EXCEPTION 'cb: headers must be a JSON object';
+    END IF;
+
     -- ON CONFLICT DO UPDATE with WHERE FALSE: atomic insert + return row ID (new or conflicting).
     -- Use UNION ALL to handle both INSERT success and conflict cases atomically.
     -- Pattern from: https://stackoverflow.com/a/35953488
     EXECUTE format(
         $QUERY$
         WITH ins AS (
-            INSERT INTO %I (topic, payload, idempotency_key, visible_at)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO %I (topic, payload, idempotency_key, headers, visible_at)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
             DO UPDATE SET visible_at = EXCLUDED.visible_at WHERE FALSE
             RETURNING id
@@ -349,6 +365,7 @@ BEGIN
     USING cb_send.topic,
           cb_send.payload,
           cb_send.idempotency_key,
+            cb_send.headers,
           _visible_at
     INTO _id;
 
@@ -401,6 +418,7 @@ BEGIN
                   m.idempotency_key,
                   m.topic,
                   m.payload,
+                  m.headers,
                   m.deliveries,
                   m.created_at,
                   m.visible_at;
@@ -483,6 +501,7 @@ BEGIN
                       m.idempotency_key,
                       m.topic,
                       m.payload,
+                      m.headers,
                       m.deliveries,
                       m.created_at,
                       m.visible_at;
@@ -639,6 +658,7 @@ CREATE OR REPLACE FUNCTION cb_send(
     payloads jsonb[],
     topic text = null,
     idempotency_keys text[] = null,
+    headers jsonb[] = null,
     visible_at timestamptz = null
 )
 RETURNS bigint[]
@@ -652,6 +672,20 @@ BEGIN
         RAISE EXCEPTION 'cb: idempotency_keys length must match payloads length';
     END IF;
 
+    IF cb_send.headers IS NOT NULL AND cardinality(cb_send.headers) <> cardinality(cb_send.payloads) THEN
+        RAISE EXCEPTION 'cb: headers length must match payloads length';
+    END IF;
+
+    IF cb_send.headers IS NOT NULL THEN
+        IF EXISTS (
+            SELECT 1
+            FROM unnest(cb_send.headers) AS h(header)
+            WHERE h.header IS NOT NULL AND jsonb_typeof(h.header) <> 'object'
+        ) THEN
+            RAISE EXCEPTION 'cb: headers must be JSON objects';
+        END IF;
+    END IF;
+
     EXECUTE format(
         $QUERY$
         WITH payload_list AS (
@@ -659,14 +693,18 @@ BEGIN
                 payload,
                 ordinality,
                 CASE
-                    WHEN $4 IS NULL THEN NULL
-                    ELSE $4[ordinality]
-                END AS idempotency_key
+                    WHEN $5 IS NULL THEN NULL
+                    ELSE $5[ordinality]
+                END AS idempotency_key,
+                CASE
+                    WHEN $3 IS NULL THEN NULL
+                    ELSE $3[ordinality]
+                END AS headers
             FROM unnest($1) WITH ORDINALITY AS t(payload, ordinality)
         ),
         ins AS (
-            INSERT INTO %I (topic, payload, idempotency_key, visible_at)
-            SELECT $2, payload, idempotency_key, $3
+            INSERT INTO %I (topic, payload, idempotency_key, headers, visible_at)
+            SELECT $2, payload, idempotency_key, headers, $4
             FROM payload_list
             ORDER BY ordinality
             ON CONFLICT (idempotency_key) DO NOTHING
@@ -679,6 +717,7 @@ BEGIN
     )
     USING cb_send.payloads,
           cb_send.topic,
+            cb_send.headers,
           _visible_at,
           cb_send.idempotency_keys
     INTO _ids;
@@ -701,6 +740,7 @@ CREATE OR REPLACE FUNCTION cb_publish(
     topic text,
     payloads jsonb[],
     idempotency_keys text[] = null,
+    headers jsonb[] = null,
     visible_at timestamptz = null
 )
 RETURNS void
@@ -712,6 +752,20 @@ DECLARE
 BEGIN
     IF cb_publish.idempotency_keys IS NOT NULL AND cardinality(cb_publish.idempotency_keys) <> cardinality(cb_publish.payloads) THEN
         RAISE EXCEPTION 'cb: idempotency_keys length must match payloads length';
+    END IF;
+
+    IF cb_publish.headers IS NOT NULL AND cardinality(cb_publish.headers) <> cardinality(cb_publish.payloads) THEN
+        RAISE EXCEPTION 'cb: headers length must match payloads length';
+    END IF;
+
+    IF cb_publish.headers IS NOT NULL THEN
+        IF EXISTS (
+            SELECT 1
+            FROM unnest(cb_publish.headers) AS h(header)
+            WHERE h.header IS NOT NULL AND jsonb_typeof(h.header) <> 'object'
+        ) THEN
+            RAISE EXCEPTION 'cb: headers must be JSON objects';
+        END IF;
     END IF;
 
     FOR _rec IN
@@ -729,13 +783,17 @@ BEGIN
         BEGIN
             EXECUTE format(
                 $QUERY$
-                INSERT INTO %I (topic, payload, idempotency_key, visible_at)
+                INSERT INTO %I (topic, payload, idempotency_key, headers, visible_at)
                 SELECT
                     $1,
                     payload,
                     CASE
                         WHEN $4 IS NULL THEN NULL
                         ELSE $4[ordinality]
+                    END,
+                    CASE
+                        WHEN $5 IS NULL THEN NULL
+                        ELSE $5[ordinality]
                     END,
                     $2
                 FROM unnest($3) WITH ORDINALITY AS t(payload, ordinality)
@@ -746,7 +804,8 @@ BEGIN
             USING cb_publish.topic,
                   _visible_at,
                   cb_publish.payloads,
-                  cb_publish.idempotency_keys;
+                  cb_publish.idempotency_keys,
+                  cb_publish.headers;
         EXCEPTION WHEN undefined_table THEN
             CONTINUE;
         END;
@@ -772,11 +831,13 @@ DROP FUNCTION IF EXISTS cb_unbind(text, text);
 DROP FUNCTION IF EXISTS cb_bind(text, text);
 DROP FUNCTION IF EXISTS cb_create_queue(text, timestamptz, boolean, text);
 DROP FUNCTION IF EXISTS cb_delete_queue(text);
-DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, timestamptz);
-DROP FUNCTION IF EXISTS cb_publish(text, jsonb[], text[], timestamptz);
-DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, timestamptz);
-DROP FUNCTION IF EXISTS cb_send(text, jsonb[], text, text[], timestamptz);
-DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, text, timestamptz);
+DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, jsonb, timestamptz);
+DROP FUNCTION IF EXISTS cb_publish(text, jsonb[], text[], jsonb[], timestamptz);
+DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, jsonb, timestamptz);
+DROP FUNCTION IF EXISTS cb_send(text, jsonb[], text, text[], jsonb[], timestamptz);
+DROP FUNCTION IF EXISTS cb_send(text, jsonb[], text, text[], jsonb, timestamptz);
+DROP FUNCTION IF EXISTS cb_publish(text, jsonb[], text[], jsonb, timestamptz);
+DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, text, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_read(text, int, int);
 DROP FUNCTION IF EXISTS cb_read_poll(text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_hide(text, bigint, integer);

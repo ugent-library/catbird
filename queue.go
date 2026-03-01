@@ -14,6 +14,7 @@ type Message struct {
 	IdempotencyKey string          `json:"idempotency_key,omitempty"`
 	Topic          string          `json:"topic"`
 	Payload        json.RawMessage `json:"payload"`
+	Headers        json.RawMessage `json:"headers,omitempty"`
 	Deliveries     int             `json:"deliveries"`
 	CreatedAt      time.Time       `json:"created_at"`
 	VisibleAt      time.Time       `json:"visible_at"`
@@ -75,6 +76,7 @@ func DeleteQueue(ctx context.Context, conn Conn, queueName string) (bool, error)
 type SendOpts struct {
 	Topic          string
 	IdempotencyKey string
+	Headers        map[string]any
 	VisibleAt      time.Time
 }
 
@@ -102,9 +104,13 @@ func SendQuery(queueName string, payload any, opts ...SendOpts) (string, []any, 
 	if err != nil {
 		return "", nil, err
 	}
+	headers, err := marshalOptionalHeaders(resolved.Headers)
+	if err != nil {
+		return "", nil, err
+	}
 
-	q := `SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, visible_at => $5);`
-	args := []any{queueName, b, ptrOrNil(resolved.Topic), ptrOrNil(resolved.IdempotencyKey), ptrOrNil(resolved.VisibleAt)}
+	q := `SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, headers => $5::jsonb, visible_at => $6);`
+	args := []any{queueName, b, ptrOrNil(resolved.Topic), ptrOrNil(resolved.IdempotencyKey), headers, ptrOrNil(resolved.VisibleAt)}
 
 	return q, args, nil
 }
@@ -112,6 +118,7 @@ func SendQuery(queueName string, payload any, opts ...SendOpts) (string, []any, 
 type SendManyOpts struct {
 	Topic           string
 	IdempotencyKeys []string
+	Headers         []map[string]any
 	VisibleAt       time.Time
 }
 
@@ -143,9 +150,13 @@ func SendManyQuery(queueName string, payloads []any, opts ...SendManyOpts) (stri
 	if err != nil {
 		return "", nil, err
 	}
+	headers, err := marshalOptionalHeadersArray(resolved.Headers)
+	if err != nil {
+		return "", nil, err
+	}
 
-	q := `SELECT cb_send(queue => $1, payloads => $2, topic => $3, idempotency_keys => $4, visible_at => $5);`
-	args := []any{queueName, encodedPayloads, ptrOrNil(resolved.Topic), resolved.IdempotencyKeys, ptrOrNil(resolved.VisibleAt)}
+	q := `SELECT cb_send(queue => $1, payloads => $2, topic => $3, idempotency_keys => $4, headers => $5::jsonb[], visible_at => $6);`
+	args := []any{queueName, encodedPayloads, ptrOrNil(resolved.Topic), resolved.IdempotencyKeys, headers, ptrOrNil(resolved.VisibleAt)}
 
 	return q, args, nil
 }
@@ -168,11 +179,13 @@ func Unbind(ctx context.Context, conn Conn, queueName string, pattern string) er
 
 type PublishOpts struct {
 	IdempotencyKey string
+	Headers        map[string]any
 	VisibleAt      *time.Time
 }
 
 type PublishManyOpts struct {
 	IdempotencyKeys []string
+	Headers         []map[string]any
 	VisibleAt       time.Time
 }
 
@@ -200,9 +213,13 @@ func PublishQuery(topic string, payload any, opts ...PublishOpts) (string, []any
 	if err != nil {
 		return "", nil, err
 	}
+	headers, err := marshalOptionalHeaders(resolved.Headers)
+	if err != nil {
+		return "", nil, err
+	}
 
-	q := `SELECT cb_publish(topic => $1, payload => $2, idempotency_key => $3, visible_at => $4);`
-	args := []any{topic, b, ptrOrNil(resolved.IdempotencyKey), ptrOrNil(resolved.VisibleAt)}
+	q := `SELECT cb_publish(topic => $1, payload => $2, idempotency_key => $3, headers => $4::jsonb, visible_at => $5);`
+	args := []any{topic, b, ptrOrNil(resolved.IdempotencyKey), headers, ptrOrNil(resolved.VisibleAt)}
 
 	return q, args, nil
 }
@@ -235,9 +252,13 @@ func PublishManyQuery(topic string, payloads []any, opts ...PublishManyOpts) (st
 	if err != nil {
 		return "", nil, err
 	}
+	headers, err := marshalOptionalHeadersArray(resolved.Headers)
+	if err != nil {
+		return "", nil, err
+	}
 
-	q := `SELECT cb_publish(topic => $1, payloads => $2, idempotency_keys => $3, visible_at => $4);`
-	args := []any{topic, encodedPayloads, resolved.IdempotencyKeys, ptrOrNil(resolved.VisibleAt)}
+	q := `SELECT cb_publish(topic => $1, payloads => $2, idempotency_keys => $3, headers => $4::jsonb[], visible_at => $5);`
+	args := []any{topic, encodedPayloads, resolved.IdempotencyKeys, headers, ptrOrNil(resolved.VisibleAt)}
 
 	return q, args, nil
 }
@@ -326,12 +347,14 @@ func scanMessage(row pgx.Row) (Message, error) {
 
 	var idempotencyKey *string
 	var topic *string
+	var headers *json.RawMessage
 
 	if err := row.Scan(
 		&rec.ID,
 		&idempotencyKey,
 		&topic,
 		&rec.Payload,
+		&headers,
 		&rec.Deliveries,
 		&rec.CreatedAt,
 		&rec.VisibleAt,
@@ -344,6 +367,9 @@ func scanMessage(row pgx.Row) (Message, error) {
 	}
 	if idempotencyKey != nil {
 		rec.IdempotencyKey = *idempotencyKey
+	}
+	if headers != nil {
+		rec.Headers = *headers
 	}
 
 	return rec, nil
