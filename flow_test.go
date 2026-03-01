@@ -444,14 +444,15 @@ func TestFlowMapMetadataInInfo(t *testing.T) {
 	flowName := testFlowName(t, "map_info_flow")
 
 	flow := NewFlow(flowName).
+		Description("Flow metadata description").
 		AddStep(NewStep("numbers").Handler(func(ctx context.Context, in string) ([]int, error) {
 			return []int{1, 2, 3}, nil
-		})).
+		}).Description("Numbers source")).
 		AddStep(NewStep("double").
 			Map("numbers").
 			Handler(func(ctx context.Context, in string, n int) (int, error) {
 				return n * 2, nil
-			}))
+			}).Description("Multiply by two"))
 
 	if err := client.CreateFlow(t.Context(), flow); err != nil {
 		t.Fatal(err)
@@ -466,7 +467,12 @@ func TestFlowMapMetadataInInfo(t *testing.T) {
 		t.Fatalf("expected 2 steps, got %d", len(info.Steps))
 	}
 
+	if info.Description != "Flow metadata description" {
+		t.Fatalf("unexpected flow description: %q", info.Description)
+	}
+
 	var foundMapped bool
+	var foundSource bool
 	for _, s := range info.Steps {
 		if s.Name == "double" {
 			foundMapped = true
@@ -476,11 +482,23 @@ func TestFlowMapMetadataInInfo(t *testing.T) {
 			if s.MapSource != "numbers" {
 				t.Fatalf("expected map source 'numbers', got %q", s.MapSource)
 			}
+			if s.Description != "Multiply by two" {
+				t.Fatalf("unexpected mapped step description: %q", s.Description)
+			}
+		}
+		if s.Name == "numbers" {
+			foundSource = true
+			if s.Description != "Numbers source" {
+				t.Fatalf("unexpected source step description: %q", s.Description)
+			}
 		}
 	}
 
 	if !foundMapped {
 		t.Fatalf("mapped step not found in flow info")
+	}
+	if !foundSource {
+		t.Fatalf("source step not found in flow info")
 	}
 }
 

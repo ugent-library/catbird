@@ -263,7 +263,7 @@ func TestPublishManyQuery(t *testing.T) {
 func TestQueueCreate(t *testing.T) {
 	client := getTestClient(t)
 
-	err := client.CreateQueue(t.Context(), "simple_queue")
+	err := client.CreateQueue(t.Context(), "simple_queue", QueueOpts{Description: "A simple queue"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,6 +274,9 @@ func TestQueueCreate(t *testing.T) {
 	}
 	if info.Name != "simple_queue" {
 		t.Fatalf("unexpected queue name: %s", info.Name)
+	}
+	if info.Description != "A simple queue" {
+		t.Fatalf("unexpected queue description: %s", info.Description)
 	}
 }
 

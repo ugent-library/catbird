@@ -101,7 +101,7 @@ func (m model) renderTaskDetail() string {
 	var selected *taskDetailView
 	for _, t := range m.data.tasks {
 		if t.Name == m.detailName {
-			selected = &taskDetailView{name: t.Name, createdAt: t.CreatedAt.Format(timeRFC3339)}
+			selected = &taskDetailView{name: t.Name, description: t.Description, createdAt: t.CreatedAt.Format(timeRFC3339)}
 			break
 		}
 	}
@@ -113,6 +113,7 @@ func (m model) renderTaskDetail() string {
 	lines := []string{
 		"Task Detail",
 		fmt.Sprintf("name: %s", selected.name),
+		fmt.Sprintf("description: %s", defaultString(selected.description, "-")),
 		fmt.Sprintf("created: %s", selected.createdAt),
 		"",
 		"Recent runs",
@@ -159,18 +160,20 @@ func (m model) renderFlowDetail() string {
 				deps = append(deps, dep.Name)
 			}
 			steps[i] = flowStepDetailView{
-				name:      s.Name,
-				dependsOn: deps,
-				hasSignal: s.HasSignal,
-				isMapStep: s.IsMapStep,
-				mapSource: s.MapSource,
+				name:        s.Name,
+				description: s.Description,
+				dependsOn:   deps,
+				hasSignal:   s.HasSignal,
+				isMapStep:   s.IsMapStep,
+				mapSource:   s.MapSource,
 			}
 		}
 
 		flow = &flowDetailView{
-			name:      f.Name,
-			createdAt: f.CreatedAt.Format(timeRFC3339),
-			steps:     steps,
+			name:        f.Name,
+			description: f.Description,
+			createdAt:   f.CreatedAt.Format(timeRFC3339),
+			steps:       steps,
 		}
 		break
 	}
@@ -182,12 +185,17 @@ func (m model) renderFlowDetail() string {
 	lines := []string{
 		"Flow Detail",
 		fmt.Sprintf("name: %s", flow.name),
+		fmt.Sprintf("description: %s", defaultString(flow.description, "-")),
 		fmt.Sprintf("created: %s", flow.createdAt),
 		fmt.Sprintf("steps: %d", len(flow.steps)),
 		"",
 		"Shape",
 	}
 	lines = append(lines, m.renderFlowShape(flow)...)
+	lines = append(lines, "", "Step descriptions")
+	for _, step := range flow.steps {
+		lines = append(lines, fmt.Sprintf("- %s: %s", step.name, defaultString(step.description, "-")))
+	}
 	lines = append(lines, "", "Recent runs")
 
 	if len(m.data.flowRuns) == 0 {
@@ -375,22 +383,25 @@ func sortedStrings(values []string) []string {
 }
 
 type taskDetailView struct {
-	name      string
-	createdAt string
+	name        string
+	description string
+	createdAt   string
 }
 
 type flowDetailView struct {
-	name      string
-	createdAt string
-	steps     []flowStepDetailView
+	name        string
+	description string
+	createdAt   string
+	steps       []flowStepDetailView
 }
 
 type flowStepDetailView struct {
-	name      string
-	dependsOn []string
-	hasSignal bool
-	isMapStep bool
-	mapSource string
+	name        string
+	description string
+	dependsOn   []string
+	hasSignal   bool
+	isMapStep   bool
+	mapSource   string
 }
 
 func (s flowStepDetailView) flowStepMeta() string {
@@ -488,13 +499,13 @@ func (m model) renderQueues() string {
 		}
 		line := ""
 		if m.isCompact() {
-			line = fmt.Sprintf("%s%s  unlogged=%t", prefix, q.Name, q.Unlogged)
+			line = fmt.Sprintf("%s%s  unlogged=%t  desc=%s", prefix, q.Name, q.Unlogged, defaultString(q.Description, "-"))
 		} else {
 			expiresAt := "-"
 			if !q.ExpiresAt.IsZero() {
 				expiresAt = q.ExpiresAt.Format(timeRFC3339)
 			}
-			line = fmt.Sprintf("%s%s  unlogged=%t  created=%s  expires=%s", prefix, q.Name, q.Unlogged, q.CreatedAt.Format(timeRFC3339), expiresAt)
+			line = fmt.Sprintf("%s%s  desc=%s  unlogged=%t  created=%s  expires=%s", prefix, q.Name, defaultString(q.Description, "-"), q.Unlogged, q.CreatedAt.Format(timeRFC3339), expiresAt)
 		}
 		b.WriteString(truncateWithEllipsis(line, m.contentWidth()))
 		b.WriteString("\n")
@@ -517,9 +528,9 @@ func (m model) renderTasks() string {
 		}
 		line := ""
 		if m.isCompact() {
-			line = fmt.Sprintf("%s%s", prefix, t.Name)
+			line = fmt.Sprintf("%s%s  desc=%s", prefix, t.Name, defaultString(t.Description, "-"))
 		} else {
-			line = fmt.Sprintf("%s%s  created=%s", prefix, t.Name, t.CreatedAt.Format(timeRFC3339))
+			line = fmt.Sprintf("%s%s  desc=%s  created=%s", prefix, t.Name, defaultString(t.Description, "-"), t.CreatedAt.Format(timeRFC3339))
 		}
 		b.WriteString(truncateWithEllipsis(line, m.contentWidth()))
 		b.WriteString("\n")
@@ -573,9 +584,9 @@ func (m model) renderFlows() string {
 		}
 		line := ""
 		if m.isCompact() {
-			line = fmt.Sprintf("%s%s  steps=%d", prefix, f.Name, len(f.Steps))
+			line = fmt.Sprintf("%s%s  steps=%d  desc=%s", prefix, f.Name, len(f.Steps), defaultString(f.Description, "-"))
 		} else {
-			line = fmt.Sprintf("%s%s  steps=%d  created=%s", prefix, f.Name, len(f.Steps), f.CreatedAt.Format(timeRFC3339))
+			line = fmt.Sprintf("%s%s  desc=%s  steps=%d  created=%s", prefix, f.Name, defaultString(f.Description, "-"), len(f.Steps), f.CreatedAt.Format(timeRFC3339))
 		}
 		b.WriteString(truncateWithEllipsis(line, m.contentWidth()))
 		b.WriteString("\n")

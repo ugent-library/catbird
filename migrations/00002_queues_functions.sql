@@ -25,11 +25,13 @@
 --   name: Queue name (must be unique)
 --   expires_at: Optional timestamp when the queue can be garbage collected
 --   unlogged: Whether to use an unlogged table for better performance (loses durability)
+--   description: Optional queue description metadata
 -- Returns: void
 CREATE OR REPLACE FUNCTION cb_create_queue(
     name text,
     expires_at timestamptz = null,
-    unlogged boolean = false
+    unlogged boolean = false,
+    description text = null
 )
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -74,9 +76,10 @@ BEGIN
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at);', _q_table || '_visible_at_idx', _q_table);
 
     -- Insert queue metadata
-    INSERT INTO cb_queues (name, unlogged, expires_at)
+    INSERT INTO cb_queues (name, description, unlogged, expires_at)
     VALUES (
         cb_create_queue.name,
+        cb_create_queue.description,
         cb_create_queue.unlogged,
         cb_create_queue.expires_at
     )
@@ -735,7 +738,7 @@ $$;
 
 DROP FUNCTION IF EXISTS cb_unbind(text, text);
 DROP FUNCTION IF EXISTS cb_bind(text, text);
-DROP FUNCTION IF EXISTS cb_create_queue(text, timestamptz, boolean);
+DROP FUNCTION IF EXISTS cb_create_queue(text, timestamptz, boolean, text);
 DROP FUNCTION IF EXISTS cb_delete_queue(text);
 DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, timestamptz);
 DROP FUNCTION IF EXISTS cb_publish(text, jsonb[], text[], timestamptz);

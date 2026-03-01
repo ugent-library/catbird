@@ -21,6 +21,7 @@ END$$;
 
 CREATE TABLE IF NOT EXISTS cb_queues (
     name text PRIMARY KEY,
+    description text,
     unlogged boolean NOT null,
     created_at timestamptz NOT NULL DEFAULT now(),
     expires_at timestamptz,

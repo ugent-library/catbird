@@ -112,7 +112,14 @@
         const elements = [];
         const nodeIds = [];
         steps.forEach((step) => {
-          elements.push({ id: step.name, data: { id: step.name, label: step.name } });
+          elements.push({
+            id: step.name,
+            data: {
+              id: step.name,
+              label: step.name,
+              description: step.description || 'No description'
+            }
+          });
           nodeIds.push(step.name);
           if (step.depends_on) {
             step.depends_on.forEach((dep) => {
@@ -163,6 +170,51 @@
               }
             }
           ]
+        });
+
+        el.style.position = 'relative';
+        const tooltip = document.createElement('div');
+        tooltip.style.position = 'absolute';
+        tooltip.style.display = 'none';
+        tooltip.style.zIndex = '10';
+        tooltip.style.pointerEvents = 'none';
+        tooltip.style.maxWidth = '220px';
+        tooltip.style.padding = '6px 8px';
+        tooltip.style.borderRadius = '6px';
+        tooltip.style.fontSize = '12px';
+        tooltip.style.lineHeight = '1.3';
+        tooltip.style.backgroundColor = '#252540';
+        tooltip.style.color = '#e0e0e0';
+        tooltip.style.border = '1px solid #2d2d44';
+        tooltip.style.boxShadow = '0 4px 12px rgba(0, 0, 0, 0.35)';
+        el.appendChild(tooltip);
+
+        const placeTooltip = (event) => {
+          const x = Math.min(Math.max(event.renderedPosition.x + 12, 8), Math.max(el.clientWidth - 228, 8));
+          const y = Math.min(Math.max(event.renderedPosition.y + 12, 8), Math.max(el.clientHeight - 40, 8));
+          tooltip.style.left = `${x}px`;
+          tooltip.style.top = `${y}px`;
+        };
+
+        cy.on('mouseover', 'node', (event) => {
+          const description = event.target.data('description');
+          if (!description) {
+            tooltip.style.display = 'none';
+            return;
+          }
+          tooltip.textContent = description;
+          tooltip.style.display = 'block';
+          placeTooltip(event);
+        });
+
+        cy.on('mousemove', 'node', (event) => {
+          if (tooltip.style.display !== 'none') {
+            placeTooltip(event);
+          }
+        });
+
+        cy.on('mouseout', 'node', () => {
+          tooltip.style.display = 'none';
         });
 
         // Fit graph after a brief delay to ensure container has dimensions

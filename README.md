@@ -43,6 +43,7 @@ client.Send(ctx, "my_queue", map[string]any{"job": "cleanup"}, catbird.SendOpts{
 
 // Tasks and flows
 task := catbird.NewTask("send-email").
+    Description("Send a transactional email to a user").
     Handler(func(ctx context.Context, input string) (string, error) {
         return "sent", nil
     })

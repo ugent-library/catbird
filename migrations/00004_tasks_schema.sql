@@ -17,6 +17,7 @@ END$$;
 
 CREATE TABLE IF NOT EXISTS cb_tasks (
     name text PRIMARY KEY,
+    description text,
     created_at timestamptz NOT NULL DEFAULT now(),
     condition jsonb,
     CONSTRAINT name_not_empty CHECK (name <> ''),

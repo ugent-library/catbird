@@ -19,10 +19,11 @@
 -- Creates the flow metadata and associated tables for flow runs and steps
 -- Parameters:
 --   name: Flow name (must be unique)
+--   description: Optional flow description metadata
 --   steps: JSON array describing flow steps and their dependencies
 --   output_priority: Optional ordered array of step names for output ownership
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_create_flow(name text, steps jsonb, output_priority text[] DEFAULT NULL)
+CREATE OR REPLACE FUNCTION cb_create_flow(name text, description text DEFAULT NULL, steps jsonb DEFAULT '[]'::jsonb, output_priority text[] DEFAULT NULL)
 RETURNS void AS $$
 #variable_conflict use_column
 DECLARE
@@ -75,10 +76,11 @@ BEGIN
 
     PERFORM pg_advisory_xact_lock(hashtext(_f_table));
 
-    INSERT INTO cb_flows (name, output_priority, step_count)
-    VALUES (cb_create_flow.name, coalesce(_output_priority, ARRAY['__pending_output_priority__']), 0)
+    INSERT INTO cb_flows (name, description, output_priority, step_count)
+    VALUES (cb_create_flow.name, cb_create_flow.description, coalesce(_output_priority, ARRAY['__pending_output_priority__']), 0)
     ON CONFLICT (name) DO UPDATE
-    SET output_priority = coalesce(EXCLUDED.output_priority, ARRAY['__pending_output_priority__']),
+    SET description = EXCLUDED.description,
+      output_priority = coalesce(EXCLUDED.output_priority, ARRAY['__pending_output_priority__']),
       step_count = 0;
 
     DELETE FROM cb_step_handlers WHERE flow_name = cb_create_flow.name;
@@ -154,10 +156,11 @@ BEGIN
             _condition := cb_parse_condition(_step->>'condition');
         END IF;
 
-        INSERT INTO cb_steps (flow_name, name, idx, dependency_count, is_generator, is_map_step, map_source, has_signal, condition)
+        INSERT INTO cb_steps (flow_name, name, description, idx, dependency_count, is_generator, is_map_step, map_source, has_signal, condition)
         VALUES (
             cb_create_flow.name,
             _step_name,
+          nullif(_step->>'description', ''),
             _idx,
             jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb)),
             _is_generator,
@@ -2691,6 +2694,4 @@ DROP FUNCTION IF EXISTS cb_hide_steps(text, text, bigint[], integer);
 DROP FUNCTION IF EXISTS cb_poll_steps(text, text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_start_steps(text, bigint, timestamptz);
 DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text, text, timestamptz);
-DROP FUNCTION IF EXISTS cb_create_flow(text, jsonb, text[]);
-DROP FUNCTION IF EXISTS cb_create_flow(text, jsonb, jsonb);
-DROP FUNCTION IF EXISTS cb_create_flow(text, jsonb);
+DROP FUNCTION IF EXISTS cb_create_flow(text, text, jsonb, text[]);

@@ -10,8 +10,7 @@
 - [ ] Versioning?
 - [ ] Fair queueing? (see https://docs.hatchet.run/blog/multi-tenant-queues)
 - [ ] Event-triggered task/flow runs via queue bindings MVP (see EVENT_TRIGGER.md)
-- [ ] Description fields for queue, task, flow and step definitions
-- [ ] Meta field for messages, task and flow runs
+- [ ] Headers field for messages, task and flow runs
 - [ ] Metrics, observability
 - [ ] Schemas for task/flow input/output? (see https://opensource.googleblog.com/2026/01/a-json-schema-package-for-go.html)
 - [ ] Unlogged tasks and flows

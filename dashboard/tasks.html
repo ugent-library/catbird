@@ -7,11 +7,13 @@
   <tbody>
     <tr>
       <th scope="col">Name</th>
+      <th scope="col">Description</th>
       <th scope="col">Created</th>
     </tr>
     {{ range .Tasks }}
     <tr>
       <th><a href="{{ route `task` .Name }}">{{ .Name }}</a></th>
+      <td>{{ with .Description }}{{ . }}{{ else }}-{{ end }}</td>
       <td>{{ formatTime .CreatedAt }}</td>
     </tr>
     {{ end }}

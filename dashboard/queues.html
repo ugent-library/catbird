@@ -147,6 +147,10 @@
           <label for="queue-name" class="form-label">Queue Name</label>
           <input type="text" class="form-control" id="queue-name" name="name" placeholder="my-queue" required>
         </div>
+        <div class="mb-3">
+          <label for="queue-description" class="form-label">Description (optional)</label>
+          <input type="text" class="form-control" id="queue-description" name="description" placeholder="Queue purpose">
+        </div>
       </div>
       <div class="modal-footer">
         <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
@@ -197,6 +201,7 @@
   <tbody>
     <tr>
       <th scope="col">Name</th>
+      <th scope="col">Description</th>
       <th scope="col">Unlogged</th>
       <th scope="col">Created</th>
       <th scope="col">Expires at</th>
@@ -204,6 +209,7 @@
     {{ range .Queues }}
     <tr>
       <th>{{ .Name }}</th>
+      <td>{{ with .Description }}{{ . }}{{ else }}-{{ end }}</td>
       <td>{{ if .Unlogged }}Unlogged{{ end }}</td>
       <td>{{ formatTime .CreatedAt }}</td>
       <td>{{ formatTime .ExpiresAt }}</td>

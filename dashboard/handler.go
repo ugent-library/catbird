@@ -269,7 +269,9 @@ func (a *App) handleCreateQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := a.client.CreateQueue(r.Context(), name)
+	description := r.FormValue("description")
+
+	err := a.client.CreateQueue(r.Context(), name, catbird.QueueOpts{Description: description})
 	if err != nil {
 		a.queues.ExecuteTemplate(w, "create_queue_error", struct {
 			Error string

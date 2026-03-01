@@ -32,6 +32,13 @@ func oneLine(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
+func defaultString(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
 func truncateWithEllipsis(s string, maxWidth int) string {
 	if maxWidth <= 0 {
 		return s

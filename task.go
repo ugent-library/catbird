@@ -17,6 +17,7 @@ import (
 // Use NewTask() for definition-only tasks.
 type Task struct {
 	name        string
+	description string
 	condition   string
 	handler     func(context.Context, json.RawMessage) (json.RawMessage, error)
 	handlerOpts *HandlerOpts
@@ -45,6 +46,12 @@ func NewTask(name string) *Task {
 // Condition sets the condition expression for the task.
 func (t *Task) Condition(condition string) *Task {
 	t.condition = condition
+	return t
+}
+
+// Description sets the description for the task definition.
+func (t *Task) Description(description string) *Task {
+	t.description = description
 	return t
 }
 
@@ -77,12 +84,14 @@ func (t *Task) OnFail(fn any, opts ...HandlerOpts) *Task {
 // MarshalJSON serializes the task for JSON output
 func (t *Task) MarshalJSON() ([]byte, error) {
 	type serializableTask struct {
-		Name      string `json:"name"`
-		Condition string `json:"condition,omitempty"`
+		Name        string `json:"name"`
+		Description string `json:"description,omitempty"`
+		Condition   string `json:"condition,omitempty"`
 	}
 	return json.Marshal(serializableTask{
-		Name:      t.name,
-		Condition: t.condition,
+		Name:        t.name,
+		Description: t.description,
+		Condition:   t.condition,
 	})
 }
 
@@ -179,8 +188,9 @@ type taskClaim struct {
 }
 
 type TaskInfo struct {
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
+	Name        string    `json:"name"`
+	Description string    `json:"description,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // TaskScheduleInfo contains metadata about a scheduled task.
@@ -345,18 +355,11 @@ func canceledRunError(reason string) error {
 
 // CreateTask creates one or more task definitions.
 func CreateTask(ctx context.Context, conn Conn, tasks ...*Task) error {
-	q := `SELECT * FROM cb_create_task(name => $1);`
+	q := `SELECT * FROM cb_create_task(name => $1, description => $2, condition => $3);`
 	for _, task := range tasks {
-		_, err := conn.Exec(ctx, q, task.name)
+		_, err := conn.Exec(ctx, q, task.name, ptrOrNil(task.description), ptrOrNil(task.condition))
 		if err != nil {
 			return err
-		}
-
-		if strings.TrimSpace(task.condition) != "" {
-			condQuery := `UPDATE cb_tasks SET condition = cb_parse_condition($1) WHERE name = $2;`
-			if _, err := conn.Exec(ctx, condQuery, task.condition, task.name); err != nil {
-				return err
-			}
 		}
 	}
 
@@ -365,13 +368,13 @@ func CreateTask(ctx context.Context, conn Conn, tasks ...*Task) error {
 
 // GetTask retrieves task metadata by name.
 func GetTask(ctx context.Context, conn Conn, taskName string) (*TaskInfo, error) {
-	q := `SELECT name, created_at FROM cb_tasks WHERE name = $1;`
+	q := `SELECT name, description, created_at FROM cb_tasks WHERE name = $1;`
 	return scanTask(conn.QueryRow(ctx, q, taskName))
 }
 
 // ListTasks returns all tasks
 func ListTasks(ctx context.Context, conn Conn) ([]*TaskInfo, error) {
-	q := `SELECT name, created_at FROM cb_tasks ORDER BY name;`
+	q := `SELECT name, description, created_at FROM cb_tasks ORDER BY name;`
 	rows, err := conn.Query(ctx, q)
 	if err != nil {
 		return nil, err
@@ -520,12 +523,18 @@ func scanCollectibleTask(row pgx.CollectableRow) (*TaskInfo, error) {
 
 func scanTask(row pgx.Row) (*TaskInfo, error) {
 	rec := TaskInfo{}
+	var description *string
 
 	if err := row.Scan(
 		&rec.Name,
+		&description,
 		&rec.CreatedAt,
 	); err != nil {
 		return nil, err
+	}
+
+	if description != nil {
+		rec.Description = *description
 	}
 
 	return &rec, nil

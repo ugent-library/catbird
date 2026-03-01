@@ -81,7 +81,7 @@ func TestTaskCreate(t *testing.T) {
 
 	task := NewTask("test_task").Handler(func(ctx context.Context, in string) (string, error) {
 		return in + " processed", nil
-	})
+	}).Description("Task description")
 
 	err := client.CreateTask(t.Context(), task)
 	if err != nil {
@@ -94,6 +94,9 @@ func TestTaskCreate(t *testing.T) {
 	}
 	if info.Name != "test_task" {
 		t.Fatalf("unexpected task name: %s", info.Name)
+	}
+	if info.Description != "Task description" {
+		t.Fatalf("unexpected task description: %s", info.Description)
 	}
 }
 

@@ -20,6 +20,7 @@ type Optional[T any] struct {
 
 type Flow struct {
 	name               string
+	description        string
 	steps              []Step
 	outputPriority     []string
 	priorityConfigured bool
@@ -49,6 +50,11 @@ func NewFlow(name string) *Flow {
 
 func (f *Flow) AddStep(step *Step) *Flow {
 	f.steps = append(f.steps, *step)
+	return f
+}
+
+func (f *Flow) Description(description string) *Flow {
+	f.description = description
 	return f
 }
 
@@ -134,6 +140,7 @@ func (f FlowFailure) FailedStepSignalAs(out any) error {
 
 type Step struct {
 	name                 string
+	description          string
 	dependencies         []string
 	optionalDependencies map[string]bool // tracks which dependencies are Optional[T]
 	isGenerator          bool
@@ -160,6 +167,11 @@ func NewStep(name string) *Step {
 		name:                 name,
 		optionalDependencies: make(map[string]bool),
 	}
+}
+
+func (s *Step) Description(description string) *Step {
+	s.description = description
+	return s
 }
 
 func NewGeneratorStep(name string) *Step {
@@ -729,6 +741,7 @@ func makeFlowOnFailHandler(fn any) (func(context.Context, json.RawMessage, FlowF
 
 type FlowInfo struct {
 	Name           string     `json:"name"`
+	Description    string     `json:"description,omitempty"`
 	Steps          []StepInfo `json:"steps"`
 	OutputPriority []string   `json:"output_priority,omitempty"`
 	CreatedAt      time.Time  `json:"created_at"`
@@ -748,6 +761,7 @@ type FlowScheduleInfo struct {
 
 type StepInfo struct {
 	Name        string               `json:"name"`
+	Description string               `json:"description,omitempty"`
 	IsGenerator bool                 `json:"is_generator,omitempty"`
 	IsMapStep   bool                 `json:"is_map_step,omitempty"`
 	MapSource   string               `json:"map_source,omitempty"`
@@ -917,7 +931,7 @@ func validateFlowDependencies(flow *Flow) error {
 
 // CreateFlow creates one or more flow definitions.
 func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
-	q := `SELECT * FROM cb_create_flow(name => $1, steps => $2, output_priority => $3);`
+	q := `SELECT * FROM cb_create_flow(name => $1, description => $2, steps => $3, output_priority => $4);`
 	for _, flow := range flows {
 		if err := validateFlowDependencies(flow); err != nil {
 			return err
@@ -930,6 +944,7 @@ func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 		}
 		type serializableStep struct {
 			Name        string            `json:"name"`
+			Description string            `json:"description,omitempty"`
 			Condition   string            `json:"condition,omitempty"`
 			IsGenerator bool              `json:"is_generator,omitempty"`
 			IsMapStep   bool              `json:"is_map_step,omitempty"`
@@ -950,6 +965,7 @@ func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 
 			serStep := serializableStep{
 				Name:        s.name,
+				Description: s.description,
 				IsGenerator: s.isGenerator,
 				IsMapStep:   s.isMapStep,
 				MapSource:   s.mapSource,
@@ -970,7 +986,7 @@ func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 			priority = defaultFlowOutputPriority(flow)
 		}
 
-		_, err = conn.Exec(ctx, q, flow.name, b, priority)
+		_, err = conn.Exec(ctx, q, flow.name, ptrOrNil(flow.description), b, priority)
 		if err != nil {
 			return err
 		}
@@ -1466,16 +1482,22 @@ func scanCollectibleFlow(row pgx.CollectableRow) (*FlowInfo, error) {
 func scanFlow(row pgx.Row) (*FlowInfo, error) {
 	rec := FlowInfo{}
 
+	var description *string
 	var steps json.RawMessage
 	var outputPriority []string
 
 	if err := row.Scan(
 		&rec.Name,
+		&description,
 		&steps,
 		&outputPriority,
 		&rec.CreatedAt,
 	); err != nil {
 		return nil, err
+	}
+
+	if description != nil {
+		rec.Description = *description
 	}
 
 	if err := json.Unmarshal(steps, &rec.Steps); err != nil {

@@ -18,12 +18,15 @@
 -- Creates the task metadata and associated queue table for task runs
 -- Parameters:
 --   name: Task name (must be unique)
+--   description: Optional task description metadata
+--   condition: Optional condition expression for task execution
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_create_task(name text)
+CREATE OR REPLACE FUNCTION cb_create_task(name text, description text = null, condition text = null)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
     _t_table text := cb_table_name(cb_create_task.name, 't');
+    _condition jsonb;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext(_t_table));
 
@@ -37,9 +40,16 @@ BEGIN
         RAISE EXCEPTION 'cb: task name "input" is reserved';
     END IF;
 
-    INSERT INTO cb_tasks (name)
+    _condition := NULL;
+    IF cb_create_task.condition IS NOT NULL AND cb_create_task.condition <> '' THEN
+        _condition := cb_parse_condition(cb_create_task.condition);
+    END IF;
+
+    INSERT INTO cb_tasks (name, description, condition)
     VALUES (
-        cb_create_task.name
+        cb_create_task.name,
+        cb_create_task.description,
+        _condition
     );
 
     EXECUTE format(
@@ -698,4 +708,4 @@ DROP FUNCTION IF EXISTS cb_wait_task_output(text, bigint, int, int);
 DROP FUNCTION IF EXISTS cb_hide_tasks(text, bigint[], integer);
 DROP FUNCTION IF EXISTS cb_poll_tasks(text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text, text, timestamptz);
-DROP FUNCTION IF EXISTS cb_create_task(text);
+DROP FUNCTION IF EXISTS cb_create_task(text, text, text);

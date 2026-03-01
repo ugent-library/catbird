@@ -20,6 +20,7 @@ END$$;
 
 CREATE TABLE IF NOT EXISTS cb_flows (
     name text PRIMARY KEY,
+    description text,
     output_priority text[] NOT NULL,
     step_count int NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now(),
@@ -33,6 +34,7 @@ CREATE TABLE IF NOT EXISTS cb_flows (
 CREATE TABLE IF NOT EXISTS cb_steps (
     flow_name text NOT NULL REFERENCES cb_flows (name),
     name text NOT NULL,
+    description text,
     idx int NOT NULL DEFAULT 0,
     dependency_count int NOT NULL DEFAULT 0,
     is_generator boolean NOT NULL DEFAULT false,
@@ -76,30 +78,32 @@ CREATE INDEX IF NOT EXISTS cb_step_dependencies_dependency_name_fk ON cb_step_de
 CREATE OR REPLACE VIEW cb_flow_info AS
     SELECT
         f.name,
-        s.steps,
+        f.description,
+        step_data.steps,
         f.output_priority,
         f.created_at
     FROM cb_flows f
     LEFT JOIN LATERAL (
         SELECT
-            s.flow_name,
+            st.flow_name,
             jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
-                'name', s.name,
-                'is_generator', s.is_generator,
-                'is_map_step', s.is_map_step,
-                'map_source', s.map_source,
-                'has_signal', s.has_signal,
+                'name', st.name,
+                'description', st.description,
+                'is_generator', st.is_generator,
+                'is_map_step', st.is_map_step,
+                'map_source', st.map_source,
+                'has_signal', st.has_signal,
                 'depends_on', (
                     SELECT jsonb_agg(jsonb_build_object('name', s_d.dependency_name))
                     FROM cb_step_dependencies AS s_d
-                    WHERE s_d.flow_name = s.flow_name
-                    AND s_d.step_name = s.name
+                    WHERE s_d.flow_name = st.flow_name
+                    AND s_d.step_name = st.name
                 )
-            )) ORDER BY s.idx) FILTER (WHERE s.idx IS NOT NULL) AS steps
-        FROM cb_steps s
-        WHERE s.flow_name = f.name
+            )) ORDER BY st.idx) FILTER (WHERE st.idx IS NOT NULL) AS steps
+        FROM cb_steps st
+        WHERE st.flow_name = f.name
         GROUP BY flow_name
-    ) s ON s.flow_name = f.name;
+    ) step_data ON step_data.flow_name = f.name;
 
 -- +goose down
 
