@@ -23,40 +23,38 @@ type Message struct {
 type QueueInfo struct {
 	Name        string    `json:"name"`
 	Description string    `json:"description,omitempty"`
-	Unlogged    bool      `json:"unlogged"`
 	CreatedAt   time.Time `json:"created_at"`
 	ExpiresAt   time.Time `json:"expires_at,omitzero"`
 }
 
 type QueueOpts struct {
 	ExpiresAt   time.Time
-	Unlogged    bool
 	Description string
 }
 
 // CreateQueue creates a queue with the given name and optional options.
 // Use Bind() separately to create topic bindings.
 func CreateQueue(ctx context.Context, conn Conn, queueName string, opts ...QueueOpts) error {
-	q := `SELECT cb_create_queue(name => $1, expires_at => $2, unlogged => $3, description => $4);`
+	q := `SELECT cb_create_queue(name => $1, expires_at => $2, description => $3);`
 
 	var resolved QueueOpts
 	if len(opts) > 0 {
 		resolved = opts[0]
 	}
 
-	_, err := conn.Exec(ctx, q, queueName, ptrOrNil(resolved.ExpiresAt), resolved.Unlogged, ptrOrNil(resolved.Description))
+	_, err := conn.Exec(ctx, q, queueName, ptrOrNil(resolved.ExpiresAt), ptrOrNil(resolved.Description))
 	return err
 }
 
 // GetQueue retrieves queue metadata by name.
 func GetQueue(ctx context.Context, conn Conn, queueName string) (*QueueInfo, error) {
-	q := `SELECT name, description, unlogged, created_at, expires_at FROM cb_queues WHERE name = $1;`
+	q := `SELECT name, description, created_at, expires_at FROM cb_queues WHERE name = $1;`
 	return scanQueue(conn.QueryRow(ctx, q, queueName))
 }
 
 // ListQueues returns all queues
 func ListQueues(ctx context.Context, conn Conn) ([]*QueueInfo, error) {
-	q := `SELECT name, description, unlogged, created_at, expires_at FROM cb_queues ORDER BY name;`
+	q := `SELECT name, description, created_at, expires_at FROM cb_queues ORDER BY name;`
 	rows, err := conn.Query(ctx, q)
 	if err != nil {
 		return nil, err
@@ -388,7 +386,6 @@ func scanQueue(row pgx.Row) (*QueueInfo, error) {
 	if err := row.Scan(
 		&rec.Name,
 		&description,
-		&rec.Unlogged,
 		&rec.CreatedAt,
 		&expiresAt,
 	); err != nil {

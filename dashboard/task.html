@@ -7,7 +7,6 @@
 </div>
 
 <p class="mb-3">{{ with .Task.Description }}{{ . }}{{ else }}No description{{ end }}</p>
-<p class="mb-3 text-muted">Storage: {{ if .Task.Unlogged }}Unlogged{{ else }}Logged{{ end }}</p>
 
 <h2>Runs</h2>
 

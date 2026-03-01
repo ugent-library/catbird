@@ -20,29 +20,23 @@
 --   name: Task name (must be unique)
 --   description: Optional task description metadata
 --   condition: Optional condition expression for task execution
---   unlogged: Whether task runs are stored in an unlogged table
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_create_task(name text, description text = null, condition text = null, unlogged boolean = false)
+CREATE OR REPLACE FUNCTION cb_create_task(name text, description text = null, condition text = null)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
     _t_table text := cb_table_name(cb_create_task.name, 't');
     _condition jsonb;
-    _existing_unlogged boolean;
-    _create_table_stmt text := 'CREATE TABLE';
+    _existing_name text;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext(_t_table));
 
-    SELECT t.unlogged
-    INTO _existing_unlogged
+    SELECT t.name
+    INTO _existing_name
     FROM cb_tasks t
     WHERE t.name = cb_create_task.name;
 
-    IF _existing_unlogged IS NOT NULL THEN
-        IF _existing_unlogged <> cb_create_task.unlogged THEN
-            RAISE EXCEPTION 'cb: task % already exists with unlogged=%; requested unlogged=%', cb_create_task.name, _existing_unlogged, cb_create_task.unlogged;
-        END IF;
-
+    IF _existing_name IS NOT NULL THEN
         RETURN;
     END IF;
 
@@ -56,21 +50,16 @@ BEGIN
         _condition := cb_parse_condition(cb_create_task.condition);
     END IF;
 
-    INSERT INTO cb_tasks (name, description, condition, unlogged)
+    INSERT INTO cb_tasks (name, description, condition)
     VALUES (
         cb_create_task.name,
         cb_create_task.description,
-        _condition,
-        cb_create_task.unlogged
+        _condition
     );
-
-    IF cb_create_task.unlogged THEN
-        _create_table_stmt := 'CREATE UNLOGGED TABLE';
-    END IF;
 
     EXECUTE format(
         $QUERY$
-        %s IF NOT EXISTS %I (
+        CREATE TABLE IF NOT EXISTS %I (
             id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
             concurrency_key text,
             idempotency_key text,
@@ -107,13 +96,14 @@ BEGIN
             CONSTRAINT headers_is_object CHECK (headers IS NULL OR jsonb_typeof(headers) = 'object')
         )
         $QUERY$,
-        _create_table_stmt,
         _t_table
     );
 
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (concurrency_key) WHERE concurrency_key IS NOT NULL AND status IN (''queued'', ''started'')', _t_table || '_concurrency_key_idx', _t_table);
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN (''queued'', ''started'', ''completed'')', _t_table || '_idempotency_key_idx', _t_table);
-    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at);', _t_table || '_visible_at_idx', _t_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at, id) WHERE status IN (''queued'', ''started'');', _t_table || '_poll_visible_id_idx', _t_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (on_fail_visible_at, id) WHERE status = ''failed'' AND on_fail_status IN (''queued'', ''failed'');', _t_table || '_on_fail_poll_idx', _t_table);
+    EXECUTE format('DROP INDEX IF EXISTS %I;', _t_table || '_visible_at_idx');
 END;
 $$;
 -- +goose statementend
@@ -729,4 +719,4 @@ DROP FUNCTION IF EXISTS cb_wait_task_output(text, bigint, int, int);
 DROP FUNCTION IF EXISTS cb_hide_tasks(text, bigint[], integer);
 DROP FUNCTION IF EXISTS cb_poll_tasks(text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text, text, jsonb, timestamptz);
-DROP FUNCTION IF EXISTS cb_create_task(text, text, text, boolean);
+DROP FUNCTION IF EXISTS cb_create_task(text, text, text);

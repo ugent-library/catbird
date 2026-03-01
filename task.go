@@ -19,7 +19,6 @@ type Task struct {
 	name        string
 	description string
 	condition   string
-	unlogged    bool
 	handler     func(context.Context, json.RawMessage) (json.RawMessage, error)
 	handlerOpts *HandlerOpts
 	onFail      func(context.Context, json.RawMessage, TaskFailure) error
@@ -56,12 +55,6 @@ func (t *Task) Description(description string) *Task {
 	return t
 }
 
-// Unlogged sets whether task run rows are stored in an unlogged table.
-func (t *Task) Unlogged(unlogged bool) *Task {
-	t.unlogged = unlogged
-	return t
-}
-
 // Handler sets the task handler function and execution options.
 // fn must have signature (context.Context, In) (Out, error).
 // If opts is omitted, defaults are used (concurrency: 1, batchSize: 10).
@@ -94,13 +87,11 @@ func (t *Task) MarshalJSON() ([]byte, error) {
 		Name        string `json:"name"`
 		Description string `json:"description,omitempty"`
 		Condition   string `json:"condition,omitempty"`
-		Unlogged    bool   `json:"unlogged,omitempty"`
 	}
 	return json.Marshal(serializableTask{
 		Name:        t.name,
 		Description: t.description,
 		Condition:   t.condition,
-		Unlogged:    t.unlogged,
 	})
 }
 
@@ -199,7 +190,6 @@ type taskClaim struct {
 type TaskInfo struct {
 	Name        string    `json:"name"`
 	Description string    `json:"description,omitempty"`
-	Unlogged    bool      `json:"unlogged"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
@@ -366,9 +356,9 @@ func canceledRunError(reason string) error {
 
 // CreateTask creates one or more task definitions.
 func CreateTask(ctx context.Context, conn Conn, tasks ...*Task) error {
-	q := `SELECT * FROM cb_create_task(name => $1, description => $2, condition => $3, unlogged => $4);`
+	q := `SELECT * FROM cb_create_task(name => $1, description => $2, condition => $3);`
 	for _, task := range tasks {
-		_, err := conn.Exec(ctx, q, task.name, ptrOrNil(task.description), ptrOrNil(task.condition), task.unlogged)
+		_, err := conn.Exec(ctx, q, task.name, ptrOrNil(task.description), ptrOrNil(task.condition))
 		if err != nil {
 			return err
 		}
@@ -379,13 +369,13 @@ func CreateTask(ctx context.Context, conn Conn, tasks ...*Task) error {
 
 // GetTask retrieves task metadata by name.
 func GetTask(ctx context.Context, conn Conn, taskName string) (*TaskInfo, error) {
-	q := `SELECT name, description, unlogged, created_at FROM cb_tasks WHERE name = $1;`
+	q := `SELECT name, description, created_at FROM cb_tasks WHERE name = $1;`
 	return scanTask(conn.QueryRow(ctx, q, taskName))
 }
 
 // ListTasks returns all tasks
 func ListTasks(ctx context.Context, conn Conn) ([]*TaskInfo, error) {
-	q := `SELECT name, description, unlogged, created_at FROM cb_tasks ORDER BY name;`
+	q := `SELECT name, description, created_at FROM cb_tasks ORDER BY name;`
 	rows, err := conn.Query(ctx, q)
 	if err != nil {
 		return nil, err
@@ -549,7 +539,6 @@ func scanTask(row pgx.Row) (*TaskInfo, error) {
 	if err := row.Scan(
 		&rec.Name,
 		&description,
-		&rec.Unlogged,
 		&rec.CreatedAt,
 	); err != nil {
 		return nil, err

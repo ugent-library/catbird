@@ -107,6 +107,69 @@ These are hardcoded in:
 ./scripts/test.sh -cover
 ```
 
+## Benchmarks
+
+Throughput benchmarks are available for queues, tasks, and flows:
+- `BenchmarkQueueThroughput`
+- `BenchmarkTaskThroughput`
+- `BenchmarkFlowThroughput`
+
+Steady-state pipelined variants (batch submit + batch wait):
+- `BenchmarkQueueThroughputBatched`
+- `BenchmarkTaskThroughputPipelined`
+- `BenchmarkFlowThroughputPipelined`
+
+Tuned high-throughput variants (higher handler concurrency + batch size):
+- `BenchmarkTaskThroughputPipelinedTuned`
+- `BenchmarkFlowThroughputPipelinedTuned`
+
+These benchmarks use the same Docker PostgreSQL setup and test harness (`getTestClient()`) as regular tests.
+
+### Quick Benchmark Smoke Check
+Runs each benchmark once to validate setup without a long run:
+
+```bash
+go test -run '^$' -bench 'Benchmark(QueueThroughput|TaskThroughput|FlowThroughput)$' -benchtime=1x .
+```
+
+To include pipelined variants:
+
+```bash
+go test -run '^$' -bench 'Benchmark(QueueThroughput|TaskThroughput|FlowThroughput|QueueThroughputBatched|TaskThroughputPipelined|FlowThroughputPipelined)$' -benchtime=1x .
+```
+
+### Practical Throughput Run
+Run for a fixed duration per benchmark and include memory stats:
+
+```bash
+go test -run '^$' -bench 'Benchmark(QueueThroughput|TaskThroughput|FlowThroughput)$' -benchmem -benchtime=10s .
+```
+
+Pipelined-only steady-state run:
+
+```bash
+go test -run '^$' -bench 'Benchmark(TaskThroughputPipelined|FlowThroughputPipelined)$' -benchmem -benchtime=10s .
+```
+
+Tuned high-throughput run:
+
+```bash
+go test -run '^$' -bench 'Benchmark(TaskThroughputPipelinedTuned|FlowThroughputPipelinedTuned)$' -benchmem -benchtime=10s .
+```
+
+Queue batched run:
+
+```bash
+go test -run '^$' -bench 'BenchmarkQueueThroughputBatched$' -benchmem -benchtime=10s .
+```
+
+### Compare CPU Scaling
+Run the same benchmark suite across different `GOMAXPROCS` values:
+
+```bash
+go test -run '^$' -bench 'Benchmark(QueueThroughput|TaskThroughput|FlowThroughput)$' -benchmem -benchtime=10s -cpu=1,2,4 .
+```
+
 ### Include Long-Running Concurrency Tests
 Some stress/concurrency tests are optional by default to keep local runs fast.
 

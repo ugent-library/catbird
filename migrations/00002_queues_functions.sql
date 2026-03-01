@@ -27,30 +27,23 @@ DROP FUNCTION IF EXISTS cb_publish(text, jsonb[], text[], jsonb, timestamptz);
 -- Parameters:
 --   name: Queue name (must be unique)
 --   expires_at: Optional timestamp when the queue can be garbage collected
---   unlogged: Whether to use an unlogged table for better performance (loses durability)
 --   description: Optional queue description metadata
 -- Returns: void
 CREATE OR REPLACE FUNCTION cb_create_queue(
     name text,
     expires_at timestamptz = null,
-    unlogged boolean = false,
     description text = null
 )
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
     _q_table text := cb_table_name(cb_create_queue.name, 'q');
-    _create_table_stmt text := 'CREATE TABLE';
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext(_q_table));
 
-    IF cb_create_queue.unlogged THEN
-        _create_table_stmt := 'CREATE UNLOGGED TABLE';
-    END IF;
-
     EXECUTE format(
         $QUERY$
-        %s IF NOT EXISTS %I (
+        CREATE TABLE IF NOT EXISTS %I (
             id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
             idempotency_key text,
             topic text,
@@ -62,19 +55,18 @@ BEGIN
             CONSTRAINT headers_is_object CHECK (headers IS NULL OR jsonb_typeof(headers) = 'object')
         )
         $QUERY$,
-        _create_table_stmt,
         _q_table
     );
 
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (idempotency_key);', _q_table || '_idempotency_key_idx', _q_table);
-    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at);', _q_table || '_visible_at_idx', _q_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at, id);', _q_table || '_poll_visible_id_idx', _q_table);
+    EXECUTE format('DROP INDEX IF EXISTS %I;', _q_table || '_visible_at_idx');
 
     -- Insert queue metadata
-    INSERT INTO cb_queues (name, description, unlogged, expires_at)
+    INSERT INTO cb_queues (name, description, expires_at)
     VALUES (
         cb_create_queue.name,
         cb_create_queue.description,
-        cb_create_queue.unlogged,
         cb_create_queue.expires_at
     )
     ON CONFLICT DO NOTHING;
@@ -829,7 +821,7 @@ $$;
 
 DROP FUNCTION IF EXISTS cb_unbind(text, text);
 DROP FUNCTION IF EXISTS cb_bind(text, text);
-DROP FUNCTION IF EXISTS cb_create_queue(text, timestamptz, boolean, text);
+DROP FUNCTION IF EXISTS cb_create_queue(text, timestamptz, text);
 DROP FUNCTION IF EXISTS cb_delete_queue(text);
 DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_publish(text, jsonb[], text[], jsonb[], timestamptz);

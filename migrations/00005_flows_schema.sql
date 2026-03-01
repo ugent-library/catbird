@@ -21,7 +21,6 @@ END$$;
 CREATE TABLE IF NOT EXISTS cb_flows (
     name text PRIMARY KEY,
     description text,
-    unlogged boolean NOT NULL DEFAULT false,
     output_priority text[] NOT NULL,
     step_count int NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now(),
@@ -81,7 +80,6 @@ CREATE OR REPLACE VIEW cb_flow_info AS
         f.name,
         f.description,
         step_data.steps,
-        f.unlogged,
         f.output_priority,
         f.created_at
     FROM cb_flows f

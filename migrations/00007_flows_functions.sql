@@ -22,9 +22,8 @@
 --   description: Optional flow description metadata
 --   steps: JSON array describing flow steps and their dependencies
 --   output_priority: Optional ordered array of step names for output ownership
---   unlogged: Whether flow runs and step/map run tables are unlogged
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_create_flow(name text, description text DEFAULT NULL, steps jsonb DEFAULT '[]'::jsonb, output_priority text[] DEFAULT NULL, unlogged boolean DEFAULT false)
+CREATE OR REPLACE FUNCTION cb_create_flow(name text, description text DEFAULT NULL, steps jsonb DEFAULT '[]'::jsonb, output_priority text[] DEFAULT NULL)
 RETURNS void AS $$
 #variable_conflict use_column
 DECLARE
@@ -48,7 +47,6 @@ DECLARE
     _terminal_count int;
     _priority_count int;
     _priority_distinct_count int;
-    _existing_unlogged boolean;
     _create_table_stmt text;
 BEGIN
     IF cb_create_flow.name IS NULL OR cb_create_flow.name = '' THEN
@@ -79,25 +77,12 @@ BEGIN
 
     PERFORM pg_advisory_xact_lock(hashtext(_f_table));
 
-    SELECT f.unlogged
-    INTO _existing_unlogged
-    FROM cb_flows f
-    WHERE f.name = cb_create_flow.name;
-
-    IF _existing_unlogged IS NOT NULL AND _existing_unlogged <> cb_create_flow.unlogged THEN
-        RAISE EXCEPTION 'cb: flow % already exists with unlogged=%; requested unlogged=%', cb_create_flow.name, _existing_unlogged, cb_create_flow.unlogged;
-    END IF;
-
     _create_table_stmt := 'CREATE TABLE';
-    IF cb_create_flow.unlogged THEN
-        _create_table_stmt := 'CREATE UNLOGGED TABLE';
-    END IF;
 
-    INSERT INTO cb_flows (name, description, unlogged, output_priority, step_count)
-    VALUES (cb_create_flow.name, cb_create_flow.description, cb_create_flow.unlogged, coalesce(_output_priority, ARRAY['__pending_output_priority__']), 0)
+    INSERT INTO cb_flows (name, description, output_priority, step_count)
+    VALUES (cb_create_flow.name, cb_create_flow.description, coalesce(_output_priority, ARRAY['__pending_output_priority__']), 0)
     ON CONFLICT (name) DO UPDATE
     SET description = EXCLUDED.description,
-        unlogged = EXCLUDED.unlogged,
         output_priority = coalesce(EXCLUDED.output_priority, ARRAY['__pending_output_priority__']),
         step_count = 0;
 
@@ -357,6 +342,7 @@ BEGIN
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (status);', _f_table || '_status_idx', _f_table);
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (concurrency_key) WHERE concurrency_key IS NOT NULL AND status = ''started''', _f_table || '_concurrency_key_idx', _f_table);
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN (''started'', ''completed'')', _f_table || '_idempotency_key_idx', _f_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (on_fail_visible_at, id) WHERE status = ''failed'' AND on_fail_status IN (''queued'', ''failed'');', _f_table || '_on_fail_poll_idx', _f_table);
 
     -- Create step runs table - includes 'skipped' in status constraint
     EXECUTE format(
@@ -406,7 +392,8 @@ BEGIN
     );
 
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, status);', _s_table || '_flow_run_id_status_idx', _s_table);
-    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at);', _s_table || '_visible_at_idx', _s_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (step_name, visible_at, id) WHERE status IN (''queued'', ''started'');', _s_table || '_poll_step_visible_id_idx', _s_table);
+    EXECUTE format('DROP INDEX IF EXISTS %I;', _s_table || '_visible_at_idx');
 
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (status, generator_status) WHERE status IN (''pending'', ''started'');', _s_table || '_generator_status_idx', _s_table);
 
@@ -442,8 +429,10 @@ BEGIN
     _create_table_stmt, _m_table, _s_table
     );
 
-    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (step_name, status, visible_at);', _m_table || '_step_status_visible_idx', _m_table);
-    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, step_name, status);', _m_table || '_flow_step_status_idx', _m_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (step_name, visible_at, id) WHERE status IN (''queued'', ''started'');', _m_table || '_poll_step_visible_id_idx', _m_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, step_name, status, item_idx);', _m_table || '_flow_step_status_item_idx', _m_table);
+    EXECUTE format('DROP INDEX IF EXISTS %I;', _m_table || '_step_status_visible_idx');
+    EXECUTE format('DROP INDEX IF EXISTS %I;', _m_table || '_flow_step_status_idx');
 
 END;
 $$ LANGUAGE plpgsql;
@@ -2716,4 +2705,4 @@ DROP FUNCTION IF EXISTS cb_hide_steps(text, text, bigint[], integer);
 DROP FUNCTION IF EXISTS cb_poll_steps(text, text, int, int, int, int);
 DROP FUNCTION IF EXISTS cb_start_steps(text, bigint, timestamptz);
 DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text, text, jsonb, timestamptz);
-DROP FUNCTION IF EXISTS cb_create_flow(text, text, jsonb, text[], boolean);
+DROP FUNCTION IF EXISTS cb_create_flow(text, text, jsonb, text[]);

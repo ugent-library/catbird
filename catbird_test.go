@@ -111,7 +111,9 @@ func verifyMigrationsApplied(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-func getTestClient(t *testing.T) *Client {
+func getTestClient(tb testing.TB) *Client {
+	tb.Helper()
+
 	testOnce.Do(func() {
 		ctx := context.Background()
 		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -121,13 +123,13 @@ func getTestClient(t *testing.T) *Client {
 		// Open SQL DB for migrations
 		db, err := sql.Open("pgx", testDSN)
 		if err != nil {
-			t.Fatalf("error opening database: %v", err)
+			tb.Fatalf("error opening database: %v", err)
 		}
 		defer db.Close()
 
 		// Verify connection
 		if err := db.Ping(); err != nil {
-			t.Fatalf("error connecting to database: %v\nMake sure Docker is running: docker compose up -d", err)
+			tb.Fatalf("error connecting to database: %v\nMake sure Docker is running: docker compose up -d", err)
 		}
 		logger.Info("connected to test database")
 
@@ -142,20 +144,20 @@ func getTestClient(t *testing.T) *Client {
 		// Migrate up to current schema
 		logger.Info("starting migration", "step", "up", "target_version", SchemaVersion)
 		if err := MigrateUpTo(ctx, db, SchemaVersion); err != nil {
-			t.Fatalf("migration up failed: %v", err)
+			tb.Fatalf("migration up failed: %v", err)
 		}
 		logger.Info("migration complete", "step", "up", "version", SchemaVersion)
 
 		// Verify migrations were applied
 		if err := verifyMigrationsApplied(ctx, db); err != nil {
-			t.Fatalf("migration verification failed: %v", err)
+			tb.Fatalf("migration verification failed: %v", err)
 		}
 		logger.Info("migration verification passed")
 
 		// Create connection pool
 		pool, err := pgxpool.New(ctx, testDSN)
 		if err != nil {
-			t.Fatalf("error creating connection pool: %v", err)
+			tb.Fatalf("error creating connection pool: %v", err)
 		}
 		testPool = pool
 		testClient = New(pool)

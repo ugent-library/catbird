@@ -685,31 +685,6 @@ If retries are exhausted in either phase, the parent step fails and task/flow `O
 
 Catbird deduplication (`ConcurrencyKey`/`IdempotencyKey`) controls duplicate run creation, while handler retries can still re-attempt the same run after transient failures. For non-repeatable side effects (payments, email, webhooks), use idempotent write patterns or upstream idempotency keys so retry attempts remain safe.
 
-# Durability
-
-You can relax durability to gain throughput, but realize that unlogged mode is best reserved for workloads that are safe to replay (ephemeral, retryable, or recomputable jobs). Unlogged data can be lost on crash/restart and is not replicated via PostgreSQL streaming replication.
-
-Examples:
-
-```go
-err := client.CreateQueue(ctx, "fast-queue", catbird.QueueOpts{Unlogged: true})
-if err != nil {
-    return err
-}
-
-flow := catbird.NewFlow("fast-flow").
-    Unlogged(true).
-    AddStep(catbird.NewStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
-        return in, nil
-    }))
-
-if err := client.CreateFlow(ctx, flow); err != nil {
-    return err
-}
-```
-
-Definition mode is treated as part of identity for create operations. If a definition already exists as logged/unlogged and you create it again with the opposite mode, Catbird returns an error.
-
 # Cancellation
 
 `Cancellation` semantics:
@@ -834,8 +809,7 @@ SELECT cb_unbind(
 ```sql
 -- Create a task definition
 SELECT cb_create_task(
-    name => 'send_email',
-    unlogged => true
+    name => 'send_email'
 );
 
 -- Run a task

@@ -202,7 +202,6 @@
     <tr>
       <th scope="col">Name</th>
       <th scope="col">Description</th>
-      <th scope="col">Unlogged</th>
       <th scope="col">Created</th>
       <th scope="col">Expires at</th>
     </tr>
@@ -210,7 +209,6 @@
     <tr>
       <th>{{ .Name }}</th>
       <td>{{ with .Description }}{{ . }}{{ else }}-{{ end }}</td>
-      <td>{{ if .Unlogged }}Unlogged{{ end }}</td>
       <td>{{ formatTime .CreatedAt }}</td>
       <td>{{ formatTime .ExpiresAt }}</td>
     </tr>

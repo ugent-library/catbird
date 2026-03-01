@@ -23,7 +23,6 @@ END$$;
 CREATE TABLE IF NOT EXISTS cb_queues (
     name text PRIMARY KEY,
     description text,
-    unlogged boolean NOT null,
     created_at timestamptz NOT NULL DEFAULT now(),
     expires_at timestamptz,
     CONSTRAINT expires_at_is_valid CHECK (expires_at IS NULL OR expires_at > created_at)

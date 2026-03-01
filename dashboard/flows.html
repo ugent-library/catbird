@@ -8,13 +8,11 @@
     <tr>
       <th scope="col">Name</th>
       <th scope="col">Description</th>
-      <th scope="col">Unlogged</th>
       <th scope="col">Created</th>
       {{ range .Flows }}
     <tr>
       <th><a href="{{ route `flow` .Name }}">{{ .Name }}</a></th>
       <td>{{ with .Description }}{{ . }}{{ else }}-{{ end }}</td>
-      <td>{{ if .Unlogged }}Unlogged{{ else }}-{{ end }}</td>
       <td>{{ formatTime .CreatedAt }}</td>
     </tr>
     {{ end }}

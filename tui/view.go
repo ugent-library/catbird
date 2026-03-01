@@ -101,7 +101,7 @@ func (m model) renderTaskDetail() string {
 	var selected *taskDetailView
 	for _, t := range m.data.tasks {
 		if t.Name == m.detailName {
-			selected = &taskDetailView{name: t.Name, description: t.Description, unlogged: t.Unlogged, createdAt: t.CreatedAt.Format(timeRFC3339)}
+			selected = &taskDetailView{name: t.Name, description: t.Description, createdAt: t.CreatedAt.Format(timeRFC3339)}
 			break
 		}
 	}
@@ -114,7 +114,6 @@ func (m model) renderTaskDetail() string {
 		"Task Detail",
 		fmt.Sprintf("name: %s", selected.name),
 		fmt.Sprintf("description: %s", defaultString(selected.description, "-")),
-		fmt.Sprintf("storage: %s", storageLabel(selected.unlogged)),
 		fmt.Sprintf("created: %s", selected.createdAt),
 		"",
 		"Recent runs",
@@ -173,7 +172,6 @@ func (m model) renderFlowDetail() string {
 		flow = &flowDetailView{
 			name:        f.Name,
 			description: f.Description,
-			unlogged:    f.Unlogged,
 			createdAt:   f.CreatedAt.Format(timeRFC3339),
 			steps:       steps,
 		}
@@ -188,7 +186,6 @@ func (m model) renderFlowDetail() string {
 		"Flow Detail",
 		fmt.Sprintf("name: %s", flow.name),
 		fmt.Sprintf("description: %s", defaultString(flow.description, "-")),
-		fmt.Sprintf("storage: %s", storageLabel(flow.unlogged)),
 		fmt.Sprintf("created: %s", flow.createdAt),
 		fmt.Sprintf("steps: %d", len(flow.steps)),
 		"",
@@ -388,23 +385,14 @@ func sortedStrings(values []string) []string {
 type taskDetailView struct {
 	name        string
 	description string
-	unlogged    bool
 	createdAt   string
 }
 
 type flowDetailView struct {
 	name        string
 	description string
-	unlogged    bool
 	createdAt   string
 	steps       []flowStepDetailView
-}
-
-func storageLabel(unlogged bool) string {
-	if unlogged {
-		return "unlogged"
-	}
-	return "logged"
 }
 
 type flowStepDetailView struct {
@@ -511,13 +499,13 @@ func (m model) renderQueues() string {
 		}
 		line := ""
 		if m.isCompact() {
-			line = fmt.Sprintf("%s%s  unlogged=%t  desc=%s", prefix, q.Name, q.Unlogged, defaultString(q.Description, "-"))
+			line = fmt.Sprintf("%s%s  desc=%s", prefix, q.Name, defaultString(q.Description, "-"))
 		} else {
 			expiresAt := "-"
 			if !q.ExpiresAt.IsZero() {
 				expiresAt = q.ExpiresAt.Format(timeRFC3339)
 			}
-			line = fmt.Sprintf("%s%s  desc=%s  unlogged=%t  created=%s  expires=%s", prefix, q.Name, defaultString(q.Description, "-"), q.Unlogged, q.CreatedAt.Format(timeRFC3339), expiresAt)
+			line = fmt.Sprintf("%s%s  desc=%s  created=%s  expires=%s", prefix, q.Name, defaultString(q.Description, "-"), q.CreatedAt.Format(timeRFC3339), expiresAt)
 		}
 		b.WriteString(truncateWithEllipsis(line, m.contentWidth()))
 		b.WriteString("\n")
@@ -540,9 +528,9 @@ func (m model) renderTasks() string {
 		}
 		line := ""
 		if m.isCompact() {
-			line = fmt.Sprintf("%s%s  unlogged=%t  desc=%s", prefix, t.Name, t.Unlogged, defaultString(t.Description, "-"))
+			line = fmt.Sprintf("%s%s  desc=%s", prefix, t.Name, defaultString(t.Description, "-"))
 		} else {
-			line = fmt.Sprintf("%s%s  desc=%s  unlogged=%t  created=%s", prefix, t.Name, defaultString(t.Description, "-"), t.Unlogged, t.CreatedAt.Format(timeRFC3339))
+			line = fmt.Sprintf("%s%s  desc=%s  created=%s", prefix, t.Name, defaultString(t.Description, "-"), t.CreatedAt.Format(timeRFC3339))
 		}
 		b.WriteString(truncateWithEllipsis(line, m.contentWidth()))
 		b.WriteString("\n")
@@ -596,9 +584,9 @@ func (m model) renderFlows() string {
 		}
 		line := ""
 		if m.isCompact() {
-			line = fmt.Sprintf("%s%s  steps=%d  unlogged=%t  desc=%s", prefix, f.Name, len(f.Steps), f.Unlogged, defaultString(f.Description, "-"))
+			line = fmt.Sprintf("%s%s  steps=%d  desc=%s", prefix, f.Name, len(f.Steps), defaultString(f.Description, "-"))
 		} else {
-			line = fmt.Sprintf("%s%s  desc=%s  steps=%d  unlogged=%t  created=%s", prefix, f.Name, defaultString(f.Description, "-"), len(f.Steps), f.Unlogged, f.CreatedAt.Format(timeRFC3339))
+			line = fmt.Sprintf("%s%s  desc=%s  steps=%d  created=%s", prefix, f.Name, defaultString(f.Description, "-"), len(f.Steps), f.CreatedAt.Format(timeRFC3339))
 		}
 		b.WriteString(truncateWithEllipsis(line, m.contentWidth()))
 		b.WriteString("\n")
