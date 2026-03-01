@@ -842,6 +842,22 @@ export CB_CONN="postgres://user:pass@localhost:5432/mydb?sslmode=disable"
 cb dashboard
 ```
 
+# Terminal UI
+
+The terminal UI provides an interactive dashboard-like view in your terminal.
+
+```bash
+go install github.com/ugent-library/catbird/cmd/cb@latest
+export CB_CONN="postgres://user:pass@localhost:5432/mydb?sslmode=disable"
+cb ui
+```
+
+You can also start it from the root command using interactive mode:
+
+```bash
+cb -i
+```
+
 The dashboard is a standard `http.Handler` and can be embedded in any Go web application:
 
 ```go
