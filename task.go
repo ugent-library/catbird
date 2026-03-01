@@ -57,7 +57,7 @@ func (t *Task) Description(description string) *Task {
 
 // Handler sets the task handler function and execution options.
 // fn must have signature (context.Context, In) (Out, error).
-// If opts is omitted, defaults are used (concurrency: 1, batchSize: 10).
+// If opts is omitted, defaults are used (concurrency: 4, batchSize: 64, timeout: 30s, maxRetries: 2 with full-jitter backoff 100ms-2s).
 func (t *Task) Handler(fn any, opts ...HandlerOpts) *Task {
 	handler, err := makeTaskHandler(fn, t.name)
 	if err != nil {
@@ -70,7 +70,7 @@ func (t *Task) Handler(fn any, opts ...HandlerOpts) *Task {
 
 // OnFail sets a task failure handler and execution options.
 // fn must have signature (context.Context, In, TaskFailure) error.
-// If opts is omitted, defaults are used (concurrency: 1, batchSize: 10).
+// If opts is omitted, defaults are used (concurrency: 4, batchSize: 64, timeout: 30s, maxRetries: 2 with full-jitter backoff 100ms-2s).
 func (t *Task) OnFail(fn any, opts ...HandlerOpts) *Task {
 	handler, err := makeTaskOnFailHandler(fn)
 	if err != nil {

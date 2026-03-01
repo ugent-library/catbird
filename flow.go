@@ -72,7 +72,7 @@ func (f *Flow) OutputPriority(stepNames ...string) *Flow {
 
 // OnFail sets a flow failure handler and execution options.
 // fn must have signature (context.Context, In, FlowFailure) error.
-// If opts is omitted, defaults are used (concurrency: 1, batchSize: 10).
+// If opts is omitted, defaults are used (concurrency: 4, batchSize: 64, timeout: 30s, maxRetries: 2 with full-jitter backoff 100ms-2s).
 func (f *Flow) OnFail(fn any, opts ...HandlerOpts) *Flow {
 	handler, err := makeFlowOnFailHandler(fn)
 	if err != nil {

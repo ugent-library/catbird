@@ -37,17 +37,34 @@ type HandlerOpts struct {
 	CircuitBreaker CircuitBreakerStrategy
 }
 
+const (
+	defaultHandlerConcurrency = 4
+	defaultHandlerBatchSize   = 64
+	defaultHandlerTimeout     = 30 * time.Second
+	defaultHandlerMaxRetries  = 2
+)
+
+var defaultHandlerBackoff = NewFullJitterBackoff(100*time.Millisecond, 2*time.Second)
+
 // applyDefaultHandlerOpts sets default values for handler options.
 func applyDefaultHandlerOpts(opts ...HandlerOpts) *HandlerOpts {
 	var resolved HandlerOpts
-	if len(opts) > 0 {
+	hasOpts := len(opts) > 0
+	if hasOpts {
 		resolved = opts[0]
 	}
+
+	if !hasOpts {
+		resolved.Timeout = defaultHandlerTimeout
+		resolved.MaxRetries = defaultHandlerMaxRetries
+		resolved.Backoff = defaultHandlerBackoff
+	}
+
 	if resolved.Concurrency == 0 {
-		resolved.Concurrency = 1
+		resolved.Concurrency = defaultHandlerConcurrency
 	}
 	if resolved.BatchSize == 0 {
-		resolved.BatchSize = 10
+		resolved.BatchSize = defaultHandlerBatchSize
 	}
 	return &resolved
 }
