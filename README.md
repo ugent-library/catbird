@@ -173,7 +173,7 @@ client.CreateTaskSchedule(
     ctx,
     "send-report",
     "@hourly",
-    catbird.WithScheduleInput(EmailRequest{To: "ops@example.com", Subject: "Hourly report"}),
+    catbird.WithInput(EmailRequest{To: "ops@example.com", Subject: "Hourly report"}),
 )
 
 // Define a task with a condition (skipped when condition is false)
