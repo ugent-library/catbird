@@ -352,7 +352,7 @@ BEGIN
       flow_run_id bigint NOT NULL,
       step_name text NOT NULL,
       flow_input jsonb NOT NULL DEFAULT '{}'::jsonb,
-      status text NOT NULL DEFAULT 'pending',
+      status text NOT NULL DEFAULT 'waiting_for_dependencies',
       condition jsonb,
       is_generator boolean NOT NULL DEFAULT false,
       is_map_step boolean NOT NULL DEFAULT false,
@@ -378,7 +378,7 @@ BEGIN
       canceled_at timestamptz,
       UNIQUE (flow_run_id, step_name),
       FOREIGN KEY (flow_run_id) REFERENCES %I (id),
-      CONSTRAINT status_valid CHECK (status IN ('pending', 'queued', 'started', 'completed', 'failed', 'skipped', 'canceled')),
+      CONSTRAINT status_valid CHECK (status IN ('waiting_for_dependencies', 'waiting_for_signal', 'queued', 'started', 'waiting_for_map_tasks', 'completed', 'failed', 'skipped', 'canceled')),
       CONSTRAINT generator_status_valid CHECK (generator_status IS NULL OR generator_status IN ('started', 'complete', 'failed')),
       CONSTRAINT map_tasks_spawned_valid CHECK (map_tasks_spawned >= 0),
       CONSTRAINT map_tasks_completed_valid CHECK (map_tasks_completed >= 0 AND map_tasks_completed <= map_tasks_spawned),
@@ -395,7 +395,7 @@ BEGIN
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (step_name, visible_at, id) WHERE status IN (''queued'', ''started'');', _s_table || '_poll_step_visible_id_idx', _s_table);
     EXECUTE format('DROP INDEX IF EXISTS %I;', _s_table || '_visible_at_idx');
 
-    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (status, generator_status) WHERE status IN (''pending'', ''started'');', _s_table || '_generator_status_idx', _s_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (status, generator_status) WHERE status IN (''waiting_for_dependencies'', ''waiting_for_signal'', ''started'', ''waiting_for_map_tasks'');', _s_table || '_generator_status_idx', _s_table);
 
     -- Create map task table used by map steps for per-item coordination
     EXECUTE format(
@@ -561,7 +561,10 @@ BEGIN
       %L,
       s.name,
       %L,
-      'pending',
+      CASE
+        WHEN s.dependency_count = 0 AND s.has_signal THEN 'waiting_for_signal'
+        ELSE 'waiting_for_dependencies'
+      END,
       s.dependency_count,
       s.condition,
       s.is_generator,
@@ -653,7 +656,7 @@ BEGIN
       SET status = 'canceled',
           canceled_at = coalesce(canceled_at, now())
       WHERE flow_run_id = $1
-        AND status IN ('pending', 'queued', 'started')
+        AND status IN ('waiting_for_dependencies', 'waiting_for_signal', 'queued', 'started', 'waiting_for_map_tasks')
       $QUERY$,
       _s_table
     )
@@ -777,7 +780,7 @@ BEGIN
       SET status = 'canceled',
           canceled_at = now()
       WHERE flow_run_id = $1
-        AND status IN ('pending', 'queued')
+        AND status IN ('waiting_for_dependencies', 'waiting_for_signal', 'waiting_for_map_tasks', 'queued')
       $QUERY$,
       _s_table
     )
@@ -851,7 +854,7 @@ BEGIN
       SET status = 'canceled',
           canceled_at = now()
       WHERE id = $1
-        AND status IN ('pending', 'queued', 'started')
+        AND status IN ('waiting_for_dependencies', 'waiting_for_signal', 'queued', 'started', 'waiting_for_map_tasks')
       RETURNING flow_run_id
       $QUERY$,
       _s_table
@@ -900,7 +903,7 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- cb_start_steps: Start steps in a flow that have no pending dependencies
+-- cb_start_steps: Start steps in a flow that are ready to run
 -- Called automatically after step completion to start dependent steps
 -- Evaluates conditions and can skip steps based on condition evaluation
 -- Parameters:
@@ -947,8 +950,23 @@ BEGIN
     LOOP
     _steps_processed_this_iteration := 0;
 
-    -- Start all steps with no dependencies and no signal requirement (or signal already received)
-    -- Evaluate step conditions to decide if step should be skipped
+    -- Promote dependency waiters to signal waiters when deps are fully resolved but signal is still missing.
+    EXECUTE format(
+      $QUERY$
+      UPDATE %I
+      SET status = 'waiting_for_signal'
+      WHERE flow_run_id = $1
+        AND status = 'waiting_for_dependencies'
+        AND remaining_dependencies = 0
+        AND has_signal = true
+        AND signal_input IS NULL
+      $QUERY$,
+      _s_table
+    )
+    USING cb_start_steps.flow_run_id;
+
+    -- Start all steps that are now ready to activate.
+    -- Evaluate step conditions to decide if step should be skipped.
     FOR _step_to_process IN
     EXECUTE format(
       $QUERY$
@@ -972,9 +990,11 @@ BEGIN
              sr.map_source
       FROM %I sr
       WHERE sr.flow_run_id = $1
-        AND sr.status = 'pending'
-        AND sr.remaining_dependencies = 0
-        AND (NOT sr.has_signal OR sr.signal_input IS NOT NULL)
+        AND (
+          (sr.status = 'waiting_for_dependencies' AND sr.remaining_dependencies = 0 AND (NOT sr.has_signal OR sr.signal_input IS NOT NULL))
+          OR
+          (sr.status = 'waiting_for_signal' AND sr.remaining_dependencies = 0 AND sr.signal_input IS NOT NULL)
+        )
       FOR UPDATE SKIP LOCKED
       $QUERY$,
       _s_table, _s_table
@@ -1014,14 +1034,22 @@ BEGIN
         )
         USING _step_to_process.id;
 
-        -- Decrement dependent steps' remaining_dependencies
+        -- Decrement dependent steps' remaining_dependencies and promote newly-unblocked steps.
         EXECUTE format(
           $QUERY$
           UPDATE %I
-          SET remaining_dependencies = remaining_dependencies - 1
+          SET remaining_dependencies = remaining_dependencies - 1,
+              status = CASE
+                WHEN remaining_dependencies - 1 = 0 THEN
+                  CASE
+                    WHEN has_signal = true AND signal_input IS NULL THEN 'waiting_for_signal'
+                    ELSE 'waiting_for_dependencies'
+                  END
+                ELSE status
+              END
           WHERE flow_run_id = $1
             AND step_name = any($2)
-            AND status = 'pending'
+            AND status = 'waiting_for_dependencies'
           $QUERY$,
           _s_table
         )
@@ -1143,14 +1171,14 @@ BEGIN
       EXECUTE format(
         $QUERY$
         UPDATE %I
-        SET status = 'started',
+        SET status = 'waiting_for_map_tasks',
             started_at = coalesce(started_at, now()),
-            visible_at = now() + interval '100 years'
+            visible_at = coalesce($2, now())
         WHERE id = $1
         $QUERY$,
         _s_table
       )
-      USING _step_to_process.id;
+      USING _step_to_process.id, cb_start_steps.initial_visible_at;
 
       -- Spawn map tasks in deterministic order
       EXECUTE format(
@@ -1607,7 +1635,11 @@ BEGIN
     EXECUTE format(
       $QUERY$
       UPDATE %I
-      SET generator_status = 'complete'
+      SET generator_status = 'complete',
+          status = CASE
+              WHEN map_tasks_spawned = map_tasks_completed THEN status
+              ELSE 'waiting_for_map_tasks'
+          END
       WHERE id = $1
         AND step_name = $2
         AND status = 'started'
@@ -1729,7 +1761,7 @@ BEGIN
       END
       WHERE flow_run_id = $1
         AND step_name = $2
-        AND status = 'started'
+        AND status IN ('started', 'waiting_for_map_tasks')
       RETURNING id, generator_status, map_tasks_spawned, map_tasks_completed
       $QUERY$,
       _s_table
@@ -1795,7 +1827,15 @@ BEGIN
     EXECUTE format(
         $QUERY$
         UPDATE %I
-        SET generator_status = 'complete'
+        SET generator_status = 'complete',
+          status = CASE
+            WHEN map_tasks_spawned = map_tasks_completed THEN 'queued'
+            ELSE 'waiting_for_map_tasks'
+          END,
+          visible_at = CASE
+            WHEN map_tasks_spawned = map_tasks_completed THEN now()
+            ELSE visible_at
+          END
         WHERE id = $1
           AND step_name = $2
           AND status = 'started'
@@ -1812,22 +1852,6 @@ BEGIN
     END IF;
 
     _ready := _spawned = _completed;
-
-    IF _ready THEN
-        EXECUTE format(
-            $QUERY$
-            UPDATE %I
-            SET status = 'queued',
-                visible_at = now()
-            WHERE id = $1
-              AND step_name = $2
-              AND status = 'started'
-              AND generator_status = 'complete'
-            $QUERY$,
-            _s_table
-        )
-        USING cb_complete_generator_step_or_queue_reduce.step_id, cb_complete_generator_step_or_queue_reduce.step_name;
-    END IF;
 
     RETURN _ready;
 END;
@@ -1877,7 +1901,7 @@ BEGIN
         END
         WHERE flow_run_id = $1
           AND step_name = $2
-          AND status = 'started'
+          AND status IN ('started', 'waiting_for_map_tasks')
         RETURNING id, generator_status, map_tasks_spawned, map_tasks_completed
         $QUERY$,
         _s_table
@@ -1897,7 +1921,7 @@ BEGIN
                 SET status = 'queued',
                     visible_at = now()
                 WHERE id = $1
-                  AND status = 'started'
+                  AND status IN ('started', 'waiting_for_map_tasks')
                   AND generator_status = 'complete'
                 $QUERY$,
                 _s_table
@@ -1925,7 +1949,7 @@ BEGIN
         SET status = 'queued',
             visible_at = now()
         WHERE id = $1
-          AND status = 'started'
+          AND status IN ('started', 'waiting_for_map_tasks')
           AND generator_status IS NULL
         $QUERY$,
         _s_table
@@ -2023,7 +2047,7 @@ BEGIN
         completed_at = now(),
         output = $2
     WHERE id = $1
-      AND status = 'started'
+      AND status IN ('started', 'waiting_for_map_tasks')
     RETURNING flow_run_id, dependent_step_names
     $QUERY$,
     _s_table
@@ -2058,10 +2082,18 @@ BEGIN
     EXECUTE format(
     $QUERY$
     UPDATE %I
-    SET remaining_dependencies = remaining_dependencies - 1
+    SET remaining_dependencies = remaining_dependencies - 1,
+        status = CASE
+          WHEN remaining_dependencies - 1 = 0 THEN
+            CASE
+              WHEN has_signal = true AND signal_input IS NULL THEN 'waiting_for_signal'
+              ELSE 'waiting_for_dependencies'
+            END
+          ELSE status
+        END
     WHERE flow_run_id = $1
       AND step_name = any($2)
-      AND status = 'pending'
+      AND status = 'waiting_for_dependencies'
     $QUERY$,
     _s_table
     )
@@ -2142,7 +2174,7 @@ DECLARE
     _m_table text := cb_table_name(cb_fail_step.flow_name, 'm');
     _flow_run_id bigint;
 BEGIN
-    -- Fail step run atomically - only succeeds if status is 'pending', 'queued', or 'started'
+    -- Fail step run atomically - only succeeds if status is non-terminal.
     EXECUTE format(
     $QUERY$
     UPDATE %I
@@ -2150,7 +2182,7 @@ BEGIN
         failed_at = now(),
         error_message = $2
     WHERE id = $1
-      AND status IN ('pending', 'queued', 'started')
+      AND status IN ('waiting_for_dependencies', 'waiting_for_signal', 'queued', 'started', 'waiting_for_map_tasks')
     RETURNING flow_run_id
     $QUERY$,
     _s_table
@@ -2158,7 +2190,7 @@ BEGIN
     USING cb_fail_step.step_id, cb_fail_step.error_message
     INTO _flow_run_id;
 
-    -- If step wasn't in 'pending', 'queued', or 'started' status, return early (already completed/failed)
+    -- If step wasn't in a non-terminal status, return early (already terminal)
     IF _flow_run_id IS NULL THEN
     RETURN;
     END IF;
@@ -2198,7 +2230,7 @@ BEGIN
         failed_at = coalesce(failed_at, now()),
         error_message = coalesce(error_message, $2)
     WHERE flow_run_id = $1
-      AND status IN ('pending', 'queued', 'started')
+      AND status IN ('waiting_for_dependencies', 'waiting_for_signal', 'queued', 'started', 'waiting_for_map_tasks')
     $QUERY$,
     _s_table
     )
@@ -2374,14 +2406,15 @@ DECLARE
     _s_table text := cb_table_name(cb_signal_flow.flow_name, 's');
     _updated boolean;
 BEGIN
-    -- Atomically update signal_input - only succeeds if step is pending, requires signal, and not already signaled
+    -- Atomically update signal_input - only succeeds for a step that is waiting for dependencies or signal,
+    -- requires signal, and has not already received one.
     EXECUTE format(
     $QUERY$
     UPDATE %I sr
     SET signal_input = $3
     WHERE sr.flow_run_id = $1
       AND sr.step_name = $2
-      AND sr.status = 'pending'
+      AND sr.status IN ('waiting_for_dependencies', 'waiting_for_signal')
       AND sr.signal_input IS NULL
       AND sr.has_signal = true
     RETURNING true

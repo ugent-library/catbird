@@ -1039,7 +1039,7 @@ type FlowRunInfo struct {
 // IsDone reports whether the flow run reached a terminal state.
 func (r *FlowRunInfo) IsDone() bool {
 	switch r.Status {
-	case "completed", "failed", "canceled":
+	case StatusCompleted, StatusFailed, StatusCanceled:
 		return true
 	default:
 		return false
@@ -1048,19 +1048,19 @@ func (r *FlowRunInfo) IsDone() bool {
 
 // IsCompleted reports whether the flow run completed successfully.
 func (r *FlowRunInfo) IsCompleted() bool {
-	return r.Status == "completed"
+	return r.Status == StatusCompleted
 }
 
 // OutputAs unmarshals the output of a completed flow run.
 // Returns an error if the flow run has failed or is not completed yet.
 func (r *FlowRunInfo) OutputAs(out any) error {
-	if r.Status == "failed" {
+	if r.Status == StatusFailed {
 		return fmt.Errorf("%w: %s", ErrRunFailed, r.ErrorMessage)
 	}
-	if r.Status == "canceled" {
+	if r.Status == StatusCanceled {
 		return canceledRunError(r.CancelReason)
 	}
-	if r.Status != "completed" {
+	if r.Status != StatusCompleted {
 		return fmt.Errorf("run not completed: current status is %s", r.Status)
 	}
 	return json.Unmarshal(r.Output, out)
@@ -1108,14 +1108,14 @@ func (h *FlowHandle) WaitForOutput(ctx context.Context, out any, opts ...WaitOpt
 		}
 
 		switch status {
-		case "completed":
+		case StatusCompleted:
 			return json.Unmarshal(output, out)
-		case "failed":
+		case StatusFailed:
 			if errorMessage != nil {
 				return fmt.Errorf("%w: %s", ErrRunFailed, *errorMessage)
 			}
 			return ErrRunFailed
-		case "canceled":
+		case StatusCanceled:
 			if errorMessage != nil {
 				return canceledRunError(*errorMessage)
 			}
@@ -1334,7 +1334,7 @@ type StepRunInfo struct {
 // IsDone reports whether the step run reached a terminal state.
 func (r *StepRunInfo) IsDone() bool {
 	switch r.Status {
-	case "completed", "failed", "skipped", "canceled":
+	case StatusCompleted, StatusFailed, StatusSkipped, StatusCanceled:
 		return true
 	default:
 		return false
@@ -1343,7 +1343,7 @@ func (r *StepRunInfo) IsDone() bool {
 
 // IsCompleted reports whether the step run completed successfully.
 func (r *StepRunInfo) IsCompleted() bool {
-	return r.Status == "completed"
+	return r.Status == StatusCompleted
 }
 
 func getStepStatus(ctx context.Context, conn Conn, flowName string, flowRunID int64, stepName string) (*StepRunInfo, error) {

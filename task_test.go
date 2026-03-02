@@ -168,7 +168,7 @@ func TestTaskRunDelayedVisibleAt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runInfo.Status != "queued" {
+	if runInfo.Status != StatusQueued {
 		t.Fatalf("expected delayed task to remain queued before visible_at, got %s", runInfo.Status)
 	}
 
@@ -263,7 +263,7 @@ func TestTaskPanicRecovery(t *testing.T) {
 	}
 
 	// Check that the task run shows failure due to panic
-	if taskRuns[0].Status != "failed" {
+	if taskRuns[0].Status != StatusFailed {
 		t.Fatalf("expected status failed, got %s", taskRuns[0].Status)
 	}
 
@@ -513,7 +513,7 @@ func TestTaskDeduplicationRetryOnFailure(t *testing.T) {
 		t.Fatal("expected first run to be created")
 	}
 
-	waitForTaskRunStatus(t, client, taskName, h1.ID, "failed", 5*time.Second)
+	waitForTaskRunStatus(t, client, taskName, h1.ID, StatusFailed, 5*time.Second)
 
 	h2, err := client.RunTask(t.Context(), taskName, RetryInput{Fail: false}, RunTaskOpts{ConcurrencyKey: "retry-test-1"})
 	if err != nil {
@@ -531,7 +531,7 @@ func TestTaskDeduplicationRetryOnFailure(t *testing.T) {
 		t.Fatal("expected first run to be created")
 	}
 
-	waitForTaskRunStatus(t, client, taskName, h3.ID, "failed", 5*time.Second)
+	waitForTaskRunStatus(t, client, taskName, h3.ID, StatusFailed, 5*time.Second)
 
 	h4, err := client.RunTask(t.Context(), taskName, RetryInput{Fail: false}, RunTaskOpts{IdempotencyKey: "idempotent-retry-1"})
 	if err != nil {
@@ -744,7 +744,7 @@ func TestTaskCancelQueuedRun(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if run.Status != "canceled" {
+	if run.Status != StatusCanceled {
 		t.Fatalf("expected canceled, got %s", run.Status)
 	}
 	if run.CancelReason == "" {
@@ -770,13 +770,13 @@ func TestTaskCancelStartedRun(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitForTaskRunStatus(t, client, taskName, h.ID, "started", 5*time.Second)
+	waitForTaskRunStatus(t, client, taskName, h.ID, StatusStarted, 5*time.Second)
 
 	if err := client.CancelTaskRun(t.Context(), taskName, h.ID, CancelOpts{Reason: "test cancel started"}); err != nil {
 		t.Fatal(err)
 	}
 
-	waitForTaskRunStatus(t, client, taskName, h.ID, "canceled", 5*time.Second)
+	waitForTaskRunStatus(t, client, taskName, h.ID, StatusCanceled, 5*time.Second)
 }
 
 func TestTaskInternalCancelCurrentRun(t *testing.T) {
@@ -812,7 +812,7 @@ func TestTaskInternalCancelCurrentRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.Status != "canceled" {
+	if run.Status != StatusCanceled {
 		t.Fatalf("expected canceled, got %s", run.Status)
 	}
 }
@@ -849,7 +849,7 @@ func TestTaskHandleWaitForOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.Status != "completed" {
+	if run.Status != StatusCompleted {
 		t.Fatalf("expected completed, got %s", run.Status)
 	}
 	if !run.IsDone() {
@@ -861,7 +861,7 @@ func TestTaskHandleWaitForOutput(t *testing.T) {
 }
 
 func TestTaskRunInfoOutputAsSkipped(t *testing.T) {
-	run := &TaskRunInfo{Status: "skipped"}
+	run := &TaskRunInfo{Status: StatusSkipped}
 
 	var out string
 	err := run.OutputAs(&out)

@@ -183,7 +183,7 @@ func TestFlowRunDelayedVisibleAt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runInfo.Status != "started" {
+	if runInfo.Status != StatusStarted {
 		t.Fatalf("expected delayed flow to remain started before visible_at, got %s", runInfo.Status)
 	}
 
@@ -730,7 +730,7 @@ func TestFlowMapParentCompletesAfterAllMapTasks(t *testing.T) {
 	if workStep == nil {
 		t.Fatalf("work step not found")
 	}
-	if workStep.Status == "completed" {
+	if workStep.Status == StatusCompleted {
 		t.Fatalf("expected map parent step not to be completed while tasks are still in-flight")
 	}
 
@@ -749,8 +749,8 @@ func TestFlowMapParentCompletesAfterAllMapTasks(t *testing.T) {
 	if err := client.Conn.QueryRow(t.Context(), earlyQ, h.ID, "work").Scan(&total, &completed, &active); err != nil {
 		t.Fatal(err)
 	}
-	if workStep.Status == "started" && total == 0 {
-		t.Fatalf("expected spawned map tasks while parent step is started")
+	if (workStep.Status == StatusStarted || workStep.Status == StatusWaitingForMapTasks) && total == 0 {
+		t.Fatalf("expected spawned map tasks while parent step is active/waiting")
 	}
 
 	var out []int
@@ -830,7 +830,7 @@ func TestFlowMapTaskFailureFailsParentAndFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runInfo.Status != "failed" {
+	if runInfo.Status != StatusFailed {
 		t.Fatalf("expected flow status failed, got %s", runInfo.Status)
 	}
 
@@ -846,7 +846,7 @@ func TestFlowMapTaskFailureFailsParentAndFlow(t *testing.T) {
 			break
 		}
 	}
-	if workStatus != "failed" {
+	if workStatus != StatusFailed {
 		t.Fatalf("expected map parent step to be failed, got %s", workStatus)
 	}
 
@@ -1106,7 +1106,7 @@ func TestFlowGeneratorStepFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runInfo.Status != "failed" {
+	if runInfo.Status != StatusFailed {
 		t.Fatalf("expected failed flow status, got %s", runInfo.Status)
 	}
 	if !strings.Contains(runInfo.ErrorMessage, "generator stopped at 1") {
@@ -1476,7 +1476,7 @@ func TestStepPanicRecovery(t *testing.T) {
 	}
 
 	// Flow should have failed due to step panic
-	if flowRuns[0].Status != "failed" {
+	if flowRuns[0].Status != StatusFailed {
 		t.Fatalf("expected flow status failed, got %s", flowRuns[0].Status)
 	}
 }
@@ -2020,7 +2020,7 @@ func TestFlowCondition(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to query step state: %v", err)
 		}
-		if state != "skipped" {
+		if state != StatusSkipped {
 			t.Errorf("step2 state = %q, want 'skipped'", state)
 		}
 	})
@@ -2115,7 +2115,7 @@ func TestFlowCondition(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to query step state: %v", err)
 		}
-		if state != "skipped" {
+		if state != StatusSkipped {
 			t.Errorf("step2 state = %q, want 'skipped'", state)
 		}
 	})
@@ -2261,7 +2261,7 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to query step state: %v", err)
 		}
-		if state != "skipped" {
+		if state != StatusSkipped {
 			t.Errorf("step2 state = %q, want 'skipped'", state)
 		}
 	})
@@ -2412,13 +2412,13 @@ func TestFlowCancelStartedRun(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitForFlowRunStatus(t, client, flowName, h.ID, "started", 5*time.Second)
+	waitForFlowRunStatus(t, client, flowName, h.ID, StatusStarted, 5*time.Second)
 
 	if err := client.CancelFlowRun(t.Context(), flowName, h.ID, CancelOpts{Reason: "test flow cancel"}); err != nil {
 		t.Fatal(err)
 	}
 
-	waitForFlowRunStatus(t, client, flowName, h.ID, "canceled", 5*time.Second)
+	waitForFlowRunStatus(t, client, flowName, h.ID, StatusCanceled, 5*time.Second)
 }
 
 func TestFlowInternalCancelCurrentRun(t *testing.T) {
@@ -2455,7 +2455,7 @@ func TestFlowInternalCancelCurrentRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.Status != "canceled" {
+	if run.Status != StatusCanceled {
 		t.Fatalf("expected canceled, got %s", run.Status)
 	}
 }
@@ -2515,7 +2515,7 @@ func TestFlowFailStopsInFlightParallelStep(t *testing.T) {
 		// in-flight sibling observed cancellation after flow failure
 	case <-time.After(2 * time.Second):
 		stepInfo := waitForFlowStepFinished(t, client, flowName, h.ID, "long_running", 2*time.Second)
-		if stepInfo.Status == "completed" {
+		if stepInfo.Status == StatusCompleted {
 			t.Fatalf("expected long_running not to complete after sibling failure, got status=%s", stepInfo.Status)
 		}
 	}
@@ -2569,7 +2569,7 @@ func TestFlowCompleteEarlyFromStep(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.Status != "completed" {
+	if run.Status != StatusCompleted {
 		t.Fatalf("expected completed, got %s", run.Status)
 	}
 
@@ -2578,7 +2578,7 @@ func TestFlowCompleteEarlyFromStep(t *testing.T) {
 		// in-flight sibling observed stop after early completion
 	case <-time.After(2 * time.Second):
 		stepInfo := waitForFlowStepFinished(t, client, flowName, h.ID, "long_running", 2*time.Second)
-		if stepInfo.Status == "completed" {
+		if stepInfo.Status == StatusCompleted {
 			t.Fatalf("expected long_running not to complete after early completion, got status=%s", stepInfo.Status)
 		}
 	}
@@ -2661,7 +2661,7 @@ func TestStepStatusAndWaitForOutput(t *testing.T) {
 		t.Fatalf("unexpected step1 output: %s", step1Out)
 	}
 
-	if stepInfo.Status != "completed" {
+	if stepInfo.Status != StatusCompleted {
 		t.Fatalf("expected completed, got %s", stepInfo.Status)
 	}
 	if stepInfo.Attempts < 1 {
@@ -2688,7 +2688,7 @@ func TestStepStatusAndWaitForOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.Status != "completed" {
+	if run.Status != StatusCompleted {
 		t.Fatalf("expected completed, got %s", run.Status)
 	}
 	if !run.IsDone() {
@@ -2737,7 +2737,7 @@ func TestStepWaitForOutputSkipped(t *testing.T) {
 	}
 
 	stepInfo := waitForFlowStepFinished(t, client, flowName, h.ID, "step1", 8*time.Second)
-	if stepInfo.Status != "skipped" {
+	if stepInfo.Status != StatusSkipped {
 		t.Fatalf("expected step1 status skipped, got %s", stepInfo.Status)
 	}
 }

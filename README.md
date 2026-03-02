@@ -559,7 +559,9 @@ _ = handle.WaitForOutput(ctx, &out)
 | Status | Meaning | Used by |
 |--------|---------|---------|
 | `queued` | Runnable and never picked up by a worker | Task runs, flow step runs, map item runs |
-| `pending` | Not runnable yet (waiting on dependencies and/or signal input) | Flow step runs |
+| `waiting_for_dependencies` | Not runnable yet because one or more dependencies are still incomplete | Flow step runs |
+| `waiting_for_signal` | Dependencies are resolved, but required signal input has not been delivered yet | Flow step runs |
+| `waiting_for_map_tasks` | Parent map/reducer step is waiting for spawned map item runs to finish | Flow step runs |
 | `started` | Picked up by a worker at least once (including retries) | Task runs, flow runs, flow step runs, map item runs |
 | `completed` | Finished successfully and output is available | Task runs, flow runs, flow step runs, map item runs |
 | `failed` | Finished with an error | Task runs, flow runs, flow step runs, map item runs |

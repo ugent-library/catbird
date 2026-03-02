@@ -213,7 +213,7 @@ type TaskRunInfo struct {
 // IsDone reports whether the task run reached a terminal state.
 func (r *TaskRunInfo) IsDone() bool {
 	switch r.Status {
-	case "completed", "failed", "skipped", "canceled":
+	case StatusCompleted, StatusFailed, StatusSkipped, StatusCanceled:
 		return true
 	default:
 		return false
@@ -222,22 +222,22 @@ func (r *TaskRunInfo) IsDone() bool {
 
 // IsCompleted reports whether the task run completed successfully.
 func (r *TaskRunInfo) IsCompleted() bool {
-	return r.Status == "completed"
+	return r.Status == StatusCompleted
 }
 
 // OutputAs unmarshals the output of a completed task run.
 // Returns an error if the task run has failed or is not completed yet.
 func (r *TaskRunInfo) OutputAs(out any) error {
-	if r.Status == "failed" {
+	if r.Status == StatusFailed {
 		return fmt.Errorf("%w: %s", ErrRunFailed, r.ErrorMessage)
 	}
-	if r.Status == "canceled" {
+	if r.Status == StatusCanceled {
 		return canceledRunError(r.CancelReason)
 	}
-	if r.Status == "skipped" {
+	if r.Status == StatusSkipped {
 		return fmt.Errorf("run skipped: condition not met")
 	}
-	if r.Status != "completed" {
+	if r.Status != StatusCompleted {
 		return fmt.Errorf("run not completed: current status is %s", r.Status)
 	}
 	return json.Unmarshal(r.Output, out)
@@ -285,19 +285,19 @@ func (h *TaskHandle) WaitForOutput(ctx context.Context, out any, opts ...WaitOpt
 		}
 
 		switch status {
-		case "completed":
+		case StatusCompleted:
 			return json.Unmarshal(output, out)
-		case "failed":
+		case StatusFailed:
 			if errorMessage != nil {
 				return fmt.Errorf("%w: %s", ErrRunFailed, *errorMessage)
 			}
 			return ErrRunFailed
-		case "canceled":
+		case StatusCanceled:
 			if errorMessage != nil {
 				return canceledRunError(*errorMessage)
 			}
 			return ErrRunCanceled
-		case "skipped":
+		case StatusSkipped:
 			return fmt.Errorf("run skipped: condition not met")
 		}
 	}

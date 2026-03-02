@@ -855,7 +855,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 				return
 			}
 
-			if changed || status == "completed" {
+			if changed || status == StatusCompleted {
 				stopRequested.Store(true)
 				claimCancel()
 			}
@@ -1277,7 +1277,7 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 				return
 			}
 
-			if changed || status == "completed" {
+			if changed || status == StatusCompleted {
 				stopRequested.Store(true)
 				claimCancel()
 			}
@@ -1599,7 +1599,7 @@ func finalizeStepReduction(ctx context.Context, conn Conn, logger *slog.Logger, 
 
 func getStepFlowRunIDForReduction(ctx context.Context, conn Conn, flowName string, step *Step, stepID int64) (int64, error) {
 	tableName := fmt.Sprintf("cb_s_%s", strings.ToLower(flowName))
-	q := fmt.Sprintf(`SELECT flow_run_id FROM %s WHERE id = $1 AND step_name = $2 AND status IN ('queued', 'started')`, tableName)
+	q := fmt.Sprintf(`SELECT flow_run_id FROM %s WHERE id = $1 AND step_name = $2 AND status IN ('%s', '%s', '%s')`, tableName, StatusQueued, StatusStarted, StatusWaitingForMapTasks)
 	if step.isGenerator {
 		q += ` AND generator_status = 'complete'`
 	}
@@ -1615,7 +1615,7 @@ func getStepFlowRunIDForReduction(ctx context.Context, conn Conn, flowName strin
 
 func generatorReductionReady(ctx context.Context, conn Conn, flowName, stepName string, stepID int64) (bool, error) {
 	tableName := fmt.Sprintf("cb_s_%s", strings.ToLower(flowName))
-	q := fmt.Sprintf(`SELECT generator_status = 'complete' FROM %s WHERE id = $1 AND step_name = $2 AND status IN ('queued', 'started')`, tableName)
+	q := fmt.Sprintf(`SELECT coalesce(generator_status = 'complete', false) FROM %s WHERE id = $1 AND step_name = $2 AND status IN ('%s', '%s', '%s')`, tableName, StatusQueued, StatusStarted, StatusWaitingForMapTasks)
 	var ready bool
 	if err := conn.QueryRow(ctx, q, stepID, stepName).Scan(&ready); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1730,7 +1730,7 @@ func getFlowStatusBestEffort(ctx context.Context, conn Conn, flowName string, ru
 
 func shouldStopFlow(status string) bool {
 	switch status {
-	case "canceling", "canceled", "failed", "completed":
+	case StatusCanceling, StatusCanceled, StatusFailed, StatusCompleted:
 		return true
 	default:
 		return false
@@ -1752,14 +1752,14 @@ func stopFlowIfRequested(
 		return false
 	}
 
-	if cancelRequested != nil && (status == "canceling" || status == "canceled") {
+	if cancelRequested != nil && (status == StatusCanceling || status == StatusCanceled) {
 		*cancelRequested = true
 	}
 
 	if claimCancel != nil {
 		claimCancel()
 	}
-	if onCancel != nil && (status == "canceling" || status == "canceled") {
+	if onCancel != nil && (status == StatusCanceling || status == StatusCanceled) {
 		onCancel()
 	}
 	if logger != nil {

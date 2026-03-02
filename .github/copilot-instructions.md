@@ -339,8 +339,9 @@ docker compose logs -f postgres
 6. **Concurrency**: Default 1 per handler; set via `WithConcurrency(...)`
 7. **Conditional execution**: Use `.Condition("expression")` on tasks/steps. Tasks use `input.field` syntax (e.g., `"input.is_premium"`), flow steps use `step_name.field` syntax (e.g., `"validate.score gte 50"`)
 8. **Optional dependencies**: Use `Optional[T]` + `OptionalDependency()` pair when depending on conditional steps. Validation at flow construction time enforces type safety.
-9. **SQL parameter/column conflicts**: Use `#variable_conflict use_column` directive in PL/pgSQL when parameter names match column names (prevents "column ambiguous" errors)
-10. **Atomic deduplication with UNION ALL**: For `RunTask()` and `RunFlow()` deduplication (concurrency_key / idempotency_key), use the atomic ON CONFLICT DO UPDATE pattern with UNION ALL fallback. **DO NOT remove the UNION ALL or simplify to plain `RETURNING id`**. The pattern is:
+9. **Status constants in Go**: Use shared status constants from `statuses.go` (e.g., `StatusQueued`, `StatusStarted`, `StatusWaitingForDependencies`) instead of raw status string literals in Go code and tests.
+10. **SQL parameter/column conflicts**: Use `#variable_conflict use_column` directive in PL/pgSQL when parameter names match column names (prevents "column ambiguous" errors)
+11. **Atomic deduplication with UNION ALL**: For `RunTask()` and `RunFlow()` deduplication (concurrency_key / idempotency_key), use the atomic ON CONFLICT DO UPDATE pattern with UNION ALL fallback. **DO NOT remove the UNION ALL or simplify to plain `RETURNING id`**. The pattern is:
 ```sql
 WITH ins AS (
     INSERT INTO table_name (key_col, data_col)
