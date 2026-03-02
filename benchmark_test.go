@@ -167,10 +167,10 @@ func BenchmarkFlowThroughput(b *testing.B) {
 	ctx := context.Background()
 
 	flowName := fmt.Sprintf("bench_flow_%d", time.Now().UnixNano())
-	flow := NewFlow(flowName).
-		AddStep(NewStep("step1").Handler(func(ctx context.Context, in int) (int, error) {
-			return in + 1, nil
-		}))
+	flow := NewFlow(flowName)
+	flow.AddStep("step1").Handler(func(ctx context.Context, in int) (int, error) {
+		return in + 1, nil
+	})
 
 	worker := client.NewWorker(ctx).AddFlow(flow)
 	startBenchmarkWorker(b, worker)
@@ -311,10 +311,10 @@ func BenchmarkFlowThroughputPipelined(b *testing.B) {
 	ctx := context.Background()
 
 	flowName := fmt.Sprintf("bench_flow_pipelined_%d", time.Now().UnixNano())
-	flow := NewFlow(flowName).
-		AddStep(NewStep("step1").Handler(func(ctx context.Context, in int) (int, error) {
-			return in + 1, nil
-		}))
+	flow := NewFlow(flowName)
+	flow.AddStep("step1").Handler(func(ctx context.Context, in int) (int, error) {
+		return in + 1, nil
+	})
 
 	worker := client.NewWorker(ctx).AddFlow(flow)
 	startBenchmarkWorker(b, worker)
@@ -443,10 +443,10 @@ func BenchmarkFlowThroughputPipelinedTuned(b *testing.B) {
 	ctx := context.Background()
 
 	flowName := fmt.Sprintf("bench_flow_pipelined_tuned_%d", time.Now().UnixNano())
-	flow := NewFlow(flowName).
-		AddStep(NewStep("step1").Handler(func(ctx context.Context, in int) (int, error) {
-			return in + 1, nil
-		}, benchmarkTunedHandlerOpts...))
+	flow := NewFlow(flowName)
+	flow.AddStep("step1").Handler(func(ctx context.Context, in int) (int, error) {
+		return in + 1, nil
+	}, benchmarkTunedHandlerOpts...)
 
 	worker := client.NewWorker(ctx).AddFlow(flow)
 	startBenchmarkWorker(b, worker)

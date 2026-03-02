@@ -87,11 +87,11 @@ task := catbird.NewTask("my_task").
 **Flows**: Multi-step DAGs with dependencies using builder pattern:
 ```go
 flow := catbird.NewFlow("my_flow").
-  AddStep(catbird.NewStep("step1").
+  AddStep("step1").
     Handler(func(ctx context.Context, in string) (string, error) {
       return in + " modified", nil
     })).
-  AddStep(catbird.NewStep("step2").
+  AddStep("step2").
     DependsOn("step1").
     Handler(func(ctx context.Context, in string, step1Out string) (string, error) {
       return step1Out + " from step2", nil
@@ -116,17 +116,17 @@ task := catbird.NewTask("premium_processing").
 **Flow step conditions** reference step outputs with `step_name.*` prefix and can also reference signal input via `signal.*` when present:
 ```go
 NewFlow("risk-check").
-  AddStep(NewStep("validate").
+  AddStep("validate").
     Handler(func(ctx context.Context, amount int) (int, error) {
       return amount, nil
     })).
-  AddStep(NewStep("audit").
+  AddStep("audit").
     DependsOn("validate").
     WithCondition("validate gt 1000"). // Conditional step
     Handler(func(ctx context.Context, in int, validateOut int) (int, error) {
       return validateOut * 2, nil  // expensive check
     })).
-  AddStep(NewStep("finalize").
+  AddStep("finalize").
     DependsOn("audit").
     Handler(func(ctx context.Context, in int, auditResult catbird.Optional[int]) (int, error) {
       if auditResult.IsSet {
@@ -141,11 +141,11 @@ NewFlow("risk-check").
 **Signals** enable human-in-the-loop workflows: steps can optionally wait for external input via `.WithSignal()` builder method before executing:
 ```go
 NewFlow("workflow").
-  AddStep(NewStep("step1").
+  AddStep("step1").
     Handler(func(ctx context.Context, in string) (string, error) {
       return in + " processed by step 1", nil
     })).
-  AddStep(NewStep("approve").
+  AddStep("approve").
     DependsOn("step1").
     WithSignal(). // Wait for signal
     Handler(func(ctx context.Context, in string, approval ApprovalInput, step1Out string) (string, error) {
@@ -161,7 +161,7 @@ NewFlow("workflow").
 - **Optional outputs**: When a conditional step is skipped, dependent steps receive `Optional[T]{IsSet: false}`. When executed, `Optional[T]{IsSet: true, Value: result}`
 - **Cascading resolution**: `cb_start_steps()` loops until no more steps unblock; handles chains like step2 skips → step3 unblocks → step4 unblocks
 - **Validation**: Flow construction panics if a step depends on a conditional step without using `.OptionalDependency()` variant and `Optional[T]` parameter type
-- **Builder methods**: All construction through chainable methods: `NewStep(name).DependsOn(...).WithCondition(...).WithSignal().Handler(fn, opts...)`
+- **Builder methods**: All construction through chainable methods: `flow.AddStep(name).DependsOn(...).WithCondition(...).WithSignal().Handler(fn, opts...)`
 
 ## Key Conventions
 

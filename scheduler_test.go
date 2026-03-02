@@ -202,10 +202,10 @@ func TestSchedulerUTCNormalization(t *testing.T) {
 func TestSchedulerFlowIdempotency(t *testing.T) {
 	client := getTestClient(t)
 
-	flow := NewFlow("scheduled_flow").
-		AddStep(NewStep("step1").Handler(func(ctx context.Context, in string) (int, error) {
-			return 42, nil
-		}))
+	flow := NewFlow("scheduled_flow")
+	flow.AddStep("step1").Handler(func(ctx context.Context, in string) (int, error) {
+		return 42, nil
+	})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 
@@ -271,9 +271,10 @@ func TestSchedulerEnqueueRollback(t *testing.T) {
 	}
 
 	// Similarly for flows
-	flow := NewFlow("test_sched_flow").AddStep(NewStep("s1").Handler(func(ctx context.Context, in int) (int, error) {
+	flow := NewFlow("test_sched_flow")
+	flow.AddStep("s1").Handler(func(ctx context.Context, in int) (int, error) {
 		return in, nil
-	}))
+	})
 
 	if err := CreateFlow(t.Context(), client.Conn, flow); err != nil {
 		t.Fatal(err)

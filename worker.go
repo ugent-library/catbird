@@ -205,12 +205,12 @@ func (w *Worker) startFlowWorkers(shutdownCtx, handlerCtx context.Context, wg *s
 
 			stepHandlers = append(stepHandlers, &StepHandlerInfo{FlowName: f.name, StepName: s.name})
 
-			if shouldStartStepWorker(&s) {
-				newStepWorker(w.conn, w.logger, f.name, &s).start(shutdownCtx, handlerCtx, wg)
+			if shouldStartStepWorker(s) {
+				newStepWorker(w.conn, w.logger, f.name, s).start(shutdownCtx, handlerCtx, wg)
 			}
 
-			if shouldStartMapStepWorker(&s) {
-				newMapStepWorker(w.conn, w.logger, f.name, &s).start(shutdownCtx, handlerCtx, wg)
+			if shouldStartMapStepWorker(s) {
+				newMapStepWorker(w.conn, w.logger, f.name, s).start(shutdownCtx, handlerCtx, wg)
 			}
 		}
 	}

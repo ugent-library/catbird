@@ -21,7 +21,7 @@ type Optional[T any] struct {
 type Flow struct {
 	name               string
 	description        string
-	steps              []Step
+	steps              []*Step
 	outputPriority     []string
 	priorityConfigured bool
 	onFail             func(context.Context, json.RawMessage, FlowFailure) error
@@ -48,9 +48,26 @@ func NewFlow(name string) *Flow {
 	return &Flow{name: name}
 }
 
-func (f *Flow) AddStep(step *Step) *Flow {
-	f.steps = append(f.steps, *step)
-	return f
+func (f *Flow) AddStep(name string) *Step {
+	step := &Step{
+		name:                 name,
+		optionalDependencies: make(map[string]bool),
+	}
+	f.steps = append(f.steps, step)
+	return step
+}
+
+func (f *Flow) AddGeneratorStep(name string) *Step {
+	step := f.AddStep(name)
+	step.isGenerator = true
+	return step
+}
+
+func (f *Flow) AddMapStep(name string) *Step {
+	step := f.AddStep(name)
+	step.isMapStep = true
+	step.mapSource = ""
+	return step
 }
 
 func (f *Flow) WithDescription(description string) *Flow {
@@ -162,21 +179,8 @@ type Step struct {
 	handlerOpts          *handlerOpts
 }
 
-func NewStep(name string) *Step {
-	return &Step{
-		name:                 name,
-		optionalDependencies: make(map[string]bool),
-	}
-}
-
 func (s *Step) WithDescription(description string) *Step {
 	s.description = description
-	return s
-}
-
-func NewGeneratorStep(name string) *Step {
-	s := NewStep(name)
-	s.isGenerator = true
 	return s
 }
 
@@ -214,7 +218,7 @@ func (s *Step) Map(stepName string) *Step {
 	if strings.TrimSpace(stepName) == "" {
 		panic(fmt.Sprintf("step %s: map source step name must not be empty", s.name))
 	}
-	if s.isMapStep && s.mapSource != stepName {
+	if s.isMapStep && s.mapSource != "" && s.mapSource != stepName {
 		panic(fmt.Sprintf("step %s: map source already set to %q", s.name, s.mapSource))
 	}
 	s.isMapStep = true
@@ -230,7 +234,7 @@ func (s *Step) Map(stepName string) *Step {
 
 func (s *Step) Generator(fn any) *Step {
 	if !s.isGenerator {
-		panic(fmt.Sprintf("step %s: Generator() is only valid for NewGeneratorStep", s.name))
+		panic(fmt.Sprintf("step %s: Generator() is only valid for AddGeneratorStep", s.name))
 	}
 
 	depType, itemType, err := parseGeneratorFn(fn, s.name)
@@ -812,7 +816,7 @@ func validateFlowDependencies(flow *Flow) error {
 					return fmt.Errorf("flow %q: step %q reducer item type %v does not match handler output type %v", flow.name, step.name, step.reducerItem, step.outputType)
 				}
 			}
-			if err := validateGeneratorFnForStep(&step, flow.name); err != nil {
+			if err := validateGeneratorFnForStep(step, flow.name); err != nil {
 				return err
 			}
 		}

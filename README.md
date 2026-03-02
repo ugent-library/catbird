@@ -49,11 +49,11 @@ task := catbird.NewTask("send-email").
     })
 
 flow := catbird.NewFlow("double-add").
-    AddStep(catbird.NewStep("double").
+    AddStep("double").
         Handler(func(ctx context.Context, input int) (int, error) {
             return input * 2, nil
         })).
-    AddStep(catbird.NewStep("add").
+    AddStep("add").
         DependsOn("double").
         Handler(func(ctx context.Context, input int, doubled int) (int, error) {
             return doubled + 1, nil
@@ -245,14 +245,14 @@ A **flow** is a **directed acyclic graph (DAG)** of steps that execute when thei
 
 ```go
 flow := catbird.NewFlow("order-processing").
-    AddStep(catbird.NewStep("validate").
+    AddStep("validate").
         Handler(func(ctx context.Context, order Order) (ValidationResult, error) {
             if order.Amount <= 0 {
                 return ValidationResult{Valid: false, Reason: "Invalid amount"}, nil
             }
             return ValidationResult{Valid: true}, nil
         })).
-    AddStep(catbird.NewStep("charge").
+    AddStep("charge").
         DependsOn("validate").
         Handler(func(ctx context.Context, order Order, validated ValidationResult) (ChargeResult, error) {
             if !validated.Valid {
@@ -263,7 +263,7 @@ flow := catbird.NewFlow("order-processing").
                 Amount:        order.Amount,
             }, nil
         })).
-    AddStep(catbird.NewStep("check-inventory").
+    AddStep("check-inventory").
         DependsOn("validate").
         Handler(func(ctx context.Context, order Order, validated ValidationResult) (InventoryCheck, error) {
             return InventoryCheck{
@@ -271,7 +271,7 @@ flow := catbird.NewFlow("order-processing").
                 Qty:     order.Amount,
             }, nil
         })).
-    AddStep(catbird.NewStep("ship").
+    AddStep("ship").
         DependsOn("charge", "check-inventory").
         Handler(func(ctx context.Context, order Order, chargeResult ChargeResult, inventory InventoryCheck) (ShipmentResult, error) {
             if !inventory.InStock {
@@ -300,17 +300,17 @@ Flows can have multiple terminal steps.
 ```go
 flow := catbird.NewFlow("approval-or-escalation").
     OutputPriority("approve", "escalate").
-    AddStep(catbird.NewStep("validate").
+    AddStep("validate").
         Handler(func(ctx context.Context, req Request) (Validation, error) {
             return Validation{Score: req.Score}, nil
         })).
-    AddStep(catbird.NewStep("approve").
+    AddStep("approve").
         DependsOn("validate").
         WithCondition("validate.score gte 80").
         Handler(func(ctx context.Context, req Request, v Validation) (Decision, error) {
             return Decision{Status: "approved"}, nil
         })).
-    AddStep(catbird.NewStep("escalate").
+    AddStep("escalate").
         DependsOn("validate").
         WithCondition("validate.score lt 80").
         Handler(func(ctx context.Context, req Request, v Validation) (Decision, error) {
@@ -322,9 +322,9 @@ If you omit `OutputPriority(...)`, Catbird uses terminal steps in definition ord
 
 ```go
 flow := catbird.NewFlow("default-terminal-priority").
-    AddStep(catbird.NewStep("a").Handler(func(ctx context.Context, in int) (int, error) { return in, nil })).
-    AddStep(catbird.NewStep("left").DependsOn("a").Handler(func(ctx context.Context, in int, a int) (int, error) { return a + 1, nil })).
-    AddStep(catbird.NewStep("right").DependsOn("a").Handler(func(ctx context.Context, in int, a int) (int, error) { return a + 2, nil }))
+    AddStep("a").Handler(func(ctx context.Context, in int) (int, error) { return in, nil })).
+    AddStep("left").DependsOn("a").Handler(func(ctx context.Context, in int, a int) (int, error) { return a + 1, nil })).
+    AddStep("right").DependsOn("a").Handler(func(ctx context.Context, in int, a int) (int, error) { return a + 2, nil }))
 
 // Effective priority: left, then right.
 ```
@@ -337,7 +337,7 @@ original input plus rich failure context.
 
 ```go
 flow := catbird.NewFlow("order-processing").
-    AddStep(catbird.NewStep("charge").
+    AddStep("charge").
         Handler(func(ctx context.Context, order Order) (string, error) {
             return "", fmt.Errorf("charge failed")
         })).
@@ -362,11 +362,11 @@ Signals enable workflows that wait for external input before proceeding, such as
 
 ```go
 flow := catbird.NewFlow("document_approval").
-    AddStep(catbird.NewStep("submit").
+    AddStep("submit").
         Handler(func(ctx context.Context, doc Document) (string, error) {
             return doc.ID, nil
         })).
-    AddStep(catbird.NewStep("approve").
+    AddStep("approve").
         DependsOn("submit").
         WithSignal().
         Handler(func(ctx context.Context, doc Document, approval ApprovalInput, docID string) (ApprovalResult, error) {
@@ -379,7 +379,7 @@ flow := catbird.NewFlow("document_approval").
                 Timestamp:  time.Now().Format(time.RFC3339),
             }, nil
         })).
-    AddStep(catbird.NewStep("publish").
+    AddStep("publish").
         DependsOn("approve").
         Handler(func(ctx context.Context, doc Document, approval ApprovalResult) (PublishResult, error) {
             return PublishResult{
@@ -397,20 +397,20 @@ Use `CompleteEarly(ctx, output, reason)` inside a flow step handler when you alr
 
 ```go
 flow := catbird.NewFlow("fraud-check").
-    AddStep(catbird.NewStep("quick_guard").
+    AddStep("quick_guard").
         Handler(func(ctx context.Context, in Order) (string, error) {
             if in.IsKnownSafe {
                 return "", catbird.CompleteEarly(ctx, Decision{Approved: true}, "known-safe fast path")
             }
             return "continue", nil
         })).
-    AddStep(catbird.NewStep("slow_analysis").
+    AddStep("slow_analysis").
         Handler(func(ctx context.Context, in Order) (string, error) {
             // potentially expensive work
             time.Sleep(2 * time.Second)
             return "done", nil
         })).
-    AddStep(catbird.NewStep("final").
+    AddStep("final").
         DependsOn("quick_guard", "slow_analysis").
         Handler(func(ctx context.Context, in Order, guard string, analysis string) (Decision, error) {
             return Decision{Approved: guard == "continue" && analysis == "done"}, nil
@@ -423,6 +423,7 @@ When early completion wins the race, the flow run becomes `completed` with the p
 
 Map steps fan out array processing into per-item SQL-coordinated work and aggregate results back in item order.
 
+- Define map steps with `AddMapStep("name")`
 - Use `MapInput()` to map over flow input (flow input must be a JSON array)
 - Use `Map("step_name")` to map over a dependency step output array
 - Each mapped item runs as its own task, so retries happen per item instead of rerunning the whole step.
@@ -436,7 +437,7 @@ Retry order with `Reduce(...)`: per-item handler retries happen first (per map t
 
 ```go
 flow := catbird.NewFlow("double-input").
-    AddStep(catbird.NewStep("double").
+    AddMapStep("double").
         MapInput().
         Handler(func(ctx context.Context, n int) (int, error) {
             return n * 2, nil
@@ -452,11 +453,11 @@ _ = handle.WaitForOutput(ctx, &out)
 
 ```go
 flow := catbird.NewFlow("double-numbers").
-    AddStep(catbird.NewStep("numbers").
+    AddStep("numbers").
         Handler(func(ctx context.Context, _ string) ([]int, error) {
             return []int{1, 2, 3}, nil
         })).
-    AddStep(catbird.NewStep("double").
+    AddMapStep("double").
         Map("numbers").
         Handler(func(ctx context.Context, _ string, n int) (int, error) {
             return n * 2, nil
@@ -464,11 +465,11 @@ flow := catbird.NewFlow("double-numbers").
 
 // Reduce mapped outputs without materializing []int on the step output
 flow = catbird.NewFlow("double-numbers-reduced").
-    AddStep(catbird.NewStep("numbers").
+    AddStep("numbers").
         Handler(func(ctx context.Context, _ string) ([]int, error) {
             return []int{1, 2, 3}, nil
         })).
-    AddStep(catbird.NewStep("double").
+    AddMapStep("double").
         Map("numbers").
         Handler(func(ctx context.Context, _ string, n int) (int, error) {
             return n * 2, nil
@@ -482,7 +483,7 @@ flow = catbird.NewFlow("double-numbers-reduced").
 
 Generator steps act like normal flow steps with an extra trailing `yield` callback for streaming items; yielded items are processed by a per-item handler.
 
-- Define the step with `NewGeneratorStep("name")`
+- Define the step with `flow.AddGeneratorStep("name")`
 - Optionally add `DependsOn(...)` and/or `WithSignal()` like a normal step
 - Provide a generator with signature `func(context.Context, In[, Signal][, Dep1, Dep2, ...], func(ItemType) error) error`
 - Provide an item handler with signature `func(context.Context, ItemType) (OutType, error)`
@@ -495,11 +496,11 @@ Retry order with `Reduce(...)`: per-item handler retries happen first (per yield
 
 ```go
 flow := catbird.NewFlow("generate-double-sum").
-    AddStep(catbird.NewStep("seed").
+    AddStep("seed").
         Handler(func(ctx context.Context, in int) (int, error) {
             return in, nil
         })).
-    AddStep(catbird.NewGeneratorStep("generate").
+    AddGeneratorStep("generate").
         DependsOn("seed").
         Generator(func(ctx context.Context, in int, seed int, yield func(int) error) error {
             for i := 0; i < seed; i++ {
@@ -512,7 +513,7 @@ flow := catbird.NewFlow("generate-double-sum").
         Handler(func(ctx context.Context, item int) (int, error) {
             return item * 2, nil
         })).
-    AddStep(catbird.NewStep("sum").
+    AddStep("sum").
         DependsOn("generate").
         Handler(func(ctx context.Context, in int, generated []int) (int, error) {
             total := 0
@@ -532,7 +533,7 @@ Use `Reduce(...)` when you want bounded generator output instead of storing all 
 
 ```go
 flow := catbird.NewFlow("generate-double-sum-reduced").
-    AddStep(catbird.NewGeneratorStep("generate").
+    AddGeneratorStep("generate").
         Generator(func(ctx context.Context, input int, yield func(int) error) error {
             for i := 0; i < input; i++ {
                 if err := yield(i); err != nil {
@@ -571,12 +572,12 @@ _ = handle.WaitForOutput(ctx, &out)
 
 ```go
 flow := catbird.NewFlow("parallel_watch_flow").
-    AddStep(catbird.NewStep("long_job").
+    AddStep("long_job").
         Handler(func(ctx context.Context, in Order) (string, error) {
             time.Sleep(500 * time.Millisecond)
             return "job-finished", nil
         })).
-    AddStep(catbird.NewStep("watch_job").
+    AddStep("watch_job").
         Handler(func(ctx context.Context, in Order) (string, error) {
             step, err := catbird.WaitForStep(ctx, "long_job", catbird.WaitOpts{PollInterval: 25 * time.Millisecond})
             if err != nil {
@@ -593,12 +594,12 @@ This runs `long_job` and `watch_job` in parallel. `watch_job` blocks on `WaitFor
 
 ```go
 flow := catbird.NewFlow("loop_until_peer_done").
-    AddStep(catbird.NewStep("controller").
+    AddStep("controller").
         Handler(func(ctx context.Context, in string) (string, error) {
             time.Sleep(2 * time.Second)
             return "stop-now", nil
         })).
-    AddStep(catbird.NewStep("worker_loop").
+    AddStep("worker_loop").
         Handler(func(ctx context.Context, in string) (string, error) {
             for {
                 controller, err := catbird.GetStep(ctx, "controller")
@@ -629,7 +630,7 @@ Both tasks and flow steps support conditional execution via `WithCondition` on t
 - **Prefixes**: tasks use `input.*`; flow steps use `input.*`, `step_name.*`, or `signal.*`.
 - **Operators**: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `exists`, `contains`, plus `not <expr>`.
 - **Optional outputs**: if a step can be skipped, downstream handlers must accept `Optional[T]` for that dependency.
-- **Map steps**: use `MapInput()` or `Map("step_name")`; map source values must be arrays.
+- **Map steps**: define with `AddMapStep("name")`, then use `MapInput()` or `Map("step_name")`; map source values must be arrays.
 - **No AND/OR**: only one expression per task/step; compute a derived field upstream if needed.
 
 ## Tasks with Conditions
@@ -663,17 +664,17 @@ Flow steps can branch based on prior outputs. Use `Optional[T]` to handle skippe
 ```go
 flow := catbird.NewFlow("payment_processing").
     OutputPriority("charge", "free_order").
-    AddStep(catbird.NewStep("validate").
+    AddStep("validate").
         Handler(func(ctx context.Context, order Order) (ValidationResult, error) {
             return ValidationResult{Valid: order.Amount > 0}, nil
         })).
-    AddStep(catbird.NewStep("charge").
+    AddStep("charge").
         DependsOn("validate").
         WithCondition("validate.valid").
         Handler(func(ctx context.Context, order Order, validation ValidationResult) (FinalResult, error) {
             return FinalResult{Status: "charged", TxnID: "txn-123"}, nil
         })).
-    AddStep(catbird.NewStep("free_order").
+    AddStep("free_order").
         DependsOn("validate").
         WithCondition("not validate.valid").
         Handler(func(ctx context.Context, order Order, validation ValidationResult) (FinalResult, error) {
@@ -726,7 +727,7 @@ task := catbird.NewTask("validate-order").
     })
 
 flow := catbird.NewFlow("order-processing").
-    AddStep(catbird.NewStep("guard").
+    AddStep("guard").
         Handler(func(ctx context.Context, input Order) (string, error) {
             if input.Amount <= 0 {
                 if err := catbird.Cancel(ctx, catbird.CancelOpts{Reason: "invalid amount"}); err != nil {
