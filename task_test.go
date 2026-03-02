@@ -89,7 +89,7 @@ func TestTaskCreate(t *testing.T) {
 
 	task := NewTask("test_task").Handler(func(ctx context.Context, in string) (string, error) {
 		return in + " processed", nil
-	}).Description("Task description")
+	}).WithDescription("Task description")
 
 	err := client.CreateTask(t.Context(), task)
 	if err != nil {

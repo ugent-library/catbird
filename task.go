@@ -43,14 +43,14 @@ func NewTask(name string) *Task {
 	return &Task{name: name}
 }
 
-// Condition sets the condition expression for the task.
-func (t *Task) Condition(condition string) *Task {
+// WithCondition sets the condition expression for the task.
+func (t *Task) WithCondition(condition string) *Task {
 	t.condition = condition
 	return t
 }
 
-// Description sets the description for the task definition.
-func (t *Task) Description(description string) *Task {
+// WithDescription sets the description for the task definition.
+func (t *Task) WithDescription(description string) *Task {
 	t.description = description
 	return t
 }

@@ -43,7 +43,7 @@ client.Send(ctx, "my_queue", map[string]any{"job": "cleanup"}, catbird.SendOpts{
 
 // Tasks and flows
 task := catbird.NewTask("send-email").
-    Description("Send a transactional email to a user").
+    WithDescription("Send a transactional email to a user").
     Handler(func(ctx context.Context, input string) (string, error) {
         return "sent", nil
     })
@@ -178,7 +178,7 @@ client.CreateTaskSchedule(
 
 // Define a task with a condition (skipped when condition is false)
 conditionalTask := catbird.NewTask("premium-processing").
-    Condition("input.is_premium"). // Skipped if is_premium = false
+    WithCondition("input.is_premium"). // Skipped if is_premium = false
     Handler(func(ctx context.Context, input ProcessRequest) (string, error) {
         return "processed", nil
     })
@@ -306,13 +306,13 @@ flow := catbird.NewFlow("approval-or-escalation").
         })).
     AddStep(catbird.NewStep("approve").
         DependsOn("validate").
-        Condition("validate.score gte 80").
+        WithCondition("validate.score gte 80").
         Handler(func(ctx context.Context, req Request, v Validation) (Decision, error) {
             return Decision{Status: "approved"}, nil
         })).
     AddStep(catbird.NewStep("escalate").
         DependsOn("validate").
-        Condition("validate.score lt 80").
+        WithCondition("validate.score lt 80").
         Handler(func(ctx context.Context, req Request, v Validation) (Decision, error) {
             return Decision{Status: "escalated"}, nil
         }))
@@ -368,7 +368,7 @@ flow := catbird.NewFlow("document_approval").
         })).
     AddStep(catbird.NewStep("approve").
         DependsOn("submit").
-        Signal().
+        WithSignal().
         Handler(func(ctx context.Context, doc Document, approval ApprovalInput, docID string) (ApprovalResult, error) {
             if !approval.Approved {
                 return ApprovalResult{}, fmt.Errorf("approval denied by %s: %s", approval.ApproverID, approval.Notes)
@@ -483,7 +483,7 @@ flow = catbird.NewFlow("double-numbers-reduced").
 Generator steps act like normal flow steps with an extra trailing `yield` callback for streaming items; yielded items are processed by a per-item handler.
 
 - Define the step with `NewGeneratorStep("name")`
-- Optionally add `DependsOn(...)` and/or `Signal()` like a normal step
+- Optionally add `DependsOn(...)` and/or `WithSignal()` like a normal step
 - Provide a generator with signature `func(context.Context, In[, Signal][, Dep1, Dep2, ...], func(ItemType) error) error`
 - Provide an item handler with signature `func(context.Context, ItemType) (OutType, error)`
 - Optionally fold item outputs with `Reduce(initial, fn)` using `func(context.Context, Acc, OutType) (Acc, error)`
@@ -622,7 +622,7 @@ This pattern keeps `worker_loop` alive until `controller` reaches any terminal s
 
 # Conditional Execution
 
-Both tasks and flow steps support conditional execution via `Condition` on the builder methods. If the condition evaluates to false (or a referenced field is missing), the task/step is marked `skipped` and its handler does not run.
+Both tasks and flow steps support conditional execution via `WithCondition` on the builder methods. If the condition evaluates to false (or a referenced field is missing), the task/step is marked `skipped` and its handler does not run.
 
 ## Rules at a Glance
 
@@ -646,7 +646,7 @@ type ProcessRequest struct {
 
 // Only process premium users
 premiumTask := catbird.NewTask("premium_processing").
-    Condition("input.is_premium"). // Skipped if is_premium = false
+    WithCondition("input.is_premium"). // Skipped if is_premium = false
     Handler(func(ctx context.Context, req ProcessRequest) (string, error) {
         return fmt.Sprintf("Processed premium user %d", req.UserID), nil
     })
@@ -669,13 +669,13 @@ flow := catbird.NewFlow("payment_processing").
         })).
     AddStep(catbird.NewStep("charge").
         DependsOn("validate").
-        Condition("validate.valid").
+        WithCondition("validate.valid").
         Handler(func(ctx context.Context, order Order, validation ValidationResult) (FinalResult, error) {
             return FinalResult{Status: "charged", TxnID: "txn-123"}, nil
         })).
     AddStep(catbird.NewStep("free_order").
         DependsOn("validate").
-        Condition("not validate.valid").
+        WithCondition("not validate.valid").
         Handler(func(ctx context.Context, order Order, validation ValidationResult) (FinalResult, error) {
             return FinalResult{Status: "free_order", TxnID: ""}, nil
         }))

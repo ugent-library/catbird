@@ -53,7 +53,7 @@ func (f *Flow) AddStep(step *Step) *Flow {
 	return f
 }
 
-func (f *Flow) Description(description string) *Flow {
+func (f *Flow) WithDescription(description string) *Flow {
 	f.description = description
 	return f
 }
@@ -169,7 +169,7 @@ func NewStep(name string) *Step {
 	}
 }
 
-func (s *Step) Description(description string) *Step {
+func (s *Step) WithDescription(description string) *Step {
 	s.description = description
 	return s
 }
@@ -185,12 +185,12 @@ func (s *Step) DependsOn(deps ...string) *Step {
 	return s
 }
 
-func (s *Step) Condition(condition string) *Step {
+func (s *Step) WithCondition(condition string) *Step {
 	s.condition = condition
 	return s
 }
 
-func (s *Step) Signal() *Step {
+func (s *Step) WithSignal() *Step {
 	s.hasSignal = true
 	return s
 }
@@ -1466,7 +1466,7 @@ func GetFlowRunSteps(ctx context.Context, conn Conn, flowName string, flowRunID 
 }
 
 // SignalFlow delivers a signal to a waiting step in a flow run.
-// The step must have been defined with `.Signal()`.
+// The step must have been defined with `.WithSignal()`.
 // Signals enable human-in-the-loop workflows where a step waits for external input before executing.
 // Returns an error if the signal was already delivered or the step doesn't require a signal.
 func SignalFlow(ctx context.Context, conn Conn, flowName string, flowRunID int64, stepName string, input any) error {

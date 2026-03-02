@@ -415,7 +415,7 @@ func TestFlowFailsWhenNoOutputCandidateCompleted(t *testing.T) {
 		})).
 		AddStep(NewStep("maybe").
 			DependsOn("gate").
-			Condition("gate.run eq true").
+			WithCondition("gate.run eq true").
 			Handler(func(ctx context.Context, in string, gate gateOut) (string, error) {
 				return "done", nil
 			}))
@@ -525,15 +525,15 @@ func TestFlowMapMetadataInInfo(t *testing.T) {
 	flowName := testFlowName(t, "map_info_flow")
 
 	flow := NewFlow(flowName).
-		Description("Flow metadata description").
+		WithDescription("Flow metadata description").
 		AddStep(NewStep("numbers").Handler(func(ctx context.Context, in string) ([]int, error) {
 			return []int{1, 2, 3}, nil
-		}).Description("Numbers source")).
+		}).WithDescription("Numbers source")).
 		AddStep(NewStep("double").
 			Map("numbers").
 			Handler(func(ctx context.Context, in string, n int) (int, error) {
 				return n * 2, nil
-			}).Description("Multiply by two"))
+			}).WithDescription("Multiply by two"))
 
 	if err := client.CreateFlow(t.Context(), flow); err != nil {
 		t.Fatal(err)
@@ -1176,7 +1176,7 @@ func TestFlowGeneratorStepWithSignalAndDependency(t *testing.T) {
 		})).
 		AddStep(NewGeneratorStep("generate").
 			DependsOn("seed").
-			Signal().
+			WithSignal().
 			Generator(func(ctx context.Context, in int, signal approval, seed int, yield func(int) error) error {
 				for i := 0; i < seed; i++ {
 					if err := yield(in + signal.Offset + i); err != nil {
@@ -1565,7 +1565,7 @@ func TestFlowWithSignal(t *testing.T) {
 		})).
 		AddStep(NewStep("approve").
 			DependsOn("submit").
-			Signal().
+			WithSignal().
 			Handler(func(ctx context.Context, doc string, approval ApprovalInput, submitResult string) (string, error) {
 				if !approval.Approved {
 					return "", fmt.Errorf("approval denied by %s", approval.ApproverID)
@@ -1626,7 +1626,7 @@ func TestFlowWithInitialSignal(t *testing.T) {
 	flowName := testFlowName(t, "initial_signal_flow")
 	flow := NewFlow(flowName).
 		AddStep(NewStep("start").
-			Signal().
+			WithSignal().
 			Handler(func(ctx context.Context, flowInput string, signal StartInput) (string, error) {
 				return fmt.Sprintf("started by %s", signal.InitiatorID), nil
 			})).
@@ -1685,7 +1685,7 @@ func TestFlowSignalAlreadyDelivered(t *testing.T) {
 		})).
 		AddStep(NewStep("approve").
 			DependsOn("request").
-			Signal().
+			WithSignal().
 			Handler(func(ctx context.Context, doc string, approval ApprovalInput, reqResult string) (string, error) {
 				if approval.Response != "approved" {
 					return "", fmt.Errorf("approval denied by %s: %s", approval.ApproverID, approval.Response)
@@ -1979,7 +1979,7 @@ func TestFlowCondition(t *testing.T) {
 			})).
 			AddStep(NewStep("step2").
 				DependsOn("step1").
-				Condition("step1 lt 90").
+				WithCondition("step1 lt 90").
 				Handler(func(ctx context.Context, score int, step1Score int) (string, error) {
 					return "step2_executed", nil
 				})).
@@ -2033,7 +2033,7 @@ func TestFlowCondition(t *testing.T) {
 			})).
 			AddStep(NewStep("step2").
 				DependsOn("step1").
-				Condition("step1 lt 90").
+				WithCondition("step1 lt 90").
 				Handler(func(ctx context.Context, score int, step1Score int) (string, error) {
 					return "step2_executed", nil
 				})).
@@ -2078,7 +2078,7 @@ func TestFlowCondition(t *testing.T) {
 			})).
 			AddStep(NewStep("step2").
 				DependsOn("step1").
-				Condition("step1 lt 90").
+				WithCondition("step1 lt 90").
 				Handler(func(ctx context.Context, score int, step1Score int) (string, error) {
 					return "step2_executed", nil
 				})).
@@ -2132,7 +2132,7 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 			})).
 			AddStep(NewStep("step2").
 				DependsOn("step1").
-				Condition("step1.optional_field ne value").
+				WithCondition("step1.optional_field ne value").
 				Handler(func(ctx context.Context, input map[string]interface{}, step1Out map[string]interface{}) (string, error) {
 					return "executed", nil
 				})).
@@ -2174,7 +2174,7 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 			})).
 			AddStep(NewStep("step2").
 				DependsOn("step1").
-				Condition("step1.field exists").
+				WithCondition("step1.field exists").
 				Handler(func(ctx context.Context, input map[string]interface{}, step1Out map[string]interface{}) (string, error) {
 					return "executed", nil
 				})).
@@ -2219,7 +2219,7 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 			})).
 			AddStep(NewStep("step2").
 				DependsOn("step1").
-				Condition("step1.data.user.age gte 18").
+				WithCondition("step1.data.user.age gte 18").
 				Handler(func(ctx context.Context, input map[string]interface{}, step1Out map[string]interface{}) (string, error) {
 					return "executed", nil
 				})).
@@ -2277,7 +2277,7 @@ func TestFlowOptionalDependency(t *testing.T) {
 		})).
 		AddStep(NewStep("step2").
 			DependsOn("step1").
-			Condition("step1 gte 50").
+			WithCondition("step1 gte 50").
 			Handler(func(ctx context.Context, score int, step1Score int) (int, error) {
 				return step1Score * 2, nil
 			})).
@@ -2338,7 +2338,7 @@ func TestFlowConditionalDependencyRequiresOptional(t *testing.T) {
 		})).
 		AddStep(NewStep("step2").
 			DependsOn("step1").
-			Condition("step1 gte 50").
+			WithCondition("step1 gte 50").
 			Handler(func(ctx context.Context, score int, step1Score int) (int, error) {
 				return step1Score * 2, nil
 			})).
@@ -2714,7 +2714,7 @@ func TestStepWaitForOutputSkipped(t *testing.T) {
 			})).
 		AddStep(NewStep("step1").
 			DependsOn("gate").
-			Condition("gate eq true").
+			WithCondition("gate eq true").
 			Handler(func(ctx context.Context, in flowInput, gate bool) (string, error) {
 				return "ran", nil
 			})).

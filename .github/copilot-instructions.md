@@ -79,10 +79,10 @@ task := catbird.NewTask("my_task").
 
 **Key characteristics**:
 - **No type parameters**: Input/output types are discovered at runtime via reflection (handlers receive `[]byte` payloads internally)
-- **Builder pattern**: Construction via method chaining: `NewTask(name).Condition(...).Handler(fn, opts...)`
+- **Builder pattern**: Construction via method chaining: `NewTask(name).WithCondition(...).Handler(fn, opts...)`
 - **Execution options**: Applied via functional `HandlerOpt` values (e.g., `WithConcurrency`, `WithBatchSize`, `WithTimeout`, `WithMaxRetries`, `WithFullJitterBackoff`, `WithCircuitBreaker`)
 - **Handler options validation**: Worker validates all task and flow step handler options at initialization time, catching configuration errors early before database operations
-- **Task/step metadata**: Conditions applied via `.Condition(expr)` method chain
+- **Task/step metadata**: Conditions applied via `.WithCondition(expr)` method chain
 
 **Flows**: Multi-step DAGs with dependencies using builder pattern:
 ```go
@@ -100,13 +100,13 @@ flow := catbird.NewFlow("my_flow").
 
 **CRITICAL - Flow Output Design**: Flow output is **the unwrapped output value of the final step** (the step with no dependents after completion). This is NOT an aggregated object. The flow's remaining_steps counter reaches 0 when the last step completes; that step's output becomes the flow's output. When the flow completes in `cb_complete_step()`, it directly selects that step's output and stores it as the flow's output.
 
-**Conditional Execution**: Both tasks and flow steps support conditional execution via `.Condition(expression)` builder method. When a condition evaluates to false or a referenced field is missing, the task/step is skipped (status='skipped') instead of executed.
+**Conditional Execution**: Both tasks and flow steps support conditional execution via `.WithCondition(expression)` builder method. When a condition evaluates to false or a referenced field is missing, the task/step is skipped (status='skipped') instead of executed.
 Use `not <expr>` to negate any condition expression (e.g., `not input.is_premium`).
 
 **Task conditions** reference input fields with `input.*` prefix:
 ```go
 task := catbird.NewTask("premium_processing").
-  Condition("input.is_premium"). // Skipped if is_premium = false
+  WithCondition("input.is_premium"). // Skipped if is_premium = false
   Handler(func(ctx context.Context, req ProcessRequest) (string, error) {
     return "processed", nil
   })
@@ -122,7 +122,7 @@ NewFlow("risk-check").
     })).
   AddStep(NewStep("audit").
     DependsOn("validate").
-    Condition("validate gt 1000"). // Conditional step
+    WithCondition("validate gt 1000"). // Conditional step
     Handler(func(ctx context.Context, in int, validateOut int) (int, error) {
       return validateOut * 2, nil  // expensive check
     })).
@@ -138,7 +138,7 @@ NewFlow("risk-check").
 // Flow input: 2000 → audit runs → finalize gets Optional[int]{IsSet: true, Value: 4000}
 ```
 
-**Signals** enable human-in-the-loop workflows: steps can optionally wait for external input via `.Signal()` builder method before executing:
+**Signals** enable human-in-the-loop workflows: steps can optionally wait for external input via `.WithSignal()` builder method before executing:
 ```go
 NewFlow("workflow").
   AddStep(NewStep("step1").
@@ -147,7 +147,7 @@ NewFlow("workflow").
     })).
   AddStep(NewStep("approve").
     DependsOn("step1").
-    Signal(). // Wait for signal
+    WithSignal(). // Wait for signal
     Handler(func(ctx context.Context, in string, approval ApprovalInput, step1Out string) (string, error) {
       return step1Out + " approved by " + approval.ApproverID, nil
     }))
@@ -155,13 +155,13 @@ NewFlow("workflow").
 ```
 
 **Key Flow Patterns**:
-- **Conditions work for both tasks and steps**: Use `.Condition("expression")` builder method. Tasks use `input.field` to reference input; steps use `step_name.field` to reference outputs; steps with signals can use `signal.field` to reference signal input.
+- **Conditions work for both tasks and steps**: Use `.WithCondition("expression")` builder method. Tasks use `input.field` to reference input; steps use `step_name.field` to reference outputs; steps with signals can use `signal.field` to reference signal input.
 - **Map steps**: Steps can map over arrays with `.MapInput()` (maps flow input array) or `.Map("step_name")` (maps dependency step output array). Map steps execute one logical item per array element and aggregate outputs in source order.
 - **Dependency tracking**: `dependency_count` includes all deps (required + optional); `remaining_dependencies` decrements for both completed and skipped steps
 - **Optional outputs**: When a conditional step is skipped, dependent steps receive `Optional[T]{IsSet: false}`. When executed, `Optional[T]{IsSet: true, Value: result}`
 - **Cascading resolution**: `cb_start_steps()` loops until no more steps unblock; handles chains like step2 skips → step3 unblocks → step4 unblocks
 - **Validation**: Flow construction panics if a step depends on a conditional step without using `.OptionalDependency()` variant and `Optional[T]` parameter type
-- **Builder methods**: All construction through chainable methods: `NewStep(name).DependsOn(...).Condition(...).Signal().Handler(fn, opts...)`
+- **Builder methods**: All construction through chainable methods: `NewStep(name).DependsOn(...).WithCondition(...).WithSignal().Handler(fn, opts...)`
 
 ## Key Conventions
 
@@ -182,8 +182,8 @@ NewFlow("workflow").
   - **Mutually exclusive**: Cannot specify both keys simultaneously (returns error).
 - **Topic bindings**: Explicit via `Bind(queue, pattern)`; wildcards `?` (single token) and `*` (multi-token tail as `.*`). Foreign key CASCADE deletes bindings when queue is deleted. Pattern validation at bind time; regex precompiled in PostgreSQL.
 - **Task/Flow execution**: `client.RunTask()` or `client.RunFlow()` return handles with `WaitForOutput()` to block until completion. When deduplication detects an existing run, the handle contains the existing run's ID.
-- **Workflow signals**: Steps can require signals (external input) before executing. Use `.Signal()` builder method. Signal delivered via `client.SignalFlow(ctx, flowName, flowRunID, stepName, input)`. Steps with both dependencies and signals wait for **both** conditions before starting. Enables approval workflows, webhooks, and human-in-the-loop patterns.
-- **Optional dependencies**: When a step depends on a conditional step (one with `.Condition()`), use dependent step parameter as `Optional[T]`. The `Optional[T]` type has `IsSet bool` and `Value T` fields. Flow construction validates this constraint and panics if violated. Enables reconvergence patterns where multiple branches merge back together.
+- **Workflow signals**: Steps can require signals (external input) before executing. Use `.WithSignal()` builder method. Signal delivered via `client.SignalFlow(ctx, flowName, flowRunID, stepName, input)`. Steps with both dependencies and signals wait for **both** conditions before starting. Enables approval workflows, webhooks, and human-in-the-loop patterns.
+- **Optional dependencies**: When a step depends on a conditional step (one with `.WithCondition()`), use dependent step parameter as `Optional[T]`. The `Optional[T]` type has `IsSet bool` and `Value T` fields. Flow construction validates this constraint and panics if violated. Enables reconvergence patterns where multiple branches merge back together.
 
 ## Developer Workflows
 
@@ -337,7 +337,7 @@ docker compose logs -f postgres
 4. **Retries**: Built-in with configurable exponential backoff with full jitter (see `NewFullJitterBackoff(min, max)`)
 5. **Circuit breaker**: Optional per-handler protection for external dependencies (configure with `WithCircuitBreaker(failures, openTimeout)`)
 6. **Concurrency**: Default 1 per handler; set via `WithConcurrency(...)`
-7. **Conditional execution**: Use `.Condition("expression")` on tasks/steps. Tasks use `input.field` syntax (e.g., `"input.is_premium"`), flow steps use `step_name.field` syntax (e.g., `"validate.score gte 50"`)
+7. **Conditional execution**: Use `.WithCondition("expression")` on tasks/steps. Tasks use `input.field` syntax (e.g., `"input.is_premium"`), flow steps use `step_name.field` syntax (e.g., `"validate.score gte 50"`)
 8. **Optional dependencies**: Use `Optional[T]` + `OptionalDependency()` pair when depending on conditional steps. Validation at flow construction time enforces type safety.
 9. **Status constants in Go**: Use shared status constants from `statuses.go` (e.g., `StatusQueued`, `StatusStarted`, `StatusWaitingForDependencies`) instead of raw status string literals in Go code and tests.
 10. **SQL parameter/column conflicts**: Use `#variable_conflict use_column` directive in PL/pgSQL when parameter names match column names (prevents "column ambiguous" errors)
