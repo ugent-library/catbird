@@ -132,6 +132,9 @@ func (w *Worker) AddFlow(f *Flow) *Worker {
 
 func (w *Worker) validateRegisteredHandlers() error {
 	for _, t := range w.tasks {
+		if t.configErr != nil {
+			return fmt.Errorf("task %q configuration error: %w", t.name, t.configErr)
+		}
 		if t.handlerOpts != nil {
 			if err := t.handlerOpts.validate(); err != nil {
 				return fmt.Errorf("task %q has invalid handler options: %w", t.name, err)
@@ -145,6 +148,9 @@ func (w *Worker) validateRegisteredHandlers() error {
 	}
 
 	for _, f := range w.flows {
+		if f.configErr != nil {
+			return fmt.Errorf("flow %q configuration error: %w", f.name, f.configErr)
+		}
 		if f.onFailOpts != nil {
 			if err := f.onFailOpts.validate(); err != nil {
 				return fmt.Errorf("flow %q has invalid on-fail options: %w", f.name, err)
@@ -245,13 +251,17 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 
 	// Create tasks in database
-	if err := CreateTask(ctx, w.conn, w.tasks...); err != nil {
-		return err
+	for _, task := range w.tasks {
+		if err := CreateTask(ctx, w.conn, task); err != nil {
+			return err
+		}
 	}
 
 	// Create flows in database
-	if err := CreateFlow(ctx, w.conn, w.flows...); err != nil {
-		return err
+	for _, flow := range w.flows {
+		if err := CreateFlow(ctx, w.conn, flow); err != nil {
+			return err
+		}
 	}
 
 	var wg sync.WaitGroup

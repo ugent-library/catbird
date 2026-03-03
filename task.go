@@ -19,6 +19,7 @@ type Task struct {
 	name            string
 	description     string
 	condition       string
+	configErr       error
 	retentionPeriod time.Duration
 	handler         func(context.Context, json.RawMessage) (json.RawMessage, error)
 	handlerOpts     *handlerOpts
@@ -67,9 +68,13 @@ func (t *Task) RetentionPeriod(d time.Duration) *Task {
 // fn must have signature (context.Context, In) (Out, error).
 // If opts is omitted, defaults are used (concurrency: 4, batchSize: 64, timeout: 30s, maxRetries: 2 with full-jitter backoff 100ms-2s).
 func (t *Task) Do(fn any, opts ...HandlerOpt) *Task {
+	if t.configErr != nil {
+		return t
+	}
 	handler, err := makeTaskHandler(fn, t.name)
 	if err != nil {
-		panic(err)
+		t.configErr = err
+		return t
 	}
 	t.handler = handler
 	t.handlerOpts = applyDefaultHandlerOpts(opts...)
@@ -80,9 +85,13 @@ func (t *Task) Do(fn any, opts ...HandlerOpt) *Task {
 // fn must have signature (context.Context, In, TaskFailure) error.
 // If opts is omitted, defaults are used (concurrency: 4, batchSize: 64, timeout: 30s, maxRetries: 2 with full-jitter backoff 100ms-2s).
 func (t *Task) OnFail(fn any, opts ...HandlerOpt) *Task {
+	if t.configErr != nil {
+		return t
+	}
 	handler, err := makeTaskOnFailHandler(fn)
 	if err != nil {
-		panic(err)
+		t.configErr = err
+		return t
 	}
 	t.onFail = handler
 	t.onFailOpts = applyDefaultHandlerOpts(opts...)
@@ -349,18 +358,20 @@ func canceledRunError(reason string) error {
 	return fmt.Errorf("%w: %s", ErrRunCanceled, reason)
 }
 
-// CreateTask creates one or more task definitions.
-func CreateTask(ctx context.Context, conn Conn, tasks ...*Task) error {
+// CreateTask creates a task definition.
+func CreateTask(ctx context.Context, conn Conn, task *Task) error {
 	q := `SELECT * FROM cb_create_task(name => $1, description => $2, condition => $3, retention_period => $4);`
-	for _, task := range tasks {
-		var retentionPeriod *time.Duration
-		if task.retentionPeriod > 0 {
-			retentionPeriod = &task.retentionPeriod
-		}
-		_, err := conn.Exec(ctx, q, task.name, ptrOrNil(task.description), ptrOrNil(task.condition), retentionPeriod)
-		if err != nil {
-			return err
-		}
+	if task.configErr != nil {
+		return fmt.Errorf("task %q configuration error: %w", task.name, task.configErr)
+	}
+
+	var retentionPeriod *time.Duration
+	if task.retentionPeriod > 0 {
+		retentionPeriod = &task.retentionPeriod
+	}
+	_, err := conn.Exec(ctx, q, task.name, ptrOrNil(task.description), ptrOrNil(task.condition), retentionPeriod)
+	if err != nil {
+		return err
 	}
 
 	return nil

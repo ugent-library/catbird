@@ -32,6 +32,7 @@ type Flow struct {
 	name               string
 	description        string
 	steps              []*Step
+	configErr          error
 	outputPriority     []string
 	priorityConfigured bool
 	retentionPeriod    time.Duration
@@ -70,6 +71,10 @@ func NewFlow(name string) *Flow {
 	return &Flow{name: name}
 }
 
+func NewStep(name string) *Step {
+	return newFlowStep(nil, name, StepTypeNormal)
+}
+
 func newFlowStep(flow *Flow, name string, stepType StepType) *Step {
 	return &Step{
 		flow:                 flow,
@@ -79,28 +84,28 @@ func newFlowStep(flow *Flow, name string, stepType StepType) *Step {
 	}
 }
 
-func (f *Flow) AddStep(name string) *StepBuilder {
-	step := newFlowStep(f, name, StepTypeNormal)
+func (f *Flow) AddStep(step *Step) *Flow {
+	if step == nil {
+		return f
+	}
+	step = cloneStep(step)
+	step.flow = f
+	if step.optionalDependencies == nil {
+		step.optionalDependencies = make(map[string]bool)
+	}
+	if step.stepType == StepTypeReducer {
+		if sourceStep := step.sourceStepForReducer(); sourceStep != nil {
+			sourceOutputType := sourceStep.outputType
+			if sourceStep.stepType == StepTypeGenerator {
+				sourceOutputType = sourceStep.generatorOutputType
+			}
+			if sourceOutputType != nil && step.reducerItem != nil && sourceOutputType != step.reducerItem {
+				step.configErr = fmt.Errorf("step %s: reducer item type %v does not match source step %q output type %v", step.name, step.reducerItem, sourceStep.name, sourceOutputType)
+			}
+		}
+	}
 	f.steps = append(f.steps, step)
-	return &StepBuilder{Step: step}
-}
-
-func (f *Flow) AddGeneratorStep(name string) *GeneratorStepBuilder {
-	step := newFlowStep(f, name, StepTypeGenerator)
-	f.steps = append(f.steps, step)
-	return &GeneratorStepBuilder{Step: step}
-}
-
-func (f *Flow) AddMapStep(name string) *MapStepBuilder {
-	step := newFlowStep(f, name, StepTypeMapper)
-	f.steps = append(f.steps, step)
-	return &MapStepBuilder{Step: step}
-}
-
-func (f *Flow) AddReducerStep(name string) *ReducerStepBuilder {
-	step := newFlowStep(f, name, StepTypeReducer)
-	f.steps = append(f.steps, step)
-	return &ReducerStepBuilder{Step: step}
+	return f
 }
 
 func (f *Flow) WithDescription(description string) *Flow {
@@ -131,9 +136,13 @@ func (f *Flow) RetentionPeriod(d time.Duration) *Flow {
 // fn must have signature (context.Context, In, FlowFailure) error.
 // If opts is omitted, defaults are used (concurrency: 4, batchSize: 64, timeout: 30s, maxRetries: 2 with full-jitter backoff 100ms-2s).
 func (f *Flow) OnFail(fn any, opts ...HandlerOpt) *Flow {
+	if f.configErr != nil {
+		return f
+	}
 	handler, err := makeFlowOnFailHandler(fn)
 	if err != nil {
-		panic(err)
+		f.configErr = err
+		return f
 	}
 	f.onFail = handler
 	f.onFailOpts = applyDefaultHandlerOpts(opts...)
@@ -198,6 +207,7 @@ type Step struct {
 	flow                 *Flow
 	name                 string
 	stepType             StepType
+	configErr            error
 	description          string
 	dependencies         []string
 	optionalDependencies map[string]bool // tracks which dependencies are Optional[T]
@@ -219,59 +229,116 @@ type Step struct {
 	handlerOpts          *handlerOpts
 }
 
-func (s *Step) withDescription(description string) {
+func (s *Step) setConfigErr(err error) {
+	if s.configErr == nil && err != nil {
+		s.configErr = err
+	}
+}
+
+func (s *Step) WithDescription(description string) *Step {
+	if s.configErr != nil {
+		return s
+	}
 	s.description = description
+	return s
 }
 
-func (s *Step) dependsOn(deps ...string) {
+func (s *Step) DependsOn(deps ...string) *Step {
+	if s.configErr != nil {
+		return s
+	}
 	s.dependencies = append(s.dependencies, deps...)
+	return s
 }
 
-func (s *Step) withCondition(condition string) {
+func (s *Step) WithCondition(condition string) *Step {
+	if s.configErr != nil {
+		return s
+	}
 	s.condition = condition
+	return s
 }
 
-func (s *Step) withSignal() {
+func (s *Step) WithSignal() *Step {
+	if s.configErr != nil {
+		return s
+	}
 	s.hasSignal = true
+	return s
 }
 
-func (s *Step) mapInput() {
+func (s *Step) Do(fn any, opts ...HandlerOpt) *Step {
+	if s.configErr != nil {
+		return s
+	}
+	s.applyHandler(fn, opts...)
+	return s
+}
+
+func (s *Step) MapFlowInput() *Step {
+	if s.configErr != nil {
+		return s
+	}
+	if s.stepType == StepTypeNormal {
+		s.stepType = StepTypeMapper
+	}
 	if s.stepType != StepTypeMapper {
-		panic(fmt.Sprintf("step %s: only mapper steps support MapFlowInput()", s.name))
+		s.setConfigErr(fmt.Errorf("step %s: only mapper steps support MapFlowInput()", s.name))
+		return s
 	}
 	if s.mapSource != "" {
-		panic(fmt.Sprintf("step %s: map source already set to %q", s.name, s.mapSource))
+		s.setConfigErr(fmt.Errorf("step %s: map source already set to %q", s.name, s.mapSource))
+		return s
 	}
 	s.mapSource = ""
+	return s
 }
 
-func (s *Step) mapFrom(stepName string) {
+func (s *Step) MapStepOutput(stepName string) *Step {
+	if s.configErr != nil {
+		return s
+	}
+	if s.stepType == StepTypeNormal {
+		s.stepType = StepTypeMapper
+	}
 	if s.stepType != StepTypeMapper {
-		panic(fmt.Sprintf("step %s: only mapper steps support MapStepOutput()", s.name))
+		s.setConfigErr(fmt.Errorf("step %s: only mapper steps support MapStepOutput()", s.name))
+		return s
 	}
 	if strings.TrimSpace(stepName) == "" {
-		panic(fmt.Sprintf("step %s: map source step name must not be empty", s.name))
+		s.setConfigErr(fmt.Errorf("step %s: map source step name must not be empty", s.name))
+		return s
 	}
 	if s.mapSource != "" && s.mapSource != stepName {
-		panic(fmt.Sprintf("step %s: map source already set to %q", s.name, s.mapSource))
+		s.setConfigErr(fmt.Errorf("step %s: map source already set to %q", s.name, s.mapSource))
+		return s
 	}
 	s.mapSource = stepName
 	for _, dep := range s.dependencies {
 		if dep == stepName {
-			return
+			return s
 		}
 	}
 	s.dependencies = append(s.dependencies, stepName)
+	return s
 }
 
-func (s *Step) generator(fn any) {
+func (s *Step) Generate(fn any) *Step {
+	if s.configErr != nil {
+		return s
+	}
+	if s.stepType == StepTypeNormal {
+		s.stepType = StepTypeGenerator
+	}
 	if s.stepType != StepTypeGenerator {
-		panic(fmt.Sprintf("step %s: Generate() is only valid for AddGeneratorStep", s.name))
+		s.setConfigErr(fmt.Errorf("step %s: Generate() is only valid for generator steps", s.name))
+		return s
 	}
 
 	depType, itemType, err := parseGeneratorFn(fn, s.name)
 	if err != nil {
-		panic(err)
+		s.setConfigErr(err)
+		return s
 	}
 
 	s.generatorFn = fn
@@ -281,101 +348,89 @@ func (s *Step) generator(fn any) {
 	if s.generatorHandler != nil {
 		handlerItemType, handlerOutputType, handlerErr := parseGeneratorHandlerFn(s.generatorHandler, s.name)
 		if handlerErr != nil {
-			panic(handlerErr)
+			s.setConfigErr(handlerErr)
+			return s
 		}
 		if handlerItemType != itemType {
-			panic(fmt.Sprintf("step %s: generator item type %v does not match handler item type %v", s.name, itemType, handlerItemType))
+			s.setConfigErr(fmt.Errorf("step %s: generator item type %v does not match handler item type %v", s.name, itemType, handlerItemType))
+			return s
 		}
 		s.generatorOutputType = handlerOutputType
 		s.outputType = handlerOutputType
 		if s.reducerFn != nil && s.reducerItem != handlerOutputType {
-			panic(fmt.Sprintf("step %s: reducer item type %v does not match handler output type %v", s.name, s.reducerItem, handlerOutputType))
+			s.setConfigErr(fmt.Errorf("step %s: reducer item type %v does not match handler output type %v", s.name, s.reducerItem, handlerOutputType))
+			return s
 		}
 	}
+	return s
 }
 
-func (s *Step) reduceStep(stepName string) {
+func (s *Step) Map(fn any, opts ...HandlerOpt) *Step {
+	if s.configErr != nil {
+		return s
+	}
+	s.applyHandler(fn, opts...)
+	return s
+}
+
+func (s *Step) ReduceStep(stepName string) *Step {
+	if s.configErr != nil {
+		return s
+	}
+	if s.stepType == StepTypeNormal {
+		s.stepType = StepTypeReducer
+	}
 	if s.stepType != StepTypeReducer {
-		panic(fmt.Sprintf("step %s: ReduceStep() is only valid for AddReducerStep", s.name))
+		s.setConfigErr(fmt.Errorf("step %s: ReduceStep() is only valid for reducer steps", s.name))
+		return s
 	}
 	if strings.TrimSpace(stepName) == "" {
-		panic(fmt.Sprintf("step %s: reduce source step name must not be empty", s.name))
+		s.setConfigErr(fmt.Errorf("step %s: reduce source step name must not be empty", s.name))
+		return s
 	}
 	s.reduceSourceStep = stepName
 	for _, dep := range s.dependencies {
 		if dep == stepName {
-			return
+			return s
 		}
 	}
 	s.dependencies = append(s.dependencies, stepName)
+	return s
 }
 
-func (s *Step) applyHandler(fn any, opts ...HandlerOpt) {
-	if s.stepType == StepTypeReducer {
-		panic(fmt.Sprintf("step %s: reducer steps use Reduce(...) instead of Map/Handler", s.name))
+func (s *Step) Reduce(initial any, fn any) *Step {
+	if s.configErr != nil {
+		return s
 	}
-
-	if s.stepType == StepTypeGenerator {
-		itemType, outputType, err := parseGeneratorHandlerFn(fn, s.name)
-		if err != nil {
-			panic(err)
-		}
-		s.generatorHandler = fn
-		s.generatorOutputType = outputType
-		s.outputType = outputType
-		if s.generatorFn != nil && s.generatorItemType != nil && s.generatorItemType != itemType {
-			panic(fmt.Sprintf("step %s: generator item type %v does not match handler item type %v", s.name, s.generatorItemType, itemType))
-		}
-		if s.reducerFn != nil && s.reducerItem != outputType {
-			panic(fmt.Sprintf("step %s: reducer item type %v does not match handler output type %v", s.name, s.reducerItem, outputType))
-		}
-		s.handlerOpts = applyDefaultHandlerOpts(opts...)
-		return
+	if s.stepType == StepTypeNormal {
+		s.stepType = StepTypeReducer
 	}
-
-	fnType := reflect.TypeOf(fn)
-	if fnType == nil || fnType.Kind() != reflect.Func {
-		panic(fmt.Sprintf("step %s: handler must be a function", s.name))
-	}
-	if fnType.NumOut() != 2 || !fnType.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
-		panic(fmt.Sprintf("step %s: handler must return (Out, error)", s.name))
-	}
-	s.outputType = fnType.Out(0)
-	if s.reducerFn != nil && s.reducerItem != s.outputType {
-		panic(fmt.Sprintf("step %s: reducer item type %v does not match handler output type %v", s.name, s.reducerItem, s.outputType))
-	}
-
-	handler, optionalDeps, err := makeStepHandler(fn, s.name, s.dependencies, s.hasSignal, s.stepType == StepTypeMapper, s.mapSource)
-	if err != nil {
-		panic(err)
-	}
-	s.handler = handler
-	s.optionalDependencies = optionalDeps
-	s.handlerOpts = applyDefaultHandlerOpts(opts...)
-}
-
-func (s *Step) reduce(initial any, fn any) {
 	if s.stepType != StepTypeReducer {
-		panic(fmt.Sprintf("step %s: Reduce() is only valid for reducer steps", s.name))
+		s.setConfigErr(fmt.Errorf("step %s: Reduce() is only valid for reducer steps", s.name))
+		return s
 	}
 
 	accType, itemType, err := parseGeneratorReducerFn(fn, s.name)
 	if err != nil {
-		panic(err)
+		s.setConfigErr(err)
+		return s
 	}
 
 	if initial == nil {
-		panic(fmt.Sprintf("step %s: reducer initial value must not be nil", s.name))
+		s.setConfigErr(fmt.Errorf("step %s: reducer initial value must not be nil", s.name))
+		return s
 	}
 
 	initType := reflect.TypeOf(initial)
 	if !initType.AssignableTo(accType) {
-		panic(fmt.Sprintf("step %s: reducer initial type %v is not assignable to accumulator type %v", s.name, initType, accType))
+		s.setConfigErr(fmt.Errorf("step %s: reducer initial type %v is not assignable to accumulator type %v", s.name, initType, accType))
+		return s
 	}
 
 	initJSON, err := json.Marshal(initial)
 	if err != nil {
-		panic(fmt.Sprintf("step %s: reducer initial value is not JSON serializable: %v", s.name, err))
+		s.setConfigErr(fmt.Errorf("step %s: reducer initial value is not JSON serializable: %v", s.name, err))
+		return s
 	}
 
 	s.reducerFn = fn
@@ -390,13 +445,67 @@ func (s *Step) reduce(initial any, fn any) {
 			sourceOutputType = sourceStep.generatorOutputType
 		}
 		if sourceOutputType != nil && sourceOutputType != itemType {
-			panic(fmt.Sprintf("step %s: reducer item type %v does not match source step %q output type %v", s.name, itemType, sourceStep.name, sourceOutputType))
+			s.setConfigErr(fmt.Errorf("step %s: reducer item type %v does not match source step %q output type %v", s.name, itemType, sourceStep.name, sourceOutputType))
+			return s
 		}
 	}
 
 	if s.handlerOpts == nil {
 		s.handlerOpts = applyDefaultHandlerOpts()
 	}
+	return s
+}
+
+func (s *Step) applyHandler(fn any, opts ...HandlerOpt) {
+	if s.stepType == StepTypeReducer {
+		s.setConfigErr(fmt.Errorf("step %s: reducer steps use Reduce(...) instead of Map/Handler", s.name))
+		return
+	}
+
+	if s.stepType == StepTypeGenerator {
+		itemType, outputType, err := parseGeneratorHandlerFn(fn, s.name)
+		if err != nil {
+			s.setConfigErr(err)
+			return
+		}
+		s.generatorHandler = fn
+		s.generatorOutputType = outputType
+		s.outputType = outputType
+		if s.generatorFn != nil && s.generatorItemType != nil && s.generatorItemType != itemType {
+			s.setConfigErr(fmt.Errorf("step %s: generator item type %v does not match handler item type %v", s.name, s.generatorItemType, itemType))
+			return
+		}
+		if s.reducerFn != nil && s.reducerItem != outputType {
+			s.setConfigErr(fmt.Errorf("step %s: reducer item type %v does not match handler output type %v", s.name, s.reducerItem, outputType))
+			return
+		}
+		s.handlerOpts = applyDefaultHandlerOpts(opts...)
+		return
+	}
+
+	fnType := reflect.TypeOf(fn)
+	if fnType == nil || fnType.Kind() != reflect.Func {
+		s.setConfigErr(fmt.Errorf("step %s: handler must be a function", s.name))
+		return
+	}
+	if fnType.NumOut() != 2 || !fnType.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+		s.setConfigErr(fmt.Errorf("step %s: handler must return (Out, error)", s.name))
+		return
+	}
+	s.outputType = fnType.Out(0)
+	if s.reducerFn != nil && s.reducerItem != s.outputType {
+		s.setConfigErr(fmt.Errorf("step %s: reducer item type %v does not match handler output type %v", s.name, s.reducerItem, s.outputType))
+		return
+	}
+
+	handler, optionalDeps, err := makeStepHandler(fn, s.name, s.dependencies, s.hasSignal, s.stepType == StepTypeMapper, s.mapSource)
+	if err != nil {
+		s.setConfigErr(err)
+		return
+	}
+	s.handler = handler
+	s.optionalDependencies = optionalDeps
+	s.handlerOpts = applyDefaultHandlerOpts(opts...)
 }
 
 func (s *Step) sourceStepForReducer() *Step {
@@ -411,220 +520,17 @@ func (s *Step) sourceStepForReducer() *Step {
 	return nil
 }
 
-type StepBuilder struct {
-	*Step
-}
-
-func (b *StepBuilder) AddStep(name string) *StepBuilder {
-	return b.flow.AddStep(name)
-}
-
-func (b *StepBuilder) AddGeneratorStep(name string) *GeneratorStepBuilder {
-	return b.flow.AddGeneratorStep(name)
-}
-
-func (b *StepBuilder) AddMapStep(name string) *MapStepBuilder {
-	return b.flow.AddMapStep(name)
-}
-
-func (b *StepBuilder) AddReducerStep(name string) *ReducerStepBuilder {
-	return b.flow.AddReducerStep(name)
-}
-
-func (b *StepBuilder) WithDescription(description string) *StepBuilder {
-	b.withDescription(description)
-	return b
-}
-
-func (b *StepBuilder) DependsOn(deps ...string) *StepBuilder {
-	b.dependsOn(deps...)
-	return b
-}
-
-func (b *StepBuilder) WithCondition(condition string) *StepBuilder {
-	b.withCondition(condition)
-	return b
-}
-
-func (b *StepBuilder) WithSignal() *StepBuilder {
-	b.withSignal()
-	return b
-}
-
-func (b *StepBuilder) Do(fn any, opts ...HandlerOpt) *StepBuilder {
-	b.applyHandler(fn, opts...)
-	return b
-}
-
-func (b *StepBuilder) Flow() *Flow {
-	return b.flow
-}
-
-type MapStepBuilder struct {
-	*Step
-}
-
-func (b *MapStepBuilder) AddStep(name string) *StepBuilder {
-	return b.flow.AddStep(name)
-}
-
-func (b *MapStepBuilder) AddGeneratorStep(name string) *GeneratorStepBuilder {
-	return b.flow.AddGeneratorStep(name)
-}
-
-func (b *MapStepBuilder) AddMapStep(name string) *MapStepBuilder {
-	return b.flow.AddMapStep(name)
-}
-
-func (b *MapStepBuilder) AddReducerStep(name string) *ReducerStepBuilder {
-	return b.flow.AddReducerStep(name)
-}
-
-func (b *MapStepBuilder) WithDescription(description string) *MapStepBuilder {
-	b.withDescription(description)
-	return b
-}
-
-func (b *MapStepBuilder) DependsOn(deps ...string) *MapStepBuilder {
-	b.dependsOn(deps...)
-	return b
-}
-
-func (b *MapStepBuilder) WithCondition(condition string) *MapStepBuilder {
-	b.withCondition(condition)
-	return b
-}
-
-func (b *MapStepBuilder) WithSignal() *MapStepBuilder {
-	b.withSignal()
-	return b
-}
-
-func (b *MapStepBuilder) MapFlowInput() *MapStepBuilder {
-	b.mapInput()
-	return b
-}
-
-func (b *MapStepBuilder) MapStepOutput(stepName string) *MapStepBuilder {
-	b.mapFrom(stepName)
-	return b
-}
-
-func (b *MapStepBuilder) Map(fn any, opts ...HandlerOpt) *MapStepBuilder {
-	b.applyHandler(fn, opts...)
-	return b
-}
-
-func (b *MapStepBuilder) Flow() *Flow {
-	return b.flow
-}
-
-type GeneratorStepBuilder struct {
-	*Step
-}
-
-func (b *GeneratorStepBuilder) AddStep(name string) *StepBuilder {
-	return b.flow.AddStep(name)
-}
-
-func (b *GeneratorStepBuilder) AddGeneratorStep(name string) *GeneratorStepBuilder {
-	return b.flow.AddGeneratorStep(name)
-}
-
-func (b *GeneratorStepBuilder) AddMapStep(name string) *MapStepBuilder {
-	return b.flow.AddMapStep(name)
-}
-
-func (b *GeneratorStepBuilder) AddReducerStep(name string) *ReducerStepBuilder {
-	return b.flow.AddReducerStep(name)
-}
-
-func (b *GeneratorStepBuilder) WithDescription(description string) *GeneratorStepBuilder {
-	b.withDescription(description)
-	return b
-}
-
-func (b *GeneratorStepBuilder) DependsOn(deps ...string) *GeneratorStepBuilder {
-	b.dependsOn(deps...)
-	return b
-}
-
-func (b *GeneratorStepBuilder) WithCondition(condition string) *GeneratorStepBuilder {
-	b.withCondition(condition)
-	return b
-}
-
-func (b *GeneratorStepBuilder) WithSignal() *GeneratorStepBuilder {
-	b.withSignal()
-	return b
-}
-
-func (b *GeneratorStepBuilder) Generate(fn any) *GeneratorStepBuilder {
-	b.generator(fn)
-	return b
-}
-
-func (b *GeneratorStepBuilder) Map(fn any, opts ...HandlerOpt) *GeneratorStepBuilder {
-	b.applyHandler(fn, opts...)
-	return b
-}
-
-func (b *GeneratorStepBuilder) Flow() *Flow {
-	return b.flow
-}
-
-type ReducerStepBuilder struct {
-	*Step
-}
-
-func (b *ReducerStepBuilder) AddStep(name string) *StepBuilder {
-	return b.flow.AddStep(name)
-}
-
-func (b *ReducerStepBuilder) AddGeneratorStep(name string) *GeneratorStepBuilder {
-	return b.flow.AddGeneratorStep(name)
-}
-
-func (b *ReducerStepBuilder) AddMapStep(name string) *MapStepBuilder {
-	return b.flow.AddMapStep(name)
-}
-
-func (b *ReducerStepBuilder) AddReducerStep(name string) *ReducerStepBuilder {
-	return b.flow.AddReducerStep(name)
-}
-
-func (b *ReducerStepBuilder) WithDescription(description string) *ReducerStepBuilder {
-	b.withDescription(description)
-	return b
-}
-
-func (b *ReducerStepBuilder) DependsOn(deps ...string) *ReducerStepBuilder {
-	b.dependsOn(deps...)
-	return b
-}
-
-func (b *ReducerStepBuilder) WithCondition(condition string) *ReducerStepBuilder {
-	b.withCondition(condition)
-	return b
-}
-
-func (b *ReducerStepBuilder) WithSignal() *ReducerStepBuilder {
-	b.withSignal()
-	return b
-}
-
-func (b *ReducerStepBuilder) ReduceStep(stepName string) *ReducerStepBuilder {
-	b.reduceStep(stepName)
-	return b
-}
-
-func (b *ReducerStepBuilder) Reduce(initial any, fn any) *ReducerStepBuilder {
-	b.reduce(initial, fn)
-	return b
-}
-
-func (b *ReducerStepBuilder) Flow() *Flow {
-	return b.flow
+func cloneStep(step *Step) *Step {
+	clone := *step
+	clone.flow = nil
+	clone.configErr = step.configErr
+	clone.dependencies = append([]string(nil), step.dependencies...)
+	clone.optionalDependencies = make(map[string]bool, len(step.optionalDependencies))
+	for dep, optional := range step.optionalDependencies {
+		clone.optionalDependencies[dep] = optional
+	}
+	clone.reducerInit = append([]byte(nil), step.reducerInit...)
+	return &clone
 }
 
 func parseGeneratorFn(fn any, stepName string) (reflect.Type, reflect.Type, error) {
@@ -1150,9 +1056,19 @@ func validateReducerStepDefinition(flowName string, step *Step, stepNameSet map[
 }
 
 func validateFlowDependencies(flow *Flow) error {
+	if flow.configErr != nil {
+		return fmt.Errorf("flow %q configuration error: %w", flow.name, flow.configErr)
+	}
+
 	steps := flow.steps
 	if len(steps) == 0 {
 		return fmt.Errorf("flow %q must have at least one step", flow.name)
+	}
+
+	for _, step := range steps {
+		if step.configErr != nil {
+			return fmt.Errorf("flow %q: step %q configuration error: %w", flow.name, step.name, step.configErr)
+		}
 	}
 
 	stepNameSet := make(map[string]bool)
@@ -1248,71 +1164,69 @@ func validateFlowDependencies(flow *Flow) error {
 	return nil
 }
 
-// CreateFlow creates one or more flow definitions.
-func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
+// CreateFlow creates a flow definition.
+func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 	q := `SELECT * FROM cb_create_flow(name => $1, description => $2, steps => $3, output_priority => $4, retention_period => $5);`
-	for _, flow := range flows {
-		if err := validateFlowDependencies(flow); err != nil {
-			return err
+	if err := validateFlowDependencies(flow); err != nil {
+		return err
+	}
+
+	// Need to marshal the steps with their public fields for JSON
+	// Convert to a serializable structure
+	type stepDependency struct {
+		Name string `json:"name"`
+	}
+	type serializableStep struct {
+		Name             string            `json:"name"`
+		Description      string            `json:"description,omitempty"`
+		Condition        string            `json:"condition,omitempty"`
+		StepType         StepType          `json:"step_type,omitempty"`
+		MapSource        string            `json:"map_source,omitempty"`
+		ReduceSourceStep string            `json:"reduce_source_step,omitempty"`
+		HasSignal        bool              `json:"has_signal"`
+		DependsOn        []*stepDependency `json:"depends_on,omitempty"`
+	}
+
+	steps := flow.steps
+	serSteps := make([]serializableStep, len(steps))
+	for i, s := range steps {
+		// Convert dependency names to stepDependency objects
+		depNames := s.dependencies
+		deps := make([]*stepDependency, len(depNames))
+		for j, depName := range depNames {
+			deps[j] = &stepDependency{Name: depName}
 		}
 
-		// Need to marshal the steps with their public fields for JSON
-		// Convert to a serializable structure
-		type stepDependency struct {
-			Name string `json:"name"`
+		serStep := serializableStep{
+			Name:             s.name,
+			Description:      s.description,
+			StepType:         s.stepType,
+			MapSource:        s.mapSource,
+			ReduceSourceStep: s.reduceSourceStep,
+			HasSignal:        s.hasSignal,
+			DependsOn:        deps,
 		}
-		type serializableStep struct {
-			Name             string            `json:"name"`
-			Description      string            `json:"description,omitempty"`
-			Condition        string            `json:"condition,omitempty"`
-			StepType         StepType          `json:"step_type,omitempty"`
-			MapSource        string            `json:"map_source,omitempty"`
-			ReduceSourceStep string            `json:"reduce_source_step,omitempty"`
-			HasSignal        bool              `json:"has_signal"`
-			DependsOn        []*stepDependency `json:"depends_on,omitempty"`
-		}
+		serStep.Condition = s.condition
+		serSteps[i] = serStep
+	}
 
-		steps := flow.steps
-		serSteps := make([]serializableStep, len(steps))
-		for i, s := range steps {
-			// Convert dependency names to stepDependency objects
-			depNames := s.dependencies
-			deps := make([]*stepDependency, len(depNames))
-			for j, depName := range depNames {
-				deps[j] = &stepDependency{Name: depName}
-			}
+	b, err := json.Marshal(serSteps)
+	if err != nil {
+		return err
+	}
 
-			serStep := serializableStep{
-				Name:             s.name,
-				Description:      s.description,
-				StepType:         s.stepType,
-				MapSource:        s.mapSource,
-				ReduceSourceStep: s.reduceSourceStep,
-				HasSignal:        s.hasSignal,
-				DependsOn:        deps,
-			}
-			serStep.Condition = s.condition
-			serSteps[i] = serStep
-		}
+	priority := flow.outputPriority
+	if !flow.priorityConfigured {
+		priority = defaultFlowOutputPriority(flow)
+	}
 
-		b, err := json.Marshal(serSteps)
-		if err != nil {
-			return err
-		}
-
-		priority := flow.outputPriority
-		if !flow.priorityConfigured {
-			priority = defaultFlowOutputPriority(flow)
-		}
-
-		var retentionPeriod *time.Duration
-		if flow.retentionPeriod > 0 {
-			retentionPeriod = &flow.retentionPeriod
-		}
-		_, err = conn.Exec(ctx, q, flow.name, ptrOrNil(flow.description), b, priority, retentionPeriod)
-		if err != nil {
-			return err
-		}
+	var retentionPeriod *time.Duration
+	if flow.retentionPeriod > 0 {
+		retentionPeriod = &flow.retentionPeriod
+	}
+	_, err = conn.Exec(ctx, q, flow.name, ptrOrNil(flow.description), b, priority, retentionPeriod)
+	if err != nil {
+		return err
 	}
 
 	return nil

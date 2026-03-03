@@ -105,9 +105,9 @@ func (c *Client) DeleteMany(ctx context.Context, queueName string, ids []int64) 
 	return DeleteMany(ctx, c.Conn, queueName, ids)
 }
 
-// CreateTask creates one or more task definitions.
-func (c *Client) CreateTask(ctx context.Context, tasks ...*Task) error {
-	return CreateTask(ctx, c.Conn, tasks...)
+// CreateTask creates a task definition.
+func (c *Client) CreateTask(ctx context.Context, task *Task) error {
+	return CreateTask(ctx, c.Conn, task)
 }
 
 // GetTask retrieves task metadata by name.
@@ -141,9 +141,9 @@ func (c *Client) ListTaskRuns(ctx context.Context, taskName string) ([]*TaskRunI
 	return ListTaskRuns(ctx, c.Conn, taskName)
 }
 
-// CreateFlow creates one or more flow definitions.
-func (c *Client) CreateFlow(ctx context.Context, flows ...*Flow) error {
-	return CreateFlow(ctx, c.Conn, flows...)
+// CreateFlow creates a flow definition.
+func (c *Client) CreateFlow(ctx context.Context, flow *Flow) error {
+	return CreateFlow(ctx, c.Conn, flow)
 }
 
 // GetFlow retrieves flow metadata by name.

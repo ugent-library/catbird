@@ -491,13 +491,13 @@ func TestFlowOnFailIntegration(t *testing.T) {
 	onFailCalled := make(chan FlowFailure, 1)
 
 	flow := NewFlow("flow_on_fail")
-	flow.AddStep("step1").Do(func(_ context.Context, _ Input) (string, error) {
+	flow.AddStep(NewStep("step1").Do(func(_ context.Context, _ Input) (string, error) {
 		return "", fmt.Errorf("step failed")
 	},
 		WithConcurrency(1),
 		WithBatchSize(10),
 		WithMaxRetries(0),
-	)
+	))
 	flow.OnFail(func(_ context.Context, in Input, failure FlowFailure) error {
 		if in.OrderID != "ord-2" {
 			return fmt.Errorf("unexpected flow input in on-fail: %+v", in)
@@ -564,7 +564,7 @@ func TestFlowOnFailMapStepInputIntegration(t *testing.T) {
 	onFailCalled := make(chan FlowFailure, 1)
 
 	flow := NewFlow("flow_on_fail_map_input")
-	flow.AddMapStep("map_fail").
+	flow.AddStep(NewStep("map_fail").
 		MapFlowInput().
 		Map(func(_ context.Context, in Item) (string, error) {
 			return "", fmt.Errorf("map item failed: %d", in.ID)
@@ -572,7 +572,7 @@ func TestFlowOnFailMapStepInputIntegration(t *testing.T) {
 			WithConcurrency(1),
 			WithBatchSize(10),
 			WithMaxRetries(0),
-		)
+		))
 	flow.OnFail(func(_ context.Context, in []Item, failure FlowFailure) error {
 		onFailCalled <- failure
 		if len(in) != 2 {
@@ -689,12 +689,12 @@ func TestWorkerValidatesStepHandlerOpts(t *testing.T) {
 	// Test invalid concurrency in flow step
 	t.Run("negative_concurrency", func(t *testing.T) {
 		flow := NewFlow("invalid_flow")
-		flow.AddStep("step1").Do(func(_ context.Context, _ any) (any, error) {
+		flow.AddStep(NewStep("step1").Do(func(_ context.Context, _ any) (any, error) {
 			return nil, nil
 		},
 			WithConcurrency(-1),
 			WithBatchSize(10),
-		)
+		))
 
 		worker := client.NewWorker(t.Context()).AddFlow(flow)
 		err := worker.Start(t.Context())
@@ -709,12 +709,12 @@ func TestWorkerValidatesStepHandlerOpts(t *testing.T) {
 	// Test invalid batch size in flow step
 	t.Run("negative_batch_size", func(t *testing.T) {
 		flow := NewFlow("invalid_flow2")
-		flow.AddStep("step1").Do(func(_ context.Context, _ any) (any, error) {
+		flow.AddStep(NewStep("step1").Do(func(_ context.Context, _ any) (any, error) {
 			return nil, nil
 		},
 			WithConcurrency(1),
 			WithBatchSize(-5), // Negative value
-		)
+		))
 
 		worker := client.NewWorker(t.Context()).AddFlow(flow)
 		err := worker.Start(t.Context())
@@ -729,13 +729,13 @@ func TestWorkerValidatesStepHandlerOpts(t *testing.T) {
 	// Test invalid circuit breaker config in flow step
 	t.Run("invalid_circuit_breaker", func(t *testing.T) {
 		flow := NewFlow("invalid_flow3")
-		flow.AddStep("step1").Do(func(_ context.Context, _ any) (any, error) {
+		flow.AddStep(NewStep("step1").Do(func(_ context.Context, _ any) (any, error) {
 			return nil, nil
 		},
 			WithConcurrency(1),
 			WithBatchSize(10),
 			WithCircuitBreaker(0, time.Second), // Invalid threshold
-		)
+		))
 
 		worker := client.NewWorker(t.Context()).AddFlow(flow)
 		err := worker.Start(t.Context())

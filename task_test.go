@@ -551,10 +551,10 @@ func TestFlowConcurrencyKey(t *testing.T) {
 	input2 := "input2"
 
 	flow := NewFlow(flowName)
-	flow.AddStep("step1").Do(func(ctx context.Context, in string) (string, error) {
+	flow.AddStep(NewStep("step1").Do(func(ctx context.Context, in string) (string, error) {
 		time.Sleep(200 * time.Millisecond)
 		return in + " processed", nil
-	})
+	}))
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -598,10 +598,10 @@ func TestFlowIdempotencyKey(t *testing.T) {
 	client := getTestClient(t)
 
 	flow := NewFlow("idempotent_flow")
-	flow.AddStep("step1").Do(func(ctx context.Context, in int) (int, error) {
+	flow.AddStep(NewStep("step1").Do(func(ctx context.Context, in int) (int, error) {
 		time.Sleep(100 * time.Millisecond)
 		return in * 5, nil
-	})
+	}))
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -680,9 +680,9 @@ func TestFlowBothKeysRejected(t *testing.T) {
 	var err error
 
 	flow := NewFlow("both_keys_flow")
-	flow.AddStep("step1").Do(func(ctx context.Context, in string) (string, error) {
+	flow.AddStep(NewStep("step1").Do(func(ctx context.Context, in string) (string, error) {
 		return in, nil
-	})
+	}))
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)

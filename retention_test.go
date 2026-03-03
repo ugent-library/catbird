@@ -103,10 +103,11 @@ func TestFlowRetentionPeriodRoundTrip(t *testing.T) {
 	client := getTestClient(t)
 
 	flowName := testFlowName(t, "retention_flow_with_period")
-	flow := NewFlow(flowName).RetentionPeriod(30 * 24 * time.Hour).
-		AddStep("step1").Do(func(ctx context.Context, in string) (string, error) {
+	flow := NewFlow(flowName)
+	flow.RetentionPeriod(30 * 24 * time.Hour)
+	flow.AddStep(NewStep("step1").Do(func(ctx context.Context, in string) (string, error) {
 		return in, nil
-	}).Flow()
+	}))
 
 	if err := client.CreateFlow(t.Context(), flow); err != nil {
 		t.Fatal(err)
@@ -127,10 +128,10 @@ func TestFlowRetentionPeriodDefaultsToZero(t *testing.T) {
 	client := getTestClient(t)
 
 	flowName := testFlowName(t, "retention_flow_no_period")
-	flow := NewFlow(flowName).
-		AddStep("step1").Do(func(ctx context.Context, in string) (string, error) {
+	flow := NewFlow(flowName)
+	flow.AddStep(NewStep("step1").Do(func(ctx context.Context, in string) (string, error) {
 		return in, nil
-	}).Flow()
+	}))
 
 	if err := client.CreateFlow(t.Context(), flow); err != nil {
 		t.Fatal(err)
@@ -151,10 +152,10 @@ func TestPurgeFlowRuns(t *testing.T) {
 	client := getTestClient(t)
 
 	flowName := testFlowName(t, "retention_purge_flow")
-	flow := NewFlow(flowName).
-		AddStep("step1").Do(func(ctx context.Context, in string) (string, error) {
+	flow := NewFlow(flowName)
+	flow.AddStep(NewStep("step1").Do(func(ctx context.Context, in string) (string, error) {
 		return in + " done", nil
-	}).Flow()
+	}))
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -202,10 +203,11 @@ func TestGCPurgesRetentionRuns(t *testing.T) {
 		})
 
 	flowName := testFlowName(t, "retention_gc_flow")
-	flow := NewFlow(flowName).RetentionPeriod(time.Nanosecond).
-		AddStep("step1").Do(func(ctx context.Context, in string) (string, error) {
+	flow := NewFlow(flowName)
+	flow.RetentionPeriod(time.Nanosecond)
+	flow.AddStep(NewStep("step1").Do(func(ctx context.Context, in string) (string, error) {
 		return in, nil
-	}).Flow()
+	}))
 
 	worker := client.NewWorker(t.Context()).AddTask(task).AddFlow(flow)
 	startTestWorker(t, worker)
