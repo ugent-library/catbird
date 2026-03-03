@@ -132,7 +132,7 @@ func BenchmarkTaskThroughput(b *testing.B) {
 	ctx := context.Background()
 
 	taskName := fmt.Sprintf("bench_task_%d", time.Now().UnixNano())
-	task := NewTask(taskName).Handler(func(ctx context.Context, in int) (int, error) {
+	task := NewTask(taskName).Do(func(ctx context.Context, in int) (int, error) {
 		return in + 1, nil
 	})
 
@@ -168,7 +168,7 @@ func BenchmarkFlowThroughput(b *testing.B) {
 
 	flowName := fmt.Sprintf("bench_flow_%d", time.Now().UnixNano())
 	flow := NewFlow(flowName)
-	flow.AddStep("step1").Handler(func(ctx context.Context, in int) (int, error) {
+	flow.AddStep("step1").Do(func(ctx context.Context, in int) (int, error) {
 		return in + 1, nil
 	})
 
@@ -203,7 +203,7 @@ func BenchmarkTaskThroughputPipelined(b *testing.B) {
 	ctx := context.Background()
 
 	taskName := fmt.Sprintf("bench_task_pipelined_%d", time.Now().UnixNano())
-	task := NewTask(taskName).Handler(func(ctx context.Context, in int) (int, error) {
+	task := NewTask(taskName).Do(func(ctx context.Context, in int) (int, error) {
 		return in + 1, nil
 	})
 
@@ -312,7 +312,7 @@ func BenchmarkFlowThroughputPipelined(b *testing.B) {
 
 	flowName := fmt.Sprintf("bench_flow_pipelined_%d", time.Now().UnixNano())
 	flow := NewFlow(flowName)
-	flow.AddStep("step1").Handler(func(ctx context.Context, in int) (int, error) {
+	flow.AddStep("step1").Do(func(ctx context.Context, in int) (int, error) {
 		return in + 1, nil
 	})
 
@@ -361,7 +361,7 @@ func BenchmarkTaskThroughputPipelinedTuned(b *testing.B) {
 	ctx := context.Background()
 
 	taskName := fmt.Sprintf("bench_task_pipelined_tuned_%d", time.Now().UnixNano())
-	task := NewTask(taskName).Handler(func(ctx context.Context, in int) (int, error) {
+	task := NewTask(taskName).Do(func(ctx context.Context, in int) (int, error) {
 		return in + 1, nil
 	}, benchmarkTunedHandlerOpts...)
 
@@ -410,7 +410,7 @@ func BenchmarkTaskEngineThroughputTuned(b *testing.B) {
 	ctx := context.Background()
 
 	taskName := fmt.Sprintf("bench_task_engine_tuned_%d", time.Now().UnixNano())
-	task := NewTask(taskName).Handler(func(ctx context.Context, in int) (int, error) {
+	task := NewTask(taskName).Do(func(ctx context.Context, in int) (int, error) {
 		return in + 1, nil
 	}, benchmarkTunedHandlerOpts...)
 
@@ -444,7 +444,7 @@ func BenchmarkFlowThroughputPipelinedTuned(b *testing.B) {
 
 	flowName := fmt.Sprintf("bench_flow_pipelined_tuned_%d", time.Now().UnixNano())
 	flow := NewFlow(flowName)
-	flow.AddStep("step1").Handler(func(ctx context.Context, in int) (int, error) {
+	flow.AddStep("step1").Do(func(ctx context.Context, in int) (int, error) {
 		return in + 1, nil
 	}, benchmarkTunedHandlerOpts...)
 

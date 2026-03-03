@@ -87,7 +87,7 @@ func TestRunTaskQuery(t *testing.T) {
 func TestTaskCreate(t *testing.T) {
 	client := getTestClient(t)
 
-	task := NewTask("test_task").Handler(func(ctx context.Context, in string) (string, error) {
+	task := NewTask("test_task").Do(func(ctx context.Context, in string) (string, error) {
 		return in + " processed", nil
 	}).WithDescription("Task description")
 
@@ -115,7 +115,7 @@ func TestTaskRunAndWait(t *testing.T) {
 		Value int `json:"value"`
 	}
 
-	task := NewTask("math_task").Handler(func(ctx context.Context, in TaskInput) (int, error) {
+	task := NewTask("math_task").Do(func(ctx context.Context, in TaskInput) (int, error) {
 		return in.Value * 2, nil
 	})
 
@@ -147,7 +147,7 @@ func TestTaskRunDelayedVisibleAt(t *testing.T) {
 	client := getTestClient(t)
 
 	taskName := fmt.Sprintf("delayed_task_%d", time.Now().UnixNano())
-	task := NewTask(taskName).Handler(func(ctx context.Context, in string) (string, error) {
+	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
 		return in + " processed", nil
 	})
 
@@ -188,7 +188,7 @@ func TestTaskRunHeadersRoundTrip(t *testing.T) {
 	client := getTestClient(t)
 
 	taskName := fmt.Sprintf("task_headers_roundtrip_%d", time.Now().UnixNano())
-	task := NewTask(taskName).Handler(func(ctx context.Context, in string) (string, error) {
+	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
 		return in, nil
 	})
 
@@ -234,7 +234,7 @@ func TestTaskRunHeadersRoundTrip(t *testing.T) {
 func TestTaskPanicRecovery(t *testing.T) {
 	client := getTestClient(t)
 
-	task := NewTask("panic_task").Handler(func(ctx context.Context, in string) (string, error) {
+	task := NewTask("panic_task").Do(func(ctx context.Context, in string) (string, error) {
 		panic("intentional panic in task")
 	})
 
@@ -283,7 +283,7 @@ func TestTaskCircuitBreaker(t *testing.T) {
 	var mu sync.Mutex
 	var times []time.Time
 
-	task := NewTask("circuit_task").Handler(func(ctx context.Context, in string) (string, error) {
+	task := NewTask("circuit_task").Do(func(ctx context.Context, in string) (string, error) {
 		n := atomic.AddInt32(&calls, 1)
 		mu.Lock()
 		times = append(times, time.Now())
@@ -366,7 +366,7 @@ func TestTaskConcurrencyKey(t *testing.T) {
 	client := getTestClient(t)
 	taskName := fmt.Sprintf("concurrent_task_%d", time.Now().UnixNano())
 
-	task := NewTask(taskName).Handler(func(ctx context.Context, in int) (int, error) {
+	task := NewTask(taskName).Do(func(ctx context.Context, in int) (int, error) {
 		time.Sleep(200 * time.Millisecond)
 		return in * 2, nil
 	})
@@ -424,7 +424,7 @@ func TestTaskIdempotencyKey(t *testing.T) {
 	client := getTestClient(t)
 	taskName := fmt.Sprintf("idempotent_task_%d", time.Now().UnixNano())
 
-	task := NewTask(taskName).Handler(func(ctx context.Context, in int) (int, error) {
+	task := NewTask(taskName).Do(func(ctx context.Context, in int) (int, error) {
 		time.Sleep(100 * time.Millisecond)
 		return in * 3, nil
 	})
@@ -494,7 +494,7 @@ func TestTaskDeduplicationRetryOnFailure(t *testing.T) {
 	}
 
 	taskName := fmt.Sprintf("retry_task_dedupe_%d", time.Now().UnixNano())
-	task := NewTask(taskName).Handler(func(ctx context.Context, in RetryInput) (string, error) {
+	task := NewTask(taskName).Do(func(ctx context.Context, in RetryInput) (string, error) {
 		if in.Fail {
 			return "", fmt.Errorf("task failed")
 		}
@@ -551,7 +551,7 @@ func TestFlowConcurrencyKey(t *testing.T) {
 	input2 := "input2"
 
 	flow := NewFlow(flowName)
-	flow.AddStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
+	flow.AddStep("step1").Do(func(ctx context.Context, in string) (string, error) {
 		time.Sleep(200 * time.Millisecond)
 		return in + " processed", nil
 	})
@@ -598,7 +598,7 @@ func TestFlowIdempotencyKey(t *testing.T) {
 	client := getTestClient(t)
 
 	flow := NewFlow("idempotent_flow")
-	flow.AddStep("step1").Handler(func(ctx context.Context, in int) (int, error) {
+	flow.AddStep("step1").Do(func(ctx context.Context, in int) (int, error) {
 		time.Sleep(100 * time.Millisecond)
 		return in * 5, nil
 	})
@@ -658,7 +658,7 @@ func TestTaskBothKeysRejected(t *testing.T) {
 	var err error
 	taskName := fmt.Sprintf("both_keys_task_%d", time.Now().UnixNano())
 
-	task := NewTask(taskName).Handler(func(ctx context.Context, in string) (string, error) {
+	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
 		return in, nil
 	})
 
@@ -680,7 +680,7 @@ func TestFlowBothKeysRejected(t *testing.T) {
 	var err error
 
 	flow := NewFlow("both_keys_flow")
-	flow.AddStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
+	flow.AddStep("step1").Do(func(ctx context.Context, in string) (string, error) {
 		return in, nil
 	})
 
@@ -722,7 +722,7 @@ func TestTaskCancelQueuedRun(t *testing.T) {
 	client := getTestClient(t)
 
 	taskName := fmt.Sprintf("cancel_queued_task_%d", time.Now().UnixNano())
-	task := NewTask(taskName).Handler(func(ctx context.Context, in string) (string, error) {
+	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
 		return in + " done", nil
 	})
 
@@ -756,7 +756,7 @@ func TestTaskCancelStartedRun(t *testing.T) {
 	client := getTestClient(t)
 
 	taskName := fmt.Sprintf("cancel_started_task_%d", time.Now().UnixNano())
-	task := NewTask(taskName).Handler(func(ctx context.Context, in string) (string, error) {
+	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
 		<-ctx.Done()
 		return "", ctx.Err()
 	})
@@ -783,7 +783,7 @@ func TestTaskInternalCancelCurrentRun(t *testing.T) {
 	client := getTestClient(t)
 
 	taskName := fmt.Sprintf("cancel_internal_task_%d", time.Now().UnixNano())
-	task := NewTask(taskName).Handler(func(ctx context.Context, in string) (string, error) {
+	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
 		if err := Cancel(ctx, CancelOpts{Reason: "business early exit"}); err != nil {
 			return "", err
 		}
@@ -821,7 +821,7 @@ func TestTaskHandleWaitForOutput(t *testing.T) {
 	client := getTestClient(t)
 
 	taskName := fmt.Sprintf("task_handle_finished_%d", time.Now().UnixNano())
-	task := NewTask(taskName).Handler(func(ctx context.Context, in string) (string, error) {
+	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
 		time.Sleep(150 * time.Millisecond)
 		return in + ":ok", nil
 	})

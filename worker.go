@@ -163,7 +163,10 @@ func (w *Worker) validateRegisteredHandlers() error {
 }
 
 func shouldStartStepWorker(step *Step) bool {
-	return step.isGenerator || (step.isMapStep && step.reducerFn != nil) || !step.isMapStep
+	if step.isReducer {
+		return true
+	}
+	return step.isGenerator || !step.isMapStep
 }
 
 func shouldStartMapStepWorker(step *Step) bool {
@@ -693,7 +696,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 		)
 	}
 
-	if w.step.isMapStep && w.step.reducerFn != nil {
+	if w.step.isReducer {
 		if stopIfRequested() {
 			return
 		}
@@ -732,50 +735,6 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 	if w.step.isGenerator {
 		if stopIfRequested() {
 			return
-		}
-
-		if w.step.reducerFn != nil {
-			reductionReady, reductionReadyErr := generatorReductionReady(ctx, w.conn, w.flowName, w.step.name, msg.ID)
-			if reductionReadyErr != nil {
-				if h.circuitBreaker != nil {
-					h.circuitBreaker.RecordFailure(time.Now())
-				}
-				w.logger.ErrorContext(ctx, "worker: reducer readiness check failed", "flow", w.flowName, "step", w.step.name, "error", reductionReadyErr)
-				if msg.Attempts > h.maxRetries {
-					failGeneratorStep(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, reductionReadyErr.Error())
-				} else {
-					delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
-					hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay reducer readiness retry")
-				}
-				return
-			}
-
-			if reductionReady {
-				err := runWithTimeoutErr(ctx, h.timeout, func(fnCtx context.Context) error {
-					_, reduceErr := runSafely("reducer panic", func() (struct{}, error) {
-						return struct{}{}, finalizeStepReduction(fnCtx, w.conn, w.logger, w.flowName, w.step, msg.ID)
-					})
-					return reduceErr
-				})
-
-				if err != nil {
-					if h.circuitBreaker != nil {
-						h.circuitBreaker.RecordFailure(time.Now())
-					}
-					if msg.Attempts > h.maxRetries {
-						failGeneratorStep(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, err.Error())
-					} else {
-						delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
-						hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay reduced generator step retry")
-					}
-					return
-				}
-
-				if h.circuitBreaker != nil {
-					h.circuitBreaker.RecordSuccess()
-				}
-				return
-			}
 		}
 
 		err := runWithTimeoutErr(handlerCtx, h.timeout, func(fnCtx context.Context) error {
@@ -1018,19 +977,7 @@ func (w *stepWorker) handleGeneratorClaim(ctx context.Context, msg stepClaim) er
 		return err
 	}
 
-	if w.step.reducerFn == nil {
-		return completeGeneratorStep(ctx, w.conn, w.flowName, w.step.name, msg.ID)
-	}
-
-	ready, err := completeGeneratorStepOrQueueReduce(ctx, w.conn, w.flowName, w.step.name, msg.ID)
-	if err != nil {
-		return err
-	}
-	if !ready {
-		return nil
-	}
-
-	return finalizeStepReduction(ctx, w.conn, w.logger, w.flowName, w.step, msg.ID)
+	return completeGeneratorStep(ctx, w.conn, w.flowName, w.step.name, msg.ID)
 }
 
 func scanCollectibleStepClaim(row pgx.CollectableRow) (stepClaim, error) {
@@ -1309,14 +1256,6 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 		return
 	}
 
-	if w.step.reducerFn != nil {
-		_, err := completeMapTaskOrQueueReduce(ctx, w.conn, w.flowName, w.step.name, msg.ID, itemOutput)
-		if err != nil {
-			w.logger.ErrorContext(ctx, "worker: cannot mark reduced map task as completed", "flow", w.flowName, "step", w.step.name, "error", err)
-		}
-		return
-	}
-
 	completeMapTaskRun(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, itemOutput)
 }
 
@@ -1512,30 +1451,15 @@ func completeGeneratorStep(ctx context.Context, conn Conn, flowName, stepName st
 	return nil
 }
 
-func completeGeneratorStepOrQueueReduce(ctx context.Context, conn Conn, flowName, stepName string, stepID int64) (bool, error) {
-	q := `SELECT cb_complete_generator_step_or_queue_reduce(flow_name => $1, step_name => $2, step_id => $3);`
-	var ready bool
-	if err := conn.QueryRow(ctx, q, flowName, stepName, stepID).Scan(&ready); err != nil {
-		return false, fmt.Errorf("complete generator step or queue reduce: %w", err)
-	}
-	return ready, nil
-}
-
-func completeMapTaskOrQueueReduce(ctx context.Context, conn Conn, flowName, stepName string, mapTaskID int64, output []byte) (int64, error) {
-	q := `SELECT cb_complete_map_task_or_queue_reduce(flow_name => $1, step_name => $2, map_task_id => $3, output => $4);`
-	var stepID *int64
-	if err := conn.QueryRow(ctx, q, flowName, stepName, mapTaskID, output).Scan(&stepID); err != nil {
-		return 0, fmt.Errorf("complete map task or queue reduce: %w", err)
-	}
-	if stepID == nil {
-		return 0, nil
-	}
-	return *stepID, nil
-}
-
 func finalizeStepReduction(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, step *Step, stepID int64) error {
 	if step.reducerFn == nil {
 		return fmt.Errorf("step %s has no reducer", step.name)
+	}
+	if !step.isReducer {
+		return fmt.Errorf("step %s is not a reducer step", step.name)
+	}
+	if strings.TrimSpace(step.reduceSourceStep) == "" {
+		return fmt.Errorf("step %s has no reduce source step", step.name)
 	}
 
 	flowRunID, err := getStepFlowRunIDForReduction(ctx, conn, flowName, step, stepID)
@@ -1554,7 +1478,7 @@ func finalizeStepReduction(ctx context.Context, conn Conn, logger *slog.Logger, 
 
 	mapTable := fmt.Sprintf("cb_m_%s", strings.ToLower(flowName))
 	q := fmt.Sprintf(`SELECT output FROM %s WHERE flow_run_id = $1 AND step_name = $2 AND status = 'completed' ORDER BY item_idx`, mapTable)
-	rows, err := queryWithRetry(ctx, conn, q, flowRunID, step.name)
+	rows, err := queryWithRetry(ctx, conn, q, flowRunID, step.reduceSourceStep)
 	if err != nil {
 		return fmt.Errorf("query reducer map outputs: %w", err)
 	}
@@ -1599,10 +1523,7 @@ func finalizeStepReduction(ctx context.Context, conn Conn, logger *slog.Logger, 
 
 func getStepFlowRunIDForReduction(ctx context.Context, conn Conn, flowName string, step *Step, stepID int64) (int64, error) {
 	tableName := fmt.Sprintf("cb_s_%s", strings.ToLower(flowName))
-	q := fmt.Sprintf(`SELECT flow_run_id FROM %s WHERE id = $1 AND step_name = $2 AND status IN ('%s', '%s', '%s')`, tableName, StatusQueued, StatusStarted, StatusWaitingForMapTasks)
-	if step.isGenerator {
-		q += ` AND generator_status = 'complete'`
-	}
+	q := fmt.Sprintf(`SELECT flow_run_id FROM %s WHERE id = $1 AND step_name = $2 AND status IN ('%s', '%s')`, tableName, StatusQueued, StatusStarted)
 	var flowRunID int64
 	if err := conn.QueryRow(ctx, q, stepID, step.name).Scan(&flowRunID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1611,19 +1532,6 @@ func getStepFlowRunIDForReduction(ctx context.Context, conn Conn, flowName strin
 		return 0, fmt.Errorf("get flow run for reducer: %w", err)
 	}
 	return flowRunID, nil
-}
-
-func generatorReductionReady(ctx context.Context, conn Conn, flowName, stepName string, stepID int64) (bool, error) {
-	tableName := fmt.Sprintf("cb_s_%s", strings.ToLower(flowName))
-	q := fmt.Sprintf(`SELECT coalesce(generator_status = 'complete', false) FROM %s WHERE id = $1 AND step_name = $2 AND status IN ('%s', '%s', '%s')`, tableName, StatusQueued, StatusStarted, StatusWaitingForMapTasks)
-	var ready bool
-	if err := conn.QueryRow(ctx, q, stepID, stepName).Scan(&ready); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return false, nil
-		}
-		return false, fmt.Errorf("check generator reducer readiness: %w", err)
-	}
-	return ready, nil
 }
 
 func failGeneratorStep(ctx context.Context, conn Conn, logger *slog.Logger, flowName, stepName string, stepID int64, errorMessage string) {

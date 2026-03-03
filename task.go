@@ -13,7 +13,7 @@ import (
 )
 
 // Task is a reflection-based task with optional handler.
-// Use NewTask().Handler(fn, opts) for tasks with handlers.
+// Use NewTask().Do(fn, opts) for tasks with handlers.
 // Use NewTask() for definition-only tasks.
 type Task struct {
 	name        string
@@ -38,7 +38,7 @@ type TaskFailure struct {
 }
 
 // NewTask creates a new task definition with the given name.
-// Chain .Handler() to add a handler, otherwise returns a definition-only task.
+// Chain .Do() to add a handler, otherwise returns a definition-only task.
 func NewTask(name string) *Task {
 	return &Task{name: name}
 }
@@ -55,10 +55,10 @@ func (t *Task) WithDescription(description string) *Task {
 	return t
 }
 
-// Handler sets the task handler function and execution options.
+// Do sets the task handler function and execution options.
 // fn must have signature (context.Context, In) (Out, error).
 // If opts is omitted, defaults are used (concurrency: 4, batchSize: 64, timeout: 30s, maxRetries: 2 with full-jitter backoff 100ms-2s).
-func (t *Task) Handler(fn any, opts ...HandlerOpt) *Task {
+func (t *Task) Do(fn any, opts ...HandlerOpt) *Task {
 	handler, err := makeTaskHandler(fn, t.name)
 	if err != nil {
 		panic(err)

@@ -164,7 +164,7 @@ func (m model) renderFlowDetail() string {
 				description: s.Description,
 				dependsOn:   deps,
 				hasSignal:   s.HasSignal,
-				isMapStep:   s.IsMapStep,
+				stepType:    string(s.StepType),
 				mapSource:   s.MapSource,
 			}
 		}
@@ -400,7 +400,7 @@ type flowStepDetailView struct {
 	description string
 	dependsOn   []string
 	hasSignal   bool
-	isMapStep   bool
+	stepType    string
 	mapSource   string
 }
 
@@ -409,7 +409,7 @@ func (s flowStepDetailView) flowStepMeta() string {
 	if s.hasSignal {
 		flags = append(flags, "signal")
 	}
-	if s.isMapStep {
+	if s.stepType == "mapper" {
 		if s.mapSource != "" {
 			flags = append(flags, "map:"+s.mapSource)
 		} else {

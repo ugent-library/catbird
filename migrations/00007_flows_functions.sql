@@ -15,6 +15,26 @@
 -- +goose up
 
 -- +goose statementbegin
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_type
+    WHERE typname = 'cb_step_claim'
+  ) THEN
+    CREATE TYPE cb_step_claim AS (
+      id bigint,
+      flow_run_id bigint,
+      attempts int,
+      input jsonb,
+      step_outputs jsonb,
+      signal_input jsonb
+    );
+  END IF;
+END$$;
+-- +goose statementend
+
+-- +goose statementbegin
 -- cb_create_flow: Create a flow definition
 -- Creates the flow metadata and associated tables for flow runs and steps
 -- Parameters:
@@ -31,10 +51,11 @@ DECLARE
     _dep jsonb;
     _step_name text;
     _dep_name text;
-    _is_generator boolean;
-    _is_map_step boolean;
+    _step_type text;
     _map_source text;
+    _reduce_source_step text;
     _has_map_source_dependency boolean;
+    _has_reduce_source_dependency boolean;
     _idx int := 0;
     _dep_idx int;
     _f_table text;
@@ -86,8 +107,22 @@ BEGIN
         output_priority = coalesce(EXCLUDED.output_priority, ARRAY['__pending_output_priority__']),
         step_count = 0;
 
-    DELETE FROM cb_step_dependencies WHERE flow_name = cb_create_flow.name;
-    DELETE FROM cb_steps WHERE flow_name = cb_create_flow.name;
+    IF to_regclass('public.cb_step_handlers') IS NOT NULL THEN
+      EXECUTE 'DELETE FROM public.cb_step_handlers WHERE flow_name = $1'
+      USING cb_create_flow.name;
+    END IF;
+
+    BEGIN
+      DELETE FROM cb_step_dependencies WHERE flow_name = cb_create_flow.name;
+      DELETE FROM cb_steps WHERE flow_name = cb_create_flow.name;
+    EXCEPTION WHEN foreign_key_violation THEN
+      IF to_regclass('public.cb_step_handlers') IS NOT NULL THEN
+        EXECUTE 'DELETE FROM public.cb_step_handlers WHERE flow_name = $1'
+        USING cb_create_flow.name;
+      END IF;
+      DELETE FROM cb_step_dependencies WHERE flow_name = cb_create_flow.name;
+      DELETE FROM cb_steps WHERE flow_name = cb_create_flow.name;
+    END;
 
     FOR _step IN SELECT jsonb_array_elements(cb_create_flow.steps)
     LOOP
@@ -113,27 +148,40 @@ BEGIN
             RAISE EXCEPTION 'cb: step name "%" is too long, maximum length is 58', _step_name;
         END IF;
 
-        _is_map_step := coalesce((_step->>'is_map_step')::boolean, false);
-        _is_generator := coalesce((_step->>'is_generator')::boolean, false);
+        _step_type := coalesce(nullif(_step->>'step_type', ''), 'normal');
+
+        IF _step_type NOT IN ('normal', 'mapper', 'generator', 'reducer') THEN
+            RAISE EXCEPTION 'cb: step "%" has invalid step_type "%"', _step_name, _step_type;
+        END IF;
+
         _map_source := nullif(_step->>'map_source', '');
+        _reduce_source_step := nullif(_step->>'reduce_source_step', '');
 
-        IF _is_generator AND _is_map_step THEN
-            RAISE EXCEPTION 'cb: step "%" cannot be both generator and map step', _step_name;
+        IF _step_type <> 'mapper' AND _map_source IS NOT NULL THEN
+            RAISE EXCEPTION 'cb: step "%" has map_source but step_type is not mapper', _step_name;
         END IF;
 
-        IF NOT _is_map_step AND _map_source IS NOT NULL THEN
-            RAISE EXCEPTION 'cb: step "%" has map_source but is_map_step is false', _step_name;
+        IF _step_type <> 'reducer' AND _reduce_source_step IS NOT NULL THEN
+            RAISE EXCEPTION 'cb: step "%" has reduce_source_step but step_type is not reducer', _step_name;
         END IF;
 
-        -- Map input mode: is_map_step=true and map_source omitted/null.
-        -- Map dependency mode: is_map_step=true and map_source set to a dependency step name.
-        IF _is_map_step AND _map_source IS NULL THEN
+        -- Map input mode: step_type=mapper and map_source omitted/null.
+        -- Map dependency mode: step_type=mapper and map_source set to a dependency step name.
+        IF _step_type = 'mapper' AND _map_source IS NULL THEN
             -- map-input mode, valid
             NULL;
         END IF;
 
-        IF _is_map_step AND _map_source = _step_name THEN
+        IF _step_type = 'mapper' AND _map_source = _step_name THEN
             RAISE EXCEPTION 'cb: step "%" cannot map its own output', _step_name;
+        END IF;
+
+        IF _step_type = 'reducer' AND _reduce_source_step IS NULL THEN
+            RAISE EXCEPTION 'cb: reducer step "%" must specify reduce_source_step', _step_name;
+        END IF;
+
+        IF _step_type = 'reducer' AND _reduce_source_step = _step_name THEN
+            RAISE EXCEPTION 'cb: step "%" cannot reduce its own output', _step_name;
         END IF;
 
         IF _map_source IS NOT NULL THEN
@@ -152,22 +200,38 @@ BEGIN
             END IF;
         END IF;
 
+        IF _reduce_source_step IS NOT NULL THEN
+            IF NOT _reduce_source_step ~ '^[a-z0-9_]+$' THEN
+                RAISE EXCEPTION 'cb: reduce source step "%" contains invalid characters, allowed: a-z, 0-9, _', _reduce_source_step;
+            END IF;
+
+            SELECT EXISTS(
+                SELECT 1
+                FROM jsonb_array_elements(coalesce(_step->'depends_on', '[]'::jsonb)) d
+                WHERE d->>'name' = _reduce_source_step
+            ) INTO _has_reduce_source_dependency;
+
+            IF NOT _has_reduce_source_dependency THEN
+                RAISE EXCEPTION 'cb: step "%" reduces "%" but does not depend on it', _step_name, _reduce_source_step;
+            END IF;
+        END IF;
+
         -- Extract condition from step if present
         _condition := NULL;
         IF _step ? 'condition' AND _step->>'condition' IS NOT NULL AND _step->>'condition' != '' THEN
             _condition := cb_parse_condition(_step->>'condition');
         END IF;
 
-        INSERT INTO cb_steps (flow_name, name, description, idx, dependency_count, is_generator, is_map_step, map_source, has_signal, condition)
+        INSERT INTO cb_steps (flow_name, name, description, idx, dependency_count, step_type, map_source, reduce_source_step, has_signal, condition)
         VALUES (
             cb_create_flow.name,
             _step_name,
             nullif(_step->>'description', ''),
             _idx,
             jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb)),
-            _is_generator,
-            _is_map_step,
+            _step_type,
             _map_source,
+            _reduce_source_step,
             coalesce((_step->>'has_signal')::boolean, false),
             _condition
         );
@@ -190,7 +254,7 @@ BEGIN
         SELECT 1
         FROM cb_steps s
         WHERE s.flow_name = cb_create_flow.name
-            AND s.is_map_step = true
+        AND s.step_type = 'mapper'
             AND s.map_source IS NOT NULL
             AND NOT EXISTS (
                 SELECT 1
@@ -201,6 +265,26 @@ BEGIN
             )
     ) THEN
         RAISE EXCEPTION 'cb: map step must depend on its map_source (flow=%)', cb_create_flow.name;
+    END IF;
+
+    -- SQL-level reducer validation
+    IF EXISTS (
+      SELECT 1
+      FROM cb_steps s
+      WHERE s.flow_name = cb_create_flow.name
+        AND s.step_type = 'reducer'
+        AND (
+          s.reduce_source_step IS NULL
+          OR NOT EXISTS (
+            SELECT 1
+            FROM cb_step_dependencies d
+            WHERE d.flow_name = s.flow_name
+              AND d.step_name = s.name
+              AND d.dependency_name = s.reduce_source_step
+          )
+        )
+    ) THEN
+      RAISE EXCEPTION 'cb: reducer step must depend on its reduce_source_step (flow=%)', cb_create_flow.name;
     END IF;
 
     -- Output ownership validation
@@ -354,9 +438,9 @@ BEGIN
       flow_input jsonb NOT NULL DEFAULT '{}'::jsonb,
       status text NOT NULL DEFAULT 'waiting_for_dependencies',
       condition jsonb,
-      is_generator boolean NOT NULL DEFAULT false,
-      is_map_step boolean NOT NULL DEFAULT false,
+      step_type text NOT NULL DEFAULT 'normal',
       map_source text,
+      reduce_source_step text,
       has_signal boolean NOT NULL DEFAULT false,
       dependency_names text[] NOT NULL DEFAULT '{}'::text[],
       dependent_step_names text[] NOT NULL DEFAULT '{}'::text[],
@@ -379,6 +463,7 @@ BEGIN
       UNIQUE (flow_run_id, step_name),
       FOREIGN KEY (flow_run_id) REFERENCES %I (id),
       CONSTRAINT status_valid CHECK (status IN ('waiting_for_dependencies', 'waiting_for_signal', 'queued', 'started', 'waiting_for_map_tasks', 'completed', 'failed', 'skipped', 'canceled')),
+      CONSTRAINT step_type_valid CHECK (step_type IN ('normal', 'mapper', 'generator', 'reducer')),
       CONSTRAINT generator_status_valid CHECK (generator_status IS NULL OR generator_status IN ('started', 'complete', 'failed')),
       CONSTRAINT map_tasks_spawned_valid CHECK (map_tasks_spawned >= 0),
       CONSTRAINT map_tasks_completed_valid CHECK (map_tasks_completed >= 0 AND map_tasks_completed <= map_tasks_spawned),
@@ -550,9 +635,9 @@ BEGIN
       status,
       remaining_dependencies,
       condition,
-      is_generator,
-      is_map_step,
+      step_type,
       map_source,
+      reduce_source_step,
       has_signal,
       dependency_names,
       dependent_step_names
@@ -567,9 +652,9 @@ BEGIN
       END,
       s.dependency_count,
       s.condition,
-      s.is_generator,
-      s.is_map_step,
+      s.step_type,
       s.map_source,
+      s.reduce_source_step,
       s.has_signal,
       coalesce(array(
         SELECT d.dependency_name
@@ -985,8 +1070,7 @@ BEGIN
              END AS step_outputs,
              sr.signal_input,
              sr.condition,
-             sr.is_generator,
-             sr.is_map_step,
+                  sr.step_type,
              sr.map_source
       FROM %I sr
       WHERE sr.flow_run_id = $1
@@ -1125,7 +1209,7 @@ BEGIN
       END IF;
     END IF;
 
-    IF _step_to_process.is_generator THEN
+    IF _step_to_process.step_type = 'generator' THEN
       EXECUTE format(
         $QUERY$
         UPDATE %I
@@ -1147,7 +1231,7 @@ BEGIN
     END IF;
 
     -- Map-step activation: spawn item-level map tasks coordinated in SQL
-    IF _step_to_process.is_map_step THEN
+    IF _step_to_process.step_type = 'mapper' THEN
       IF _step_to_process.map_source IS NULL THEN
         _map_items := _flow_input;
       ELSE

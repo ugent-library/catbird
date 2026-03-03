@@ -37,9 +37,9 @@ CREATE TABLE IF NOT EXISTS cb_steps (
     description text,
     idx int NOT NULL DEFAULT 0,
     dependency_count int NOT NULL DEFAULT 0,
-    is_generator boolean NOT NULL DEFAULT false,
-    is_map_step boolean NOT NULL DEFAULT false,
+    step_type text NOT NULL DEFAULT 'normal',
     map_source text,
+    reduce_source_step text,
     has_signal boolean NOT NULL DEFAULT false,
     condition jsonb,
     PRIMARY KEY (flow_name, name),
@@ -48,9 +48,16 @@ CREATE TABLE IF NOT EXISTS cb_steps (
     CONSTRAINT name_not_reserved CHECK (name NOT IN ('input', 'signal')),
     CONSTRAINT idx_valid CHECK (idx >= 0),
     CONSTRAINT dependency_count_valid CHECK (dependency_count >= 0),
+    CONSTRAINT step_type_valid CHECK (step_type IN ('normal', 'mapper', 'generator', 'reducer')),
     CONSTRAINT map_source_not_self CHECK (map_source IS NULL OR map_source <> name),
-    CONSTRAINT map_source_requires_map_step CHECK ((NOT is_map_step AND map_source IS NULL) OR is_map_step),
-    CONSTRAINT map_source_fk FOREIGN KEY (flow_name, map_source) REFERENCES cb_steps (flow_name, name)
+    CONSTRAINT map_source_requires_mapper CHECK ((step_type <> 'mapper' AND map_source IS NULL) OR step_type = 'mapper'),
+    CONSTRAINT reduce_source_not_self CHECK (reduce_source_step IS NULL OR reduce_source_step <> name),
+    CONSTRAINT reduce_source_requires_reducer CHECK (
+        (step_type = 'reducer' AND reduce_source_step IS NOT NULL)
+        OR (step_type <> 'reducer' AND reduce_source_step IS NULL)
+    ),
+    CONSTRAINT map_source_fk FOREIGN KEY (flow_name, map_source) REFERENCES cb_steps (flow_name, name),
+    CONSTRAINT reduce_source_fk FOREIGN KEY (flow_name, reduce_source_step) REFERENCES cb_steps (flow_name, name)
 );
 
 CREATE TABLE IF NOT EXISTS cb_step_dependencies (
@@ -71,16 +78,15 @@ CREATE INDEX IF NOT EXISTS cb_step_dependencies_dependency_name_fk ON cb_step_de
 
 -- cb_flow_info: Query information about all flow definitions
 -- Returns all registered flows with their step definitions and metadata
--- Columns:
---   - name: Flow name
---   - steps: JSON array of step definitions with dependencies
---   - created_at: Flow creation timestamp
+-- Single SELECT with recursive derivation for compatibility with analyzers
 CREATE OR REPLACE VIEW cb_flow_info AS
     SELECT
         f.name,
-        f.description,
-        step_data.steps,
-        f.output_priority,
+        nullif((CASE WHEN jsonb_typeof(to_jsonb(f)) = 'object' THEN to_jsonb(f)->>'description' ELSE NULL END), '') AS description,
+        (CASE WHEN step_data.steps IS NOT NULL THEN step_data.steps ELSE '[]'::jsonb END) AS steps,
+        (CASE WHEN jsonb_typeof(to_jsonb(f)->'output_priority') = 'array' THEN
+            ARRAY(SELECT jsonb_array_elements_text(to_jsonb(f)->'output_priority'))
+         ELSE ARRAY[]::text[] END) AS output_priority,
         f.created_at
     FROM cb_flows f
     LEFT JOIN LATERAL (
@@ -88,11 +94,14 @@ CREATE OR REPLACE VIEW cb_flow_info AS
             st.flow_name,
             jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
                 'name', st.name,
-                'description', st.description,
-                'is_generator', st.is_generator,
-                'is_map_step', st.is_map_step,
-                'map_source', st.map_source,
-                'has_signal', st.has_signal,
+                'description', (CASE WHEN jsonb_typeof(to_jsonb(st)) = 'object' THEN to_jsonb(st)->'description' ELSE NULL END),
+                'step_type', (CASE WHEN jsonb_typeof(to_jsonb(st)) = 'object' THEN to_jsonb(st)->'step_type' ELSE NULL END),
+                'is_generator', (to_jsonb(st)->>'step_type' = 'generator'),
+                'is_map_step', (to_jsonb(st)->>'step_type' = 'mapper'),
+                'is_reducer', (to_jsonb(st)->>'step_type' = 'reducer'),
+                'map_source', (CASE WHEN jsonb_typeof(to_jsonb(st)) = 'object' THEN to_jsonb(st)->'map_source' ELSE NULL END),
+                'reduce_source_step', (CASE WHEN jsonb_typeof(to_jsonb(st)) = 'object' THEN to_jsonb(st)->'reduce_source_step' ELSE NULL END),
+                'has_signal', (CASE WHEN jsonb_typeof(to_jsonb(st)) = 'object' THEN to_jsonb(st)->'has_signal' ELSE NULL END),
                 'depends_on', (
                     SELECT jsonb_agg(jsonb_build_object('name', s_d.dependency_name))
                     FROM cb_step_dependencies AS s_d

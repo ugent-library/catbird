@@ -66,8 +66,7 @@ tableName := fmt.Sprintf("cb_m_%s", strings.ToLower(flowName))  // Map tasks
 **Task handlers use reflection and a builder pattern**:
 ```go
 // Handler fn: (context.Context, InputType) -> (OutputType, error)
-task := catbird.NewTask("my_task").
-  Handler(func(ctx context.Context, input MyInput) (MyOutput, error) {
+task := catbird.NewTask("my_task").Do(func(ctx context.Context, input MyInput) (MyOutput, error) {
     return MyOutput{}, nil
   },
     catbird.WithConcurrency(5),
@@ -79,7 +78,7 @@ task := catbird.NewTask("my_task").
 
 **Key characteristics**:
 - **No type parameters**: Input/output types are discovered at runtime via reflection (handlers receive `[]byte` payloads internally)
-- **Builder pattern**: Construction via method chaining: `NewTask(name).WithCondition(...).Handler(fn, opts...)`
+- **Builder pattern**: Construction via method chaining: `NewTask(name).WithCondition(...).Do(fn, opts...)`
 - **Execution options**: Applied via functional `HandlerOpt` values (e.g., `WithConcurrency`, `WithBatchSize`, `WithTimeout`, `WithMaxRetries`, `WithFullJitterBackoff`, `WithCircuitBreaker`)
 - **Handler options validation**: Worker validates all task and flow step handler options at initialization time, catching configuration errors early before database operations
 - **Task/step metadata**: Conditions applied via `.WithCondition(expr)` method chain
@@ -87,13 +86,11 @@ task := catbird.NewTask("my_task").
 **Flows**: Multi-step DAGs with dependencies using builder pattern:
 ```go
 flow := catbird.NewFlow("my_flow").
-  AddStep("step1").
-    Handler(func(ctx context.Context, in string) (string, error) {
+  AddStep("step1").Do(func(ctx context.Context, in string) (string, error) {
       return in + " modified", nil
     })).
   AddStep("step2").
-    DependsOn("step1").
-    Handler(func(ctx context.Context, in string, step1Out string) (string, error) {
+    DependsOn("step1").Do(func(ctx context.Context, in string, step1Out string) (string, error) {
       return step1Out + " from step2", nil
     }))
 ```
@@ -116,8 +113,7 @@ task := catbird.NewTask("premium_processing").
 **Flow step conditions** reference step outputs with `step_name.*` prefix and can also reference signal input via `signal.*` when present:
 ```go
 NewFlow("risk-check").
-  AddStep("validate").
-    Handler(func(ctx context.Context, amount int) (int, error) {
+  AddStep("validate").Do(func(ctx context.Context, amount int) (int, error) {
       return amount, nil
     })).
   AddStep("audit").
@@ -127,8 +123,7 @@ NewFlow("risk-check").
       return validateOut * 2, nil  // expensive check
     })).
   AddStep("finalize").
-    DependsOn("audit").
-    Handler(func(ctx context.Context, in int, auditResult catbird.Optional[int]) (int, error) {
+    DependsOn("audit").Do(func(ctx context.Context, in int, auditResult catbird.Optional[int]) (int, error) {
       if auditResult.IsSet {
         return auditResult.Value, nil  // used audit result
       }
@@ -141,8 +136,7 @@ NewFlow("risk-check").
 **Signals** enable human-in-the-loop workflows: steps can optionally wait for external input via `.WithSignal()` builder method before executing:
 ```go
 NewFlow("workflow").
-  AddStep("step1").
-    Handler(func(ctx context.Context, in string) (string, error) {
+  AddStep("step1").Do(func(ctx context.Context, in string) (string, error) {
       return in + " processed by step 1", nil
     })).
   AddStep("approve").
@@ -161,7 +155,7 @@ NewFlow("workflow").
 - **Optional outputs**: When a conditional step is skipped, dependent steps receive `Optional[T]{IsSet: false}`. When executed, `Optional[T]{IsSet: true, Value: result}`
 - **Cascading resolution**: `cb_start_steps()` loops until no more steps unblock; handles chains like step2 skips → step3 unblocks → step4 unblocks
 - **Validation**: Flow construction panics if a step depends on a conditional step without using `.OptionalDependency()` variant and `Optional[T]` parameter type
-- **Builder methods**: All construction through chainable methods: `flow.AddStep(name).DependsOn(...).WithCondition(...).WithSignal().Handler(fn, opts...)`
+- **Builder methods**: All construction through chainable methods: `flow.AddStep(name).DependsOn(...).WithCondition(...).WithSignal().Do(fn, opts...)`
 
 ## Key Conventions
 

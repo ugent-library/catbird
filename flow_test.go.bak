@@ -284,13 +284,15 @@ func TestFlowWithDependencies(t *testing.T) {
 		return in + " processed by step 1", nil
 	})
 	flow.AddStep("step2").
-		DependsOn("step1").Do(func(ctx context.Context, in string, step1Out string) (string, error) {
-		return step1Out + " and by step 2", nil
-	})
+		DependsOn("step1").
+		Do(func(ctx context.Context, in string, step1Out string) (string, error) {
+			return step1Out + " and by step 2", nil
+		})
 	flow.AddStep("step3").
-		DependsOn("step2").Do(func(ctx context.Context, in string, step2Out string) (string, error) {
-		return step2Out + " and by step 3", nil
-	})
+		DependsOn("step2").
+		Do(func(ctx context.Context, in string, step2Out string) (string, error) {
+			return step2Out + " and by step 3", nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 
@@ -320,9 +322,10 @@ func TestFlowWithDependencies(t *testing.T) {
 func TestFlowStepChaining(t *testing.T) {
 	flow := NewFlow("step_chaining")
 
-	flow.AddStep("step1").Do(func(ctx context.Context, in string) (string, error) {
-		return in + "-1", nil
-	}).
+	flow.AddStep("step1").
+		Handler(func(ctx context.Context, in string) (string, error) {
+			return in + "-1", nil
+		}).
 		AddGeneratorStep("step2").
 		DependsOn("step1").
 		Generate(func(ctx context.Context, in string, step1 string, yield func(int) error) error {
@@ -361,13 +364,15 @@ func TestFlowOutputPrioritySelection(t *testing.T) {
 		return in, nil
 	})
 	flow.AddStep("low").
-		DependsOn("base").Do(func(ctx context.Context, in int, base int) (int, error) {
-		return base + 1, nil
-	})
+		DependsOn("base").
+		Handler(func(ctx context.Context, in int, base int) (int, error) {
+			return base + 1, nil
+		})
 	flow.AddStep("high").
-		DependsOn("base").Do(func(ctx context.Context, in int, base int) (int, error) {
-		return base + 100, nil
-	})
+		DependsOn("base").
+		Handler(func(ctx context.Context, in int, base int) (int, error) {
+			return base + 100, nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -399,14 +404,16 @@ func TestFlowOutputDefaultPriorityUsesTerminalOrder(t *testing.T) {
 		return in, nil
 	})
 	flow.AddStep("first_terminal").
-		DependsOn("base").Do(func(ctx context.Context, in int, base int) (int, error) {
-		time.Sleep(120 * time.Millisecond)
-		return base + 1, nil
-	})
+		DependsOn("base").
+		Handler(func(ctx context.Context, in int, base int) (int, error) {
+			time.Sleep(120 * time.Millisecond)
+			return base + 1, nil
+		})
 	flow.AddStep("second_terminal").
-		DependsOn("base").Do(func(ctx context.Context, in int, base int) (int, error) {
-		return base + 2, nil
-	})
+		DependsOn("base").
+		Handler(func(ctx context.Context, in int, base int) (int, error) {
+			return base + 2, nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -443,9 +450,10 @@ func TestFlowFailsWhenNoOutputCandidateCompleted(t *testing.T) {
 	})
 	flow.AddStep("maybe").
 		DependsOn("gate").
-		WithCondition("gate.run eq true").Do(func(ctx context.Context, in string, gate gateOut) (string, error) {
-		return "done", nil
-	})
+		WithCondition("gate.run eq true").
+		Handler(func(ctx context.Context, in string, gate gateOut) (string, error) {
+			return "done", nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -517,13 +525,14 @@ func TestFlowMapStepOutput(t *testing.T) {
 			return n * 2, nil
 		})
 	flow.AddStep("sum").
-		DependsOn("double").Do(func(ctx context.Context, in string, doubled []int) (int, error) {
-		sum := 0
-		for _, n := range doubled {
-			sum += n
-		}
-		return sum, nil
-	})
+		DependsOn("double").
+		Handler(func(ctx context.Context, in string, doubled []int) (int, error) {
+			sum := 0
+			for _, n := range doubled {
+				sum += n
+			}
+			return sum, nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -584,7 +593,7 @@ func TestFlowMapMetadataInInfo(t *testing.T) {
 		if s.Name == "double" {
 			foundMapped = true
 			if s.StepType != StepTypeMapper {
-				t.Fatalf("expected step %q to be marked as map step", s.Name)
+				t.Fatalf("expected step %q to be mapper, got %q", s.Name, s.StepType)
 			}
 			if s.MapSource != "numbers" {
 				t.Fatalf("expected map source 'numbers', got %q", s.MapSource)
@@ -622,7 +631,7 @@ func TestMapStepReducerTypeMismatchPanics(t *testing.T) {
 		Map(func(ctx context.Context, n int) (int, error) {
 			return n * 2, nil
 		})
-	_ = flow.AddReducerStep("mapped_reducer").
+	_ = flow.AddReducerStep("reduce").
 		ReduceStep("mapped").
 		Reduce(0, func(ctx context.Context, acc int, item string) (int, error) {
 			return acc, nil
@@ -639,7 +648,7 @@ func TestFlowMapStepReducerRuntime(t *testing.T) {
 		Map(func(ctx context.Context, n int) (int, error) {
 			return n * 2, nil
 		})
-	flow.AddReducerStep("double_sum").
+	flow.AddReducerStep("sum").
 		ReduceStep("double").
 		Reduce(0, func(ctx context.Context, acc int, out int) (int, error) {
 			return acc + out, nil
@@ -695,10 +704,10 @@ func TestFlowMapSQLValidationRejectsMissingDependency(t *testing.T) {
 			"name": "numbers",
 		},
 		{
-			"name":        "mapped",
-			"is_map_step": true,
-			"map_source":  "numbers",
-			"depends_on":  []map[string]any{},
+			"name":       "mapped",
+			"step_type":  "mapper",
+			"map_source": "numbers",
+			"depends_on": []map[string]any{},
 		},
 	}
 
@@ -730,9 +739,10 @@ func TestFlowMapParentCompletesAfterAllMapTasks(t *testing.T) {
 			return item + 10, nil
 		})
 	flow.AddStep("collect").
-		DependsOn("work").Do(func(ctx context.Context, in int, items []int) ([]int, error) {
-		return items, nil
-	})
+		DependsOn("work").
+		Handler(func(ctx context.Context, in int, items []int) ([]int, error) {
+			return items, nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -834,9 +844,10 @@ func TestFlowMapTaskFailureFailsParentAndFlow(t *testing.T) {
 			return item + 10, nil
 		})
 	flow.AddStep("collect").
-		DependsOn("work").Do(func(ctx context.Context, in int, items []int) ([]int, error) {
-		return items, nil
-	})
+		DependsOn("work").
+		Handler(func(ctx context.Context, in int, items []int) ([]int, error) {
+			return items, nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -922,13 +933,14 @@ func TestFlowMapStepConcurrentWorkersSlow(t *testing.T) {
 			return item * 2, nil
 		})
 	flow.AddStep("sum").
-		DependsOn("work").Do(func(ctx context.Context, n int, doubled []int) (int, error) {
-		sum := 0
-		for _, v := range doubled {
-			sum += v
-		}
-		return sum, nil
-	})
+		DependsOn("work").
+		Handler(func(ctx context.Context, n int, doubled []int) (int, error) {
+			sum := 0
+			for _, v := range doubled {
+				sum += v
+			}
+			return sum, nil
+		})
 
 	// Start multiple workers for same flow to stress DB claim concurrency.
 	for i := 0; i < 4; i++ {
@@ -1056,7 +1068,7 @@ func TestGeneratorStepReducerTypeMismatchPanics(t *testing.T) {
 		Map(func(ctx context.Context, item int) (int, error) {
 			return item, nil
 		})
-	_ = flow.AddReducerStep("discover_reducer").
+	_ = flow.AddReducerStep("reduce").
 		ReduceStep("discover").
 		Reduce(0, func(ctx context.Context, acc int, item string) (int, error) {
 			return acc, nil
@@ -1085,13 +1097,14 @@ func TestFlowGeneratorStepRuntime(t *testing.T) {
 			return item * 2, nil
 		})
 	flow.AddStep("sum").
-		DependsOn("generate").Do(func(ctx context.Context, in int, generated []int) (int, error) {
-		total := 0
-		for _, v := range generated {
-			total += v
-		}
-		return total, nil
-	})
+		DependsOn("generate").
+		Handler(func(ctx context.Context, in int, generated []int) (int, error) {
+			total := 0
+			for _, v := range generated {
+				total += v
+			}
+			return total, nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -1186,13 +1199,14 @@ func TestFlowGeneratorStepNoDependencies(t *testing.T) {
 			return item + 1, nil
 		})
 	flow.AddStep("sum").
-		DependsOn("generate").Do(func(ctx context.Context, in int, generated []int) (int, error) {
-		total := 0
-		for _, v := range generated {
-			total += v
-		}
-		return total, nil
-	})
+		DependsOn("generate").
+		Handler(func(ctx context.Context, in int, generated []int) (int, error) {
+			total := 0
+			for _, v := range generated {
+				total += v
+			}
+			return total, nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -1242,13 +1256,14 @@ func TestFlowGeneratorStepWithSignalAndDependency(t *testing.T) {
 			return item, nil
 		})
 	flow.AddStep("sum").
-		DependsOn("generate").Do(func(ctx context.Context, in int, generated []int) (int, error) {
-		total := 0
-		for _, v := range generated {
-			total += v
-		}
-		return total, nil
-	})
+		DependsOn("generate").
+		Handler(func(ctx context.Context, in int, generated []int) (int, error) {
+			total := 0
+			for _, v := range generated {
+				total += v
+			}
+			return total, nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -1293,7 +1308,7 @@ func TestFlowGeneratorStepReducerRuntime(t *testing.T) {
 		Map(func(ctx context.Context, item int) (int, error) {
 			return item * 2, nil
 		})
-	flow.AddReducerStep("generate_sum").
+	flow.AddReducerStep("sum").
 		ReduceStep("generate").
 		Reduce(0, func(ctx context.Context, acc int, out int) (int, error) {
 			return acc + out, nil
@@ -1443,17 +1458,20 @@ func TestFlowComplexDependencies(t *testing.T) {
 		return 10, nil
 	})
 	flow.AddStep("step2").
-		DependsOn("step1").Do(func(ctx context.Context, in string, step1Out int) (int, error) {
-		return step1Out * 2, nil // 20
-	})
+		DependsOn("step1").
+		Handler(func(ctx context.Context, in string, step1Out int) (int, error) {
+			return step1Out * 2, nil // 20
+		})
 	flow.AddStep("step3").
-		DependsOn("step1").Do(func(ctx context.Context, in string, step1Out int) (int, error) {
-		return step1Out * 3, nil // 30
-	})
+		DependsOn("step1").
+		Handler(func(ctx context.Context, in string, step1Out int) (int, error) {
+			return step1Out * 3, nil // 30
+		})
 	flow.AddStep("step4").
-		DependsOn("step2", "step3").Do(func(ctx context.Context, in string, step2Out, step3Out int) (int, error) {
-		return step2Out + step3Out, nil // 20 + 30 = 50
-	})
+		DependsOn("step2", "step3").
+		Handler(func(ctx context.Context, in string, step2Out, step3Out int) (int, error) {
+			return step2Out + step3Out, nil // 20 + 30 = 50
+		})
 
 	err := client.CreateFlow(t.Context(), flow)
 	if err != nil {
@@ -1497,9 +1515,10 @@ func TestStepPanicRecovery(t *testing.T) {
 		return "success", nil
 	})
 	flow.AddStep("step2").
-		DependsOn("step1").Do(func(ctx context.Context, in string, step1Out string) (string, error) {
-		panic("intentional panic in flow step")
-	})
+		DependsOn("step1").
+		Handler(func(ctx context.Context, in string, step1Out string) (string, error) {
+			panic("intentional panic in flow step")
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 
@@ -1615,16 +1634,18 @@ func TestFlowWithSignal(t *testing.T) {
 	})
 	flow.AddStep("approve").
 		DependsOn("submit").
-		WithSignal().Do(func(ctx context.Context, doc string, approval ApprovalInput, submitResult string) (string, error) {
-		if !approval.Approved {
-			return "", fmt.Errorf("approval denied by %s", approval.ApproverID)
-		}
-		return fmt.Sprintf("approved by %s: %s", approval.ApproverID, submitResult), nil
-	})
+		WithSignal().
+		Handler(func(ctx context.Context, doc string, approval ApprovalInput, submitResult string) (string, error) {
+			if !approval.Approved {
+				return "", fmt.Errorf("approval denied by %s", approval.ApproverID)
+			}
+			return fmt.Sprintf("approved by %s: %s", approval.ApproverID, submitResult), nil
+		})
 	flow.AddStep("publish").
-		DependsOn("approve").Do(func(ctx context.Context, doc string, approveResult string) (string, error) {
-		return "published: " + approveResult, nil
-	})
+		DependsOn("approve").
+		Handler(func(ctx context.Context, doc string, approveResult string) (string, error) {
+			return "published: " + approveResult, nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 
@@ -1674,13 +1695,15 @@ func TestFlowWithInitialSignal(t *testing.T) {
 	flowName := testFlowName(t, "initial_signal_flow")
 	flow := NewFlow(flowName)
 	flow.AddStep("start").
-		WithSignal().Do(func(ctx context.Context, flowInput string, signal StartInput) (string, error) {
-		return fmt.Sprintf("started by %s", signal.InitiatorID), nil
-	})
+		WithSignal().
+		Handler(func(ctx context.Context, flowInput string, signal StartInput) (string, error) {
+			return fmt.Sprintf("started by %s", signal.InitiatorID), nil
+		})
 	flow.AddStep("process").
-		DependsOn("start").Do(func(ctx context.Context, flowInput string, startResult string) (string, error) {
-		return startResult + " - processed", nil
-	})
+		DependsOn("start").
+		Handler(func(ctx context.Context, flowInput string, startResult string) (string, error) {
+			return startResult + " - processed", nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 
@@ -1731,16 +1754,18 @@ func TestFlowSignalAlreadyDelivered(t *testing.T) {
 	})
 	flow.AddStep("approve").
 		DependsOn("request").
-		WithSignal().Do(func(ctx context.Context, doc string, approval ApprovalInput, reqResult string) (string, error) {
-		if approval.Response != "approved" {
-			return "", fmt.Errorf("approval denied by %s: %s", approval.ApproverID, approval.Response)
-		}
-		return fmt.Sprintf("approved by %s: %s", approval.ApproverID, reqResult), nil
-	})
+		WithSignal().
+		Handler(func(ctx context.Context, doc string, approval ApprovalInput, reqResult string) (string, error) {
+			if approval.Response != "approved" {
+				return "", fmt.Errorf("approval denied by %s: %s", approval.ApproverID, approval.Response)
+			}
+			return fmt.Sprintf("approved by %s: %s", approval.ApproverID, reqResult), nil
+		})
 	flow.AddStep("complete").
-		DependsOn("approve").Do(func(ctx context.Context, doc string, approveResult string) (string, error) {
-		return approveResult + " - completed", nil
-	})
+		DependsOn("approve").
+		Handler(func(ctx context.Context, doc string, approveResult string) (string, error) {
+			return approveResult + " - completed", nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 
@@ -2023,9 +2048,10 @@ func TestFlowCondition(t *testing.T) {
 		})
 		flow.AddStep("step2").
 			DependsOn("step1").
-			WithCondition("step1 lt 90").Do(func(ctx context.Context, score int, step1Score int) (string, error) {
-			return "step2_executed", nil
-		})
+			WithCondition("step1 lt 90").
+			Handler(func(ctx context.Context, score int, step1Score int) (string, error) {
+				return "step2_executed", nil
+			})
 		flow.AddStep("finalize").DependsOn("step2").Do(func(ctx context.Context, score int, step2Result Optional[string]) (map[string]any, error) {
 			result := make(map[string]any)
 			result["step1"] = score
@@ -2076,9 +2102,10 @@ func TestFlowCondition(t *testing.T) {
 		})
 		flow.AddStep("step2").
 			DependsOn("step1").
-			WithCondition("step1 lt 90").Do(func(ctx context.Context, score int, step1Score int) (string, error) {
-			return "step2_executed", nil
-		})
+			WithCondition("step1 lt 90").
+			Handler(func(ctx context.Context, score int, step1Score int) (string, error) {
+				return "step2_executed", nil
+			})
 		flow.AddStep("finalize").DependsOn("step2").Do(func(ctx context.Context, score int, step2Result Optional[string]) (map[string]any, error) {
 			result := make(map[string]any)
 			result["step1"] = score
@@ -2120,9 +2147,10 @@ func TestFlowCondition(t *testing.T) {
 		})
 		flow.AddStep("step2").
 			DependsOn("step1").
-			WithCondition("step1 lt 90").Do(func(ctx context.Context, score int, step1Score int) (string, error) {
-			return "step2_executed", nil
-		})
+			WithCondition("step1 lt 90").
+			Handler(func(ctx context.Context, score int, step1Score int) (string, error) {
+				return "step2_executed", nil
+			})
 		flow.AddStep("finalize").DependsOn("step2").Do(func(ctx context.Context, score int, step2Result Optional[string]) (map[string]any, error) {
 			result := make(map[string]any)
 			result["step1"] = score
@@ -2173,9 +2201,10 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 		})
 		flow.AddStep("step2").
 			DependsOn("step1").
-			WithCondition("step1.optional_field ne value").Do(func(ctx context.Context, input map[string]interface{}, step1Out map[string]interface{}) (string, error) {
-			return "executed", nil
-		})
+			WithCondition("step1.optional_field ne value").
+			Handler(func(ctx context.Context, input map[string]interface{}, step1Out map[string]interface{}) (string, error) {
+				return "executed", nil
+			})
 		flow.AddStep("finalize").DependsOn("step2").Do(func(ctx context.Context, input map[string]interface{}, step2Result Optional[string]) (map[string]any, error) {
 			result := make(map[string]any)
 			if step2Result.IsSet {
@@ -2214,9 +2243,10 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 		})
 		flow.AddStep("step2").
 			DependsOn("step1").
-			WithCondition("step1.field exists").Do(func(ctx context.Context, input map[string]interface{}, step1Out map[string]interface{}) (string, error) {
-			return "executed", nil
-		})
+			WithCondition("step1.field exists").
+			Handler(func(ctx context.Context, input map[string]interface{}, step1Out map[string]interface{}) (string, error) {
+				return "executed", nil
+			})
 		flow.AddStep("finalize").DependsOn("step2").Do(func(ctx context.Context, input map[string]interface{}, step2Result Optional[string]) (map[string]any, error) {
 			result := make(map[string]any)
 			if step2Result.IsSet {
@@ -2258,9 +2288,10 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 		})
 		flow.AddStep("step2").
 			DependsOn("step1").
-			WithCondition("step1.data.user.age gte 18").Do(func(ctx context.Context, input map[string]interface{}, step1Out map[string]interface{}) (string, error) {
-			return "executed", nil
-		})
+			WithCondition("step1.data.user.age gte 18").
+			Handler(func(ctx context.Context, input map[string]interface{}, step1Out map[string]interface{}) (string, error) {
+				return "executed", nil
+			})
 		flow.AddStep("finalize").DependsOn("step2").Do(func(ctx context.Context, input map[string]interface{}, step2Result Optional[string]) (map[string]any, error) {
 			result := make(map[string]any)
 			if step2Result.IsSet {
@@ -2315,16 +2346,18 @@ func TestFlowOptionalDependency(t *testing.T) {
 	})
 	flow.AddStep("step2").
 		DependsOn("step1").
-		WithCondition("step1 gte 50").Do(func(ctx context.Context, score int, step1Score int) (int, error) {
-		return step1Score * 2, nil
-	})
+		WithCondition("step1 gte 50").
+		Handler(func(ctx context.Context, score int, step1Score int) (int, error) {
+			return step1Score * 2, nil
+		})
 	flow.AddStep("step3").
-		DependsOn("step2").Do(func(ctx context.Context, score int, step2Out Optional[int]) (int, error) {
-		if step2Out.IsSet {
-			return step2Out.Value, nil
-		}
-		return 0, nil
-	})
+		DependsOn("step2").
+		Handler(func(ctx context.Context, score int, step2Out Optional[int]) (int, error) {
+			if step2Out.IsSet {
+				return step2Out.Value, nil
+			}
+			return 0, nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -2374,13 +2407,15 @@ func TestFlowConditionalDependencyRequiresOptional(t *testing.T) {
 	})
 	flow.AddStep("step2").
 		DependsOn("step1").
-		WithCondition("step1 gte 50").Do(func(ctx context.Context, score int, step1Score int) (int, error) {
-		return step1Score * 2, nil
-	})
+		WithCondition("step1 gte 50").
+		Handler(func(ctx context.Context, score int, step1Score int) (int, error) {
+			return step1Score * 2, nil
+		})
 	flow.AddStep("step3").
-		DependsOn("step2").Do(func(ctx context.Context, score int, step2Out int) (int, error) {
-		return step2Out, nil
-	})
+		DependsOn("step2").
+		Handler(func(ctx context.Context, score int, step2Out int) (int, error) {
+			return step2Out, nil
+		})
 
 	if err := client.CreateFlow(t.Context(), flow); err == nil {
 		t.Fatalf("expected CreateFlow to fail when depending on conditional step without OptionalDependency")
@@ -2522,9 +2557,10 @@ func TestFlowFailStopsInFlightParallelStep(t *testing.T) {
 		return "", fmt.Errorf("intentional failure")
 	}, WithMaxRetries(0))
 	flow.AddStep("final").
-		DependsOn("long_running", "fail_fast").Do(func(ctx context.Context, in string, longOut string, failOut string) (string, error) {
-		return longOut + ":" + failOut, nil
-	})
+		DependsOn("long_running", "fail_fast").
+		Handler(func(ctx context.Context, in string, longOut string, failOut string) (string, error) {
+			return longOut + ":" + failOut, nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -2574,9 +2610,10 @@ func TestFlowCompleteEarlyFromStep(t *testing.T) {
 		return "", CompleteEarly(ctx, "early-output", "fast-path")
 	})
 	flow.AddStep("final").
-		DependsOn("long_running", "fast_path").Do(func(ctx context.Context, in string, longOut string, fastOut string) (string, error) {
-		return longOut + ":" + fastOut, nil
-	})
+		DependsOn("long_running", "fast_path").
+		Handler(func(ctx context.Context, in string, longOut string, fastOut string) (string, error) {
+			return longOut + ":" + fastOut, nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -2633,9 +2670,10 @@ func TestStepCanCheckOtherStepFinishedFromHandler(t *testing.T) {
 		return "observed:" + status.Status, nil
 	})
 	flow.AddStep("final").
-		DependsOn("step1", "watch").Do(func(ctx context.Context, in string, step1Out, watchOut string) (string, error) {
-		return step1Out + ":" + watchOut, nil
-	})
+		DependsOn("step1", "watch").
+		Handler(func(ctx context.Context, in string, step1Out, watchOut string) (string, error) {
+			return step1Out + ":" + watchOut, nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -2668,9 +2706,10 @@ func TestStepStatusAndWaitForOutput(t *testing.T) {
 		return in + ":s1", nil
 	})
 	flow.AddStep("step2").
-		DependsOn("step1").Do(func(ctx context.Context, in string, step1Out string) (string, error) {
-		return step1Out + ":s2", nil
-	})
+		DependsOn("step1").
+		Handler(func(ctx context.Context, in string, step1Out string) (string, error) {
+			return step1Out + ":s2", nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)
@@ -2738,21 +2777,24 @@ func TestStepWaitForOutputSkipped(t *testing.T) {
 
 	flowName := testFlowName(t, "step_wait_skipped")
 	flow := NewFlow(flowName)
-	flow.AddStep("gate").Do(func(ctx context.Context, in flowInput) (bool, error) {
-		return in.RunStep1, nil
-	})
+	flow.AddStep("gate").
+		Handler(func(ctx context.Context, in flowInput) (bool, error) {
+			return in.RunStep1, nil
+		})
 	flow.AddStep("step1").
 		DependsOn("gate").
-		WithCondition("gate eq true").Do(func(ctx context.Context, in flowInput, gate bool) (string, error) {
-		return "ran", nil
-	})
+		WithCondition("gate eq true").
+		Handler(func(ctx context.Context, in flowInput, gate bool) (string, error) {
+			return "ran", nil
+		})
 	flow.AddStep("step2").
-		DependsOn("step1").Do(func(ctx context.Context, in flowInput, step1Out Optional[string]) (string, error) {
-		if step1Out.IsSet {
-			return "unexpected", nil
-		}
-		return "done", nil
-	})
+		DependsOn("step1").
+		Handler(func(ctx context.Context, in flowInput, step1Out Optional[string]) (string, error) {
+			if step1Out.IsSet {
+				return "unexpected", nil
+			}
+			return "done", nil
+		})
 
 	worker := client.NewWorker(t.Context()).AddFlow(flow)
 	startTestWorker(t, worker)

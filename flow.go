@@ -18,6 +18,15 @@ type Optional[T any] struct {
 	Value T
 }
 
+type StepType string
+
+const (
+	StepTypeNormal    StepType = "normal"
+	StepTypeMapper    StepType = "mapper"
+	StepTypeGenerator StepType = "generator"
+	StepTypeReducer   StepType = "reducer"
+)
+
 type Flow struct {
 	name               string
 	description        string
@@ -48,37 +57,49 @@ func NewFlow(name string) *Flow {
 	return &Flow{name: name}
 }
 
-func (f *Flow) AddStep(name string) *StepBuilder {
+func newFlowStep(flow *Flow, name string, stepType StepType) *Step {
 	step := &Step{
-		flow:                 f,
+		flow:                 flow,
 		name:                 name,
+		stepType:             stepType,
 		optionalDependencies: make(map[string]bool),
 	}
+
+	switch stepType {
+	case StepTypeGenerator:
+		step.isGenerator = true
+	case StepTypeMapper:
+		step.isMapStep = true
+		step.mapSource = ""
+	case StepTypeReducer:
+		step.isReducer = true
+	}
+
+	return step
+}
+
+func (f *Flow) AddStep(name string) *StepBuilder {
+	step := newFlowStep(f, name, StepTypeNormal)
 	f.steps = append(f.steps, step)
 	return &StepBuilder{Step: step}
 }
 
 func (f *Flow) AddGeneratorStep(name string) *GeneratorStepBuilder {
-	step := &Step{
-		flow:                 f,
-		name:                 name,
-		optionalDependencies: make(map[string]bool),
-		isGenerator:          true,
-	}
+	step := newFlowStep(f, name, StepTypeGenerator)
 	f.steps = append(f.steps, step)
 	return &GeneratorStepBuilder{Step: step}
 }
 
 func (f *Flow) AddMapStep(name string) *MapStepBuilder {
-	step := &Step{
-		flow:                 f,
-		name:                 name,
-		optionalDependencies: make(map[string]bool),
-		isMapStep:            true,
-		mapSource:            "",
-	}
+	step := newFlowStep(f, name, StepTypeMapper)
 	f.steps = append(f.steps, step)
 	return &MapStepBuilder{Step: step}
+}
+
+func (f *Flow) AddReducerStep(name string) *ReducerStepBuilder {
+	step := newFlowStep(f, name, StepTypeReducer)
+	f.steps = append(f.steps, step)
+	return &ReducerStepBuilder{Step: step}
 }
 
 func (f *Flow) WithDescription(description string) *Flow {
@@ -169,10 +190,12 @@ func (f FlowFailure) FailedStepSignalAs(out any) error {
 type Step struct {
 	flow                 *Flow
 	name                 string
+	stepType             StepType
 	description          string
 	dependencies         []string
 	optionalDependencies map[string]bool // tracks which dependencies are Optional[T]
 	isGenerator          bool
+	isReducer            bool
 	generatorFn          any
 	generatorHandler     any
 	generatorDepType     reflect.Type
@@ -185,6 +208,7 @@ type Step struct {
 	reducerItem          reflect.Type
 	isMapStep            bool
 	mapSource            string
+	reduceSourceStep     string
 	condition            string
 	hasSignal            bool
 	handler              func(context.Context, []byte, map[string][]byte, []byte) ([]byte, error)
@@ -208,8 +232,8 @@ func (s *Step) withSignal() {
 }
 
 func (s *Step) mapInput() {
-	if s.isGenerator {
-		panic(fmt.Sprintf("step %s: generator steps do not support MapFlowInput()", s.name))
+	if s.isGenerator || s.isReducer {
+		panic(fmt.Sprintf("step %s: only mapper steps support MapFlowInput()", s.name))
 	}
 	if s.isMapStep && s.mapSource != "" {
 		panic(fmt.Sprintf("step %s: map source already set to %q", s.name, s.mapSource))
@@ -219,8 +243,8 @@ func (s *Step) mapInput() {
 }
 
 func (s *Step) mapFrom(stepName string) {
-	if s.isGenerator {
-		panic(fmt.Sprintf("step %s: generator steps do not support MapStepOutput()", s.name))
+	if s.isGenerator || s.isReducer {
+		panic(fmt.Sprintf("step %s: only mapper steps support MapStepOutput()", s.name))
 	}
 	if strings.TrimSpace(stepName) == "" {
 		panic(fmt.Sprintf("step %s: map source step name must not be empty", s.name))
@@ -268,7 +292,27 @@ func (s *Step) generator(fn any) {
 	}
 }
 
+func (s *Step) reduceStep(stepName string) {
+	if !s.isReducer {
+		panic(fmt.Sprintf("step %s: ReduceStep() is only valid for AddReducerStep", s.name))
+	}
+	if strings.TrimSpace(stepName) == "" {
+		panic(fmt.Sprintf("step %s: reduce source step name must not be empty", s.name))
+	}
+	s.reduceSourceStep = stepName
+	for _, dep := range s.dependencies {
+		if dep == stepName {
+			return
+		}
+	}
+	s.dependencies = append(s.dependencies, stepName)
+}
+
 func (s *Step) applyHandler(fn any, opts ...HandlerOpt) {
+	if s.isReducer {
+		panic(fmt.Sprintf("step %s: reducer steps use Reduce(...) instead of Map/Handler", s.name))
+	}
+
 	if s.isGenerator {
 		itemType, outputType, err := parseGeneratorHandlerFn(fn, s.name)
 		if err != nil {
@@ -309,8 +353,8 @@ func (s *Step) applyHandler(fn any, opts ...HandlerOpt) {
 }
 
 func (s *Step) reduce(initial any, fn any) {
-	if !s.isGenerator && !s.isMapStep {
-		panic(fmt.Sprintf("step %s: Reduce() is only valid for generator or map steps", s.name))
+	if !s.isReducer {
+		panic(fmt.Sprintf("step %s: Reduce() is only valid for reducer steps", s.name))
 	}
 
 	accType, itemType, err := parseGeneratorReducerFn(fn, s.name)
@@ -336,10 +380,33 @@ func (s *Step) reduce(initial any, fn any) {
 	s.reducerInit = initJSON
 	s.reducerAcc = accType
 	s.reducerItem = itemType
+	s.outputType = accType
 
-	if s.outputType != nil && s.outputType != itemType {
-		panic(fmt.Sprintf("step %s: reducer item type %v does not match handler output type %v", s.name, itemType, s.outputType))
+	if sourceStep := s.sourceStepForReducer(); sourceStep != nil {
+		sourceOutputType := sourceStep.outputType
+		if sourceStep.isGenerator {
+			sourceOutputType = sourceStep.generatorOutputType
+		}
+		if sourceOutputType != nil && sourceOutputType != itemType {
+			panic(fmt.Sprintf("step %s: reducer item type %v does not match source step %q output type %v", s.name, itemType, sourceStep.name, sourceOutputType))
+		}
 	}
+
+	if s.handlerOpts == nil {
+		s.handlerOpts = applyDefaultHandlerOpts()
+	}
+}
+
+func (s *Step) sourceStepForReducer() *Step {
+	if s.flow == nil || s.reduceSourceStep == "" {
+		return nil
+	}
+	for _, step := range s.flow.steps {
+		if step.name == s.reduceSourceStep {
+			return step
+		}
+	}
+	return nil
 }
 
 type StepBuilder struct {
@@ -356,6 +423,10 @@ func (b *StepBuilder) AddGeneratorStep(name string) *GeneratorStepBuilder {
 
 func (b *StepBuilder) AddMapStep(name string) *MapStepBuilder {
 	return b.flow.AddMapStep(name)
+}
+
+func (b *StepBuilder) AddReducerStep(name string) *ReducerStepBuilder {
+	return b.flow.AddReducerStep(name)
 }
 
 func (b *StepBuilder) WithDescription(description string) *StepBuilder {
@@ -378,7 +449,7 @@ func (b *StepBuilder) WithSignal() *StepBuilder {
 	return b
 }
 
-func (b *StepBuilder) Handler(fn any, opts ...HandlerOpt) *StepBuilder {
+func (b *StepBuilder) Do(fn any, opts ...HandlerOpt) *StepBuilder {
 	b.applyHandler(fn, opts...)
 	return b
 }
@@ -397,6 +468,10 @@ func (b *MapStepBuilder) AddGeneratorStep(name string) *GeneratorStepBuilder {
 
 func (b *MapStepBuilder) AddMapStep(name string) *MapStepBuilder {
 	return b.flow.AddMapStep(name)
+}
+
+func (b *MapStepBuilder) AddReducerStep(name string) *ReducerStepBuilder {
+	return b.flow.AddReducerStep(name)
 }
 
 func (b *MapStepBuilder) WithDescription(description string) *MapStepBuilder {
@@ -434,11 +509,6 @@ func (b *MapStepBuilder) Map(fn any, opts ...HandlerOpt) *MapStepBuilder {
 	return b
 }
 
-func (b *MapStepBuilder) Reduce(initial any, fn any) *MapStepBuilder {
-	b.reduce(initial, fn)
-	return b
-}
-
 type GeneratorStepBuilder struct {
 	*Step
 }
@@ -453,6 +523,10 @@ func (b *GeneratorStepBuilder) AddGeneratorStep(name string) *GeneratorStepBuild
 
 func (b *GeneratorStepBuilder) AddMapStep(name string) *MapStepBuilder {
 	return b.flow.AddMapStep(name)
+}
+
+func (b *GeneratorStepBuilder) AddReducerStep(name string) *ReducerStepBuilder {
+	return b.flow.AddReducerStep(name)
 }
 
 func (b *GeneratorStepBuilder) WithDescription(description string) *GeneratorStepBuilder {
@@ -485,7 +559,52 @@ func (b *GeneratorStepBuilder) Map(fn any, opts ...HandlerOpt) *GeneratorStepBui
 	return b
 }
 
-func (b *GeneratorStepBuilder) Reduce(initial any, fn any) *GeneratorStepBuilder {
+type ReducerStepBuilder struct {
+	*Step
+}
+
+func (b *ReducerStepBuilder) AddStep(name string) *StepBuilder {
+	return b.flow.AddStep(name)
+}
+
+func (b *ReducerStepBuilder) AddGeneratorStep(name string) *GeneratorStepBuilder {
+	return b.flow.AddGeneratorStep(name)
+}
+
+func (b *ReducerStepBuilder) AddMapStep(name string) *MapStepBuilder {
+	return b.flow.AddMapStep(name)
+}
+
+func (b *ReducerStepBuilder) AddReducerStep(name string) *ReducerStepBuilder {
+	return b.flow.AddReducerStep(name)
+}
+
+func (b *ReducerStepBuilder) WithDescription(description string) *ReducerStepBuilder {
+	b.withDescription(description)
+	return b
+}
+
+func (b *ReducerStepBuilder) DependsOn(deps ...string) *ReducerStepBuilder {
+	b.dependsOn(deps...)
+	return b
+}
+
+func (b *ReducerStepBuilder) WithCondition(condition string) *ReducerStepBuilder {
+	b.withCondition(condition)
+	return b
+}
+
+func (b *ReducerStepBuilder) WithSignal() *ReducerStepBuilder {
+	b.withSignal()
+	return b
+}
+
+func (b *ReducerStepBuilder) ReduceStep(stepName string) *ReducerStepBuilder {
+	b.reduceStep(stepName)
+	return b
+}
+
+func (b *ReducerStepBuilder) Reduce(initial any, fn any) *ReducerStepBuilder {
 	b.reduce(initial, fn)
 	return b
 }
@@ -913,13 +1032,13 @@ type FlowScheduleInfo struct {
 }
 
 type StepInfo struct {
-	Name        string               `json:"name"`
-	Description string               `json:"description,omitempty"`
-	IsGenerator bool                 `json:"is_generator,omitempty"`
-	IsMapStep   bool                 `json:"is_map_step,omitempty"`
-	MapSource   string               `json:"map_source,omitempty"`
-	HasSignal   bool                 `json:"has_signal,omitempty"`
-	DependsOn   []StepDependencyInfo `json:"depends_on,omitempty"`
+	Name             string               `json:"name"`
+	Description      string               `json:"description,omitempty"`
+	StepType         StepType             `json:"step_type,omitempty"`
+	MapSource        string               `json:"map_source,omitempty"`
+	ReduceSourceStep string               `json:"reduce_source_step,omitempty"`
+	HasSignal        bool                 `json:"has_signal,omitempty"`
+	DependsOn        []StepDependencyInfo `json:"depends_on,omitempty"`
 }
 
 type StepDependencyInfo struct {
@@ -935,6 +1054,82 @@ type stepClaim struct {
 	SignalInput json.RawMessage            `json:"signal_input"`
 }
 
+func dependsOnStep(step *Step, depName string) bool {
+	for _, name := range step.dependencies {
+		if name == depName {
+			return true
+		}
+	}
+	return false
+}
+
+func validateGeneratorStepDefinition(flowName string, step *Step) error {
+	if !step.isGenerator {
+		return nil
+	}
+	if step.isMapStep {
+		return fmt.Errorf("flow %q: step %q generator steps cannot use map mode", flowName, step.name)
+	}
+	if step.isReducer {
+		return fmt.Errorf("flow %q: step %q generator steps cannot be reducer steps", flowName, step.name)
+	}
+	if step.generatorFn == nil {
+		return fmt.Errorf("flow %q: step %q generator step is missing Generate(fn)", flowName, step.name)
+	}
+	if step.generatorHandler == nil {
+		return fmt.Errorf("flow %q: step %q generator step is missing Map(fn)", flowName, step.name)
+	}
+	return validateGeneratorFnForStep(step, flowName)
+}
+
+func validateMapperStepDefinition(flowName string, step *Step, stepNameSet map[string]bool) error {
+	if !step.isMapStep {
+		return nil
+	}
+	if step.mapSource == "" {
+		return nil
+	}
+	if step.mapSource == step.name {
+		return fmt.Errorf("flow %q: step %q cannot map its own output", flowName, step.name)
+	}
+	if !stepNameSet[step.mapSource] {
+		return fmt.Errorf("flow %q: step %q maps dependency %q which does not exist", flowName, step.name, step.mapSource)
+	}
+	if !dependsOnStep(step, step.mapSource) {
+		return fmt.Errorf("flow %q: step %q maps %q but does not depend on it", flowName, step.name, step.mapSource)
+	}
+	if step.optionalDependencies[step.mapSource] {
+		return fmt.Errorf("flow %q: step %q cannot map optional dependency %q", flowName, step.name, step.mapSource)
+	}
+	return nil
+}
+
+func validateReducerStepDefinition(flowName string, step *Step, stepNameSet map[string]bool, stepByName map[string]*Step) error {
+	if !step.isReducer {
+		return nil
+	}
+	if step.reduceSourceStep == "" {
+		return fmt.Errorf("flow %q: step %q reducer step is missing ReduceStep(source)", flowName, step.name)
+	}
+	if step.reduceSourceStep == step.name {
+		return fmt.Errorf("flow %q: step %q cannot reduce its own output", flowName, step.name)
+	}
+	if !stepNameSet[step.reduceSourceStep] {
+		return fmt.Errorf("flow %q: step %q reduces unknown source step %q", flowName, step.name, step.reduceSourceStep)
+	}
+	sourceStep := stepByName[step.reduceSourceStep]
+	if sourceStep == nil || (!sourceStep.isMapStep && !sourceStep.isGenerator) {
+		return fmt.Errorf("flow %q: step %q can only reduce mapper/generator source step %q", flowName, step.name, step.reduceSourceStep)
+	}
+	if !dependsOnStep(step, step.reduceSourceStep) {
+		return fmt.Errorf("flow %q: step %q reduces %q but does not depend on it", flowName, step.name, step.reduceSourceStep)
+	}
+	if step.reducerFn == nil || step.reducerAcc == nil || len(step.reducerInit) == 0 || step.reducerItem == nil {
+		return fmt.Errorf("flow %q: step %q reducer definition is invalid", flowName, step.name)
+	}
+	return nil
+}
+
 func validateFlowDependencies(flow *Flow) error {
 	steps := flow.steps
 	if len(steps) == 0 {
@@ -942,72 +1137,21 @@ func validateFlowDependencies(flow *Flow) error {
 	}
 
 	stepNameSet := make(map[string]bool)
+	stepByName := make(map[string]*Step, len(steps))
 	for _, step := range steps {
 		stepNameSet[step.name] = true
+		stepByName[step.name] = step
 	}
 
 	for _, step := range steps {
-		if step.isGenerator {
-			if step.isMapStep {
-				return fmt.Errorf("flow %q: step %q generator steps cannot use map mode", flow.name, step.name)
-			}
-			if step.generatorFn == nil {
-				return fmt.Errorf("flow %q: step %q generator step is missing Generate(fn)", flow.name, step.name)
-			}
-			if step.generatorHandler == nil {
-				return fmt.Errorf("flow %q: step %q generator step is missing Map(fn)", flow.name, step.name)
-			}
-			if step.reducerFn != nil {
-				if step.reducerAcc == nil || len(step.reducerInit) == 0 || step.reducerItem == nil {
-					return fmt.Errorf("flow %q: step %q generator reducer is invalid", flow.name, step.name)
-				}
-				if step.outputType != nil && step.outputType != step.reducerItem {
-					return fmt.Errorf("flow %q: step %q reducer item type %v does not match handler output type %v", flow.name, step.name, step.reducerItem, step.outputType)
-				}
-			}
-			if err := validateGeneratorFnForStep(step, flow.name); err != nil {
-				return err
-			}
+		if err := validateGeneratorStepDefinition(flow.name, step); err != nil {
+			return err
 		}
-
-		if !step.isMapStep {
-			continue
+		if err := validateMapperStepDefinition(flow.name, step, stepNameSet); err != nil {
+			return err
 		}
-
-		if step.mapSource == "" {
-			continue
-		}
-
-		if step.mapSource == step.name {
-			return fmt.Errorf("flow %q: step %q cannot map its own output", flow.name, step.name)
-		}
-
-		if !stepNameSet[step.mapSource] {
-			return fmt.Errorf("flow %q: step %q maps dependency %q which does not exist", flow.name, step.name, step.mapSource)
-		}
-
-		hasDependency := false
-		for _, depName := range step.dependencies {
-			if depName == step.mapSource {
-				hasDependency = true
-				break
-			}
-		}
-		if !hasDependency {
-			return fmt.Errorf("flow %q: step %q maps %q but does not depend on it", flow.name, step.name, step.mapSource)
-		}
-
-		if step.optionalDependencies[step.mapSource] {
-			return fmt.Errorf("flow %q: step %q cannot map optional dependency %q", flow.name, step.name, step.mapSource)
-		}
-
-		if step.reducerFn != nil {
-			if step.reducerAcc == nil || len(step.reducerInit) == 0 || step.reducerItem == nil {
-				return fmt.Errorf("flow %q: step %q map reducer is invalid", flow.name, step.name)
-			}
-			if step.outputType != nil && step.outputType != step.reducerItem {
-				return fmt.Errorf("flow %q: step %q reducer item type %v does not match handler output type %v", flow.name, step.name, step.reducerItem, step.outputType)
-			}
+		if err := validateReducerStepDefinition(flow.name, step, stepNameSet, stepByName); err != nil {
+			return err
 		}
 	}
 
@@ -1068,6 +1212,9 @@ func validateFlowDependencies(flow *Flow) error {
 
 	// Validate that dependencies on conditional steps use Optional[T]
 	for _, step := range steps {
+		if step.isReducer {
+			continue
+		}
 		for _, depName := range step.dependencies {
 			if conditionalSteps[depName] {
 				// This is a dependency on a conditional step
@@ -1096,14 +1243,14 @@ func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 			Name string `json:"name"`
 		}
 		type serializableStep struct {
-			Name        string            `json:"name"`
-			Description string            `json:"description,omitempty"`
-			Condition   string            `json:"condition,omitempty"`
-			IsGenerator bool              `json:"is_generator,omitempty"`
-			IsMapStep   bool              `json:"is_map_step,omitempty"`
-			MapSource   string            `json:"map_source,omitempty"`
-			HasSignal   bool              `json:"has_signal"`
-			DependsOn   []*stepDependency `json:"depends_on,omitempty"`
+			Name             string            `json:"name"`
+			Description      string            `json:"description,omitempty"`
+			Condition        string            `json:"condition,omitempty"`
+			StepType         StepType          `json:"step_type,omitempty"`
+			MapSource        string            `json:"map_source,omitempty"`
+			ReduceSourceStep string            `json:"reduce_source_step,omitempty"`
+			HasSignal        bool              `json:"has_signal"`
+			DependsOn        []*stepDependency `json:"depends_on,omitempty"`
 		}
 
 		steps := flow.steps
@@ -1117,13 +1264,13 @@ func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 			}
 
 			serStep := serializableStep{
-				Name:        s.name,
-				Description: s.description,
-				IsGenerator: s.isGenerator,
-				IsMapStep:   s.isMapStep,
-				MapSource:   s.mapSource,
-				HasSignal:   s.hasSignal,
-				DependsOn:   deps,
+				Name:             s.name,
+				Description:      s.description,
+				StepType:         s.stepType,
+				MapSource:        s.mapSource,
+				ReduceSourceStep: s.reduceSourceStep,
+				HasSignal:        s.hasSignal,
+				DependsOn:        deps,
 			}
 			serStep.Condition = s.condition
 			serSteps[i] = serStep

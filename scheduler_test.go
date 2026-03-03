@@ -14,7 +14,7 @@ func TestSchedulerIdempotencyKeyGeneration(t *testing.T) {
 	client := getTestClient(t)
 
 	task := NewTask("scheduled_task").
-		Handler(func(ctx context.Context, in string) (string, error) {
+		Do(func(ctx context.Context, in string) (string, error) {
 			return in + " processed", nil
 		})
 
@@ -57,7 +57,7 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 	executionCount := 0
 	var countMutex sync.Mutex
 
-	task := NewTask("dedup_test_task").Handler(func(ctx context.Context, in string) (string, error) {
+	task := NewTask("dedup_test_task").Do(func(ctx context.Context, in string) (string, error) {
 		countMutex.Lock()
 		executionCount++
 		countMutex.Unlock()
@@ -117,7 +117,7 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 func TestSchedulerIdempotencyPersists(t *testing.T) {
 	client := getTestClient(t)
 
-	task := NewTask("persisted_dedup_task").Handler(func(ctx context.Context, in int) (int, error) {
+	task := NewTask("persisted_dedup_task").Do(func(ctx context.Context, in int) (int, error) {
 		return in * 2, nil
 	})
 
@@ -203,7 +203,7 @@ func TestSchedulerFlowIdempotency(t *testing.T) {
 	client := getTestClient(t)
 
 	flow := NewFlow("scheduled_flow")
-	flow.AddStep("step1").Handler(func(ctx context.Context, in string) (int, error) {
+	flow.AddStep("step1").Do(func(ctx context.Context, in string) (int, error) {
 		return 42, nil
 	})
 
@@ -256,7 +256,7 @@ func TestSchedulerEnqueueRollback(t *testing.T) {
 	// This tests the new decoupled scheduling API
 
 	// Create a task first
-	task := NewTask("test_sched_task").Handler(func(ctx context.Context, in string) (string, error) {
+	task := NewTask("test_sched_task").Do(func(ctx context.Context, in string) (string, error) {
 		return "done", nil
 	})
 
@@ -272,7 +272,7 @@ func TestSchedulerEnqueueRollback(t *testing.T) {
 
 	// Similarly for flows
 	flow := NewFlow("test_sched_flow")
-	flow.AddStep("s1").Handler(func(ctx context.Context, in int) (int, error) {
+	flow.AddStep("s1").Do(func(ctx context.Context, in int) (int, error) {
 		return in, nil
 	})
 
@@ -300,7 +300,7 @@ func TestSchedulerConcurrentWorkers(t *testing.T) {
 	var countMutex sync.Mutex
 
 	task := NewTask("concurrent_sched_test").
-		Handler(func(ctx context.Context, in any) (string, error) {
+		Do(func(ctx context.Context, in any) (string, error) {
 			countMutex.Lock()
 			executionCount++
 			countMutex.Unlock()
