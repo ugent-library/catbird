@@ -343,10 +343,10 @@ func TestFlowStepChaining(t *testing.T) {
 	if flow.steps[0].name != "step1" || flow.steps[1].name != "step2" || flow.steps[2].name != "step3" {
 		t.Fatalf("unexpected step ordering")
 	}
-	if !flow.steps[1].isGenerator {
+	if flow.steps[1].stepType != StepTypeGenerator {
 		t.Fatalf("expected step2 to be generator")
 	}
-	if !flow.steps[2].isMapStep {
+	if flow.steps[2].stepType != StepTypeMapper {
 		t.Fatalf("expected step3 to be map step")
 	}
 }
@@ -979,7 +979,7 @@ func TestAddMapStepDefaultsToMapInput(t *testing.T) {
 	flow := NewFlow("map_default_input")
 	step := flow.AddMapStep("mapped")
 
-	if !step.isMapStep {
+	if step.stepType != StepTypeMapper {
 		t.Fatalf("expected AddMapStep to mark step as map step")
 	}
 	if step.mapSource != "" {
@@ -1011,7 +1011,7 @@ func TestGeneratorStepYieldFunctionAccepted(t *testing.T) {
 			return fmt.Sprintf("%d", item), nil
 		})
 
-	if !step.isGenerator {
+	if step.stepType != StepTypeGenerator {
 		t.Fatalf("expected step to be generator")
 	}
 	if step.generatorFn == nil {

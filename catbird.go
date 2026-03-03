@@ -25,8 +25,6 @@ var (
 	ErrNoFailedStepInput = fmt.Errorf("failed step input not available")
 	// ErrNoFailedStepSignal is returned when failed step signal input is not available.
 	ErrNoFailedStepSignal = fmt.Errorf("failed step signal input not available")
-	// ErrInvalidDecodeTarget is returned when decode target is nil or not a pointer.
-	ErrInvalidDecodeTarget = fmt.Errorf("invalid decode target")
 	// ErrNoOutputCandidate is returned when a flow completes without any configured output candidate producing output.
 	ErrNoOutputCandidate = fmt.Errorf("no output candidate produced output")
 )

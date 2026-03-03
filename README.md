@@ -540,6 +540,8 @@ _ = handle.WaitForOutput(ctx, &out)
 | `completed` | Finished successfully and output is available | Task runs, flow runs, flow step runs, map item runs |
 | `failed` | Finished with an error | Task runs, flow runs, flow step runs, map item runs |
 | `skipped` | Intentionally skipped (typically due to a condition evaluating false) | Task runs, flow step runs |
+| `canceling` | Cancellation requested; run is transitioning to canceled | Task runs, flow runs |
+| `canceled` | Run was canceled before completing normally | Task runs, flow runs |
 
 ## Advanced: Step Communication at Runtime
 

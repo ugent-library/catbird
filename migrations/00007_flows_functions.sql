@@ -1060,8 +1060,18 @@ BEGIN
                     sr.dependent_step_names,
              CASE
                WHEN cardinality(sr.dependency_names) = 0 THEN NULL
+               WHEN sr.step_type = 'reducer' AND sr.condition IS NULL THEN NULL
                ELSE (
-                 SELECT jsonb_object_agg(deps.step_name, deps.output)
+                 SELECT jsonb_object_agg(deps.step_name, CASE
+                   WHEN deps.step_type IN ('mapper', 'generator') THEN (
+                     SELECT coalesce(jsonb_agg(mt.output ORDER BY mt.item_idx), '[]'::jsonb)
+                     FROM %I mt
+                     WHERE mt.flow_run_id = deps.flow_run_id
+                       AND mt.step_name = deps.step_name
+                       AND mt.status = 'completed'
+                   )
+                   ELSE deps.output
+                 END)
                  FROM %I deps
                  WHERE deps.flow_run_id = $1
                    AND deps.step_name = any(sr.dependency_names)
@@ -1081,7 +1091,7 @@ BEGIN
         )
       FOR UPDATE SKIP LOCKED
       $QUERY$,
-      _s_table, _s_table
+      _m_table, _s_table, _s_table
     )
     USING cb_start_steps.flow_run_id
     LOOP
@@ -1155,7 +1165,14 @@ BEGIN
         IF _remaining = 0 THEN
           EXECUTE format(
             $QUERY$
-            SELECT s.output
+            SELECT CASE
+              WHEN s.step_type IN ('mapper', 'generator') THEN (
+                SELECT coalesce(jsonb_agg(m.output ORDER BY m.item_idx), '[]'::jsonb)
+                FROM %I m
+                WHERE m.flow_run_id = s.flow_run_id AND m.step_name = s.step_name AND m.status = 'completed'
+              )
+              ELSE s.output
+            END
             FROM %I s
             WHERE s.flow_run_id = $1
               AND s.step_name = any($2)
@@ -1163,7 +1180,7 @@ BEGIN
             ORDER BY array_position($2, s.step_name)
             LIMIT 1
             $QUERY$,
-            _s_table
+            _m_table, _s_table
           )
           USING cb_start_steps.flow_run_id, _output_priority
           INTO _selected_output;
@@ -1348,6 +1365,7 @@ DECLARE
     _stop_at timestamp;
     _q text;
     _s_table text := cb_table_name(cb_poll_steps.flow_name, 's');
+    _m_table text := cb_table_name(cb_poll_steps.flow_name, 'm');
     _f_table text := cb_table_name(cb_poll_steps.flow_name, 'f');
 BEGIN
     IF cb_poll_steps.quantity <= 0 THEN
@@ -1402,8 +1420,18 @@ BEGIN
                   m.flow_input AS input,
                   CASE
                     WHEN cardinality(m.dependency_names) = 0 THEN NULL
+                    WHEN m.step_type = 'reducer' THEN NULL
                     ELSE (
-                      SELECT jsonb_object_agg(deps.step_name, deps.output)
+                      SELECT jsonb_object_agg(deps.step_name, CASE
+                        WHEN deps.step_type IN ('mapper', 'generator') THEN (
+                          SELECT coalesce(jsonb_agg(mt.output ORDER BY mt.item_idx), '[]'::jsonb)
+                          FROM %I mt
+                          WHERE mt.flow_run_id = deps.flow_run_id
+                            AND mt.step_name = deps.step_name
+                            AND mt.status = 'completed'
+                        )
+                        ELSE deps.output
+                      END)
                       FROM %I deps
                       WHERE deps.flow_run_id = m.flow_run_id
                         AND deps.step_name = any(m.dependency_names)
@@ -1412,7 +1440,7 @@ BEGIN
                   END AS step_outputs,
                   m.signal_input;
         $QUERY$,
-        _s_table, _f_table, _s_table, _s_table
+        _s_table, _f_table, _s_table, _m_table, _s_table
       );
 
     LOOP
@@ -1542,7 +1570,16 @@ BEGIN
                 CASE
                   WHEN cardinality(m.dependency_names) = 0 THEN NULL
                   ELSE (
-                    SELECT jsonb_object_agg(deps.step_name, deps.output)
+                    SELECT jsonb_object_agg(deps.step_name, CASE
+                      WHEN deps.step_type IN ('mapper', 'generator') THEN (
+                        SELECT coalesce(jsonb_agg(mt.output ORDER BY mt.item_idx), '[]'::jsonb)
+                        FROM %I mt
+                        WHERE mt.flow_run_id = deps.flow_run_id
+                          AND mt.step_name = deps.step_name
+                          AND mt.status = 'completed'
+                      )
+                      ELSE deps.output
+                    END)
                     FROM %I deps
                     WHERE deps.flow_run_id = m.flow_run_id
                       AND deps.step_name = any(m.dependency_names)
@@ -1552,7 +1589,7 @@ BEGIN
                 m.signal_input,
                 m.item;
       $QUERY$,
-      _m_table, _f_table, _m_table, _s_table
+      _m_table, _f_table, _m_table, _m_table, _s_table
     );
 
     LOOP
@@ -1714,7 +1751,6 @@ DECLARE
     _flow_run_id bigint;
     _spawned int;
     _completed int;
-    _agg_output jsonb;
 BEGIN
     EXECUTE format(
       $QUERY$
@@ -1743,20 +1779,8 @@ BEGIN
       RETURN;
     END IF;
 
-    EXECUTE format(
-      $QUERY$
-      SELECT coalesce(jsonb_agg(output ORDER BY item_idx), '[]'::jsonb)
-      FROM %I
-      WHERE flow_run_id = $1
-        AND step_name = $2
-        AND status = 'completed'
-      $QUERY$,
-      _m_table
-    )
-    USING _flow_run_id, cb_complete_generator_step.step_name
-    INTO _agg_output;
-
-    PERFORM cb_complete_step(cb_complete_generator_step.flow_name, cb_complete_generator_step.step_name, cb_complete_generator_step.step_id, _agg_output);
+    -- Item outputs are stored in cb_m_* and read live from there; pass NULL here.
+    PERFORM cb_complete_step(cb_complete_generator_step.flow_name, cb_complete_generator_step.step_name, cb_complete_generator_step.step_id, NULL);
 END;
 $$;
 -- +goose statementend
@@ -1814,7 +1838,6 @@ DECLARE
     _generator_status text;
     _spawned int;
     _completed int;
-    _agg_output jsonb;
     _has_pending boolean;
 BEGIN
     EXECUTE format(
@@ -1863,14 +1886,8 @@ BEGIN
         RETURN;
       END IF;
 
-      EXECUTE format(
-        'SELECT coalesce(jsonb_agg(output ORDER BY item_idx), ''[]''::jsonb) FROM %I WHERE flow_run_id = $1 AND step_name = $2 AND status = ''completed''',
-        _m_table
-      )
-      USING _flow_run_id, cb_complete_map_task.step_name
-      INTO _agg_output;
-
-      PERFORM cb_complete_step(cb_complete_map_task.flow_name, cb_complete_map_task.step_name, _step_id, _agg_output);
+      -- Item outputs are stored in cb_m_* and read live from there; pass NULL here.
+      PERFORM cb_complete_step(cb_complete_map_task.flow_name, cb_complete_map_task.step_name, _step_id, NULL);
       RETURN;
     END IF;
 
@@ -1885,162 +1902,8 @@ BEGIN
       RETURN;
     END IF;
 
-    EXECUTE format(
-      'SELECT coalesce(jsonb_agg(output ORDER BY item_idx), ''[]''::jsonb) FROM %I WHERE flow_run_id = $1 AND step_name = $2 AND status = ''completed''',
-      _m_table
-    )
-    USING _flow_run_id, cb_complete_map_task.step_name
-    INTO _agg_output;
-
-    PERFORM cb_complete_step(cb_complete_map_task.flow_name, cb_complete_map_task.step_name, _step_id, _agg_output);
-END;
-$$;
--- +goose statementend
-
--- +goose statementbegin
--- cb_complete_generator_step_or_queue_reduce: mark generator output production complete and queue reducer when ready
-CREATE OR REPLACE FUNCTION cb_complete_generator_step_or_queue_reduce(flow_name text, step_name text, step_id bigint)
-RETURNS boolean
-LANGUAGE plpgsql AS $$
-DECLARE
-    _s_table text := cb_table_name(cb_complete_generator_step_or_queue_reduce.flow_name, 's');
-    _spawned int;
-    _completed int;
-    _ready boolean;
-BEGIN
-    EXECUTE format(
-        $QUERY$
-        UPDATE %I
-        SET generator_status = 'complete',
-          status = CASE
-            WHEN map_tasks_spawned = map_tasks_completed THEN 'queued'
-            ELSE 'waiting_for_map_tasks'
-          END,
-          visible_at = CASE
-            WHEN map_tasks_spawned = map_tasks_completed THEN now()
-            ELSE visible_at
-          END
-        WHERE id = $1
-          AND step_name = $2
-          AND status = 'started'
-          AND generator_status = 'started'
-        RETURNING map_tasks_spawned, map_tasks_completed
-        $QUERY$,
-        _s_table
-    )
-    USING cb_complete_generator_step_or_queue_reduce.step_id, cb_complete_generator_step_or_queue_reduce.step_name
-    INTO _spawned, _completed;
-
-    IF _spawned IS NULL THEN
-        RETURN false;
-    END IF;
-
-    _ready := _spawned = _completed;
-
-    RETURN _ready;
-END;
-$$;
--- +goose statementend
-
--- +goose statementbegin
--- cb_complete_map_task_or_queue_reduce: complete one map item and queue reducer when all items are done
-CREATE OR REPLACE FUNCTION cb_complete_map_task_or_queue_reduce(flow_name text, step_name text, map_task_id bigint, output jsonb)
-RETURNS bigint
-LANGUAGE plpgsql AS $$
-DECLARE
-    _s_table text := cb_table_name(cb_complete_map_task_or_queue_reduce.flow_name, 's');
-    _m_table text := cb_table_name(cb_complete_map_task_or_queue_reduce.flow_name, 'm');
-    _flow_run_id bigint;
-    _step_id bigint;
-    _generator_status text;
-    _spawned int;
-    _completed int;
-    _has_pending boolean;
-BEGIN
-    EXECUTE format(
-        $QUERY$
-        UPDATE %I
-        SET status = 'completed',
-            completed_at = now(),
-            output = $2
-        WHERE id = $1
-          AND status = 'started'
-        RETURNING flow_run_id
-        $QUERY$,
-        _m_table
-    )
-    USING cb_complete_map_task_or_queue_reduce.map_task_id, cb_complete_map_task_or_queue_reduce.output
-    INTO _flow_run_id;
-
-    IF _flow_run_id IS NULL THEN
-        RETURN NULL;
-    END IF;
-
-    EXECUTE format(
-        $QUERY$
-        UPDATE %I
-        SET map_tasks_completed = CASE
-            WHEN generator_status IS NULL THEN map_tasks_completed
-            ELSE map_tasks_completed + 1
-        END
-        WHERE flow_run_id = $1
-          AND step_name = $2
-          AND status IN ('started', 'waiting_for_map_tasks')
-        RETURNING id, generator_status, map_tasks_spawned, map_tasks_completed
-        $QUERY$,
-        _s_table
-    )
-    USING _flow_run_id, cb_complete_map_task_or_queue_reduce.step_name
-    INTO _step_id, _generator_status, _spawned, _completed;
-
-    IF _step_id IS NULL THEN
-        RETURN NULL;
-    END IF;
-
-    IF _generator_status IS NOT NULL THEN
-        IF _generator_status = 'complete' AND _completed = _spawned THEN
-            EXECUTE format(
-                $QUERY$
-                UPDATE %I
-                SET status = 'queued',
-                    visible_at = now()
-                WHERE id = $1
-                  AND status IN ('started', 'waiting_for_map_tasks')
-                  AND generator_status = 'complete'
-                $QUERY$,
-                _s_table
-            )
-            USING _step_id;
-            RETURN _step_id;
-        END IF;
-        RETURN NULL;
-    END IF;
-
-    EXECUTE format(
-        'SELECT EXISTS (SELECT 1 FROM %I WHERE flow_run_id = $1 AND step_name = $2 AND status IN (''queued'', ''started''))',
-        _m_table
-    )
-    USING _flow_run_id, cb_complete_map_task_or_queue_reduce.step_name
-    INTO _has_pending;
-
-    IF _has_pending THEN
-        RETURN NULL;
-    END IF;
-
-    EXECUTE format(
-        $QUERY$
-        UPDATE %I
-        SET status = 'queued',
-            visible_at = now()
-        WHERE id = $1
-          AND status IN ('started', 'waiting_for_map_tasks')
-          AND generator_status IS NULL
-        $QUERY$,
-        _s_table
-    )
-    USING _step_id;
-
-    RETURN _step_id;
+    -- Item outputs are stored in cb_m_* and read live from there; pass NULL here.
+    PERFORM cb_complete_step(cb_complete_map_task.flow_name, cb_complete_map_task.step_name, _step_id, NULL);
 END;
 $$;
 -- +goose statementend
@@ -2116,6 +1979,7 @@ RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
     _f_table text := cb_table_name(cb_complete_step.flow_name, 'f');
+    _m_table text := cb_table_name(cb_complete_step.flow_name, 'm');
     _s_table text := cb_table_name(cb_complete_step.flow_name, 's');
     _flow_run_id bigint;
     _dependent_step_names text[];
@@ -2187,7 +2051,14 @@ BEGIN
     IF _remaining = 0 THEN
     EXECUTE format(
       $QUERY$
-      SELECT s.output
+      SELECT CASE
+        WHEN s.step_type IN ('mapper', 'generator') THEN (
+          SELECT coalesce(jsonb_agg(m.output ORDER BY m.item_idx), '[]'::jsonb)
+          FROM %I m
+          WHERE m.flow_run_id = s.flow_run_id AND m.step_name = s.step_name AND m.status = 'completed'
+        )
+        ELSE s.output
+      END
       FROM %I s
       WHERE s.flow_run_id = $1
         AND s.step_name = any($2)
@@ -2195,7 +2066,7 @@ BEGIN
       ORDER BY array_position($2, s.step_name)
       LIMIT 1
       $QUERY$,
-      _s_table
+      _m_table, _s_table
     )
     USING _flow_run_id, _output_priority
     INTO _selected_output;
@@ -2356,13 +2227,11 @@ RETURNS TABLE(
     failed_step_name text,
     failed_step_input jsonb,
     failed_step_signal_input jsonb,
-    failed_step_attempts int,
-    completed_step_outputs jsonb
+    failed_step_attempts int
 )
 LANGUAGE plpgsql AS $$
 DECLARE
     _f_table text := cb_table_name(cb_poll_flow_on_fail.name, 'f');
-    _s_table text := cb_table_name(cb_poll_flow_on_fail.name, 's');
 BEGIN
     IF cb_poll_flow_on_fail.quantity <= 0 THEN
         RAISE EXCEPTION 'cb: quantity must be greater than 0';
@@ -2397,19 +2266,61 @@ BEGIN
                 f.failed_step_name,
                 f.failed_step_input,
                 f.failed_step_signal_input,
-                f.failed_step_attempts,
-                (
-                  SELECT coalesce(jsonb_object_agg(s.step_name, s.output), '{}'::jsonb)
-                  FROM %I s
-                  WHERE s.flow_run_id = f.id
-                    AND s.status = 'completed'
-                )
+                f.failed_step_attempts
       $QUERY$,
       _f_table,
-      _f_table,
-      _s_table
+      _f_table
     )
     USING cb_poll_flow_on_fail.quantity;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_get_flow_step_output: Fetch the completed output of a single step on demand.
+-- Handles mapper/generator steps by aggregating from cb_m_* in item order.
+-- Returns NULL if the step is not found or not completed.
+CREATE OR REPLACE FUNCTION cb_get_flow_step_output(
+    flow_name text,
+    flow_run_id bigint,
+    step_name text
+)
+RETURNS jsonb
+LANGUAGE plpgsql AS $$
+DECLARE
+    _s_table text := cb_table_name(cb_get_flow_step_output.flow_name, 's');
+    _m_table text := cb_table_name(cb_get_flow_step_output.flow_name, 'm');
+    _step_type text;
+    _output jsonb;
+BEGIN
+    EXECUTE format(
+        'SELECT step_type FROM %I WHERE flow_run_id = $1 AND step_name = $2 AND status = ''completed''',
+        _s_table
+    )
+    USING cb_get_flow_step_output.flow_run_id, cb_get_flow_step_output.step_name
+    INTO _step_type;
+
+    IF _step_type IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    IF _step_type IN ('mapper', 'generator') THEN
+        EXECUTE format(
+            'SELECT coalesce(jsonb_agg(output ORDER BY item_idx), ''[]''::jsonb) FROM %I WHERE flow_run_id = $1 AND step_name = $2 AND status = ''completed''',
+            _m_table
+        )
+        USING cb_get_flow_step_output.flow_run_id, cb_get_flow_step_output.step_name
+        INTO _output;
+    ELSE
+        EXECUTE format(
+            'SELECT output FROM %I WHERE flow_run_id = $1 AND step_name = $2 AND status = ''completed''',
+            _s_table
+        )
+        USING cb_get_flow_step_output.flow_run_id, cb_get_flow_step_output.step_name
+        INTO _output;
+    END IF;
+
+    RETURN _output;
 END;
 $$;
 -- +goose statementend
@@ -2801,6 +2712,7 @@ DROP FUNCTION IF EXISTS cb_maybe_finalize_flow_cancellation(text, bigint);
 DROP FUNCTION IF EXISTS cb_request_flow_cancellation(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_fail_flow_on_fail(text, bigint, text, boolean, bigint);
 DROP FUNCTION IF EXISTS cb_complete_flow_on_fail(text, bigint);
+DROP FUNCTION IF EXISTS cb_get_flow_step_output(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_poll_flow_on_fail(text, int);
 DROP FUNCTION IF EXISTS cb_early_exit_flow(text, bigint, text, jsonb, text);
 DROP FUNCTION IF EXISTS cb_wait_flow_step_output(text, bigint, text, int, int);
@@ -2811,10 +2723,8 @@ DROP FUNCTION IF EXISTS cb_fail_step(text, text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_step(text, text, bigint, jsonb);
 DROP FUNCTION IF EXISTS cb_fail_map_task(text, text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_map_task(text, text, bigint, jsonb);
-DROP FUNCTION IF EXISTS cb_complete_map_task_or_queue_reduce(text, text, bigint, jsonb);
 DROP FUNCTION IF EXISTS cb_fail_generator_step(text, text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_generator_step(text, text, bigint);
-DROP FUNCTION IF EXISTS cb_complete_generator_step_or_queue_reduce(text, text, bigint);
 DROP FUNCTION IF EXISTS cb_spawn_generator_map_tasks(text, text, bigint, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_hide_map_tasks(text, text, bigint[], int);
 DROP FUNCTION IF EXISTS cb_poll_map_tasks(text, text, int, int, int, int);

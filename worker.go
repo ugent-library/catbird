@@ -163,14 +163,14 @@ func (w *Worker) validateRegisteredHandlers() error {
 }
 
 func shouldStartStepWorker(step *Step) bool {
-	if step.isReducer {
+	if step.stepType == StepTypeReducer {
 		return true
 	}
-	return step.isGenerator || !step.isMapStep
+	return step.stepType == StepTypeGenerator || step.stepType != StepTypeMapper
 }
 
 func shouldStartMapStepWorker(step *Step) bool {
-	return step.isGenerator || step.isMapStep
+	return step.stepType == StepTypeGenerator || step.stepType == StepTypeMapper
 }
 
 func (w *Worker) startTaskWorkers(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup) []*TaskHandlerInfo {
@@ -696,7 +696,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 		)
 	}
 
-	if w.step.isReducer {
+	if w.step.stepType == StepTypeReducer {
 		if stopIfRequested() {
 			return
 		}
@@ -732,7 +732,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 		return
 	}
 
-	if w.step.isGenerator {
+	if w.step.stepType == StepTypeGenerator {
 		if stopIfRequested() {
 			return
 		}
@@ -1128,7 +1128,7 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 
 	itemOutput, err := runWithTimeout(handlerCtx, h.timeout, func(fnCtx context.Context) (json.RawMessage, error) {
 		return runSafely("step handler panic", func() (json.RawMessage, error) {
-			if w.step.isGenerator {
+			if w.step.stepType == StepTypeGenerator {
 				if w.step.generatorHandler == nil {
 					return nil, fmt.Errorf("step %s has no generator handler", w.step.name)
 				}
@@ -1455,7 +1455,7 @@ func finalizeStepReduction(ctx context.Context, conn Conn, logger *slog.Logger, 
 	if step.reducerFn == nil {
 		return fmt.Errorf("step %s has no reducer", step.name)
 	}
-	if !step.isReducer {
+	if step.stepType != StepTypeReducer {
 		return fmt.Errorf("step %s is not a reducer step", step.name)
 	}
 	if strings.TrimSpace(step.reduceSourceStep) == "" {
@@ -1996,7 +1996,6 @@ type flowOnFailClaim struct {
 	FailedStepInput       json.RawMessage `json:"failed_step_input,omitempty"`
 	FailedStepSignalInput json.RawMessage `json:"failed_step_signal_input,omitempty"`
 	FailedStepAttempts    int             `json:"failed_step_attempts"`
-	CompletedStepOutputs  json.RawMessage `json:"completed_step_outputs,omitempty"`
 }
 
 type flowOnFailWorker struct {
@@ -2051,15 +2050,8 @@ func (w *flowOnFailWorker) handle(ctx context.Context, claim flowOnFailClaim) {
 		IdempotencyKey:        claim.IdempotencyKey,
 		FailedStepInput:       claim.FailedStepInput,
 		FailedStepSignalInput: claim.FailedStepSignalInput,
-	}
-
-	if len(claim.CompletedStepOutputs) > 0 {
-		outputs := make(map[string]json.RawMessage)
-		if err := json.Unmarshal(claim.CompletedStepOutputs, &outputs); err != nil {
-			w.logger.ErrorContext(ctx, "worker: cannot decode completed step outputs", "flow", w.flow.name, "id", claim.ID, "error", err)
-		} else {
-			failure.CompletedStepOutputs = outputs
-		}
+		conn:                  w.conn,
+		outputCache:           &flowOutputCache{},
 	}
 
 	err := runWithTimeoutErr(ctx, h.timeout, func(fnCtx context.Context) error {
@@ -2090,7 +2082,6 @@ func scanFlowOnFailClaim(row pgx.Row) (flowOnFailClaim, error) {
 	var failedStepInput *json.RawMessage
 	var failedStepSignalInput *json.RawMessage
 	var failedStepAttempts *int
-	var completedStepOutputs *json.RawMessage
 
 	if err := row.Scan(
 		&rec.ID,
@@ -2105,7 +2096,6 @@ func scanFlowOnFailClaim(row pgx.Row) (flowOnFailClaim, error) {
 		&failedStepInput,
 		&failedStepSignalInput,
 		&failedStepAttempts,
-		&completedStepOutputs,
 	); err != nil {
 		return rec, err
 	}
@@ -2133,9 +2123,6 @@ func scanFlowOnFailClaim(row pgx.Row) (flowOnFailClaim, error) {
 	}
 	if failedStepAttempts != nil {
 		rec.FailedStepAttempts = *failedStepAttempts
-	}
-	if completedStepOutputs != nil {
-		rec.CompletedStepOutputs = *completedStepOutputs
 	}
 
 	return rec, nil

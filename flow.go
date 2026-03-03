@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -37,20 +38,31 @@ type Flow struct {
 	onFailOpts         *handlerOpts
 }
 
+// flowOutputCache holds lazy-loaded step outputs. Stored behind a pointer so
+// FlowFailure can be safely passed by value without copying a sync.Mutex.
+type flowOutputCache struct {
+	mu    sync.Mutex
+	cache map[string]json.RawMessage
+}
+
 type FlowFailure struct {
-	FlowName              string                     `json:"flow_name"`
-	FlowRunID             int64                      `json:"flow_run_id"`
-	FailedStepName        string                     `json:"failed_step_name,omitempty"`
-	ErrorMessage          string                     `json:"error_message"`
-	Attempts              int                        `json:"attempts"`
-	OnFailAttempts        int                        `json:"on_fail_attempts"`
-	StartedAt             time.Time                  `json:"started_at,omitzero"`
-	FailedAt              time.Time                  `json:"failed_at,omitzero"`
-	ConcurrencyKey        string                     `json:"concurrency_key,omitempty"`
-	IdempotencyKey        string                     `json:"idempotency_key,omitempty"`
-	CompletedStepOutputs  map[string]json.RawMessage `json:"completed_step_outputs,omitempty"`
-	FailedStepInput       json.RawMessage            `json:"failed_step_input,omitempty"`
-	FailedStepSignalInput json.RawMessage            `json:"failed_step_signal_input,omitempty"`
+	FlowName              string          `json:"flow_name"`
+	FlowRunID             int64           `json:"flow_run_id"`
+	FailedStepName        string          `json:"failed_step_name,omitempty"`
+	ErrorMessage          string          `json:"error_message"`
+	Attempts              int             `json:"attempts"`
+	OnFailAttempts        int             `json:"on_fail_attempts"`
+	StartedAt             time.Time       `json:"started_at,omitzero"`
+	FailedAt              time.Time       `json:"failed_at,omitzero"`
+	ConcurrencyKey        string          `json:"concurrency_key,omitempty"`
+	IdempotencyKey        string          `json:"idempotency_key,omitempty"`
+	FailedStepInput       json.RawMessage `json:"failed_step_input,omitempty"`
+	FailedStepSignalInput json.RawMessage `json:"failed_step_signal_input,omitempty"`
+
+	// conn and outputCache provide lazy on-demand loading of completed step outputs.
+	// outputCache is a pointer so copies of FlowFailure share the same cache.
+	conn        Conn
+	outputCache *flowOutputCache
 }
 
 func NewFlow(name string) *Flow {
@@ -58,24 +70,12 @@ func NewFlow(name string) *Flow {
 }
 
 func newFlowStep(flow *Flow, name string, stepType StepType) *Step {
-	step := &Step{
+	return &Step{
 		flow:                 flow,
 		name:                 name,
 		stepType:             stepType,
 		optionalDependencies: make(map[string]bool),
 	}
-
-	switch stepType {
-	case StepTypeGenerator:
-		step.isGenerator = true
-	case StepTypeMapper:
-		step.isMapStep = true
-		step.mapSource = ""
-	case StepTypeReducer:
-		step.isReducer = true
-	}
-
-	return step
 }
 
 func (f *Flow) AddStep(name string) *StepBuilder {
@@ -132,27 +132,40 @@ func (f *Flow) OnFail(fn any, opts ...HandlerOpt) *Flow {
 	return f
 }
 
-func (f FlowFailure) Output(step string) (json.RawMessage, error) {
-	if f.CompletedStepOutputs == nil {
+func (f FlowFailure) Output(ctx context.Context, step string) (json.RawMessage, error) {
+	if f.conn == nil || f.outputCache == nil {
 		return nil, ErrUnknownStepOutput
 	}
-	out, ok := f.CompletedStepOutputs[step]
-	if !ok {
+
+	f.outputCache.mu.Lock()
+	defer f.outputCache.mu.Unlock()
+
+	if out, ok := f.outputCache.cache[step]; ok {
+		return out, nil
+	}
+
+	var out json.RawMessage
+	err := f.conn.QueryRow(
+		ctx,
+		`SELECT cb_get_flow_step_output($1, $2, $3)`,
+		f.FlowName, f.FlowRunID, step,
+	).Scan(&out)
+	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrUnknownStepOutput, step)
 	}
+	if out == nil {
+		return nil, fmt.Errorf("%w: %s", ErrUnknownStepOutput, step)
+	}
+
+	if f.outputCache.cache == nil {
+		f.outputCache.cache = make(map[string]json.RawMessage)
+	}
+	f.outputCache.cache[step] = out
 	return out, nil
 }
 
-func (f FlowFailure) OutputAs(step string, out any) error {
-	if out == nil {
-		return ErrInvalidDecodeTarget
-	}
-	v := reflect.ValueOf(out)
-	if v.Kind() != reflect.Ptr || v.IsNil() {
-		return ErrInvalidDecodeTarget
-	}
-
-	b, err := f.Output(step)
+func (f FlowFailure) OutputAs(ctx context.Context, step string, out any) error {
+	b, err := f.Output(ctx, step)
 	if err != nil {
 		return err
 	}
@@ -160,13 +173,6 @@ func (f FlowFailure) OutputAs(step string, out any) error {
 }
 
 func (f FlowFailure) FailedStepInputAs(out any) error {
-	if out == nil {
-		return ErrInvalidDecodeTarget
-	}
-	v := reflect.ValueOf(out)
-	if v.Kind() != reflect.Ptr || v.IsNil() {
-		return ErrInvalidDecodeTarget
-	}
 	if len(f.FailedStepInput) == 0 {
 		return ErrNoFailedStepInput
 	}
@@ -174,13 +180,6 @@ func (f FlowFailure) FailedStepInputAs(out any) error {
 }
 
 func (f FlowFailure) FailedStepSignalAs(out any) error {
-	if out == nil {
-		return ErrInvalidDecodeTarget
-	}
-	v := reflect.ValueOf(out)
-	if v.Kind() != reflect.Ptr || v.IsNil() {
-		return ErrInvalidDecodeTarget
-	}
 	if len(f.FailedStepSignalInput) == 0 {
 		return ErrNoFailedStepSignal
 	}
@@ -194,8 +193,6 @@ type Step struct {
 	description          string
 	dependencies         []string
 	optionalDependencies map[string]bool // tracks which dependencies are Optional[T]
-	isGenerator          bool
-	isReducer            bool
 	generatorFn          any
 	generatorHandler     any
 	generatorDepType     reflect.Type
@@ -206,7 +203,6 @@ type Step struct {
 	reducerInit          []byte
 	reducerAcc           reflect.Type
 	reducerItem          reflect.Type
-	isMapStep            bool
 	mapSource            string
 	reduceSourceStep     string
 	condition            string
@@ -232,27 +228,25 @@ func (s *Step) withSignal() {
 }
 
 func (s *Step) mapInput() {
-	if s.isGenerator || s.isReducer {
+	if s.stepType != StepTypeMapper {
 		panic(fmt.Sprintf("step %s: only mapper steps support MapFlowInput()", s.name))
 	}
-	if s.isMapStep && s.mapSource != "" {
+	if s.mapSource != "" {
 		panic(fmt.Sprintf("step %s: map source already set to %q", s.name, s.mapSource))
 	}
-	s.isMapStep = true
 	s.mapSource = ""
 }
 
 func (s *Step) mapFrom(stepName string) {
-	if s.isGenerator || s.isReducer {
+	if s.stepType != StepTypeMapper {
 		panic(fmt.Sprintf("step %s: only mapper steps support MapStepOutput()", s.name))
 	}
 	if strings.TrimSpace(stepName) == "" {
 		panic(fmt.Sprintf("step %s: map source step name must not be empty", s.name))
 	}
-	if s.isMapStep && s.mapSource != "" && s.mapSource != stepName {
+	if s.mapSource != "" && s.mapSource != stepName {
 		panic(fmt.Sprintf("step %s: map source already set to %q", s.name, s.mapSource))
 	}
-	s.isMapStep = true
 	s.mapSource = stepName
 	for _, dep := range s.dependencies {
 		if dep == stepName {
@@ -263,7 +257,7 @@ func (s *Step) mapFrom(stepName string) {
 }
 
 func (s *Step) generator(fn any) {
-	if !s.isGenerator {
+	if s.stepType != StepTypeGenerator {
 		panic(fmt.Sprintf("step %s: Generate() is only valid for AddGeneratorStep", s.name))
 	}
 
@@ -293,7 +287,7 @@ func (s *Step) generator(fn any) {
 }
 
 func (s *Step) reduceStep(stepName string) {
-	if !s.isReducer {
+	if s.stepType != StepTypeReducer {
 		panic(fmt.Sprintf("step %s: ReduceStep() is only valid for AddReducerStep", s.name))
 	}
 	if strings.TrimSpace(stepName) == "" {
@@ -309,11 +303,11 @@ func (s *Step) reduceStep(stepName string) {
 }
 
 func (s *Step) applyHandler(fn any, opts ...HandlerOpt) {
-	if s.isReducer {
+	if s.stepType == StepTypeReducer {
 		panic(fmt.Sprintf("step %s: reducer steps use Reduce(...) instead of Map/Handler", s.name))
 	}
 
-	if s.isGenerator {
+	if s.stepType == StepTypeGenerator {
 		itemType, outputType, err := parseGeneratorHandlerFn(fn, s.name)
 		if err != nil {
 			panic(err)
@@ -343,7 +337,7 @@ func (s *Step) applyHandler(fn any, opts ...HandlerOpt) {
 		panic(fmt.Sprintf("step %s: reducer item type %v does not match handler output type %v", s.name, s.reducerItem, s.outputType))
 	}
 
-	handler, optionalDeps, err := makeStepHandler(fn, s.name, s.dependencies, s.hasSignal, s.isMapStep, s.mapSource)
+	handler, optionalDeps, err := makeStepHandler(fn, s.name, s.dependencies, s.hasSignal, s.stepType == StepTypeMapper, s.mapSource)
 	if err != nil {
 		panic(err)
 	}
@@ -353,7 +347,7 @@ func (s *Step) applyHandler(fn any, opts ...HandlerOpt) {
 }
 
 func (s *Step) reduce(initial any, fn any) {
-	if !s.isReducer {
+	if s.stepType != StepTypeReducer {
 		panic(fmt.Sprintf("step %s: Reduce() is only valid for reducer steps", s.name))
 	}
 
@@ -384,7 +378,7 @@ func (s *Step) reduce(initial any, fn any) {
 
 	if sourceStep := s.sourceStepForReducer(); sourceStep != nil {
 		sourceOutputType := sourceStep.outputType
-		if sourceStep.isGenerator {
+		if sourceStep.stepType == StepTypeGenerator {
 			sourceOutputType = sourceStep.generatorOutputType
 		}
 		if sourceOutputType != nil && sourceOutputType != itemType {
@@ -1064,13 +1058,13 @@ func dependsOnStep(step *Step, depName string) bool {
 }
 
 func validateGeneratorStepDefinition(flowName string, step *Step) error {
-	if !step.isGenerator {
+	if step.stepType != StepTypeGenerator {
 		return nil
 	}
-	if step.isMapStep {
+	if step.stepType == StepTypeMapper {
 		return fmt.Errorf("flow %q: step %q generator steps cannot use map mode", flowName, step.name)
 	}
-	if step.isReducer {
+	if step.stepType == StepTypeReducer {
 		return fmt.Errorf("flow %q: step %q generator steps cannot be reducer steps", flowName, step.name)
 	}
 	if step.generatorFn == nil {
@@ -1083,7 +1077,7 @@ func validateGeneratorStepDefinition(flowName string, step *Step) error {
 }
 
 func validateMapperStepDefinition(flowName string, step *Step, stepNameSet map[string]bool) error {
-	if !step.isMapStep {
+	if step.stepType != StepTypeMapper {
 		return nil
 	}
 	if step.mapSource == "" {
@@ -1105,7 +1099,7 @@ func validateMapperStepDefinition(flowName string, step *Step, stepNameSet map[s
 }
 
 func validateReducerStepDefinition(flowName string, step *Step, stepNameSet map[string]bool, stepByName map[string]*Step) error {
-	if !step.isReducer {
+	if step.stepType != StepTypeReducer {
 		return nil
 	}
 	if step.reduceSourceStep == "" {
@@ -1118,7 +1112,7 @@ func validateReducerStepDefinition(flowName string, step *Step, stepNameSet map[
 		return fmt.Errorf("flow %q: step %q reduces unknown source step %q", flowName, step.name, step.reduceSourceStep)
 	}
 	sourceStep := stepByName[step.reduceSourceStep]
-	if sourceStep == nil || (!sourceStep.isMapStep && !sourceStep.isGenerator) {
+	if sourceStep == nil || (sourceStep.stepType != StepTypeMapper && sourceStep.stepType != StepTypeGenerator) {
 		return fmt.Errorf("flow %q: step %q can only reduce mapper/generator source step %q", flowName, step.name, step.reduceSourceStep)
 	}
 	if !dependsOnStep(step, step.reduceSourceStep) {
@@ -1212,7 +1206,7 @@ func validateFlowDependencies(flow *Flow) error {
 
 	// Validate that dependencies on conditional steps use Optional[T]
 	for _, step := range steps {
-		if step.isReducer {
+		if step.stepType == StepTypeReducer {
 			continue
 		}
 		for _, depName := range step.dependencies {
