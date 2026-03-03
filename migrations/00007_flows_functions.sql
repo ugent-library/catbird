@@ -42,8 +42,9 @@ END$$;
 --   description: Optional flow description metadata
 --   steps: JSON array describing flow steps and their dependencies
 --   output_priority: Optional ordered array of step names for output ownership
+--   retention_period: Optional retention period; completed/failed/canceled runs older than this are deleted by cb_gc()
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_create_flow(name text, description text DEFAULT NULL, steps jsonb DEFAULT '[]'::jsonb, output_priority text[] DEFAULT NULL)
+CREATE OR REPLACE FUNCTION cb_create_flow(name text, description text DEFAULT NULL, steps jsonb DEFAULT '[]'::jsonb, output_priority text[] DEFAULT NULL, retention_period interval DEFAULT NULL)
 RETURNS void AS $$
 #variable_conflict use_column
 DECLARE
@@ -100,12 +101,13 @@ BEGIN
 
     _create_table_stmt := 'CREATE TABLE';
 
-    INSERT INTO cb_flows (name, description, output_priority, step_count)
-    VALUES (cb_create_flow.name, cb_create_flow.description, coalesce(_output_priority, ARRAY['__pending_output_priority__']), 0)
+    INSERT INTO cb_flows (name, description, output_priority, step_count, retention_period)
+    VALUES (cb_create_flow.name, cb_create_flow.description, coalesce(_output_priority, ARRAY['__pending_output_priority__']), 0, cb_create_flow.retention_period)
     ON CONFLICT (name) DO UPDATE
     SET description = EXCLUDED.description,
         output_priority = coalesce(EXCLUDED.output_priority, ARRAY['__pending_output_priority__']),
-        step_count = 0;
+        step_count = 0,
+        retention_period = EXCLUDED.retention_period;
 
     IF to_regclass('public.cb_step_handlers') IS NOT NULL THEN
       EXECUTE 'DELETE FROM public.cb_step_handlers WHERE flow_name = $1'
@@ -427,6 +429,7 @@ BEGIN
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (concurrency_key) WHERE concurrency_key IS NOT NULL AND status = ''started''', _f_table || '_concurrency_key_idx', _f_table);
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN (''started'', ''completed'')', _f_table || '_idempotency_key_idx', _f_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (on_fail_visible_at, id) WHERE status = ''failed'' AND on_fail_status IN (''queued'', ''failed'');', _f_table || '_on_fail_poll_idx', _f_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (GREATEST(completed_at, failed_at, canceled_at)) WHERE status IN (''completed'', ''failed'', ''canceled'');', _f_table || '_retention_idx', _f_table);
 
     -- Create step runs table - includes 'skipped' in status constraint
     EXECUTE format(
@@ -461,7 +464,7 @@ BEGIN
       skipped_at timestamptz,
       canceled_at timestamptz,
       UNIQUE (flow_run_id, step_name),
-      FOREIGN KEY (flow_run_id) REFERENCES %I (id),
+      FOREIGN KEY (flow_run_id) REFERENCES %I (id) ON DELETE CASCADE,
       CONSTRAINT status_valid CHECK (status IN ('waiting_for_dependencies', 'waiting_for_signal', 'queued', 'started', 'waiting_for_map_tasks', 'completed', 'failed', 'skipped', 'canceled')),
       CONSTRAINT step_type_valid CHECK (step_type IN ('normal', 'mapper', 'generator', 'reducer')),
       CONSTRAINT generator_status_valid CHECK (generator_status IS NULL OR generator_status IN ('started', 'complete', 'failed')),
@@ -505,7 +508,7 @@ BEGIN
       failed_at timestamptz,
       canceled_at timestamptz,
       UNIQUE (flow_run_id, step_name, item_idx),
-      FOREIGN KEY (flow_run_id, step_name) REFERENCES %I (flow_run_id, step_name),
+      FOREIGN KEY (flow_run_id, step_name) REFERENCES %I (flow_run_id, step_name) ON DELETE CASCADE,
       CONSTRAINT status_valid CHECK (status IN ('queued', 'started', 'completed', 'failed', 'canceled')),
       CONSTRAINT item_idx_valid CHECK (item_idx >= 0),
       CONSTRAINT attempts_valid CHECK (attempts >= 0)

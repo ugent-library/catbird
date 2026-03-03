@@ -7,7 +7,6 @@
 - [ ] [!!] Replay failed runs — `client.RetryTaskRun(ctx, name, id)` / `client.RetryFlowRun(ctx, name, id)` re-enqueues a failed run using its original input; no new schema needed since failed rows already persist in the live tables (distinct from on-fail handlers, which run automatically — this is manual operator-initiated replay)
 - [ ] [!!] Queue dead letter handling — add `dead boolean` column to message tables; when `deliveries >= max_deliveries`, `cb_read` marks the message dead and skips it permanently; `client.CreateQueue(ctx, name, WithMaxDeliveries(5))` opts in; `client.RedriveQueue(ctx, name)` resets `dead = false` and `deliveries = 0` for replay
 - [ ] [!] Flow checkpointing — resume a partially completed flow run after a deploy/crash rather than restarting from scratch
-- [ ] [!!!] Data cleanup — `.RetentionPeriod(d)` on task/flow DSL; persisted to `cb_tasks`/`cb_flows`; `cb_gc()` extended to delete terminal run rows older than stored retention; `(status, finished_at)` index added at table creation time (see DATA_RETENTION.md)
 - [ ] [!!] Input/output schemas for task/flow validation (see https://opensource.googleblog.com/2026/01/a-json-schema-package-for-go.html)
 
 ## Performance

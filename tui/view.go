@@ -101,7 +101,7 @@ func (m model) renderTaskDetail() string {
 	var selected *taskDetailView
 	for _, t := range m.data.tasks {
 		if t.Name == m.detailName {
-			selected = &taskDetailView{name: t.Name, description: t.Description, createdAt: t.CreatedAt.Format(timeRFC3339)}
+			selected = &taskDetailView{name: t.Name, description: t.Description, createdAt: t.CreatedAt.Format(timeRFC3339), retentionPeriod: formatRetention(t.RetentionPeriod)}
 			break
 		}
 	}
@@ -115,6 +115,7 @@ func (m model) renderTaskDetail() string {
 		fmt.Sprintf("name: %s", selected.name),
 		fmt.Sprintf("description: %s", defaultString(selected.description, "-")),
 		fmt.Sprintf("created: %s", selected.createdAt),
+		fmt.Sprintf("retention: %s", defaultString(selected.retentionPeriod, "-")),
 		"",
 		"Recent runs",
 	}
@@ -170,10 +171,11 @@ func (m model) renderFlowDetail() string {
 		}
 
 		flow = &flowDetailView{
-			name:        f.Name,
-			description: f.Description,
-			createdAt:   f.CreatedAt.Format(timeRFC3339),
-			steps:       steps,
+			name:            f.Name,
+			description:     f.Description,
+			createdAt:       f.CreatedAt.Format(timeRFC3339),
+			retentionPeriod: formatRetention(f.RetentionPeriod),
+			steps:           steps,
 		}
 		break
 	}
@@ -188,6 +190,7 @@ func (m model) renderFlowDetail() string {
 		fmt.Sprintf("description: %s", defaultString(flow.description, "-")),
 		fmt.Sprintf("created: %s", flow.createdAt),
 		fmt.Sprintf("steps: %d", len(flow.steps)),
+		fmt.Sprintf("retention: %s", defaultString(flow.retentionPeriod, "-")),
 		"",
 		"Shape",
 	}
@@ -383,16 +386,18 @@ func sortedStrings(values []string) []string {
 }
 
 type taskDetailView struct {
-	name        string
-	description string
-	createdAt   string
+	name            string
+	description     string
+	createdAt       string
+	retentionPeriod string
 }
 
 type flowDetailView struct {
-	name        string
-	description string
-	createdAt   string
-	steps       []flowStepDetailView
+	name            string
+	description     string
+	createdAt       string
+	retentionPeriod string
+	steps           []flowStepDetailView
 }
 
 type flowStepDetailView struct {

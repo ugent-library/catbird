@@ -16,13 +16,14 @@ import (
 // Use NewTask().Do(fn, opts) for tasks with handlers.
 // Use NewTask() for definition-only tasks.
 type Task struct {
-	name        string
-	description string
-	condition   string
-	handler     func(context.Context, json.RawMessage) (json.RawMessage, error)
-	handlerOpts *handlerOpts
-	onFail      func(context.Context, json.RawMessage, TaskFailure) error
-	onFailOpts  *handlerOpts
+	name            string
+	description     string
+	condition       string
+	retentionPeriod time.Duration
+	handler         func(context.Context, json.RawMessage) (json.RawMessage, error)
+	handlerOpts     *handlerOpts
+	onFail          func(context.Context, json.RawMessage, TaskFailure) error
+	onFailOpts      *handlerOpts
 }
 
 type TaskFailure struct {
@@ -52,6 +53,13 @@ func (t *Task) WithCondition(condition string) *Task {
 // WithDescription sets the description for the task definition.
 func (t *Task) WithDescription(description string) *Task {
 	t.description = description
+	return t
+}
+
+// RetentionPeriod sets how long terminal runs (completed, failed, skipped, canceled)
+// are retained before being deleted by the garbage collector. A zero duration disables cleanup.
+func (t *Task) RetentionPeriod(d time.Duration) *Task {
+	t.retentionPeriod = d
 	return t
 }
 
@@ -174,9 +182,10 @@ type taskClaim struct {
 }
 
 type TaskInfo struct {
-	Name        string    `json:"name"`
-	Description string    `json:"description,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
+	Name            string        `json:"name"`
+	Description     string        `json:"description,omitempty"`
+	RetentionPeriod time.Duration `json:"retention_period,omitzero"`
+	CreatedAt       time.Time     `json:"created_at"`
 }
 
 // TaskScheduleInfo contains metadata about a scheduled task.
@@ -342,9 +351,13 @@ func canceledRunError(reason string) error {
 
 // CreateTask creates one or more task definitions.
 func CreateTask(ctx context.Context, conn Conn, tasks ...*Task) error {
-	q := `SELECT * FROM cb_create_task(name => $1, description => $2, condition => $3);`
+	q := `SELECT * FROM cb_create_task(name => $1, description => $2, condition => $3, retention_period => $4);`
 	for _, task := range tasks {
-		_, err := conn.Exec(ctx, q, task.name, ptrOrNil(task.description), ptrOrNil(task.condition))
+		var retentionPeriod *time.Duration
+		if task.retentionPeriod > 0 {
+			retentionPeriod = &task.retentionPeriod
+		}
+		_, err := conn.Exec(ctx, q, task.name, ptrOrNil(task.description), ptrOrNil(task.condition), retentionPeriod)
 		if err != nil {
 			return err
 		}
@@ -355,13 +368,13 @@ func CreateTask(ctx context.Context, conn Conn, tasks ...*Task) error {
 
 // GetTask retrieves task metadata by name.
 func GetTask(ctx context.Context, conn Conn, taskName string) (*TaskInfo, error) {
-	q := `SELECT name, description, created_at FROM cb_tasks WHERE name = $1;`
+	q := `SELECT name, description, retention_period, created_at FROM cb_tasks WHERE name = $1;`
 	return scanTask(conn.QueryRow(ctx, q, taskName))
 }
 
 // ListTasks returns all tasks
 func ListTasks(ctx context.Context, conn Conn) ([]*TaskInfo, error) {
-	q := `SELECT name, description, created_at FROM cb_tasks ORDER BY name;`
+	q := `SELECT name, description, retention_period, created_at FROM cb_tasks ORDER BY name;`
 	rows, err := conn.Query(ctx, q)
 	if err != nil {
 		return nil, err
@@ -471,6 +484,9 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 		&failedAt,
 		&skippedAt,
 	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
 		return nil, err
 	}
 
@@ -521,10 +537,12 @@ func scanCollectibleTask(row pgx.CollectableRow) (*TaskInfo, error) {
 func scanTask(row pgx.Row) (*TaskInfo, error) {
 	rec := TaskInfo{}
 	var description *string
+	var retentionPeriod *time.Duration
 
 	if err := row.Scan(
 		&rec.Name,
 		&description,
+		&retentionPeriod,
 		&rec.CreatedAt,
 	); err != nil {
 		return nil, err
@@ -532,6 +550,9 @@ func scanTask(row pgx.Row) (*TaskInfo, error) {
 
 	if description != nil {
 		rec.Description = *description
+	}
+	if retentionPeriod != nil {
+		rec.RetentionPeriod = *retentionPeriod
 	}
 
 	return &rec, nil

@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS cb_flows (
     output_priority text[] NOT NULL,
     step_count int NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now(),
+    retention_period interval,
     CONSTRAINT name_not_empty CHECK (name <> ''),
     CONSTRAINT step_count_valid CHECK (step_count >= 0),
     CONSTRAINT output_priority_valid CHECK (
@@ -87,6 +88,7 @@ CREATE OR REPLACE VIEW cb_flow_info AS
         (CASE WHEN jsonb_typeof(to_jsonb(f)->'output_priority') = 'array' THEN
             ARRAY(SELECT jsonb_array_elements_text(to_jsonb(f)->'output_priority'))
          ELSE ARRAY[]::text[] END) AS output_priority,
+        f.retention_period,
         f.created_at
     FROM cb_flows f
     LEFT JOIN LATERAL (

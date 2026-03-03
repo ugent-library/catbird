@@ -3,6 +3,7 @@ package tui
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -76,4 +77,25 @@ func isNoColor() bool {
 func isDumbTerm() bool {
 	term := strings.TrimSpace(strings.ToLower(os.Getenv("TERM")))
 	return term == "" || term == "dumb"
+}
+
+// formatRetention returns a human-readable representation of a retention duration,
+// or an empty string if the duration is zero (no retention configured).
+func formatRetention(d time.Duration) string {
+	if d == 0 {
+		return ""
+	}
+	days := int(d.Hours() / 24)
+	hours := int(d.Hours())
+	minutes := int(d.Minutes())
+	switch {
+	case days > 0:
+		return fmt.Sprintf("%d days", days)
+	case hours > 0:
+		return fmt.Sprintf("%d hours", hours)
+	case minutes > 0:
+		return fmt.Sprintf("%d minutes", minutes)
+	default:
+		return d.String()
+	}
 }

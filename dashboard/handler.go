@@ -5,6 +5,7 @@ import (
 	"embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"html/template"
 	"log/slog"
 	"net/http"
@@ -77,6 +78,24 @@ func New(config Config) *App {
 				return "", err
 			}
 			return template.JS(buf.String()), nil
+		},
+		"formatDuration": func(d time.Duration) string {
+			if d == 0 {
+				return ""
+			}
+			days := int(d.Hours() / 24)
+			hours := int(d.Hours())
+			minutes := int(d.Minutes())
+			switch {
+			case days > 0:
+				return fmt.Sprintf("%d days", days)
+			case hours > 0:
+				return fmt.Sprintf("%d hours", hours)
+			case minutes > 0:
+				return fmt.Sprintf("%d minutes", minutes)
+			default:
+				return d.String()
+			}
 		},
 	}
 

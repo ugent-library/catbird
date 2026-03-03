@@ -907,6 +907,40 @@ You can also start it from the root command using interactive mode:
 cb -i
 ```
 
+# Data Retention
+
+Set a retention period on a task or flow definition to have `cb_gc()` automatically
+delete terminal runs older than that duration. GC runs opportunistically from the
+worker heartbeat and can also be triggered manually via `client.GC(ctx)` or the
+standalone purge helpers below.
+
+```go
+task := catbird.NewTask("send-email").
+    RetentionPeriod(7 * 24 * time.Hour). // NULL by default = no cleanup
+    Do(fn)
+
+flow := catbird.NewFlow("order-processing").
+    RetentionPeriod(90 * 24 * time.Hour).
+    AddStep(...)
+```
+
+- **Task runs cleaned up**: `completed`, `failed`, `skipped`, `canceled` older than the retention period
+- **Flow runs cleaned up**: `completed`, `failed`, `canceled` older than the retention period; associated step runs and map tasks are removed automatically via cascade
+- **Non-terminal rows are never touched**: `queued`, `started`, `waiting_*`, `canceling` are left alone
+
+## Purge helpers
+
+For targeted or ad-hoc cleanup independent of the retention period:
+
+```go
+// Delete task runs older than 30 days
+err = client.PurgeTaskRuns(ctx, "send-email", 30*24*time.Hour)
+
+// Delete flow runs older than 90 days
+err = client.PurgeFlowRuns(ctx, "order-processing", 90*24*time.Hour)
+
+```
+
 ## External archiving
 
 For long-term archiving, export rows before they are deleted using a standard

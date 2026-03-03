@@ -5,6 +5,7 @@ package catbird
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -42,5 +43,21 @@ type Conn interface {
 func GC(ctx context.Context, conn Conn) error {
 	q := `SELECT cb_gc();`
 	_, err := conn.Exec(ctx, q)
+	return err
+}
+
+// PurgeTaskRuns deletes terminal task runs (completed, failed, skipped, canceled)
+// older than the given duration. Useful for manual cleanup or targeted removal
+// independent of the configured retention period.
+func PurgeTaskRuns(ctx context.Context, conn Conn, taskName string, olderThan time.Duration) error {
+	_, err := conn.Exec(ctx, `SELECT cb_purge_task_runs($1, $2);`, taskName, olderThan)
+	return err
+}
+
+// PurgeFlowRuns deletes terminal flow runs (completed, failed, canceled) older than
+// the given duration. Step runs and map tasks are deleted via cascade.
+// Useful for manual cleanup or targeted removal independent of the configured retention period.
+func PurgeFlowRuns(ctx context.Context, conn Conn, flowName string, olderThan time.Duration) error {
+	_, err := conn.Exec(ctx, `SELECT cb_purge_flow_runs($1, $2);`, flowName, olderThan)
 	return err
 }

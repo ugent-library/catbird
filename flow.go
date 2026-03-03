@@ -34,6 +34,7 @@ type Flow struct {
 	steps              []*Step
 	outputPriority     []string
 	priorityConfigured bool
+	retentionPeriod    time.Duration
 	onFail             func(context.Context, json.RawMessage, FlowFailure) error
 	onFailOpts         *handlerOpts
 }
@@ -116,6 +117,13 @@ func (f *Flow) Output(stepName string) *Flow {
 func (f *Flow) OutputPriority(stepNames ...string) *Flow {
 	f.priorityConfigured = true
 	f.outputPriority = append([]string(nil), stepNames...)
+	return f
+}
+
+// RetentionPeriod sets how long terminal runs (completed, failed, canceled)
+// are retained before being deleted by the garbage collector. A zero duration disables cleanup.
+func (f *Flow) RetentionPeriod(d time.Duration) *Flow {
+	f.retentionPeriod = d
 	return f
 }
 
@@ -448,6 +456,10 @@ func (b *StepBuilder) Do(fn any, opts ...HandlerOpt) *StepBuilder {
 	return b
 }
 
+func (b *StepBuilder) Flow() *Flow {
+	return b.flow
+}
+
 type MapStepBuilder struct {
 	*Step
 }
@@ -503,6 +515,10 @@ func (b *MapStepBuilder) Map(fn any, opts ...HandlerOpt) *MapStepBuilder {
 	return b
 }
 
+func (b *MapStepBuilder) Flow() *Flow {
+	return b.flow
+}
+
 type GeneratorStepBuilder struct {
 	*Step
 }
@@ -553,6 +569,10 @@ func (b *GeneratorStepBuilder) Map(fn any, opts ...HandlerOpt) *GeneratorStepBui
 	return b
 }
 
+func (b *GeneratorStepBuilder) Flow() *Flow {
+	return b.flow
+}
+
 type ReducerStepBuilder struct {
 	*Step
 }
@@ -601,6 +621,10 @@ func (b *ReducerStepBuilder) ReduceStep(stepName string) *ReducerStepBuilder {
 func (b *ReducerStepBuilder) Reduce(initial any, fn any) *ReducerStepBuilder {
 	b.reduce(initial, fn)
 	return b
+}
+
+func (b *ReducerStepBuilder) Flow() *Flow {
+	return b.flow
 }
 
 func parseGeneratorFn(fn any, stepName string) (reflect.Type, reflect.Type, error) {
@@ -1006,11 +1030,12 @@ func makeFlowOnFailHandler(fn any) (func(context.Context, json.RawMessage, FlowF
 }
 
 type FlowInfo struct {
-	Name           string     `json:"name"`
-	Description    string     `json:"description,omitempty"`
-	Steps          []StepInfo `json:"steps"`
-	OutputPriority []string   `json:"output_priority,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
+	Name            string        `json:"name"`
+	Description     string        `json:"description,omitempty"`
+	Steps           []StepInfo    `json:"steps"`
+	OutputPriority  []string      `json:"output_priority,omitempty"`
+	RetentionPeriod time.Duration `json:"retention_period,omitzero"`
+	CreatedAt       time.Time     `json:"created_at"`
 }
 
 // FlowScheduleInfo contains metadata about a scheduled flow.
@@ -1225,7 +1250,7 @@ func validateFlowDependencies(flow *Flow) error {
 
 // CreateFlow creates one or more flow definitions.
 func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
-	q := `SELECT * FROM cb_create_flow(name => $1, description => $2, steps => $3, output_priority => $4);`
+	q := `SELECT * FROM cb_create_flow(name => $1, description => $2, steps => $3, output_priority => $4, retention_period => $5);`
 	for _, flow := range flows {
 		if err := validateFlowDependencies(flow); err != nil {
 			return err
@@ -1280,7 +1305,11 @@ func CreateFlow(ctx context.Context, conn Conn, flows ...*Flow) error {
 			priority = defaultFlowOutputPriority(flow)
 		}
 
-		_, err = conn.Exec(ctx, q, flow.name, ptrOrNil(flow.description), b, priority)
+		var retentionPeriod *time.Duration
+		if flow.retentionPeriod > 0 {
+			retentionPeriod = &flow.retentionPeriod
+		}
+		_, err = conn.Exec(ctx, q, flow.name, ptrOrNil(flow.description), b, priority, retentionPeriod)
 		if err != nil {
 			return err
 		}
@@ -1568,6 +1597,9 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 		&completedAt,
 		&failedAt,
 	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
 		return nil, err
 	}
 
@@ -1790,12 +1822,14 @@ func scanFlow(row pgx.Row) (*FlowInfo, error) {
 	var description *string
 	var steps json.RawMessage
 	var outputPriority []string
+	var retentionPeriod *time.Duration
 
 	if err := row.Scan(
 		&rec.Name,
 		&description,
 		&steps,
 		&outputPriority,
+		&retentionPeriod,
 		&rec.CreatedAt,
 	); err != nil {
 		return nil, err
@@ -1810,6 +1844,10 @@ func scanFlow(row pgx.Row) (*FlowInfo, error) {
 	}
 
 	rec.OutputPriority = outputPriority
+
+	if retentionPeriod != nil {
+		rec.RetentionPeriod = *retentionPeriod
+	}
 
 	return &rec, nil
 }

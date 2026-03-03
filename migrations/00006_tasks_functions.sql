@@ -20,8 +20,9 @@
 --   name: Task name (must be unique)
 --   description: Optional task description metadata
 --   condition: Optional condition expression for task execution
+--   retention_period: Optional retention period; completed/failed/skipped/canceled runs older than this are deleted by cb_gc()
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_create_task(name text, description text = null, condition text = null)
+CREATE OR REPLACE FUNCTION cb_create_task(name text, description text = null, condition text = null, retention_period interval = null)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -37,6 +38,9 @@ BEGIN
     WHERE t.name = cb_create_task.name;
 
     IF _existing_name IS NOT NULL THEN
+        UPDATE cb_tasks
+        SET retention_period = cb_create_task.retention_period
+        WHERE name = cb_create_task.name;
         RETURN;
     END IF;
 
@@ -50,11 +54,12 @@ BEGIN
         _condition := cb_parse_condition(cb_create_task.condition);
     END IF;
 
-    INSERT INTO cb_tasks (name, description, condition)
+    INSERT INTO cb_tasks (name, description, condition, retention_period)
     VALUES (
         cb_create_task.name,
         cb_create_task.description,
-        _condition
+        _condition,
+        cb_create_task.retention_period
     );
 
     EXECUTE format(
@@ -104,6 +109,7 @@ BEGIN
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at, id) WHERE status IN (''queued'', ''started'');', _t_table || '_poll_visible_id_idx', _t_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (on_fail_visible_at, id) WHERE status = ''failed'' AND on_fail_status IN (''queued'', ''failed'');', _t_table || '_on_fail_poll_idx', _t_table);
     EXECUTE format('DROP INDEX IF EXISTS %I;', _t_table || '_visible_at_idx');
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (GREATEST(completed_at, failed_at, skipped_at, canceled_at)) WHERE status IN (''completed'', ''failed'', ''skipped'', ''canceled'');', _t_table || '_retention_idx', _t_table);
 END;
 $$;
 -- +goose statementend

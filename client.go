@@ -188,6 +188,18 @@ func (c *Client) SignalFlow(ctx context.Context, flowName string, flowRunID int6
 	return SignalFlow(ctx, c.Conn, flowName, flowRunID, stepName, input)
 }
 
+// PurgeTaskRuns deletes terminal task runs older than the given duration.
+// See PurgeTaskRuns for details.
+func (c *Client) PurgeTaskRuns(ctx context.Context, taskName string, olderThan time.Duration) error {
+	return PurgeTaskRuns(ctx, c.Conn, taskName, olderThan)
+}
+
+// PurgeFlowRuns deletes terminal flow runs older than the given duration.
+// See PurgeFlowRuns for details.
+func (c *Client) PurgeFlowRuns(ctx context.Context, flowName string, olderThan time.Duration) error {
+	return PurgeFlowRuns(ctx, c.Conn, flowName, olderThan)
+}
+
 // NewWorker creates a new worker that processes task and flow executions.
 // Use the builder pattern methods (AddTask, AddFlow, etc.) to configure,
 // then call Start(ctx) to begin processing.

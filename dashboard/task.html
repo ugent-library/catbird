@@ -8,6 +8,8 @@
 
 <p class="mb-3">{{ with .Task.Description }}{{ . }}{{ else }}No description{{ end }}</p>
 
+{{ with formatDuration .Task.RetentionPeriod }}<p class="mb-3"><small>Retention: {{ . }}</small></p>{{ else }}<p class="mb-3"><small>Retention: -</small></p>{{ end }}
+
 <h2>Runs</h2>
 
 {{ template "task_runs_table" . }}

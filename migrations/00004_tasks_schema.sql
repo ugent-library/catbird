@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS cb_tasks (
     description text,
     created_at timestamptz NOT NULL DEFAULT now(),
     condition jsonb,
+    retention_period interval,
     CONSTRAINT name_not_empty CHECK (name <> ''),
     CONSTRAINT name_not_reserved CHECK (name <> 'input')
 );
