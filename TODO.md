@@ -26,7 +26,7 @@
 
 - [ ] [!!!] OpenTelemetry traces — span per task/step execution with flow run ID as trace root; `worker.WithTracerProvider(...)`
 - [ ] [!!] Queue metrics — `cb_queue_metrics(name)` returning queue length, visible length, oldest/newest message age; prerequisite for Prometheus endpoint
-- [ ] [!!] Structured events table — `cb_events` append-only log of state transitions for audit trails and replay debugging
+- [ ] [!!] Event emission — opt-in `worker.EmitEvents()` publishes state transitions to `catbird.event.*` topic; users bind their own queues to consume, audit, or chain into other flows (see EVENT_EMISSION.md)
 - [ ] [!!!] Prometheus metrics endpoint — queue depths, step latencies, failure rates; expose via `catbird/metrics` package
 - [ ] [!!] Flow run replay — re-execute a completed/failed flow run with the same input from the dashboard
 
