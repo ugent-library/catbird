@@ -50,6 +50,7 @@ func NewFlow(name string) *Flow {
 
 func (f *Flow) AddStep(name string) *Step {
 	step := &Step{
+		flow:                 f,
 		name:                 name,
 		optionalDependencies: make(map[string]bool),
 	}
@@ -156,6 +157,7 @@ func (f FlowFailure) FailedStepSignalAs(out any) error {
 }
 
 type Step struct {
+	flow                 *Flow
 	name                 string
 	description          string
 	dependencies         []string
@@ -177,6 +179,27 @@ type Step struct {
 	hasSignal            bool
 	handler              func(context.Context, []byte, map[string][]byte, []byte) ([]byte, error)
 	handlerOpts          *handlerOpts
+}
+
+func (s *Step) AddStep(name string) *Step {
+	if s.flow == nil {
+		panic(fmt.Sprintf("step %s: AddStep() requires a step created from flow.AddStep", s.name))
+	}
+	return s.flow.AddStep(name)
+}
+
+func (s *Step) AddGeneratorStep(name string) *Step {
+	if s.flow == nil {
+		panic(fmt.Sprintf("step %s: AddGeneratorStep() requires a step created from flow.AddStep", s.name))
+	}
+	return s.flow.AddGeneratorStep(name)
+}
+
+func (s *Step) AddMapStep(name string) *Step {
+	if s.flow == nil {
+		panic(fmt.Sprintf("step %s: AddMapStep() requires a step created from flow.AddStep", s.name))
+	}
+	return s.flow.AddMapStep(name)
 }
 
 func (s *Step) WithDescription(description string) *Step {

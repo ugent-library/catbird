@@ -319,6 +319,41 @@ func TestFlowWithDependencies(t *testing.T) {
 	}
 }
 
+func TestFlowStepChaining(t *testing.T) {
+	flow := NewFlow("step_chaining")
+
+	flow.AddStep("step1").
+		Handler(func(ctx context.Context, in string) (string, error) {
+			return in + "-1", nil
+		}).
+		AddGeneratorStep("step2").
+		DependsOn("step1").
+		Generator(func(ctx context.Context, in string, step1 string, yield func(int) error) error {
+			return yield(len(step1))
+		}).
+		Handler(func(ctx context.Context, item int) (int, error) {
+			return item, nil
+		}).
+		AddMapStep("step3").
+		MapInput().
+		Handler(func(ctx context.Context, in string) (string, error) {
+			return in, nil
+		})
+
+	if len(flow.steps) != 3 {
+		t.Fatalf("expected 3 steps, got %d", len(flow.steps))
+	}
+	if flow.steps[0].name != "step1" || flow.steps[1].name != "step2" || flow.steps[2].name != "step3" {
+		t.Fatalf("unexpected step ordering")
+	}
+	if !flow.steps[1].isGenerator {
+		t.Fatalf("expected step2 to be generator")
+	}
+	if !flow.steps[2].isMapStep {
+		t.Fatalf("expected step3 to be map step")
+	}
+}
+
 func TestFlowOutputPrioritySelection(t *testing.T) {
 	client := getTestClient(t)
 	flowName := testFlowName(t, "output_priority")
