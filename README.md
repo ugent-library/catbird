@@ -907,6 +907,23 @@ You can also start it from the root command using interactive mode:
 cb -i
 ```
 
+## External archiving
+
+For long-term archiving, export rows before they are deleted using a standard
+`SELECT` query with a watermark cursor and write to your own storage
+(S3, data warehouse, etc.). Catbird does not manage the export destination
+or cursor state.
+
+```sql
+SELECT *
+FROM cb_t_my_task
+WHERE status IN ('completed', 'failed', 'skipped', 'canceled')
+  AND finished_at < now() - interval '30 days'
+  AND finished_at > $watermark
+ORDER BY finished_at, id
+LIMIT $batch_size;
+```
+
 # Documentation
 
 - **[Go API Documentation](https://pkg.go.dev/github.com/ugent-library/catbird)**: Complete reference for all public types and functions
