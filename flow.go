@@ -48,27 +48,37 @@ func NewFlow(name string) *Flow {
 	return &Flow{name: name}
 }
 
-func (f *Flow) AddStep(name string) *Step {
+func (f *Flow) AddStep(name string) *StepBuilder {
 	step := &Step{
 		flow:                 f,
 		name:                 name,
 		optionalDependencies: make(map[string]bool),
 	}
 	f.steps = append(f.steps, step)
-	return step
+	return &StepBuilder{Step: step}
 }
 
-func (f *Flow) AddGeneratorStep(name string) *Step {
-	step := f.AddStep(name)
-	step.isGenerator = true
-	return step
+func (f *Flow) AddGeneratorStep(name string) *GeneratorStepBuilder {
+	step := &Step{
+		flow:                 f,
+		name:                 name,
+		optionalDependencies: make(map[string]bool),
+		isGenerator:          true,
+	}
+	f.steps = append(f.steps, step)
+	return &GeneratorStepBuilder{Step: step}
 }
 
-func (f *Flow) AddMapStep(name string) *Step {
-	step := f.AddStep(name)
-	step.isMapStep = true
-	step.mapSource = ""
-	return step
+func (f *Flow) AddMapStep(name string) *MapStepBuilder {
+	step := &Step{
+		flow:                 f,
+		name:                 name,
+		optionalDependencies: make(map[string]bool),
+		isMapStep:            true,
+		mapSource:            "",
+	}
+	f.steps = append(f.steps, step)
+	return &MapStepBuilder{Step: step}
 }
 
 func (f *Flow) WithDescription(description string) *Flow {
@@ -181,62 +191,36 @@ type Step struct {
 	handlerOpts          *handlerOpts
 }
 
-func (s *Step) AddStep(name string) *Step {
-	if s.flow == nil {
-		panic(fmt.Sprintf("step %s: AddStep() requires a step created from flow.AddStep", s.name))
-	}
-	return s.flow.AddStep(name)
-}
-
-func (s *Step) AddGeneratorStep(name string) *Step {
-	if s.flow == nil {
-		panic(fmt.Sprintf("step %s: AddGeneratorStep() requires a step created from flow.AddStep", s.name))
-	}
-	return s.flow.AddGeneratorStep(name)
-}
-
-func (s *Step) AddMapStep(name string) *Step {
-	if s.flow == nil {
-		panic(fmt.Sprintf("step %s: AddMapStep() requires a step created from flow.AddStep", s.name))
-	}
-	return s.flow.AddMapStep(name)
-}
-
-func (s *Step) WithDescription(description string) *Step {
+func (s *Step) withDescription(description string) {
 	s.description = description
-	return s
 }
 
-func (s *Step) DependsOn(deps ...string) *Step {
+func (s *Step) dependsOn(deps ...string) {
 	s.dependencies = append(s.dependencies, deps...)
-	return s
 }
 
-func (s *Step) WithCondition(condition string) *Step {
+func (s *Step) withCondition(condition string) {
 	s.condition = condition
-	return s
 }
 
-func (s *Step) WithSignal() *Step {
+func (s *Step) withSignal() {
 	s.hasSignal = true
-	return s
 }
 
-func (s *Step) MapInput() *Step {
+func (s *Step) mapInput() {
 	if s.isGenerator {
-		panic(fmt.Sprintf("step %s: generator steps do not support MapInput()", s.name))
+		panic(fmt.Sprintf("step %s: generator steps do not support MapFlowInput()", s.name))
 	}
 	if s.isMapStep && s.mapSource != "" {
 		panic(fmt.Sprintf("step %s: map source already set to %q", s.name, s.mapSource))
 	}
 	s.isMapStep = true
 	s.mapSource = ""
-	return s
 }
 
-func (s *Step) Map(stepName string) *Step {
+func (s *Step) mapFrom(stepName string) {
 	if s.isGenerator {
-		panic(fmt.Sprintf("step %s: generator steps do not support Map()", s.name))
+		panic(fmt.Sprintf("step %s: generator steps do not support MapStepOutput()", s.name))
 	}
 	if strings.TrimSpace(stepName) == "" {
 		panic(fmt.Sprintf("step %s: map source step name must not be empty", s.name))
@@ -248,16 +232,15 @@ func (s *Step) Map(stepName string) *Step {
 	s.mapSource = stepName
 	for _, dep := range s.dependencies {
 		if dep == stepName {
-			return s
+			return
 		}
 	}
 	s.dependencies = append(s.dependencies, stepName)
-	return s
 }
 
-func (s *Step) Generator(fn any) *Step {
+func (s *Step) generator(fn any) {
 	if !s.isGenerator {
-		panic(fmt.Sprintf("step %s: Generator() is only valid for AddGeneratorStep", s.name))
+		panic(fmt.Sprintf("step %s: Generate() is only valid for AddGeneratorStep", s.name))
 	}
 
 	depType, itemType, err := parseGeneratorFn(fn, s.name)
@@ -283,11 +266,9 @@ func (s *Step) Generator(fn any) *Step {
 			panic(fmt.Sprintf("step %s: reducer item type %v does not match handler output type %v", s.name, s.reducerItem, handlerOutputType))
 		}
 	}
-
-	return s
 }
 
-func (s *Step) Handler(fn any, opts ...HandlerOpt) *Step {
+func (s *Step) applyHandler(fn any, opts ...HandlerOpt) {
 	if s.isGenerator {
 		itemType, outputType, err := parseGeneratorHandlerFn(fn, s.name)
 		if err != nil {
@@ -303,7 +284,7 @@ func (s *Step) Handler(fn any, opts ...HandlerOpt) *Step {
 			panic(fmt.Sprintf("step %s: reducer item type %v does not match handler output type %v", s.name, s.reducerItem, outputType))
 		}
 		s.handlerOpts = applyDefaultHandlerOpts(opts...)
-		return s
+		return
 	}
 
 	fnType := reflect.TypeOf(fn)
@@ -325,10 +306,9 @@ func (s *Step) Handler(fn any, opts ...HandlerOpt) *Step {
 	s.handler = handler
 	s.optionalDependencies = optionalDeps
 	s.handlerOpts = applyDefaultHandlerOpts(opts...)
-	return s
 }
 
-func (s *Step) Reduce(initial any, fn any) *Step {
+func (s *Step) reduce(initial any, fn any) {
 	if !s.isGenerator && !s.isMapStep {
 		panic(fmt.Sprintf("step %s: Reduce() is only valid for generator or map steps", s.name))
 	}
@@ -360,8 +340,154 @@ func (s *Step) Reduce(initial any, fn any) *Step {
 	if s.outputType != nil && s.outputType != itemType {
 		panic(fmt.Sprintf("step %s: reducer item type %v does not match handler output type %v", s.name, itemType, s.outputType))
 	}
+}
 
-	return s
+type StepBuilder struct {
+	*Step
+}
+
+func (b *StepBuilder) AddStep(name string) *StepBuilder {
+	return b.flow.AddStep(name)
+}
+
+func (b *StepBuilder) AddGeneratorStep(name string) *GeneratorStepBuilder {
+	return b.flow.AddGeneratorStep(name)
+}
+
+func (b *StepBuilder) AddMapStep(name string) *MapStepBuilder {
+	return b.flow.AddMapStep(name)
+}
+
+func (b *StepBuilder) WithDescription(description string) *StepBuilder {
+	b.withDescription(description)
+	return b
+}
+
+func (b *StepBuilder) DependsOn(deps ...string) *StepBuilder {
+	b.dependsOn(deps...)
+	return b
+}
+
+func (b *StepBuilder) WithCondition(condition string) *StepBuilder {
+	b.withCondition(condition)
+	return b
+}
+
+func (b *StepBuilder) WithSignal() *StepBuilder {
+	b.withSignal()
+	return b
+}
+
+func (b *StepBuilder) Handler(fn any, opts ...HandlerOpt) *StepBuilder {
+	b.applyHandler(fn, opts...)
+	return b
+}
+
+type MapStepBuilder struct {
+	*Step
+}
+
+func (b *MapStepBuilder) AddStep(name string) *StepBuilder {
+	return b.flow.AddStep(name)
+}
+
+func (b *MapStepBuilder) AddGeneratorStep(name string) *GeneratorStepBuilder {
+	return b.flow.AddGeneratorStep(name)
+}
+
+func (b *MapStepBuilder) AddMapStep(name string) *MapStepBuilder {
+	return b.flow.AddMapStep(name)
+}
+
+func (b *MapStepBuilder) WithDescription(description string) *MapStepBuilder {
+	b.withDescription(description)
+	return b
+}
+
+func (b *MapStepBuilder) DependsOn(deps ...string) *MapStepBuilder {
+	b.dependsOn(deps...)
+	return b
+}
+
+func (b *MapStepBuilder) WithCondition(condition string) *MapStepBuilder {
+	b.withCondition(condition)
+	return b
+}
+
+func (b *MapStepBuilder) WithSignal() *MapStepBuilder {
+	b.withSignal()
+	return b
+}
+
+func (b *MapStepBuilder) MapFlowInput() *MapStepBuilder {
+	b.mapInput()
+	return b
+}
+
+func (b *MapStepBuilder) MapStepOutput(stepName string) *MapStepBuilder {
+	b.mapFrom(stepName)
+	return b
+}
+
+func (b *MapStepBuilder) Map(fn any, opts ...HandlerOpt) *MapStepBuilder {
+	b.applyHandler(fn, opts...)
+	return b
+}
+
+func (b *MapStepBuilder) Reduce(initial any, fn any) *MapStepBuilder {
+	b.reduce(initial, fn)
+	return b
+}
+
+type GeneratorStepBuilder struct {
+	*Step
+}
+
+func (b *GeneratorStepBuilder) AddStep(name string) *StepBuilder {
+	return b.flow.AddStep(name)
+}
+
+func (b *GeneratorStepBuilder) AddGeneratorStep(name string) *GeneratorStepBuilder {
+	return b.flow.AddGeneratorStep(name)
+}
+
+func (b *GeneratorStepBuilder) AddMapStep(name string) *MapStepBuilder {
+	return b.flow.AddMapStep(name)
+}
+
+func (b *GeneratorStepBuilder) WithDescription(description string) *GeneratorStepBuilder {
+	b.withDescription(description)
+	return b
+}
+
+func (b *GeneratorStepBuilder) DependsOn(deps ...string) *GeneratorStepBuilder {
+	b.dependsOn(deps...)
+	return b
+}
+
+func (b *GeneratorStepBuilder) WithCondition(condition string) *GeneratorStepBuilder {
+	b.withCondition(condition)
+	return b
+}
+
+func (b *GeneratorStepBuilder) WithSignal() *GeneratorStepBuilder {
+	b.withSignal()
+	return b
+}
+
+func (b *GeneratorStepBuilder) Generate(fn any) *GeneratorStepBuilder {
+	b.generator(fn)
+	return b
+}
+
+func (b *GeneratorStepBuilder) Map(fn any, opts ...HandlerOpt) *GeneratorStepBuilder {
+	b.applyHandler(fn, opts...)
+	return b
+}
+
+func (b *GeneratorStepBuilder) Reduce(initial any, fn any) *GeneratorStepBuilder {
+	b.reduce(initial, fn)
+	return b
 }
 
 func parseGeneratorFn(fn any, stepName string) (reflect.Type, reflect.Type, error) {
@@ -826,10 +952,10 @@ func validateFlowDependencies(flow *Flow) error {
 				return fmt.Errorf("flow %q: step %q generator steps cannot use map mode", flow.name, step.name)
 			}
 			if step.generatorFn == nil {
-				return fmt.Errorf("flow %q: step %q generator step is missing Generator(fn)", flow.name, step.name)
+				return fmt.Errorf("flow %q: step %q generator step is missing Generate(fn)", flow.name, step.name)
 			}
 			if step.generatorHandler == nil {
-				return fmt.Errorf("flow %q: step %q generator step is missing Handler(fn)", flow.name, step.name)
+				return fmt.Errorf("flow %q: step %q generator step is missing Map(fn)", flow.name, step.name)
 			}
 			if step.reducerFn != nil {
 				if step.reducerAcc == nil || len(step.reducerInit) == 0 || step.reducerItem == nil {

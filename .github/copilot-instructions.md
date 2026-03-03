@@ -156,7 +156,7 @@ NewFlow("workflow").
 
 **Key Flow Patterns**:
 - **Conditions work for both tasks and steps**: Use `.WithCondition("expression")` builder method. Tasks use `input.field` to reference input; steps use `step_name.field` to reference outputs; steps with signals can use `signal.field` to reference signal input.
-- **Map steps**: Steps can map over arrays with `.MapInput()` (maps flow input array) or `.Map("step_name")` (maps dependency step output array). Map steps execute one logical item per array element and aggregate outputs in source order.
+- **Map steps**: Steps can map over arrays with `.MapFlowInput()` (maps flow input array) or `.MapStepOutput("step_name")` (maps dependency step output array). Map steps execute one logical item per array element and aggregate outputs in source order.
 - **Dependency tracking**: `dependency_count` includes all deps (required + optional); `remaining_dependencies` decrements for both completed and skipped steps
 - **Optional outputs**: When a conditional step is skipped, dependent steps receive `Optional[T]{IsSet: false}`. When executed, `Optional[T]{IsSet: true, Value: result}`
 - **Cascading resolution**: `cb_start_steps()` loops until no more steps unblock; handles chains like step2 skips → step3 unblocks → step4 unblocks

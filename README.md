@@ -424,8 +424,8 @@ When early completion wins the race, the flow run becomes `completed` with the p
 Map steps fan out array processing into per-item SQL-coordinated work and aggregate results back in item order.
 
 - Define map steps with `AddMapStep("name")`
-- Use `MapInput()` to map over flow input (flow input must be a JSON array)
-- Use `Map("step_name")` to map over a dependency step output array
+- Use `MapFlowInput()` to map over flow input (flow input must be a JSON array)
+- Use `MapStepOutput("step_name")` to map over a dependency step output array
 - Each mapped item runs as its own task, so retries happen per item instead of rerunning the whole step.
 - Optionally fold mapped outputs with `Reduce(initial, fn)` using `func(context.Context, Acc, OutType) (Acc, error)`
 
@@ -438,8 +438,8 @@ Retry order with `Reduce(...)`: per-item handler retries happen first (per map t
 ```go
 flow := catbird.NewFlow("double-input").
     AddMapStep("double").
-        MapInput().
-        Handler(func(ctx context.Context, n int) (int, error) {
+        MapFlowInput().
+        Map(func(ctx context.Context, n int) (int, error) {
             return n * 2, nil
         }))
 
@@ -458,8 +458,8 @@ flow := catbird.NewFlow("double-numbers").
             return []int{1, 2, 3}, nil
         })).
     AddMapStep("double").
-        Map("numbers").
-        Handler(func(ctx context.Context, _ string, n int) (int, error) {
+        MapStepOutput("numbers").
+        Map(func(ctx context.Context, _ string, n int) (int, error) {
             return n * 2, nil
         }))
 
@@ -470,8 +470,8 @@ flow = catbird.NewFlow("double-numbers-reduced").
             return []int{1, 2, 3}, nil
         })).
     AddMapStep("double").
-        Map("numbers").
-        Handler(func(ctx context.Context, _ string, n int) (int, error) {
+        MapStepOutput("numbers").
+        Map(func(ctx context.Context, _ string, n int) (int, error) {
             return n * 2, nil
         }).
         Reduce(0, func(ctx context.Context, acc int, out int) (int, error) {
@@ -488,7 +488,7 @@ Generator steps act like normal flow steps with an extra trailing `yield` callba
 - Provide a generator with signature `func(context.Context, In[, Signal][, Dep1, Dep2, ...], func(ItemType) error) error`
 - Provide an item handler with signature `func(context.Context, ItemType) (OutType, error)`
 - Optionally fold item outputs with `Reduce(initial, fn)` using `func(context.Context, Acc, OutType) (Acc, error)`
-- Generator steps do not support `MapInput()` or `Map()`
+- Generator steps do not support `MapFlowInput()` or `MapStepOutput()`
 
 `Reduce(...)` runs as a finalization phase after all per-item handlers complete (it does not reduce per yielded item in-stream).
 
@@ -502,7 +502,7 @@ flow := catbird.NewFlow("generate-double-sum").
         })).
     AddGeneratorStep("generate").
         DependsOn("seed").
-        Generator(func(ctx context.Context, in int, seed int, yield func(int) error) error {
+        Generate(func(ctx context.Context, in int, seed int, yield func(int) error) error {
             for i := 0; i < seed; i++ {
                 if err := yield(i); err != nil {
                     return err
@@ -510,7 +510,7 @@ flow := catbird.NewFlow("generate-double-sum").
             }
             return nil
         }).
-        Handler(func(ctx context.Context, item int) (int, error) {
+        Map(func(ctx context.Context, item int) (int, error) {
             return item * 2, nil
         })).
     AddStep("sum").
@@ -534,7 +534,7 @@ Use `Reduce(...)` when you want bounded generator output instead of storing all 
 ```go
 flow := catbird.NewFlow("generate-double-sum-reduced").
     AddGeneratorStep("generate").
-        Generator(func(ctx context.Context, input int, yield func(int) error) error {
+        Generate(func(ctx context.Context, input int, yield func(int) error) error {
             for i := 0; i < input; i++ {
                 if err := yield(i); err != nil {
                     return err
@@ -542,7 +542,7 @@ flow := catbird.NewFlow("generate-double-sum-reduced").
             }
             return nil
         }).
-        Handler(func(ctx context.Context, item int) (int, error) {
+        Map(func(ctx context.Context, item int) (int, error) {
             return item * 2, nil
         }).
         Reduce(0, func(ctx context.Context, acc int, out int) (int, error) {
@@ -630,7 +630,7 @@ Both tasks and flow steps support conditional execution via `WithCondition` on t
 - **Prefixes**: tasks use `input.*`; flow steps use `input.*`, `step_name.*`, or `signal.*`.
 - **Operators**: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `exists`, `contains`, plus `not <expr>`.
 - **Optional outputs**: if a step can be skipped, downstream handlers must accept `Optional[T]` for that dependency.
-- **Map steps**: define with `AddMapStep("name")`, then use `MapInput()` or `Map("step_name")`; map source values must be arrays.
+- **Map steps**: define with `AddMapStep("name")`, then use `MapFlowInput()` or `MapStepOutput("step_name")`; map source values must be arrays.
 - **No AND/OR**: only one expression per task/step; compute a derived field upstream if needed.
 
 ## Tasks with Conditions

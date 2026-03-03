@@ -568,9 +568,9 @@ func TestFlowOnFailMapStepInputIntegration(t *testing.T) {
 	onFailCalled := make(chan FlowFailure, 1)
 
 	flow := NewFlow("flow_on_fail_map_input")
-	flow.AddStep("map_fail").
-		MapInput().
-		Handler(func(_ context.Context, in Item) (string, error) {
+	flow.AddMapStep("map_fail").
+		MapFlowInput().
+		Map(func(_ context.Context, in Item) (string, error) {
 			return "", fmt.Errorf("map item failed: %d", in.ID)
 		},
 			WithConcurrency(1),

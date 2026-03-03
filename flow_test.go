@@ -328,15 +328,15 @@ func TestFlowStepChaining(t *testing.T) {
 		}).
 		AddGeneratorStep("step2").
 		DependsOn("step1").
-		Generator(func(ctx context.Context, in string, step1 string, yield func(int) error) error {
+		Generate(func(ctx context.Context, in string, step1 string, yield func(int) error) error {
 			return yield(len(step1))
 		}).
-		Handler(func(ctx context.Context, item int) (int, error) {
+		Map(func(ctx context.Context, item int) (int, error) {
 			return item, nil
 		}).
 		AddMapStep("step3").
-		MapInput().
-		Handler(func(ctx context.Context, in string) (string, error) {
+		MapFlowInput().
+		Map(func(ctx context.Context, in string) (string, error) {
 			return in, nil
 		})
 
@@ -484,9 +484,9 @@ func TestFlowMapInput(t *testing.T) {
 	flowName := testFlowName(t, "map_input_flow")
 
 	flow := NewFlow(flowName)
-	flow.AddStep("double").
-		MapInput().
-		Handler(func(ctx context.Context, n int) (int, error) {
+	flow.AddMapStep("double").
+		MapFlowInput().
+		Map(func(ctx context.Context, n int) (int, error) {
 			return n * 2, nil
 		})
 
@@ -519,9 +519,9 @@ func TestFlowMapStepOutput(t *testing.T) {
 	flow.AddStep("numbers").Handler(func(ctx context.Context, in string) ([]int, error) {
 		return []int{1, 2, 3, 4}, nil
 	})
-	flow.AddStep("double").
-		Map("numbers").
-		Handler(func(ctx context.Context, in string, n int) (int, error) {
+	flow.AddMapStep("double").
+		MapStepOutput("numbers").
+		Map(func(ctx context.Context, in string, n int) (int, error) {
 			return n * 2, nil
 		})
 	flow.AddStep("sum").
@@ -564,9 +564,9 @@ func TestFlowMapMetadataInInfo(t *testing.T) {
 	flow.AddStep("numbers").Handler(func(ctx context.Context, in string) ([]int, error) {
 		return []int{1, 2, 3}, nil
 	}).WithDescription("Numbers source")
-	flow.AddStep("double").
-		Map("numbers").
-		Handler(func(ctx context.Context, in string, n int) (int, error) {
+	flow.AddMapStep("double").
+		MapStepOutput("numbers").
+		Map(func(ctx context.Context, in string, n int) (int, error) {
 			return n * 2, nil
 		}).WithDescription("Multiply by two")
 
@@ -626,9 +626,9 @@ func TestMapStepReducerTypeMismatchPanics(t *testing.T) {
 	}()
 
 	flow := NewFlow("map_reducer_type_mismatch")
-	_ = flow.AddStep("mapped").
-		MapInput().
-		Handler(func(ctx context.Context, n int) (int, error) {
+	_ = flow.AddMapStep("mapped").
+		MapFlowInput().
+		Map(func(ctx context.Context, n int) (int, error) {
 			return n * 2, nil
 		}).
 		Reduce(0, func(ctx context.Context, acc int, item string) (int, error) {
@@ -641,9 +641,9 @@ func TestFlowMapStepReducerRuntime(t *testing.T) {
 	flowName := testFlowName(t, "map_reduce_runtime")
 
 	flow := NewFlow(flowName)
-	flow.AddStep("double").
-		MapInput().
-		Handler(func(ctx context.Context, n int) (int, error) {
+	flow.AddMapStep("double").
+		MapFlowInput().
+		Map(func(ctx context.Context, n int) (int, error) {
 			return n * 2, nil
 		}).
 		Reduce(0, func(ctx context.Context, acc int, out int) (int, error) {
@@ -679,9 +679,9 @@ func TestFlowMapSourceMustExist(t *testing.T) {
 	flow.AddStep("step1").Handler(func(ctx context.Context, in string) (string, error) {
 		return in, nil
 	})
-	flow.AddStep("mapped").
-		Map("does_not_exist").
-		Handler(func(ctx context.Context, in string, v int) (int, error) {
+	flow.AddMapStep("mapped").
+		MapStepOutput("does_not_exist").
+		Map(func(ctx context.Context, in string, v int) (int, error) {
 			return v, nil
 		})
 
@@ -726,9 +726,9 @@ func TestFlowMapParentCompletesAfterAllMapTasks(t *testing.T) {
 	flow.AddStep("numbers").Handler(func(ctx context.Context, in int) ([]int, error) {
 		return []int{0, 1, 2, 3, 4}, nil
 	})
-	flow.AddStep("work").
-		Map("numbers").
-		Handler(func(ctx context.Context, in int, item int) (int, error) {
+	flow.AddMapStep("work").
+		MapStepOutput("numbers").
+		Map(func(ctx context.Context, in int, item int) (int, error) {
 			if item == 4 {
 				time.Sleep(300 * time.Millisecond)
 			}
@@ -831,9 +831,9 @@ func TestFlowMapTaskFailureFailsParentAndFlow(t *testing.T) {
 	flow.AddStep("numbers").Handler(func(ctx context.Context, in int) ([]int, error) {
 		return []int{0, 1, 2, 3}, nil
 	})
-	flow.AddStep("work").
-		Map("numbers").
-		Handler(func(ctx context.Context, in int, item int) (int, error) {
+	flow.AddMapStep("work").
+		MapStepOutput("numbers").
+		Map(func(ctx context.Context, in int, item int) (int, error) {
 			if item == 2 {
 				return 0, fmt.Errorf("intentional map task failure")
 			}
@@ -920,9 +920,9 @@ func TestFlowMapStepConcurrentWorkersSlow(t *testing.T) {
 		}
 		return items, nil
 	})
-	flow.AddStep("work").
-		Map("numbers").
-		Handler(func(ctx context.Context, n int, item int) (int, error) {
+	flow.AddMapStep("work").
+		MapStepOutput("numbers").
+		Map(func(ctx context.Context, n int, item int) (int, error) {
 			processed.Add(1)
 			// tiny delay to increase overlap opportunity across workers
 			time.Sleep(1 * time.Millisecond)
@@ -980,7 +980,7 @@ func TestStepMapModeConflictPanics(t *testing.T) {
 	}()
 
 	flow := NewFlow("map_mode_conflict")
-	_ = flow.AddMapStep("conflict").Map("numbers").Map("other_numbers")
+	_ = flow.AddMapStep("conflict").MapStepOutput("numbers").MapStepOutput("other_numbers")
 }
 
 func TestAddMapStepDefaultsToMapInput(t *testing.T) {
@@ -997,7 +997,7 @@ func TestAddMapStepDefaultsToMapInput(t *testing.T) {
 
 func TestAddMapStepAllowsMapSource(t *testing.T) {
 	flow := NewFlow("map_source_assign")
-	step := flow.AddMapStep("mapped").Map("numbers")
+	step := flow.AddMapStep("mapped").MapStepOutput("numbers")
 
 	if step.mapSource != "numbers" {
 		t.Fatalf("expected map source to be numbers, got %q", step.mapSource)
@@ -1012,10 +1012,10 @@ func TestGeneratorStepYieldFunctionAccepted(t *testing.T) {
 	flow.AddStep("seed").Handler(func(ctx context.Context, in string) (string, error) { return in, nil })
 	step := flow.AddGeneratorStep("discover").
 		DependsOn("seed").
-		Generator(func(ctx context.Context, in string, seed string, yield func(int) error) error {
+		Generate(func(ctx context.Context, in string, seed string, yield func(int) error) error {
 			return yield(len(seed))
 		}).
-		Handler(func(ctx context.Context, item int) (string, error) {
+		Map(func(ctx context.Context, item int) (string, error) {
 			return fmt.Sprintf("%d", item), nil
 		})
 
@@ -1044,7 +1044,7 @@ func TestGeneratorStepChannelYieldRejected(t *testing.T) {
 	flow := NewFlow("generator_channel_yield_rejected")
 	_ = flow.AddGeneratorStep("discover").
 		DependsOn("seed").
-		Generator(func(ctx context.Context, seed string, yield chan<- int) error {
+		Generate(func(ctx context.Context, seed string, yield chan<- int) error {
 			return nil
 		})
 }
@@ -1058,10 +1058,10 @@ func TestGeneratorStepReducerTypeMismatchPanics(t *testing.T) {
 
 	flow := NewFlow("generator_reducer_type_mismatch")
 	_ = flow.AddGeneratorStep("discover").
-		Generator(func(ctx context.Context, in int, yield func(int) error) error {
+		Generate(func(ctx context.Context, in int, yield func(int) error) error {
 			return nil
 		}).
-		Handler(func(ctx context.Context, item int) (int, error) {
+		Map(func(ctx context.Context, item int) (int, error) {
 			return item, nil
 		}).
 		Reduce(0, func(ctx context.Context, acc int, item string) (int, error) {
@@ -1079,7 +1079,7 @@ func TestFlowGeneratorStepRuntime(t *testing.T) {
 	})
 	flow.AddGeneratorStep("generate").
 		DependsOn("seed").
-		Generator(func(ctx context.Context, in int, seed int, yield func(int) error) error {
+		Generate(func(ctx context.Context, in int, seed int, yield func(int) error) error {
 			for i := 0; i < seed; i++ {
 				if err := yield(i); err != nil {
 					return err
@@ -1087,7 +1087,7 @@ func TestFlowGeneratorStepRuntime(t *testing.T) {
 			}
 			return nil
 		}).
-		Handler(func(ctx context.Context, item int) (int, error) {
+		Map(func(ctx context.Context, item int) (int, error) {
 			return item * 2, nil
 		})
 	flow.AddStep("sum").
@@ -1131,7 +1131,7 @@ func TestFlowGeneratorStepFailure(t *testing.T) {
 	})
 	flow.AddGeneratorStep("generate").
 		DependsOn("seed").
-		Generator(func(ctx context.Context, in int, seed int, yield func(int) error) error {
+		Generate(func(ctx context.Context, in int, seed int, yield func(int) error) error {
 			for i := 0; i < seed; i++ {
 				if err := yield(i); err != nil {
 					return err
@@ -1142,7 +1142,7 @@ func TestFlowGeneratorStepFailure(t *testing.T) {
 			}
 			return nil
 		}).
-		Handler(func(ctx context.Context, item int) (int, error) {
+		Map(func(ctx context.Context, item int) (int, error) {
 			return item * 2, nil
 		})
 
@@ -1181,7 +1181,7 @@ func TestFlowGeneratorStepNoDependencies(t *testing.T) {
 
 	flow := NewFlow(flowName)
 	flow.AddGeneratorStep("generate").
-		Generator(func(ctx context.Context, input int, yield func(int) error) error {
+		Generate(func(ctx context.Context, input int, yield func(int) error) error {
 			for i := 0; i < input; i++ {
 				if err := yield(i); err != nil {
 					return err
@@ -1189,7 +1189,7 @@ func TestFlowGeneratorStepNoDependencies(t *testing.T) {
 			}
 			return nil
 		}).
-		Handler(func(ctx context.Context, item int) (int, error) {
+		Map(func(ctx context.Context, item int) (int, error) {
 			return item + 1, nil
 		})
 	flow.AddStep("sum").
@@ -1238,7 +1238,7 @@ func TestFlowGeneratorStepWithSignalAndDependency(t *testing.T) {
 	flow.AddGeneratorStep("generate").
 		DependsOn("seed").
 		WithSignal().
-		Generator(func(ctx context.Context, in int, signal approval, seed int, yield func(int) error) error {
+		Generate(func(ctx context.Context, in int, signal approval, seed int, yield func(int) error) error {
 			for i := 0; i < seed; i++ {
 				if err := yield(in + signal.Offset + i); err != nil {
 					return err
@@ -1246,7 +1246,7 @@ func TestFlowGeneratorStepWithSignalAndDependency(t *testing.T) {
 			}
 			return nil
 		}).
-		Handler(func(ctx context.Context, item int) (int, error) {
+		Map(func(ctx context.Context, item int) (int, error) {
 			return item, nil
 		})
 	flow.AddStep("sum").
@@ -1291,7 +1291,7 @@ func TestFlowGeneratorStepReducerRuntime(t *testing.T) {
 
 	flow := NewFlow(flowName)
 	flow.AddGeneratorStep("generate").
-		Generator(func(ctx context.Context, input int, yield func(int) error) error {
+		Generate(func(ctx context.Context, input int, yield func(int) error) error {
 			for i := 0; i < input; i++ {
 				if err := yield(i); err != nil {
 					return err
@@ -1299,7 +1299,7 @@ func TestFlowGeneratorStepReducerRuntime(t *testing.T) {
 			}
 			return nil
 		}).
-		Handler(func(ctx context.Context, item int) (int, error) {
+		Map(func(ctx context.Context, item int) (int, error) {
 			return item * 2, nil
 		}).
 		Reduce(0, func(ctx context.Context, acc int, out int) (int, error) {
