@@ -736,131 +736,7 @@ batch.Queue(q1, args1...)
 
 Catbird is built on PostgreSQL functions, so you can use the API directly from any language or tool with PostgreSQL support (psql, Python, Node.js, Ruby, etc.).
 
-## Queues
-
-```sql
--- Create a queue
-SELECT cb_create_queue(
-    name => 'my_queue'
-);
-
--- Send a message
-SELECT cb_send(
-    queue => 'my_queue',
-    payload => '{"user_id": 123, "action": "process"}'::jsonb
-);
-
--- Publish to topic-bound queues
-SELECT cb_publish(
-    topic => 'events.user.created',
-    payload => '{"user_id": 456}'::jsonb,
-    idempotency_key => 'user-456-created'
-);
-
--- Read messages (with 30 second visibility timeout)
-SELECT * FROM cb_read(
-    queue => 'my_queue',
-    quantity => 10,
-    hide_for => 30000
-);
-
--- Delete a message
-SELECT cb_delete(
-    queue => 'my_queue',
-    id => 1
-);
-
--- Bind queue to topic pattern
-SELECT cb_bind(
-    queue_name => 'user_events',
-    pattern => 'events.user.*'
-);
-SELECT cb_unbind(
-    queue_name => 'user_events',
-    pattern => 'events.user.*'
-);
-```
-
-## Tasks
-
-```sql
--- Create a task definition
-SELECT cb_create_task(
-    name => 'send_email'
-);
-
--- Run a task
-SELECT * FROM cb_run_task(
-    name => 'send_email',
-    input => '{"to": "user@example.com"}'::jsonb
-);
-```
-
-## Workflows
-
-```sql
--- Create a flow definition
-SELECT cb_create_flow(
-        name => 'order_processing',
-        steps => '[
-            {"name": "validate"},
-            {"name": "charge", "depends_on": [{"name": "validate"}]},
-            {"name": "ship", "depends_on": [{"name": "charge"}]}
-        ]'::jsonb
-);
-
--- Create a flow with a map step
-SELECT cb_create_flow(
-        name => 'map_example',
-        steps => '[
-            {"name": "numbers"},
-            {"name": "double", "step_type": "mapper", "map_source": "numbers", "depends_on": [{"name": "numbers"}]}
-        ]'::jsonb
-);
-
--- Run a flow
-SELECT * FROM cb_run_flow(
-        name => 'order_processing',
-        input => '{"order_id": 123}'::jsonb
-);
-```
-
-## Monitoring Task and Flow Runs
-
-You can query task and flow run information directly:
-
-```sql
--- List recent task runs (replace send_email with your task name)
-SELECT
-    id,
-    concurrency_key,
-    idempotency_key,
-    status,
-    input,
-    output,
-    error_message,
-    started_at,
-    completed_at,
-    failed_at
-FROM cb_t_send_email
-ORDER BY started_at DESC
-LIMIT 20;
-
--- Get flow run (replace order_processing with your flow name)
-SELECT
-    id,
-    concurrency_key,
-    idempotency_key,
-    status,
-    input,
-    output,
-    error_message,
-    started_at,
-    completed_at,
-    failed_at
-FROM cb_f_order_processing
-WHERE id = $1;
-```
+For the full SQL function reference and practical SQL examples (queues, tasks, workflows, and run monitoring), see the [SQL API reference](docs/sql-api-reference.md).
 
 # Dashboard
 
@@ -965,20 +841,8 @@ _ = flowPurged
 
 ## External archiving
 
-For long-term archiving, export rows before they are deleted using a standard
-`SELECT` query with a watermark cursor and write to your own storage
-(S3, data warehouse, etc.). Catbird does not manage the export destination
-or cursor state.
-
-```sql
-SELECT *
-FROM cb_t_my_task
-WHERE status IN ('completed', 'failed', 'skipped', 'canceled')
-  AND finished_at < now() - interval '30 days'
-  AND finished_at > $watermark
-ORDER BY finished_at, id
-LIMIT $batch_size;
-```
+For SQL-based archiving patterns and example queries, see the
+`External archiving` section in the [SQL API reference](docs/sql-api-reference.md).
 
 # Documentation
 
