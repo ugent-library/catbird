@@ -932,7 +932,7 @@ func TestFlowMapStepConcurrentWorkersSlow(t *testing.T) {
 	// Start multiple workers for same flow to stress DB claim concurrency.
 	for i := 0; i < 4; i++ {
 		worker := client.NewWorker().
-			Logger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))).
+			WithLogger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))).
 			AddFlow(flow)
 		startTestWorker(t, worker)
 	}
@@ -1458,7 +1458,7 @@ func TestFlowComplexDependencies(t *testing.T) {
 
 	// Start worker to execute flow
 	worker := client.NewWorker().
-		Logger(logger).
+		WithLogger(logger).
 		AddFlow(flow)
 
 	startTestWorker(t, worker)

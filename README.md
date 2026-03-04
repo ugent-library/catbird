@@ -183,8 +183,8 @@ conditionalTask := catbird.NewTask("premium-processing").
 
 // Create worker
 worker := client.NewWorker().
-    Logger(slog.Default()).
-    ShutdownTimeout(10 * time.Second)
+    WithLogger(slog.Default()).
+    WithShutdownTimeout(10 * time.Second)
 // Add tasks
 worker.AddTask(task)
 worker.AddTask(conditionalTask)

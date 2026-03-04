@@ -20,7 +20,7 @@ Catbird is a PostgreSQL-based message queue with task and workflow execution eng
 
 **Main Components**:
 1. **Client** (`client.go`): Facade delegating to standalone functions; call `catbird.New(conn)` to create
-2. **Worker** (`worker.go`): Runs tasks and flows; initialized with `catbird.NewWorker(conn)` or `client.NewWorker()`, then configured via builder methods (e.g., `.Logger(...)`, `.ShutdownTimeout(...)`, `.AddTask(...)`, `.AddFlow(...)`). Multiple workers can run concurrently; DB ensures each message is processed exactly once.
+2. **Worker** (`worker.go`): Runs tasks and flows; initialized with `catbird.NewWorker(conn)` or `client.NewWorker()`, then configured via builder methods (e.g., `.WithLogger(...)`, `.WithShutdownTimeout(...)`, `.AddTask(...)`, `.AddFlow(...)`). Multiple workers can run concurrently; DB ensures each message is processed exactly once.
 3. **Scheduler** (`scheduler.go`): Manages cron-based task and flow scheduling using robfig/cron; created internally by worker when registering tasks/flows with `Schedule` method. Can also be used standalone.
 4. **Dashboard** (`dashboard/`): Web UI for starting task/flow runs, monitoring progress in real-time, and viewing results; served via CLI `cb dashboard`
 5. **TUI** (`tui/`): Terminal UI built with Bubble Tea for read-only operational visibility (queues, tasks, flows, workers, and recent runs); launched via CLI `cb tui`
@@ -161,11 +161,11 @@ NewFlow("workflow").
 
 - **Idempotent API semantics**: For idempotent operations, if the requested effect is already true, return success (no-op) rather than an error. Reserve errors for invalid input, missing targets, or runtime/storage failures.
 
-- **Worker lifecycle**: `client.NewWorker()` followed by builder methods like `.Logger(...)`, `.ShutdownTimeout(...)`, `.AddTask(task)`, and `.AddFlow(flow)`, then `worker.Start(ctx)` (graceful shutdown with configurable timeout). Scheduling is decoupled: create schedules separately via `client.CreateTaskSchedule(ctx, name, cronSpec, scheduleOpts...)` or `client.CreateFlowSchedule(ctx, name, cronSpec, scheduleOpts...)`.
+- **Worker lifecycle**: `client.NewWorker()` followed by builder methods like `.WithLogger(...)`, `.WithShutdownTimeout(...)`, `.AddTask(task)`, and `.AddFlow(flow)`, then `worker.Start(ctx)` (graceful shutdown with configurable timeout). Scheduling is decoupled: create schedules separately via `client.CreateTaskSchedule(ctx, name, cronSpec, scheduleOpts...)` or `client.CreateFlowSchedule(ctx, name, cronSpec, scheduleOpts...)`.
 - **Handler options validation**: Worker validates all task and flow step handler options at initialization time. Invalid configs (negative concurrency/batch size, invalid backoff, invalid circuit breaker) are caught immediately with descriptive errors before reaching database operations. This ensures type safety at construction time.
-- **Options pattern**: Handler execution uses functional `HandlerOpt` values (e.g., `WithConcurrency`, `WithBatchSize`, `WithMaxRetries`, `WithFullJitterBackoff`, `WithCircuitBreaker`). Worker configuration uses builder methods on `Worker` (`Logger`, `ShutdownTimeout`). Scheduling uses functional `ScheduleOpt` values (e.g., `WithScheduleInput`).
+- **Options pattern**: Handler execution uses functional `HandlerOpt` values (e.g., `WithConcurrency`, `WithBatchSize`, `WithMaxRetries`, `WithFullJitterBackoff`, `WithCircuitBreaker`). Worker configuration uses builder methods on `Worker` (`WithLogger`, `WithShutdownTimeout`). Scheduling uses functional `ScheduleOpt` values (e.g., `WithScheduleInput`).
 - **Conn interface**: Abstracts pgx; accepts `*pgxpool.Pool`, `*pgx.Conn` or `pgx.Tx`
-- **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `worker.Logger(...)`
+- **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `worker.WithLogger(...)`
 - **Scheduled tasks/flows**: Decoupled from task/flow definitions. Create via `client.CreateTaskSchedule(ctx, taskName, cronSpec, opts...)` and `client.CreateFlowSchedule(ctx, flowName, cronSpec, opts...)`. Pass optional `WithScheduleInput(value)` for static JSON input (defaults to `{}`). Example: `client.CreateTaskSchedule(ctx, "mytask", "@hourly", WithScheduleInput(MyInput{...}))`. Worker polls for due schedules automatically and enqueues them with idempotency deduplication.
 - **Automatic garbage collection**: Worker heartbeats (every 10 seconds) opportunistically clean up stale workers and expired queues; no configuration needed. Manual cleanup available via `client.GC(ctx)` for deployments without workers.
 - **Deduplication strategies**: Two strategies available:

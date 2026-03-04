@@ -101,19 +101,15 @@ func NewWorker(conn Conn) *Worker {
 	}
 }
 
-// Logger sets the worker logger.
-func (w *Worker) Logger(logger *slog.Logger) *Worker {
-	if logger == nil {
-		w.logger = slog.Default()
-		return w
-	}
+// WithLogger sets the worker logger.
+func (w *Worker) WithLogger(logger *slog.Logger) *Worker {
 	w.logger = logger
 	return w
 }
 
-// ShutdownTimeout sets the graceful shutdown timeout.
+// WithShutdownTimeout sets the graceful shutdown timeout.
 // A value <= 0 disables graceful waiting and cancels handlers immediately.
-func (w *Worker) ShutdownTimeout(timeout time.Duration) *Worker {
+func (w *Worker) WithShutdownTimeout(timeout time.Duration) *Worker {
 	w.shutdownTimeout = timeout
 	return w
 }
@@ -238,11 +234,11 @@ func (w *Worker) startFlowWorkers(shutdownCtx, handlerCtx context.Context, wg *s
 // Shutdown behaviour:
 //   - when ctx is cancelled the worker immediately stops reading new work and
 //     begins shutting down
-//   - if ShutdownTimeout is set to a value > 0, that duration is used as a
+//   - if WithShutdownTimeout is set to a value > 0, that duration is used as a
 //     grace period for in‑flight handlers after ctx is cancelled; once the
 //     grace period expires the handler context is cancelled and remaining
 //     handlers are asked to stop. The default graceful shutdown timeout is 5 seconds.
-//   - if ShutdownTimeout is not set or set to 0, there is no grace period:
+//   - if WithShutdownTimeout is not set or set to 0, there is no grace period:
 //     the handler context is cancelled immediately once ctx is cancelled and
 //     Start returns after all goroutines finish
 func (w *Worker) Start(ctx context.Context) error {

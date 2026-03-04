@@ -75,7 +75,7 @@ var dashboardCmd = &cobra.Command{
 
 		h := dashboard.New(dashboard.Config{
 			Client: catbird.New(pool),
-			Log:    logger,
+			Logger: logger,
 		}).Handler()
 
 		logger.Info("starting dashboard", "port", port)

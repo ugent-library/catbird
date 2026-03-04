@@ -40,9 +40,9 @@ type Config struct {
 	// Client is a Catbird client connected to your database. Required.
 	Client *catbird.Client
 
-	// Log is a custom logger for dashboard operations. Optional.
+	// Logger is a custom logger for dashboard operations. Optional.
 	// If nil, uses slog.Default().
-	Log *slog.Logger
+	Logger *slog.Logger
 
 	// PathPrefix is the URL prefix for constructing internal links.
 	// This should match your routing setup. Optional.
@@ -101,7 +101,7 @@ func New(config Config) *App {
 
 	return &App{
 		client:        config.Client,
-		logger:        config.Log,
+		logger:        config.Logger,
 		index:         template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "index.html")),
 		queues:        template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "queues.html")),
 		tasks:         template.Must(template.New("").Funcs(funcs).ParseFS(templatesFS, "page.html", "tasks.html")),
