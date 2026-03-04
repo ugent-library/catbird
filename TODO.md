@@ -22,18 +22,18 @@ Start reply from dashboard and tui.
 
 ## Flow DSL
 
-- [ ] [!!] Event-triggered task/flow runs — `worker.AddTaskTrigger(name, pattern)` / `worker.AddFlowTrigger(name, pattern)`; worker creates internal queue + binding at startup, polls it, dispatches `RunTask`/`RunFlow` per message (see EVENT_TRIGGER.md)
+- [ ] [!!] Event-triggered task/flow runs — `worker.AddTaskTrigger(name, pattern)` / `worker.AddFlowTrigger(name, pattern)`; worker creates internal queue + binding at startup, polls it, dispatches `RunTask`/`RunFlow` per message (see `docs/event-triggers.md`)
 
 ## Observability
 
 - [ ] [!!!] OpenTelemetry traces — span per task/step execution with flow run ID as trace root; `worker.WithTracerProvider(...)`
 - [ ] [!!] Queue/task/flow metrics — add `cb_queue_metrics(name)`, `cb_task_metrics(name)`, and `cb_flow_metrics(name)` for core depth/state/latency signals; prerequisite for Prometheus endpoint
-- [ ] [!!] Event emission — opt-in `worker.EmitEvents()` publishes state transitions to `catbird.event.*` topic; users bind their own queues to consume, audit, or chain into other flows (see EVENT_EMISSION.md)
+- [ ] [!!] Event emission — opt-in `worker.EmitEvents()` publishes state transitions to `catbird.event.*` topic; users bind their own queues to consume, audit, or chain into other flows (see `docs/event-emission.md`)
 - [ ] [!!!] Prometheus metrics endpoint — queue depths, step latencies, failure rates; expose via `catbird/metrics` package
 
 ## Developer Experience
 
-- [ ] [!!!] `catbird/testing` package — in-process synchronous worker harness; no Docker needed for unit tests against user-defined task/flow handlers
+- [ ] [!!!] `catbird/testing` package — in-process synchronous worker harness; no Docker needed for unit tests against user-defined task/flow handlers (see `docs/testing-package-sketch.md`)
 - [ ] [!!] Schema drift detection on startup — warn if registered task/flow definitions drift from what's in `cb_tasks`/`cb_flows`/`cb_steps`
 - [ ] [!] `cb` CLI improvements — `cb flow replay <run-id>`, `cb task retry <run-id>`, `cb queue drain <name>`
 
