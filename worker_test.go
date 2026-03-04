@@ -226,7 +226,7 @@ func TestTaskRetriesIntegration(t *testing.T) {
 		WithFullJitterBackoff(minDelay, maxDelay),
 	)
 
-	worker := client.NewWorker(t.Context()).AddTask(task)
+	worker := client.NewWorker().AddTask(task)
 
 	startTestWorker(t, worker)
 
@@ -312,7 +312,7 @@ func TestTaskOnFailIntegration(t *testing.T) {
 		WithMaxRetries(0),
 	)
 
-	worker := client.NewWorker(t.Context()).AddTask(task)
+	worker := client.NewWorker().AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -382,7 +382,7 @@ func TestTaskOnFailRetries(t *testing.T) {
 		WithFullJitterBackoff(10*time.Millisecond, 20*time.Millisecond),
 	)
 
-	worker := client.NewWorker(t.Context()).AddTask(task)
+	worker := client.NewWorker().AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -445,7 +445,7 @@ func TestTaskOnFailMaxRetriesExhausted(t *testing.T) {
 		WithMaxRetries(0),
 	)
 
-	worker := client.NewWorker(t.Context()).AddTask(task)
+	worker := client.NewWorker().AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -510,7 +510,7 @@ func TestFlowOnFailIntegration(t *testing.T) {
 		WithMaxRetries(0),
 	)
 
-	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	worker := client.NewWorker().AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -585,7 +585,7 @@ func TestFlowOnFailMapStepInputIntegration(t *testing.T) {
 		WithMaxRetries(0),
 	)
 
-	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	worker := client.NewWorker().AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -632,7 +632,7 @@ func TestWorkerValidatesTaskHandlerOpts(t *testing.T) {
 			WithBatchSize(10),
 		)
 
-		worker := client.NewWorker(t.Context()).AddTask(task)
+		worker := client.NewWorker().AddTask(task)
 		err := worker.Start(t.Context())
 		if err == nil {
 			t.Fatal("expected error for negative concurrency")
@@ -651,7 +651,7 @@ func TestWorkerValidatesTaskHandlerOpts(t *testing.T) {
 			WithBatchSize(-1),
 		)
 
-		worker := client.NewWorker(t.Context()).AddTask(task)
+		worker := client.NewWorker().AddTask(task)
 		err := worker.Start(t.Context())
 		if err == nil {
 			t.Fatal("expected error for negative batch size")
@@ -672,7 +672,7 @@ func TestWorkerValidatesTaskHandlerOpts(t *testing.T) {
 			WithFullJitterBackoff(time.Second, 500*time.Millisecond), // MaxDelay < MinDelay
 		)
 
-		worker := client.NewWorker(t.Context()).AddTask(task)
+		worker := client.NewWorker().AddTask(task)
 		err := worker.Start(t.Context())
 		if err == nil {
 			t.Fatal("expected error for invalid backoff")
@@ -696,7 +696,7 @@ func TestWorkerValidatesStepHandlerOpts(t *testing.T) {
 			WithBatchSize(10),
 		))
 
-		worker := client.NewWorker(t.Context()).AddFlow(flow)
+		worker := client.NewWorker().AddFlow(flow)
 		err := worker.Start(t.Context())
 		if err == nil {
 			t.Fatal("expected error for negative concurrency")
@@ -716,7 +716,7 @@ func TestWorkerValidatesStepHandlerOpts(t *testing.T) {
 			WithBatchSize(-5), // Negative value
 		))
 
-		worker := client.NewWorker(t.Context()).AddFlow(flow)
+		worker := client.NewWorker().AddFlow(flow)
 		err := worker.Start(t.Context())
 		if err == nil {
 			t.Fatal("expected error for negative batch size")
@@ -737,7 +737,7 @@ func TestWorkerValidatesStepHandlerOpts(t *testing.T) {
 			WithCircuitBreaker(0, time.Second), // Invalid threshold
 		))
 
-		worker := client.NewWorker(t.Context()).AddFlow(flow)
+		worker := client.NewWorker().AddFlow(flow)
 		err := worker.Start(t.Context())
 		if err == nil {
 			t.Fatal("expected error for invalid circuit breaker")

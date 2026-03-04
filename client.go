@@ -208,7 +208,7 @@ func (c *Client) GC(ctx context.Context) (*GCInfo, error) {
 // NewWorker creates a new worker that processes task and flow executions.
 // Use the builder pattern methods (AddTask, AddFlow, etc.) to configure,
 // then call Start(ctx) to begin processing.
-func (c *Client) NewWorker(ctx context.Context) *Worker {
+func (c *Client) NewWorker() *Worker {
 	return NewWorker(c.Conn)
 }
 

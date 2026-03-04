@@ -6,7 +6,7 @@ using Catbird's own queue transport as the outbox. No new schema required.
 ## Enabling
 
 ```go
-worker := client.NewWorker(ctx).
+worker := client.NewWorker().
     EmitEvents() // opt-in; disabled by default
 ```
 

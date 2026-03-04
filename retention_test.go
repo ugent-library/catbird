@@ -64,7 +64,7 @@ func TestPurgeTaskRuns(t *testing.T) {
 			return in + " done", nil
 		})
 
-	worker := client.NewWorker(t.Context()).AddTask(task)
+	worker := client.NewWorker().AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -157,7 +157,7 @@ func TestPurgeFlowRuns(t *testing.T) {
 		return in + " done", nil
 	}))
 
-	worker := client.NewWorker(t.Context()).AddFlow(flow)
+	worker := client.NewWorker().AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -209,7 +209,7 @@ func TestGCPurgesRetentionRuns(t *testing.T) {
 		return in, nil
 	}))
 
-	worker := client.NewWorker(t.Context()).AddTask(task).AddFlow(flow)
+	worker := client.NewWorker().AddTask(task).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 

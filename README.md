@@ -56,7 +56,7 @@ flow.AddStep(catbird.NewStep("add").
     return doubled + 1, nil
 }))
 
-worker := client.NewWorker(ctx).
+worker := client.NewWorker().
     AddTask(task).
     AddFlow(flow)
 go worker.Start(ctx)
@@ -182,7 +182,7 @@ conditionalTask := catbird.NewTask("premium-processing").
     })
 
 // Create worker
-worker := client.NewWorker(ctx).
+worker := client.NewWorker().
     Logger(slog.Default()).
     ShutdownTimeout(10 * time.Second)
 // Add tasks
@@ -280,7 +280,7 @@ flow.AddStep(catbird.NewStep("ship").
     client.CreateFlowSchedule(ctx, "order-processing", "0 2 * * *") // Daily at 2 AM
 
 // Create worker
-worker := client.NewWorker(ctx)
+worker := client.NewWorker()
 // Add flow
 worker.AddFlow(flow)
 go worker.Start(ctx)
