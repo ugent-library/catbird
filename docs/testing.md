@@ -24,9 +24,9 @@ docker compose down -v && docker compose up -d
 The test infrastructure is fully isolated from your local shell environment:
 
 **Components**:
-- [docker-compose.yml](docker-compose.yml): PostgreSQL 16 in a container
-- [scripts/test.sh](scripts/test.sh): Test runner script (no env vars required)
-- [catbird_test.go](catbird_test.go): Test harness with hardcoded connection string
+- [docker-compose.yml](../docker-compose.yml): PostgreSQL 16 in a container
+- [scripts/test.sh](../scripts/test.sh): Test runner script (no env vars required)
+- [catbird_test.go](../catbird_test.go): Test harness with hardcoded connection string
 
 **Key Features**:
 - ✅ Hardcoded connection string: `postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable`
@@ -77,8 +77,8 @@ docker compose exec postgres createdb -U postgres cb_tst
 - Connection string: `postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable`
 
 These are hardcoded in:
-- [catbird_test.go](catbird_test.go#L18): `const testDSN`
-- [scripts/test.sh](scripts/test.sh#L13-16): Connection variables
+- [catbird_test.go](../catbird_test.go#L18): `const testDSN`
+- [scripts/test.sh](../scripts/test.sh#L13-L16): Connection variables
 
 ## Test Commands
 
@@ -284,17 +284,17 @@ Migrations are automatically applied during test setup via `getTestClient()`:
    $$ LANGUAGE plpgsql;
    -- +goose statementend
    ```
-4. Update `SchemaVersion` in [migrate.go](migrate.go#L12)
+4. Update `SchemaVersion` in [migrate.go](../migrate.go#L12)
 
 ## Files
 
-- [docker-compose.yml](docker-compose.yml): Docker PostgreSQL setup
-- [scripts/test.sh](scripts/test.sh): Test runner script
-- [catbird_test.go](catbird_test.go): Test harness with `getTestClient()`
-- [migrations/](migrations/): SQL migration files (goose-managed)
-- [migrate.go](migrate.go): Migration driver code
+- [docker-compose.yml](../docker-compose.yml): Docker PostgreSQL setup
+- [scripts/test.sh](../scripts/test.sh): Test runner script
+- [catbird_test.go](../catbird_test.go): Test harness with `getTestClient()`
+- [migrations/](../migrations/): SQL migration files (goose-managed)
+- [migrate.go](../migrate.go): Migration driver code
 
 ## See Also
 
-- [Copilot Instructions](.github/copilot-instructions.md) - Full development guide
-- [README.md](README.md) - Architecture overview
+- [Copilot Instructions](../.github/copilot-instructions.md) - Full development guide
+- [README.md](../README.md) - Architecture overview

@@ -9,6 +9,7 @@ Provide an in-process, synchronous test harness for user-defined task/flow handl
 - Exact SQL/runtime parity for locking, visibility timeouts, and polling internals.
 - Queue/topic broker simulation (`cb_send`, `cb_read`, `cb_publish`) beyond minimal stubs.
 - Performance benchmarking (this remains integration-level, Docker-backed).
+- Built-in assertion helpers; v1 stays framework-agnostic and minimal.
 
 ## Proposed API
 
@@ -187,4 +188,7 @@ func TestCheckoutFlow(t *testing.T) {
 
 - Should v1 include queue-message simulation, or remain task/flow-only?
 - Should condition parsing in Go be strict-parity tested against SQL fixtures in CI?
-- Should `catbird/testing` expose assertion helpers, or keep it framework-agnostic?
+
+## Decision log
+
+- **Assertions**: Keep `catbird/testing` framework-agnostic in v1 to keep the core small and simple. If needed later, add optional helpers in a separate package (e.g. `catbird/testing/assert`).
