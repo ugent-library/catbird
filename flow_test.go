@@ -172,7 +172,8 @@ func TestFlowRunDelayedVisibleAt(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	h, err := client.RunFlow(t.Context(), flowName, "input", RunFlowOpts{
-		VisibleAt: time.Now().Add(3 * time.Second),
+		VisibleAt:      time.Now().Add(3 * time.Second),
+		IdempotencyKey: "idem-1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -586,8 +587,8 @@ func TestFlowMapMetadataInInfo(t *testing.T) {
 			if s.StepType != StepTypeMapper {
 				t.Fatalf("expected step %q to be marked as map step", s.Name)
 			}
-			if s.MapSource != "numbers" {
-				t.Fatalf("expected map source 'numbers', got %q", s.MapSource)
+			if s.MapSourceStepName != "numbers" {
+				t.Fatalf("expected map source 'numbers', got %q", s.MapSourceStepName)
 			}
 			if s.Description != "Multiply by two" {
 				t.Fatalf("unexpected mapped step description: %q", s.Description)
@@ -693,10 +694,10 @@ func TestFlowMapSQLValidationRejectsMissingDependency(t *testing.T) {
 			"name": "numbers",
 		},
 		{
-			"name":        "mapped",
-			"is_map_step": true,
-			"map_source":  "numbers",
-			"depends_on":  []map[string]any{},
+			"name":                 "mapped",
+			"step_type":            "mapper",
+			"map_source_step_name": "numbers",
+			"depends_on":           []map[string]any{},
 		},
 	}
 
@@ -707,7 +708,7 @@ func TestFlowMapSQLValidationRejectsMissingDependency(t *testing.T) {
 
 	_, err = client.Conn.Exec(t.Context(), `SELECT * FROM cb_create_flow(name => $1, steps => $2);`, flowName, stepsJSON)
 	if err == nil {
-		t.Fatalf("expected SQL map validation to reject step without map_source dependency")
+		t.Fatalf("expected SQL map validation to reject step without map_source_step_name dependency")
 	}
 }
 
@@ -2443,8 +2444,12 @@ func TestFlowCancelStartedRun(t *testing.T) {
 
 	waitForFlowRunStatus(t, client, flowName, h.ID, StatusStarted, 5*time.Second)
 
-	if err := client.CancelFlowRun(t.Context(), flowName, h.ID, CancelOpts{Reason: "test flow cancel"}); err != nil {
+	applied, err := client.CancelFlowRun(t.Context(), flowName, h.ID, CancelOpts{Reason: "test flow cancel"})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !applied {
+		t.Fatal("expected cancellation to be applied")
 	}
 
 	waitForFlowRunStatus(t, client, flowName, h.ID, StatusCanceled, 5*time.Second)

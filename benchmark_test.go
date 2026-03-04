@@ -294,7 +294,7 @@ func BenchmarkQueueThroughputBatched(b *testing.B) {
 			}
 		}
 
-		if err := client.DeleteMany(ctx, queueName, ids); err != nil {
+		if _, err := client.DeleteMany(ctx, queueName, ids); err != nil {
 			b.Fatal(err)
 		}
 

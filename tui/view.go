@@ -161,12 +161,13 @@ func (m model) renderFlowDetail() string {
 				deps = append(deps, dep.Name)
 			}
 			steps[i] = flowStepDetailView{
-				name:        s.Name,
-				description: s.Description,
-				dependsOn:   deps,
-				hasSignal:   s.HasSignal,
-				stepType:    string(s.StepType),
-				mapSource:   s.MapSource,
+				name:                 s.Name,
+				description:          s.Description,
+				dependsOn:            deps,
+				signal:               s.Signal,
+				stepType:             string(s.StepType),
+				mapSourceStepName:    s.MapSourceStepName,
+				reduceSourceStepName: s.ReduceSourceStepName,
 			}
 		}
 
@@ -401,25 +402,29 @@ type flowDetailView struct {
 }
 
 type flowStepDetailView struct {
-	name        string
-	description string
-	dependsOn   []string
-	hasSignal   bool
-	stepType    string
-	mapSource   string
+	name                 string
+	description          string
+	dependsOn            []string
+	signal               bool
+	stepType             string
+	mapSourceStepName    string
+	reduceSourceStepName string
 }
 
 func (s flowStepDetailView) flowStepMeta() string {
 	flags := make([]string, 0, 2)
-	if s.hasSignal {
+	if s.signal {
 		flags = append(flags, "signal")
 	}
 	if s.stepType == "mapper" {
-		if s.mapSource != "" {
-			flags = append(flags, "map:"+s.mapSource)
+		if s.mapSourceStepName != "" {
+			flags = append(flags, "map_source_step_name:"+s.mapSourceStepName)
 		} else {
-			flags = append(flags, "map")
+			flags = append(flags, "map_source_step_name:(flow_input)")
 		}
+	}
+	if s.stepType == "reducer" && s.reduceSourceStepName != "" {
+		flags = append(flags, "reduce_source_step_name:"+s.reduceSourceStepName)
 	}
 	if len(flags) == 0 {
 		return ""

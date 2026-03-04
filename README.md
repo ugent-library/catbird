@@ -137,11 +137,11 @@ err = client.Bind(ctx, "user-events", "events.user.created")
 err = client.Bind(ctx, "user-events", "events.*.updated")
 err = client.Bind(ctx, "audit-log", "events.#")
 
-err = client.Publish(ctx, "events.user.created", map[string]any{
+_, err = client.Publish(ctx, "events.user.created", map[string]any{
     "user_id": 123,
     "email":   "user@example.com",
 })
-err = client.Unbind(ctx, "user-events", "events.*.updated")
+_, err = client.Unbind(ctx, "user-events", "events.*.updated")
 ```
 
 Wildcard rules:
@@ -668,19 +668,19 @@ Catbird deduplication (`ConcurrencyKey`/`IdempotencyKey`) controls duplicate run
 
 `Cancellation` semantics:
 - Cancellation is a distinct terminal outcome (`canceled`), separate from `failed` and `completed`.
-- Once a run is in `canceling`/`canceled`, final state converges to `canceled`.
+- Task cancellation moves `queued`/`started` runs directly to `canceled`; already-terminal task runs are unchanged.
+- Flow cancellation is two-phase: flow goes to `canceling`, queued child work is canceled, then flow becomes `canceled` after in-flight started work drains.
 - Cancellation requests are idempotent: repeated requests are successful no-ops.
-- If a cancellation request races with retry/on-fail enqueue, cancellation wins (no new retry/on-fail is queued).
-- If an `OnFail` handler is already running when cancellation is requested, it may finish, but the parent run still finalizes to `canceled`.
+- A cancel request does not rewrite an already-terminal run.
 
 External cancellation:
 
 ```go
 taskHandle, _ := client.RunTask(ctx, "send-email", "hello")
-_ = client.CancelTaskRun(ctx, "send-email", taskHandle.ID, catbird.CancelOpts{Reason: "operator requested stop"})
+_, _ = client.CancelTaskRun(ctx, "send-email", taskHandle.ID, catbird.CancelOpts{Reason: "operator requested stop"})
 
 flowHandle, _ := client.RunFlow(ctx, "order-processing", map[string]any{"order_id": 123})
-_ = client.CancelFlowRun(ctx, "order-processing", flowHandle.ID, catbird.CancelOpts{Reason: "customer canceled order"})
+_, _ = client.CancelFlowRun(ctx, "order-processing", flowHandle.ID, catbird.CancelOpts{Reason: "customer canceled order"})
 ```
 
 Internal cancellation from handlers:
@@ -918,6 +918,18 @@ worker heartbeat and can also be triggered manually via `client.GC(ctx)` or the
 standalone purge helpers below.
 
 ```go
+gcInfo, err := client.GC(ctx)
+if err != nil {
+    // handle error
+}
+
+_ = gcInfo.ExpiredQueuesDeleted
+_ = gcInfo.StaleWorkersDeleted
+_ = gcInfo.TaskRunsPurged
+_ = gcInfo.FlowRunsPurged
+```
+
+```go
 task := catbird.NewTask("send-email").
     RetentionPeriod(7 * 24 * time.Hour). // NULL by default = no cleanup
     Do(func(ctx context.Context, in EmailInput) (string, error) {
@@ -941,10 +953,13 @@ For targeted or ad-hoc cleanup independent of the retention period:
 
 ```go
 // Delete task runs older than 30 days
-err = client.PurgeTaskRuns(ctx, "send-email", 30*24*time.Hour)
+taskPurged, err := client.PurgeTaskRuns(ctx, "send-email", 30*24*time.Hour)
 
 // Delete flow runs older than 90 days
-err = client.PurgeFlowRuns(ctx, "order-processing", 90*24*time.Hour)
+flowPurged, err := client.PurgeFlowRuns(ctx, "order-processing", 90*24*time.Hour)
+
+_ = taskPurged
+_ = flowPurged
 
 ```
 

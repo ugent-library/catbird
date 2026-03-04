@@ -8,15 +8,16 @@
 -- Parameters:
 --   name: Task name
 --   older_than: Delete runs finished more than this duration ago
--- Returns: void
+-- Returns: int - deleted row count
 CREATE OR REPLACE FUNCTION cb_purge_task_runs(name text, older_than interval)
-RETURNS void
+RETURNS int
 LANGUAGE plpgsql AS $$
 DECLARE
     _table text := cb_table_name(cb_purge_task_runs.name, 't');
+    _deleted int := 0;
 BEGIN
     IF to_regclass('public.' || _table) IS NULL THEN
-        RETURN;
+        RETURN 0;
     END IF;
     EXECUTE format(
         'DELETE FROM %I
@@ -24,6 +25,9 @@ BEGIN
           AND GREATEST(completed_at, failed_at, skipped_at, canceled_at) < $1',
         _table
     ) USING (now() - cb_purge_task_runs.older_than);
+
+    GET DIAGNOSTICS _deleted = ROW_COUNT;
+    RETURN _deleted;
 END;
 $$;
 
@@ -33,15 +37,16 @@ $$;
 -- Parameters:
 --   name: Flow name
 --   older_than: Delete runs finished more than this duration ago
--- Returns: void
+-- Returns: int - deleted row count
 CREATE OR REPLACE FUNCTION cb_purge_flow_runs(name text, older_than interval)
-RETURNS void
+RETURNS int
 LANGUAGE plpgsql AS $$
 DECLARE
     _table text := cb_table_name(cb_purge_flow_runs.name, 'f');
+    _deleted int := 0;
 BEGIN
     IF to_regclass('public.' || _table) IS NULL THEN
-        RETURN;
+        RETURN 0;
     END IF;
     EXECUTE format(
         'DELETE FROM %I
@@ -49,6 +54,9 @@ BEGIN
           AND GREATEST(completed_at, failed_at, canceled_at) < $1',
         _table
     ) USING (now() - cb_purge_flow_runs.older_than);
+
+    GET DIAGNOSTICS _deleted = ROW_COUNT;
+    RETURN _deleted;
 END;
 $$;
 
@@ -57,28 +65,41 @@ $$;
 -- task/flow runs that have exceeded their configured retention period
 -- Called automatically by worker heartbeats, but can also be invoked manually
 -- for deployments without workers or for manual control
--- Returns: void
+-- Returns: jsonb report with flat counters
 CREATE OR REPLACE FUNCTION cb_gc()
-RETURNS void
+RETURNS jsonb
 LANGUAGE plpgsql AS $$
 DECLARE
     _rec record;
+    _expired_queues_deleted int := 0;
+    _stale_workers_deleted int := 0;
+    _task_runs_purged int := 0;
+    _flow_runs_purged int := 0;
+    _purged int;
 BEGIN
     -- Delete queues whose expiry has passed
-    PERFORM cb_delete_queue(name)
-    FROM cb_queues
-    WHERE expires_at IS NOT NULL AND expires_at <= now();
+    FOR _rec IN
+        SELECT name
+        FROM cb_queues
+        WHERE expires_at IS NOT NULL AND expires_at <= now()
+    LOOP
+        IF cb_delete_queue(_rec.name) THEN
+            _expired_queues_deleted := _expired_queues_deleted + 1;
+        END IF;
+    END LOOP;
 
     -- Delete workers with no heartbeat for more than 5 minutes
     DELETE FROM cb_workers
     WHERE last_heartbeat_at < now() - INTERVAL '5 minutes';
+    GET DIAGNOSTICS _stale_workers_deleted = ROW_COUNT;
 
     FOR _rec IN
         SELECT name, retention_period
         FROM cb_tasks
         WHERE retention_period IS NOT NULL
     LOOP
-        PERFORM cb_purge_task_runs(_rec.name, _rec.retention_period);
+        _purged := cb_purge_task_runs(_rec.name, _rec.retention_period);
+        _task_runs_purged := _task_runs_purged + _purged;
     END LOOP;
 
     FOR _rec IN
@@ -86,8 +107,16 @@ BEGIN
         FROM cb_flows
         WHERE retention_period IS NOT NULL
     LOOP
-        PERFORM cb_purge_flow_runs(_rec.name, _rec.retention_period);
+        _purged := cb_purge_flow_runs(_rec.name, _rec.retention_period);
+        _flow_runs_purged := _flow_runs_purged + _purged;
     END LOOP;
+
+    RETURN jsonb_build_object(
+        'expired_queues_deleted', _expired_queues_deleted,
+        'stale_workers_deleted', _stale_workers_deleted,
+        'task_runs_purged', _task_runs_purged,
+        'flow_runs_purged', _flow_runs_purged
+    );
 END;
 $$;
 -- +goose statementend

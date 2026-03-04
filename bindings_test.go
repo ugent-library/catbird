@@ -39,7 +39,7 @@ func TestBindExactTopic(t *testing.T) {
 	}
 
 	// Dispatch to first topic
-	if err := client.Publish(ctx, "events.user.created", map[string]string{"id": "123"}); err != nil {
+	if _, err := client.Publish(ctx, "events.user.created", map[string]string{"id": "123"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -93,7 +93,7 @@ func TestBindSingleTokenWildcard(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		if err := client.Publish(ctx, tc.topic, map[string]string{"test": "data"}); err != nil {
+		if _, err := client.Publish(ctx, tc.topic, map[string]string{"test": "data"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -157,7 +157,7 @@ func TestBindMultiTokenWildcard(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		if err := client.Publish(ctx, tc.topic, map[string]string{"test": "data"}); err != nil {
+		if _, err := client.Publish(ctx, tc.topic, map[string]string{"test": "data"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -217,7 +217,7 @@ func TestBindMultiplePatterns(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		if err := client.Publish(ctx, tc.topic, map[string]string{"test": "data"}); err != nil {
+		if _, err := client.Publish(ctx, tc.topic, map[string]string{"test": "data"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -260,7 +260,7 @@ func TestBindFanout(t *testing.T) {
 
 	// Dispatch one message
 	payload := map[string]string{"msg": "hello all"}
-	if err := client.Publish(ctx, "broadcast.message", payload); err != nil {
+	if _, err := client.Publish(ctx, "broadcast.message", payload); err != nil {
 		t.Fatal(err)
 	}
 
@@ -298,7 +298,7 @@ func TestUnbind(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := client.Publish(ctx, "test.topic", "before unbind"); err != nil {
+	if _, err := client.Publish(ctx, "test.topic", "before unbind"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -314,12 +314,12 @@ func TestUnbind(t *testing.T) {
 	}
 
 	// Unbind
-	if err := client.Unbind(ctx, q, "test.topic"); err != nil {
+	if _, err := client.Unbind(ctx, q, "test.topic"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Dispatch again - should not be received
-	if err := client.Publish(ctx, "test.topic", "after unbind"); err != nil {
+	if _, err := client.Publish(ctx, "test.topic", "after unbind"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -419,17 +419,17 @@ func TestBindPrefixOptimization(t *testing.T) {
 	}
 
 	// Should match zero-token tail case too
-	if err := client.Publish(ctx, "very.long.prefix.path.to.resource", "match-zero"); err != nil {
+	if _, err := client.Publish(ctx, "very.long.prefix.path.to.resource", "match-zero"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Should match
-	if err := client.Publish(ctx, "very.long.prefix.path.to.resource.created", "match"); err != nil {
+	if _, err := client.Publish(ctx, "very.long.prefix.path.to.resource.created", "match"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Should not match (different prefix)
-	if err := client.Publish(ctx, "very.long.different.path.to.resource.created", "nomatch"); err != nil {
+	if _, err := client.Publish(ctx, "very.long.different.path.to.resource.created", "nomatch"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -480,7 +480,7 @@ func TestBindCaseSensitivity(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		if err := client.Publish(ctx, tc.topic, tc.topic); err != nil {
+		if _, err := client.Publish(ctx, tc.topic, tc.topic); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -522,7 +522,7 @@ func TestBindOrderIndependence(t *testing.T) {
 	// Dispatch messages
 	topics := []string{"a.b.c", "x.y", "x.y.z", "p.m.q"}
 	for _, topic := range topics {
-		if err := client.Publish(ctx, topic, "test"); err != nil {
+		if _, err := client.Publish(ctx, topic, "test"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -571,7 +571,7 @@ func TestBindRebind(t *testing.T) {
 	}
 
 	// Dispatch once
-	if err := client.Publish(ctx, "test.topic", "data"); err != nil {
+	if _, err := client.Publish(ctx, "test.topic", "data"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -601,7 +601,7 @@ func TestBindEmptyPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := client.Publish(ctx, "foo.bar", "test"); err != nil {
+	if _, err := client.Publish(ctx, "foo.bar", "test"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -644,7 +644,7 @@ func TestBindingRaceQueueDeletion(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 50; i++ {
-			if err := client.Publish(ctx, topic, map[string]int{"value": i}); err != nil {
+			if _, err := client.Publish(ctx, topic, map[string]int{"value": i}); err != nil {
 				errors <- err
 				return
 			}
@@ -725,7 +725,7 @@ func TestBindingConcurrentBindUnbind(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				// First unbind should succeed, rest should fail
-				_ = client.Unbind(ctx, queueName, p)
+				_, _ = client.Unbind(ctx, queueName, p)
 			}()
 		}
 	}
@@ -765,7 +765,7 @@ func TestBindingDispatchDuringModification(t *testing.T) {
 				errors <- err
 				return
 			}
-			if err := client.Unbind(ctx, queueName, topic); err != nil {
+			if _, err := client.Unbind(ctx, queueName, topic); err != nil {
 				errors <- err
 				return
 			}
@@ -778,7 +778,7 @@ func TestBindingDispatchDuringModification(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < 50; i++ {
 			// This should never error, just may or may not find a binding
-			if err := client.Publish(ctx, topic, map[string]int{"value": i}); err != nil {
+			if _, err := client.Publish(ctx, topic, map[string]int{"value": i}); err != nil {
 				errors <- err
 				return
 			}

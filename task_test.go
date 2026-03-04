@@ -735,8 +735,12 @@ func TestTaskCancelQueuedRun(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := client.CancelTaskRun(t.Context(), taskName, h.ID, CancelOpts{Reason: "test cancel queued"}); err != nil {
+	applied, err := client.CancelTaskRun(t.Context(), taskName, h.ID, CancelOpts{Reason: "test cancel queued"})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !applied {
+		t.Fatal("expected cancellation to be applied")
 	}
 
 	run, err := client.GetTaskRun(t.Context(), taskName, h.ID)
@@ -772,8 +776,12 @@ func TestTaskCancelStartedRun(t *testing.T) {
 
 	waitForTaskRunStatus(t, client, taskName, h.ID, StatusStarted, 5*time.Second)
 
-	if err := client.CancelTaskRun(t.Context(), taskName, h.ID, CancelOpts{Reason: "test cancel started"}); err != nil {
+	applied, err := client.CancelTaskRun(t.Context(), taskName, h.ID, CancelOpts{Reason: "test cancel started"})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !applied {
+		t.Fatal("expected cancellation to be applied")
 	}
 
 	waitForTaskRunStatus(t, client, taskName, h.ID, StatusCanceled, 5*time.Second)

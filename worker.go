@@ -812,7 +812,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 				return
 			}
 
-			changed, status, completeErr := completeFlowEarly(ctx, w.conn, w.flowName, flowRunID, w.step.name, completion.output, completion.reason)
+			applied, completeErr := completeFlowEarly(ctx, w.conn, w.flowName, flowRunID, w.step.name, completion.output, completion.reason)
 			if completeErr != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot complete flow early", "flow", w.flowName, "step", w.step.name, "error", completeErr)
 				if msg.Attempts > h.maxRetries {
@@ -824,7 +824,7 @@ func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
 				return
 			}
 
-			if changed || status == StatusCompleted {
+			if applied {
 				stopRequested.Store(true)
 				claimCancel()
 			}
@@ -875,7 +875,7 @@ func (w *stepWorker) handleGeneratorClaim(ctx context.Context, msg stepClaim) er
 	args = append(args, flowInputPtr.Elem())
 
 	depStartIdx := 2
-	if w.step.hasSignal {
+	if w.step.signal {
 		signalPtr := reflect.New(fnType.In(2))
 		if len(msg.SignalInput) > 0 {
 			if err := json.Unmarshal(msg.SignalInput, signalPtr.Interface()); err != nil {
@@ -1222,7 +1222,7 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 				return
 			}
 
-			changed, status, completeErr := completeFlowEarly(ctx, w.conn, w.flowName, flowRunID, w.step.name, completion.output, completion.reason)
+			applied, completeErr := completeFlowEarly(ctx, w.conn, w.flowName, flowRunID, w.step.name, completion.output, completion.reason)
 			if completeErr != nil {
 				w.logger.ErrorContext(ctx, "worker: cannot complete flow early", "flow", w.flowName, "step", w.step.name, "error", completeErr)
 				if msg.Attempts > h.maxRetries {
@@ -1234,7 +1234,7 @@ func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
 				return
 			}
 
-			if changed || status == StatusCompleted {
+			if applied {
 				stopRequested.Store(true)
 				claimCancel()
 			}
@@ -1557,8 +1557,8 @@ func completeTaskOnFail(ctx context.Context, conn Conn, logger *slog.Logger, tas
 	}
 }
 
-func failTaskOnFail(ctx context.Context, conn Conn, logger *slog.Logger, taskName string, runID int64, errorMessage string, exhausted bool, delayMs int64) {
-	if _, err := execWithRetry(ctx, conn, `SELECT cb_fail_task_on_fail($1, $2, $3, $4, $5);`, taskName, runID, errorMessage, exhausted, delayMs); err != nil {
+func failTaskOnFail(ctx context.Context, conn Conn, logger *slog.Logger, taskName string, runID int64, errorMessage string, exhausted bool, retryDelay int64) {
+	if _, err := execWithRetry(ctx, conn, `SELECT cb_fail_task_on_fail($1, $2, $3, $4, $5);`, taskName, runID, errorMessage, exhausted, retryDelay); err != nil {
 		logger.ErrorContext(ctx, "worker: cannot mark task on-fail as failed", "task", taskName, "id", runID, "error", err)
 	}
 }
@@ -1569,30 +1569,29 @@ func completeFlowOnFail(ctx context.Context, conn Conn, logger *slog.Logger, flo
 	}
 }
 
-func failFlowOnFail(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, runID int64, errorMessage string, exhausted bool, delayMs int64) {
-	if _, err := execWithRetry(ctx, conn, `SELECT cb_fail_flow_on_fail($1, $2, $3, $4, $5);`, flowName, runID, errorMessage, exhausted, delayMs); err != nil {
+func failFlowOnFail(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, runID int64, errorMessage string, exhausted bool, retryDelay int64) {
+	if _, err := execWithRetry(ctx, conn, `SELECT cb_fail_flow_on_fail($1, $2, $3, $4, $5);`, flowName, runID, errorMessage, exhausted, retryDelay); err != nil {
 		logger.ErrorContext(ctx, "worker: cannot mark flow on-fail as failed", "flow", flowName, "id", runID, "error", err)
 	}
 }
 
-func completeFlowEarly(ctx context.Context, conn Conn, flowName string, runID int64, stepName string, output any, reason string) (bool, string, error) {
+func completeFlowEarly(ctx context.Context, conn Conn, flowName string, runID int64, stepName string, output any, reason string) (bool, error) {
 	payload, err := json.Marshal(output)
 	if err != nil {
-		return false, "", fmt.Errorf("marshal early completion output: %w", err)
+		return false, fmt.Errorf("marshal early completion output: %w", err)
 	}
 
-	q := `SELECT changed, status FROM cb_early_exit_flow(flow_name => $1, flow_run_id => $2, step_name => $3, output => $4, reason => $5);`
-	var changed bool
-	var status string
-	err = conn.QueryRow(ctx, q, flowName, runID, stepName, payload, reason).Scan(&changed, &status)
+	q := `SELECT cb_complete_flow_early(flow_name => $1, flow_run_id => $2, step_name => $3, output => $4, reason => $5);`
+	var applied bool
+	err = conn.QueryRow(ctx, q, flowName, runID, stepName, payload, reason).Scan(&applied)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return false, "", nil
+			return false, nil
 		}
-		return false, "", err
+		return false, err
 	}
 
-	return changed, status, nil
+	return applied, nil
 }
 
 func isTaskCancelRequested(ctx context.Context, conn Conn, taskName string, runID int64) (bool, error) {

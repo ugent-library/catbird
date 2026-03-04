@@ -224,7 +224,7 @@ type Step struct {
 	mapSource            string
 	reduceSourceStep     string
 	condition            string
-	hasSignal            bool
+	signal               bool
 	handler              func(context.Context, []byte, map[string][]byte, []byte) ([]byte, error)
 	handlerOpts          *handlerOpts
 }
@@ -263,7 +263,7 @@ func (s *Step) WithSignal() *Step {
 	if s.configErr != nil {
 		return s
 	}
-	s.hasSignal = true
+	s.signal = true
 	return s
 }
 
@@ -498,7 +498,7 @@ func (s *Step) applyHandler(fn any, opts ...HandlerOpt) {
 		return
 	}
 
-	handler, optionalDeps, err := makeStepHandler(fn, s.name, s.dependencies, s.hasSignal, s.stepType == StepTypeMapper, s.mapSource)
+	handler, optionalDeps, err := makeStepHandler(fn, s.name, s.dependencies, s.signal, s.stepType == StepTypeMapper, s.mapSource)
 	if err != nil {
 		s.setConfigErr(err)
 		return
@@ -571,7 +571,7 @@ func validateGeneratorFnForStep(step *Step, flowName string) error {
 	}
 
 	expectedInputs := 2 + len(step.dependencies) + 1 // context + flow input + dependencies + yield
-	if step.hasSignal {
+	if step.signal {
 		expectedInputs++ // signal between flow input and dependencies
 	}
 
@@ -580,7 +580,7 @@ func validateGeneratorFnForStep(step *Step, flowName string) error {
 			flowName,
 			step.name,
 			func() string {
-				if step.hasSignal {
+				if step.signal {
 					return ", Signal"
 				}
 				return ""
@@ -669,7 +669,7 @@ func parseGeneratorReducerFn(fn any, stepName string) (reflect.Type, reflect.Typ
 // Step handler signature: (context.Context, In, [Signal if signal enabled], [Dep1, Dep2, ...]) (Out, error)
 // Returns wrapper with signature: (context.Context, flowInputJSON []byte, depsJSON map[string][]byte, signalInputJSON []byte) ([]byte, error)
 // Also returns a map indicating which dependencies are Optional[T]
-func makeStepHandler(fn any, stepName string, dependencies []string, hasSignal bool, isMapStep bool, mapSource string) (func(context.Context, []byte, map[string][]byte, []byte) ([]byte, error), map[string]bool, error) {
+func makeStepHandler(fn any, stepName string, dependencies []string, signal bool, isMapStep bool, mapSource string) (func(context.Context, []byte, map[string][]byte, []byte) ([]byte, error), map[string]bool, error) {
 	fnType := reflect.TypeOf(fn)
 	fnVal := reflect.ValueOf(fn)
 
@@ -680,7 +680,7 @@ func makeStepHandler(fn any, stepName string, dependencies []string, hasSignal b
 
 	// Expected signature: (context.Context, In, [Signal if signal enabled], [Dep1, Dep2, ...]) (Out, error)
 	expectedInputs := 2 // ctx + flow input
-	if hasSignal {
+	if signal {
 		expectedInputs++ // signal input
 	}
 	expectedInputs += len(dependencies) // dependency outputs
@@ -689,7 +689,7 @@ func makeStepHandler(fn any, stepName string, dependencies []string, hasSignal b
 		return nil, nil, fmt.Errorf("step %s: handler must have %d inputs (context.Context, In%s%s), got %d",
 			stepName, expectedInputs,
 			func() string {
-				if hasSignal {
+				if signal {
 					return ", Signal"
 				}
 				return ""
@@ -717,14 +717,14 @@ func makeStepHandler(fn any, stepName string, dependencies []string, hasSignal b
 	// Determine parameter indices
 	signalParamIdx := 2 // Signal comes after ctx and flow input (if present)
 	depStartIdx := 2    // Dependencies start here
-	if hasSignal {
+	if signal {
 		depStartIdx = 3 // Dependencies start after signal
 	}
 
 	// CACHE: Extract all type info once - stored in closure
 	flowInputType := fnType.In(1)
 	var signalType reflect.Type
-	if hasSignal {
+	if signal {
 		signalType = fnType.In(signalParamIdx)
 	}
 
@@ -767,7 +767,7 @@ func makeStepHandler(fn any, stepName string, dependencies []string, hasSignal b
 	return func(ctx context.Context, flowInputJSON []byte, depsJSON map[string][]byte, signalInputJSON []byte) ([]byte, error) {
 		buildAndCall := func(flowArg reflect.Value, depValues []reflect.Value, signalValue reflect.Value) (reflect.Value, error) {
 			args := []reflect.Value{reflect.ValueOf(ctx), flowArg}
-			if hasSignal {
+			if signal {
 				args = append(args, signalValue)
 			}
 			args = append(args, depValues...)
@@ -798,7 +798,7 @@ func makeStepHandler(fn any, stepName string, dependencies []string, hasSignal b
 
 		// 2. Unmarshal signal if present (uses cached signalType)
 		var signalVal reflect.Value
-		if hasSignal {
+		if signal {
 			signalValPtr := reflect.New(signalType)
 			if len(signalInputJSON) > 0 {
 				if err := json.Unmarshal(signalInputJSON, signalValPtr.Interface()); err != nil {
@@ -957,13 +957,13 @@ type FlowScheduleInfo struct {
 }
 
 type StepInfo struct {
-	Name             string               `json:"name"`
-	Description      string               `json:"description,omitempty"`
-	StepType         StepType             `json:"step_type,omitempty"`
-	MapSource        string               `json:"map_source,omitempty"`
-	ReduceSourceStep string               `json:"reduce_source_step,omitempty"`
-	HasSignal        bool                 `json:"has_signal,omitempty"`
-	DependsOn        []StepDependencyInfo `json:"depends_on,omitempty"`
+	Name                 string               `json:"name"`
+	Description          string               `json:"description,omitempty"`
+	StepType             StepType             `json:"step_type,omitempty"`
+	MapSourceStepName    string               `json:"map_source_step_name,omitempty"`
+	ReduceSourceStepName string               `json:"reduce_source_step_name,omitempty"`
+	Signal               bool                 `json:"signal,omitempty"`
+	DependsOn            []StepDependencyInfo `json:"depends_on,omitempty"`
 }
 
 type StepDependencyInfo struct {
@@ -1177,14 +1177,14 @@ func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 		Name string `json:"name"`
 	}
 	type serializableStep struct {
-		Name             string            `json:"name"`
-		Description      string            `json:"description,omitempty"`
-		Condition        string            `json:"condition,omitempty"`
-		StepType         StepType          `json:"step_type,omitempty"`
-		MapSource        string            `json:"map_source,omitempty"`
-		ReduceSourceStep string            `json:"reduce_source_step,omitempty"`
-		HasSignal        bool              `json:"has_signal"`
-		DependsOn        []*stepDependency `json:"depends_on,omitempty"`
+		Name                 string            `json:"name"`
+		Description          string            `json:"description,omitempty"`
+		Condition            string            `json:"condition,omitempty"`
+		StepType             StepType          `json:"step_type,omitempty"`
+		MapSourceStepName    string            `json:"map_source_step_name,omitempty"`
+		ReduceSourceStepName string            `json:"reduce_source_step_name,omitempty"`
+		Signal               bool              `json:"signal"`
+		DependsOn            []*stepDependency `json:"depends_on,omitempty"`
 	}
 
 	steps := flow.steps
@@ -1198,13 +1198,13 @@ func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 		}
 
 		serStep := serializableStep{
-			Name:             s.name,
-			Description:      s.description,
-			StepType:         s.stepType,
-			MapSource:        s.mapSource,
-			ReduceSourceStep: s.reduceSourceStep,
-			HasSignal:        s.hasSignal,
-			DependsOn:        deps,
+			Name:                 s.name,
+			Description:          s.description,
+			StepType:             s.stepType,
+			MapSourceStepName:    s.mapSource,
+			ReduceSourceStepName: s.reduceSourceStep,
+			Signal:               s.signal,
+			DependsOn:            deps,
 		}
 		serStep.Condition = s.condition
 		serSteps[i] = serStep
@@ -1361,22 +1361,16 @@ func (h *FlowHandle) WaitForOutput(ctx context.Context, out any, opts ...WaitOpt
 	}
 }
 
-// CancelFlowRun requests cancellation for a flow run.
-// Returns nil for idempotent no-op when the run is already terminal.
-func CancelFlowRun(ctx context.Context, conn Conn, flowName string, runID int64, opts ...CancelOpts) error {
-	q := `SELECT changed, final_status FROM cb_request_flow_cancellation(name => $1, run_id => $2, reason => $3);`
-	var changed bool
-	var finalStatus string
-	err := conn.QueryRow(ctx, q, flowName, runID, resolveCancelReason(opts...)).Scan(&changed, &finalStatus)
+// CancelFlowRun cancels a flow run.
+// Returns true when the run exists (including idempotent no-op), false when it does not exist.
+func CancelFlowRun(ctx context.Context, conn Conn, flowName string, runID int64, opts ...CancelOpts) (bool, error) {
+	q := `SELECT cb_cancel_flow(name => $1, run_id => $2, reason => $3);`
+	var applied bool
+	err := conn.QueryRow(ctx, q, flowName, runID, resolveCancelReason(opts...)).Scan(&applied)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		}
-		return err
+		return false, err
 	}
-	_ = changed
-	_ = finalStatus
-	return nil
+	return applied, nil
 }
 
 // GetStep retrieves status details for a step in the current flow run.

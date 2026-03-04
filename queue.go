@@ -169,10 +169,15 @@ func Bind(ctx context.Context, conn Conn, queueName string, pattern string) erro
 }
 
 // Unbind unsubscribes a queue from a topic pattern.
-func Unbind(ctx context.Context, conn Conn, queueName string, pattern string) error {
+// Returns true if a binding was removed, false if it was already absent.
+func Unbind(ctx context.Context, conn Conn, queueName string, pattern string) (bool, error) {
 	q := `SELECT cb_unbind(queue_name => $1, pattern => $2);`
-	_, err := conn.Exec(ctx, q, queueName, pattern)
-	return err
+	deleted := false
+	err := conn.QueryRow(ctx, q, queueName, pattern).Scan(&deleted)
+	if err != nil {
+		return false, err
+	}
+	return deleted, nil
 }
 
 type PublishOpts struct {
@@ -189,14 +194,19 @@ type PublishManyOpts struct {
 
 // Publish sends a message to topic-subscribed queues with options.
 // Pass no opts to use defaults.
-func Publish(ctx context.Context, conn Conn, topic string, payload any, opts ...PublishOpts) error {
+func Publish(ctx context.Context, conn Conn, topic string, payload any, opts ...PublishOpts) (int, error) {
 	q, args, err := PublishQuery(topic, payload, opts...)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	_, err = conn.Exec(ctx, q, args...)
-	return err
+	var matchedQueues int
+	err = conn.QueryRow(ctx, q, args...).Scan(&matchedQueues)
+	if err != nil {
+		return 0, err
+	}
+
+	return matchedQueues, nil
 }
 
 // PublishQuery builds the SQL query and args for a Publish operation.
@@ -224,14 +234,19 @@ func PublishQuery(topic string, payload any, opts ...PublishOpts) (string, []any
 
 // PublishMany sends multiple messages to topic-subscribed queues with options.
 // Pass no opts to use defaults.
-func PublishMany(ctx context.Context, conn Conn, topic string, payloads []any, opts ...PublishManyOpts) error {
+func PublishMany(ctx context.Context, conn Conn, topic string, payloads []any, opts ...PublishManyOpts) (int, error) {
 	q, args, err := PublishManyQuery(topic, payloads, opts...)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	_, err = conn.Exec(ctx, q, args...)
-	return err
+	var matchedQueues int
+	err = conn.QueryRow(ctx, q, args...).Scan(&matchedQueues)
+	if err != nil {
+		return 0, err
+	}
+
+	return matchedQueues, nil
 }
 
 // PublishManyQuery builds the SQL query and args for a PublishMany operation.
@@ -314,10 +329,15 @@ func Hide(ctx context.Context, conn Conn, queueName string, id int64, hideFor ti
 }
 
 // HideMany hides multiple messages from being read for the specified duration.
-func HideMany(ctx context.Context, conn Conn, queueName string, ids []int64, hideFor time.Duration) error {
+// Returns the IDs that were actually hidden.
+func HideMany(ctx context.Context, conn Conn, queueName string, ids []int64, hideFor time.Duration) ([]int64, error) {
 	q := `SELECT * FROM cb_hide(queue => $1, ids => $2, hide_for => $3);`
-	_, err := conn.Exec(ctx, q, queueName, ids, hideFor.Milliseconds())
-	return err
+	var hiddenIDs []int64
+	err := conn.QueryRow(ctx, q, queueName, ids, hideFor.Milliseconds()).Scan(&hiddenIDs)
+	if err != nil {
+		return nil, err
+	}
+	return hiddenIDs, nil
 }
 
 // Delete deletes a single message from the queue.
@@ -330,10 +350,15 @@ func Delete(ctx context.Context, conn Conn, queueName string, id int64) (bool, e
 }
 
 // DeleteMany deletes multiple messages from the queue.
-func DeleteMany(ctx context.Context, conn Conn, queueName string, ids []int64) error {
+// Returns the IDs that were actually deleted.
+func DeleteMany(ctx context.Context, conn Conn, queueName string, ids []int64) ([]int64, error) {
 	q := `SELECT * FROM cb_delete(queue => $1, ids => $2);`
-	_, err := conn.Exec(ctx, q, queueName, ids)
-	return err
+	var deletedIDs []int64
+	err := conn.QueryRow(ctx, q, queueName, ids).Scan(&deletedIDs)
+	if err != nil {
+		return nil, err
+	}
+	return deletedIDs, nil
 }
 
 func scanCollectibleMessage(row pgx.CollectableRow) (Message, error) {

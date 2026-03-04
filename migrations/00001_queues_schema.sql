@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS cb_queues (
     description text,
     created_at timestamptz NOT NULL DEFAULT now(),
     expires_at timestamptz,
-    CONSTRAINT expires_at_is_valid CHECK (expires_at IS NULL OR expires_at > created_at)
+    CONSTRAINT cb_expires_at_is_valid CHECK (expires_at IS NULL OR expires_at > created_at)
 );
 
 CREATE INDEX IF NOT EXISTS cb_queues_expires_at_idx ON cb_queues (expires_at);
@@ -34,11 +34,12 @@ CREATE INDEX IF NOT EXISTS cb_queues_expires_at_idx ON cb_queues (expires_at);
 CREATE TABLE IF NOT EXISTS cb_bindings (
     queue_name text NOT NULL REFERENCES cb_queues(name) ON DELETE CASCADE,
     pattern text NOT NULL,
-    pattern_type text NOT NULL CHECK (pattern_type IN ('exact', 'wildcard')),
+    pattern_type text NOT NULL,
     prefix text,
     regex text,
     created_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (queue_name, pattern)
+    PRIMARY KEY (queue_name, pattern),
+    CONSTRAINT cb_bindings_pattern_type_valid CHECK (pattern_type IN ('exact', 'wildcard'))
 );
 
 CREATE INDEX IF NOT EXISTS cb_bindings_exact_idx ON cb_bindings(pattern)

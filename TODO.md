@@ -4,7 +4,8 @@
 
 ## Reliability
 
-- [ ] [!!] Replay failed runs — `client.RetryTaskRun(ctx, name, id)` / `client.RetryFlowRun(ctx, name, id)` re-enqueues a failed run using its original input; no new schema needed since failed rows already persist in the live tables (distinct from on-fail handlers, which run automatically — this is manual operator-initiated replay)
+- [ ] [!!] Replay failed runs — `client.RetryTaskRun(ctx, name, id)` / `client.RetryFlowRun(ctx, name, id)` re-enqueues a failed run using its original input; no new schema needed since failed rows already persist in the live tables (distinct from on-fail handlers, which run automatically — this is manual operator-initiated replay).
+Start reply from dashboard and tui.
 - [ ] [!!] Queue dead letter handling — add `dead boolean` column to message tables; when `deliveries >= max_deliveries`, `cb_read` marks the message dead and skips it permanently; `client.CreateQueue(ctx, name, WithMaxDeliveries(5))` opts in; `client.RedriveQueue(ctx, name)` resets `dead = false` and `deliveries = 0` for replay
 - [ ] [!] Flow checkpointing — resume a partially completed flow run after a deploy/crash rather than restarting from scratch
 - [ ] [!!] Input/output schemas for task/flow validation (see https://opensource.googleblog.com/2026/01/a-json-schema-package-for-go.html)
@@ -16,6 +17,7 @@
 - [ ] [!] Fair queueing (see https://docs.hatchet.run/blog/multi-tenant-queues)
 - [ ] [!] Partitioned run tables — partition `cb_t_*` / `cb_f_*` by `created_at` for large-volume deployments; GC just drops old partitions (consider pg_partman for lifecycle management)
 - [ ] [!] `pop()` — atomic read+delete in one operation; at-most-once delivery semantics for use cases where redelivery is never wanted
+- [ ] [!] `peek()` — non-destructive read (no hide, no delete) for diagnostics/inspection; returns visible messages without altering delivery state
 - [ ] [!!] `PG_NOTIFY` wakeup — replace polling sleep with `LISTEN`/`NOTIFY` on queue insert to reduce latency on low-volume queues; fall back to polling when no notification arrives within the poll interval
 
 ## Flow DSL
@@ -25,17 +27,15 @@
 ## Observability
 
 - [ ] [!!!] OpenTelemetry traces — span per task/step execution with flow run ID as trace root; `worker.WithTracerProvider(...)`
-- [ ] [!!] Queue metrics — `cb_queue_metrics(name)` returning queue length, visible length, oldest/newest message age; prerequisite for Prometheus endpoint
+- [ ] [!!] Queue/task/flow metrics — add `cb_queue_metrics(name)`, `cb_task_metrics(name)`, and `cb_flow_metrics(name)` for core depth/state/latency signals; prerequisite for Prometheus endpoint
 - [ ] [!!] Event emission — opt-in `worker.EmitEvents()` publishes state transitions to `catbird.event.*` topic; users bind their own queues to consume, audit, or chain into other flows (see EVENT_EMISSION.md)
 - [ ] [!!!] Prometheus metrics endpoint — queue depths, step latencies, failure rates; expose via `catbird/metrics` package
-- [ ] [!!] Flow run replay — re-execute a completed/failed flow run with the same input from the dashboard
 
 ## Developer Experience
 
 - [ ] [!!!] `catbird/testing` package — in-process synchronous worker harness; no Docker needed for unit tests against user-defined task/flow handlers
 - [ ] [!!] Schema drift detection on startup — warn if registered task/flow definitions drift from what's in `cb_tasks`/`cb_flows`/`cb_steps`
 - [ ] [!] `cb` CLI improvements — `cb flow replay <run-id>`, `cb task retry <run-id>`, `cb queue drain <name>`
-- [ ] [!!!] Review SQL function return values and use named constraints
 
 ## Client Implementations
 

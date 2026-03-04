@@ -25,6 +25,7 @@
 CREATE OR REPLACE FUNCTION cb_create_task(name text, description text = null, condition text = null, retention_period interval = null)
 RETURNS void
 LANGUAGE plpgsql AS $$
+#variable_conflict use_column
 DECLARE
     _t_table text := cb_table_name(cb_create_task.name, 't');
     _condition jsonb;
@@ -40,7 +41,7 @@ BEGIN
     IF _existing_name IS NOT NULL THEN
         UPDATE cb_tasks
         SET retention_period = cb_create_task.retention_period
-        WHERE name = cb_create_task.name;
+        WHERE cb_tasks.name = cb_create_task.name;
         RETURN;
     END IF;
 
@@ -88,17 +89,17 @@ BEGIN
             skipped_at timestamptz,
             canceled_at timestamptz,
             cancel_reason text,
-            CONSTRAINT status_valid CHECK (status IN ('queued', 'started', 'canceling', 'completed', 'failed', 'skipped', 'canceled')),
-            CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
-            CONSTRAINT skipped_and_completed_failed CHECK (NOT (skipped_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL OR canceled_at IS NOT NULL))),
-            CONSTRAINT canceled_terminal_exclusive CHECK (NOT (canceled_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL OR skipped_at IS NOT NULL))),
-            CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
-            CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
-            CONSTRAINT canceled_at_is_after_started_at CHECK (canceled_at IS NULL OR canceled_at >= started_at),
-            CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
-            CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = ''))),
-            CONSTRAINT on_fail_status_valid CHECK (on_fail_status IS NULL OR on_fail_status IN ('queued', 'started', 'completed', 'failed')),
-            CONSTRAINT headers_is_object CHECK (headers IS NULL OR jsonb_typeof(headers) = 'object')
+            CONSTRAINT cb_status_valid CHECK (status IN ('queued', 'started', 'canceling', 'completed', 'failed', 'skipped', 'canceled')),
+            CONSTRAINT cb_completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
+            CONSTRAINT cb_skipped_and_completed_failed CHECK (NOT (skipped_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL OR canceled_at IS NOT NULL))),
+            CONSTRAINT cb_canceled_terminal_exclusive CHECK (NOT (canceled_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL OR skipped_at IS NOT NULL))),
+            CONSTRAINT cb_completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
+            CONSTRAINT cb_failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
+            CONSTRAINT cb_canceled_at_is_after_started_at CHECK (canceled_at IS NULL OR canceled_at >= started_at),
+            CONSTRAINT cb_completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
+            CONSTRAINT cb_failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = ''))),
+            CONSTRAINT cb_on_fail_status_valid CHECK (on_fail_status IS NULL OR on_fail_status IN ('queued', 'started', 'completed', 'failed')),
+            CONSTRAINT cb_headers_is_object CHECK (headers IS NULL OR jsonb_typeof(headers) = 'object')
         )
         $QUERY$,
         _t_table
@@ -115,16 +116,16 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_request_task_cancellation(
+CREATE OR REPLACE FUNCTION cb_cancel_task(
         name text,
         run_id bigint,
         reason text DEFAULT NULL
 )
-RETURNS TABLE(changed boolean, final_status text)
+RETURNS boolean
 LANGUAGE plpgsql AS $$
 DECLARE
-    _t_table text := cb_table_name(cb_request_task_cancellation.name, 't');
-        _status text;
+    _t_table text := cb_table_name(cb_cancel_task.name, 't');
+    _status text;
 BEGIN
         EXECUTE format(
             $QUERY$
@@ -148,21 +149,19 @@ BEGIN
             $QUERY$,
             _t_table
         )
-        USING cb_request_task_cancellation.run_id, cb_request_task_cancellation.reason
+        USING cb_cancel_task.run_id, cb_cancel_task.reason
         INTO _status;
 
         IF _status IS NULL THEN
             EXECUTE format('SELECT status FROM %I WHERE id = $1', _t_table)
-            USING cb_request_task_cancellation.run_id
+            USING cb_cancel_task.run_id
             INTO _status;
             IF _status IS NULL THEN
-                RETURN;
+                RETURN false;
             END IF;
-            RETURN QUERY SELECT false, _status;
-            RETURN;
         END IF;
 
-        RETURN QUERY SELECT true, _status;
+        RETURN true;
 END;
 $$;
 -- +goose statementend
@@ -560,13 +559,12 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- cb_fail_task_on_fail: Mark on-fail handling as failed and schedule retry
 CREATE OR REPLACE FUNCTION cb_fail_task_on_fail(
         name text,
         id bigint,
         error_message text,
         retry_exhausted boolean,
-        retry_delay_ms bigint
+        retry_delay bigint
 )
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -590,7 +588,7 @@ BEGIN
         USING cb_fail_task_on_fail.id,
                     cb_fail_task_on_fail.error_message,
                     cb_fail_task_on_fail.retry_exhausted,
-                    cb_fail_task_on_fail.retry_delay_ms;
+                    cb_fail_task_on_fail.retry_delay;
 END;
 $$;
 -- +goose statementend
@@ -715,7 +713,7 @@ $$;
 
 DROP FUNCTION IF EXISTS cb_delete_task(text);
 DROP FUNCTION IF EXISTS cb_task_cancel_requested(text, bigint);
-DROP FUNCTION IF EXISTS cb_request_task_cancellation(text, bigint, text);
+DROP FUNCTION IF EXISTS cb_cancel_task(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_fail_task_on_fail(text, bigint, text, boolean, bigint);
 DROP FUNCTION IF EXISTS cb_complete_task_on_fail(text, bigint);
 DROP FUNCTION IF EXISTS cb_poll_task_on_fail(text, int);

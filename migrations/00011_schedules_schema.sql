@@ -10,7 +10,10 @@ CREATE TABLE IF NOT EXISTS cb_task_schedules (
     enabled          BOOLEAN NOT NULL DEFAULT true,
     input            JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT cb_cron_spec_not_empty CHECK (cron_spec <> ''),
+    CONSTRAINT cb_input_is_object CHECK (jsonb_typeof(input) = 'object'),
+    CONSTRAINT cb_updated_at_gte_created_at CHECK (updated_at >= created_at)
 );
 
 CREATE INDEX IF NOT EXISTS cb_task_schedules_next_run_at_enabled_idx
@@ -27,7 +30,10 @@ CREATE TABLE IF NOT EXISTS cb_flow_schedules (
     enabled          BOOLEAN NOT NULL DEFAULT true,
     input            JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT cb_cron_spec_not_empty CHECK (cron_spec <> ''),
+    CONSTRAINT cb_input_is_object CHECK (jsonb_typeof(input) = 'object'),
+    CONSTRAINT cb_updated_at_gte_created_at CHECK (updated_at >= created_at)
 );
 
 CREATE INDEX IF NOT EXISTS cb_flow_schedules_next_run_at_enabled_idx

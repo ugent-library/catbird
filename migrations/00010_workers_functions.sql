@@ -72,17 +72,26 @@ $$;
 -- Also opportunistically runs garbage collection via cb_gc()
 -- Parameters:
 --   id: Worker UUID
--- Returns: void
+-- Returns: jsonb report with `gc_info` key
 CREATE OR REPLACE FUNCTION cb_worker_heartbeat(id uuid)
-RETURNS void
+RETURNS jsonb
 LANGUAGE plpgsql AS $$
+DECLARE
+    _updated int := 0;
 BEGIN
     UPDATE cb_workers
     SET last_heartbeat_at = now()
     WHERE cb_workers.id = cb_worker_heartbeat.id;
+    GET DIAGNOSTICS _updated = ROW_COUNT;
+
+    IF _updated = 0 THEN
+        RAISE EXCEPTION 'cb: worker not found for heartbeat: %', cb_worker_heartbeat.id;
+    END IF;
 
     -- Opportunistically run garbage collection
-    PERFORM cb_gc();
+    RETURN jsonb_build_object(
+        'gc_info', cb_gc()
+    );
 END;
 $$;
 -- +goose statementend

@@ -269,40 +269,18 @@ $$ LANGUAGE plpgsql IMMUTABLE;
 -- Supports nested paths: "user.age" or array access: "items[0]"
 -- +goose statementbegin
 CREATE OR REPLACE FUNCTION cb_get_jsonb_field(obj jsonb, field_path text)
-RETURNS jsonb AS $$
-DECLARE
-    _parts text[];
-    _part text;
-    _current jsonb := obj;
-    _i int;
-BEGIN
-    IF obj IS NULL OR field_path IS NULL OR field_path = '' THEN
-        RETURN NULL;
-    END IF;
-
-    -- Split path by dots (simple split, doesn't handle complex escaping)
-    _parts := string_to_array(field_path, '.');
-
-    FOREACH _part IN ARRAY _parts
-    LOOP
-        IF _current IS NULL THEN
-            RETURN NULL;
-        END IF;
-
-        -- Check for array index notation like "items[0]"
-        IF _part LIKE '%[%]%' THEN
-            _current := _current -> split_part(_part, '[', 1) -> split_part(split_part(_part, '[', 2), ']', 1)::int;
-        ELSE
-            -- Regular object key access
-            _current := _current -> _part;
-        END IF;
-    END LOOP;
-
-    RETURN _current;
-EXCEPTION WHEN OTHERS THEN
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
+RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE AS $$
+    SELECT
+        CASE
+            WHEN obj IS NULL OR field_path IS NULL OR field_path = '' THEN NULL
+            ELSE obj #> regexp_split_to_array(
+                regexp_replace(field_path, '\[([0-9]+)\]', '.\1', 'g'),
+                '\.'
+            )
+        END
+$$;
 -- +goose statementend
 
 -- +goose statementbegin

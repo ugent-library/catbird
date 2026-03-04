@@ -53,8 +53,8 @@ DECLARE
     _step_name text;
     _dep_name text;
     _step_type text;
-    _map_source text;
-    _reduce_source_step text;
+    _map_source_step_name text;
+    _reduce_source_step_name text;
     _has_map_source_dependency boolean;
     _has_reduce_source_dependency boolean;
     _idx int := 0;
@@ -156,65 +156,65 @@ BEGIN
             RAISE EXCEPTION 'cb: step "%" has invalid step_type "%"', _step_name, _step_type;
         END IF;
 
-        _map_source := nullif(_step->>'map_source', '');
-        _reduce_source_step := nullif(_step->>'reduce_source_step', '');
+        _map_source_step_name := nullif(_step->>'map_source_step_name', '');
+        _reduce_source_step_name := nullif(_step->>'reduce_source_step_name', '');
 
-        IF _step_type <> 'mapper' AND _map_source IS NOT NULL THEN
-            RAISE EXCEPTION 'cb: step "%" has map_source but step_type is not mapper', _step_name;
+        IF _step_type <> 'mapper' AND _map_source_step_name IS NOT NULL THEN
+          RAISE EXCEPTION 'cb: step "%" has map_source_step_name but step_type is not mapper', _step_name;
         END IF;
 
-        IF _step_type <> 'reducer' AND _reduce_source_step IS NOT NULL THEN
-            RAISE EXCEPTION 'cb: step "%" has reduce_source_step but step_type is not reducer', _step_name;
+        IF _step_type <> 'reducer' AND _reduce_source_step_name IS NOT NULL THEN
+          RAISE EXCEPTION 'cb: step "%" has reduce_source_step_name but step_type is not reducer', _step_name;
         END IF;
 
-        -- Map input mode: step_type=mapper and map_source omitted/null.
-        -- Map dependency mode: step_type=mapper and map_source set to a dependency step name.
-        IF _step_type = 'mapper' AND _map_source IS NULL THEN
+        -- Map input mode: step_type=mapper and map_source_step_name omitted/null.
+        -- Map dependency mode: step_type=mapper and map_source_step_name set to a dependency step name.
+        IF _step_type = 'mapper' AND _map_source_step_name IS NULL THEN
             -- map-input mode, valid
             NULL;
         END IF;
 
-        IF _step_type = 'mapper' AND _map_source = _step_name THEN
+        IF _step_type = 'mapper' AND _map_source_step_name = _step_name THEN
             RAISE EXCEPTION 'cb: step "%" cannot map its own output', _step_name;
         END IF;
 
-        IF _step_type = 'reducer' AND _reduce_source_step IS NULL THEN
-            RAISE EXCEPTION 'cb: reducer step "%" must specify reduce_source_step', _step_name;
+        IF _step_type = 'reducer' AND _reduce_source_step_name IS NULL THEN
+          RAISE EXCEPTION 'cb: reducer step "%" must specify reduce_source_step_name', _step_name;
         END IF;
 
-        IF _step_type = 'reducer' AND _reduce_source_step = _step_name THEN
+        IF _step_type = 'reducer' AND _reduce_source_step_name = _step_name THEN
             RAISE EXCEPTION 'cb: step "%" cannot reduce its own output', _step_name;
         END IF;
 
-        IF _map_source IS NOT NULL THEN
-            IF NOT _map_source ~ '^[a-z0-9_]+$' THEN
-                RAISE EXCEPTION 'cb: map source "%" contains invalid characters, allowed: a-z, 0-9, _', _map_source;
+        IF _map_source_step_name IS NOT NULL THEN
+          IF NOT _map_source_step_name ~ '^[a-z0-9_]+$' THEN
+            RAISE EXCEPTION 'cb: map source "%" contains invalid characters, allowed: a-z, 0-9, _', _map_source_step_name;
             END IF;
 
             SELECT EXISTS(
                 SELECT 1
                 FROM jsonb_array_elements(coalesce(_step->'depends_on', '[]'::jsonb)) d
-                WHERE d->>'name' = _map_source
+                WHERE d->>'name' = _map_source_step_name
             ) INTO _has_map_source_dependency;
 
             IF NOT _has_map_source_dependency THEN
-                RAISE EXCEPTION 'cb: step "%" maps "%" but does not depend on it', _step_name, _map_source;
+                RAISE EXCEPTION 'cb: step "%" maps "%" but does not depend on it', _step_name, _map_source_step_name;
             END IF;
         END IF;
 
-        IF _reduce_source_step IS NOT NULL THEN
-            IF NOT _reduce_source_step ~ '^[a-z0-9_]+$' THEN
-                RAISE EXCEPTION 'cb: reduce source step "%" contains invalid characters, allowed: a-z, 0-9, _', _reduce_source_step;
+            IF _reduce_source_step_name IS NOT NULL THEN
+              IF NOT _reduce_source_step_name ~ '^[a-z0-9_]+$' THEN
+                RAISE EXCEPTION 'cb: reduce source step "%" contains invalid characters, allowed: a-z, 0-9, _', _reduce_source_step_name;
             END IF;
 
             SELECT EXISTS(
                 SELECT 1
                 FROM jsonb_array_elements(coalesce(_step->'depends_on', '[]'::jsonb)) d
-                WHERE d->>'name' = _reduce_source_step
+                WHERE d->>'name' = _reduce_source_step_name
             ) INTO _has_reduce_source_dependency;
 
             IF NOT _has_reduce_source_dependency THEN
-                RAISE EXCEPTION 'cb: step "%" reduces "%" but does not depend on it', _step_name, _reduce_source_step;
+                RAISE EXCEPTION 'cb: step "%" reduces "%" but does not depend on it', _step_name, _reduce_source_step_name;
             END IF;
         END IF;
 
@@ -224,7 +224,7 @@ BEGIN
             _condition := cb_parse_condition(_step->>'condition');
         END IF;
 
-        INSERT INTO cb_steps (flow_name, name, description, idx, dependency_count, step_type, map_source, reduce_source_step, has_signal, condition)
+        INSERT INTO cb_steps (flow_name, name, description, idx, dependency_count, step_type, map_source_step_name, reduce_source_step_name, signal, condition)
         VALUES (
             cb_create_flow.name,
             _step_name,
@@ -232,9 +232,9 @@ BEGIN
             _idx,
             jsonb_array_length(coalesce(_step->'depends_on', '[]'::jsonb)),
             _step_type,
-            _map_source,
-            _reduce_source_step,
-            coalesce((_step->>'has_signal')::boolean, false),
+            _map_source_step_name,
+            _reduce_source_step_name,
+            coalesce((_step->>'signal')::boolean, false),
             _condition
         );
 
@@ -243,7 +243,7 @@ BEGIN
         LOOP
             _dep_name := _dep->>'name';
 
-            INSERT INTO cb_step_dependencies (flow_name, step_name, dependency_name, idx)
+            INSERT INTO cb_step_dependencies (flow_name, step_name, dependency_step_name, idx)
             VALUES (cb_create_flow.name, _step_name, _dep_name, _dep_idx);
             _dep_idx := _dep_idx + 1;
         END LOOP;
@@ -257,16 +257,16 @@ BEGIN
         FROM cb_steps s
         WHERE s.flow_name = cb_create_flow.name
         AND s.step_type = 'mapper'
-            AND s.map_source IS NOT NULL
+            AND s.map_source_step_name IS NOT NULL
             AND NOT EXISTS (
                 SELECT 1
                 FROM cb_step_dependencies d
                 WHERE d.flow_name = s.flow_name
                     AND d.step_name = s.name
-                    AND d.dependency_name = s.map_source
+                AND d.dependency_step_name = s.map_source_step_name
             )
     ) THEN
-        RAISE EXCEPTION 'cb: map step must depend on its map_source (flow=%)', cb_create_flow.name;
+          RAISE EXCEPTION 'cb: map step must depend on its map_source_step_name (flow=%)', cb_create_flow.name;
     END IF;
 
     -- SQL-level reducer validation
@@ -276,17 +276,17 @@ BEGIN
       WHERE s.flow_name = cb_create_flow.name
         AND s.step_type = 'reducer'
         AND (
-          s.reduce_source_step IS NULL
+          s.reduce_source_step_name IS NULL
           OR NOT EXISTS (
             SELECT 1
             FROM cb_step_dependencies d
             WHERE d.flow_name = s.flow_name
               AND d.step_name = s.name
-              AND d.dependency_name = s.reduce_source_step
+              AND d.dependency_step_name = s.reduce_source_step_name
           )
         )
     ) THEN
-      RAISE EXCEPTION 'cb: reducer step must depend on its reduce_source_step (flow=%)', cb_create_flow.name;
+      RAISE EXCEPTION 'cb: reducer step must depend on its reduce_source_step_name (flow=%)', cb_create_flow.name;
     END IF;
 
     -- Output ownership validation
@@ -298,7 +298,7 @@ BEGIN
         SELECT 1
         FROM cb_step_dependencies d
         WHERE d.flow_name = s.flow_name
-          AND d.dependency_name = s.name
+            AND d.dependency_step_name = s.name
       );
 
     IF _terminal_count = 0 THEN
@@ -314,7 +314,7 @@ BEGIN
                 SELECT 1
                 FROM cb_step_dependencies d
                 WHERE d.flow_name = s.flow_name
-                    AND d.dependency_name = s.name
+                        AND d.dependency_step_name = s.name
             );
     END IF;
 
@@ -359,7 +359,7 @@ BEGIN
             SELECT 1
             FROM cb_step_dependencies d
             WHERE d.flow_name = s.flow_name
-                AND d.dependency_name = s.name
+                AND d.dependency_step_name = s.name
         )
         AND NOT EXISTS (
             SELECT 1
@@ -407,18 +407,18 @@ BEGIN
       failed_at timestamptz,
       canceled_at timestamptz,
       cancel_reason text,
-      CONSTRAINT status_valid CHECK (status IN ('started', 'canceling', 'completed', 'failed', 'canceled')),
-      CONSTRAINT remaining_steps_valid CHECK (remaining_steps >= 0),
-      CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
-      CONSTRAINT canceled_terminal_exclusive CHECK (NOT (canceled_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL))),
-      CONSTRAINT completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
-      CONSTRAINT failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
-      CONSTRAINT canceled_at_is_after_started_at CHECK (canceled_at IS NULL OR canceled_at >= started_at),
-      CONSTRAINT completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
-      CONSTRAINT output_priority_not_empty CHECK (cardinality(output_priority) > 0),
-      CONSTRAINT failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = ''))),
-      CONSTRAINT on_fail_status_valid CHECK (on_fail_status IS NULL OR on_fail_status IN ('queued', 'started', 'completed', 'failed')),
-      CONSTRAINT headers_is_object CHECK (headers IS NULL OR jsonb_typeof(headers) = 'object')
+      CONSTRAINT cb_status_valid CHECK (status IN ('started', 'canceling', 'completed', 'failed', 'canceled')),
+      CONSTRAINT cb_remaining_steps_valid CHECK (remaining_steps >= 0),
+      CONSTRAINT cb_completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
+      CONSTRAINT cb_canceled_terminal_exclusive CHECK (NOT (canceled_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL))),
+      CONSTRAINT cb_completed_at_is_after_started_at CHECK (completed_at IS NULL OR completed_at >= started_at),
+      CONSTRAINT cb_failed_at_is_after_started_at CHECK (failed_at IS NULL OR failed_at >= started_at),
+      CONSTRAINT cb_canceled_at_is_after_started_at CHECK (canceled_at IS NULL OR canceled_at >= started_at),
+      CONSTRAINT cb_completed_and_output CHECK (NOT (status = 'completed' AND output IS NULL)),
+      CONSTRAINT cb_output_priority_not_empty CHECK (cardinality(output_priority) > 0),
+      CONSTRAINT cb_failed_and_error_message CHECK (NOT (status = 'failed' AND (error_message IS NULL OR error_message = ''))),
+      CONSTRAINT cb_on_fail_status_valid CHECK (on_fail_status IS NULL OR on_fail_status IN ('queued', 'started', 'completed', 'failed')),
+      CONSTRAINT cb_headers_is_object CHECK (headers IS NULL OR jsonb_typeof(headers) = 'object')
     )
     $QUERY$,
     _create_table_stmt,
@@ -442,10 +442,10 @@ BEGIN
       status text NOT NULL DEFAULT 'waiting_for_dependencies',
       condition jsonb,
       step_type text NOT NULL DEFAULT 'normal',
-      map_source text,
-      reduce_source_step text,
-      has_signal boolean NOT NULL DEFAULT false,
-      dependency_names text[] NOT NULL DEFAULT '{}'::text[],
+      map_source_step_name text,
+      reduce_source_step_name text,
+      signal boolean NOT NULL DEFAULT false,
+      dependency_step_names text[] NOT NULL DEFAULT '{}'::text[],
       dependent_step_names text[] NOT NULL DEFAULT '{}'::text[],
       generator_status text,
       map_tasks_spawned int NOT NULL DEFAULT 0,
@@ -465,15 +465,15 @@ BEGIN
       canceled_at timestamptz,
       UNIQUE (flow_run_id, step_name),
       FOREIGN KEY (flow_run_id) REFERENCES %I (id) ON DELETE CASCADE,
-      CONSTRAINT status_valid CHECK (status IN ('waiting_for_dependencies', 'waiting_for_signal', 'queued', 'started', 'waiting_for_map_tasks', 'completed', 'failed', 'skipped', 'canceled')),
-      CONSTRAINT step_type_valid CHECK (step_type IN ('normal', 'mapper', 'generator', 'reducer')),
-      CONSTRAINT generator_status_valid CHECK (generator_status IS NULL OR generator_status IN ('started', 'complete', 'failed')),
-      CONSTRAINT map_tasks_spawned_valid CHECK (map_tasks_spawned >= 0),
-      CONSTRAINT map_tasks_completed_valid CHECK (map_tasks_completed >= 0 AND map_tasks_completed <= map_tasks_spawned),
-      CONSTRAINT remaining_dependencies_valid CHECK (remaining_dependencies >= 0),
-      CONSTRAINT completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
-      CONSTRAINT skipped_and_completed_failed CHECK (NOT (skipped_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL))),
-      CONSTRAINT attempts_valid CHECK (attempts >= 0)
+      CONSTRAINT cb_status_valid CHECK (status IN ('waiting_for_dependencies', 'waiting_for_signal', 'queued', 'started', 'waiting_for_map_tasks', 'completed', 'failed', 'skipped', 'canceled')),
+      CONSTRAINT cb_step_type_valid CHECK (step_type IN ('normal', 'mapper', 'generator', 'reducer')),
+      CONSTRAINT cb_generator_status_valid CHECK (generator_status IS NULL OR generator_status IN ('started', 'complete', 'failed')),
+      CONSTRAINT cb_map_tasks_spawned_valid CHECK (map_tasks_spawned >= 0),
+      CONSTRAINT cb_map_tasks_completed_valid CHECK (map_tasks_completed >= 0 AND map_tasks_completed <= map_tasks_spawned),
+      CONSTRAINT cb_remaining_dependencies_valid CHECK (remaining_dependencies >= 0),
+      CONSTRAINT cb_completed_at_or_failed_at CHECK (NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)),
+      CONSTRAINT cb_skipped_and_completed_failed CHECK (NOT (skipped_at IS NOT NULL AND (completed_at IS NOT NULL OR failed_at IS NOT NULL))),
+      CONSTRAINT cb_attempts_valid CHECK (attempts >= 0)
     )
     $QUERY$,
     _create_table_stmt, _s_table, _f_table
@@ -495,7 +495,7 @@ BEGIN
       item_idx int NOT NULL,
       flow_input jsonb NOT NULL DEFAULT '{}'::jsonb,
       status text NOT NULL DEFAULT 'queued',
-      dependency_names text[] NOT NULL DEFAULT '{}'::text[],
+      dependency_step_names text[] NOT NULL DEFAULT '{}'::text[],
       signal_input jsonb,
       attempts int NOT NULL DEFAULT 0,
       item jsonb NOT NULL,
@@ -509,9 +509,9 @@ BEGIN
       canceled_at timestamptz,
       UNIQUE (flow_run_id, step_name, item_idx),
       FOREIGN KEY (flow_run_id, step_name) REFERENCES %I (flow_run_id, step_name) ON DELETE CASCADE,
-      CONSTRAINT status_valid CHECK (status IN ('queued', 'started', 'completed', 'failed', 'canceled')),
-      CONSTRAINT item_idx_valid CHECK (item_idx >= 0),
-      CONSTRAINT attempts_valid CHECK (attempts >= 0)
+      CONSTRAINT cb_status_valid CHECK (status IN ('queued', 'started', 'completed', 'failed', 'canceled')),
+      CONSTRAINT cb_item_idx_valid CHECK (item_idx >= 0),
+      CONSTRAINT cb_attempts_valid CHECK (attempts >= 0)
     )
     $QUERY$,
     _create_table_stmt, _m_table, _s_table
@@ -639,10 +639,10 @@ BEGIN
       remaining_dependencies,
       condition,
       step_type,
-      map_source,
-      reduce_source_step,
-      has_signal,
-      dependency_names,
+      map_source_step_name,
+      reduce_source_step_name,
+      signal,
+      dependency_step_names,
       dependent_step_names
     )
     SELECT
@@ -650,17 +650,17 @@ BEGIN
       s.name,
       %L,
       CASE
-        WHEN s.dependency_count = 0 AND s.has_signal THEN 'waiting_for_signal'
+        WHEN s.dependency_count = 0 AND s.signal THEN 'waiting_for_signal'
         ELSE 'waiting_for_dependencies'
       END,
       s.dependency_count,
       s.condition,
       s.step_type,
-      s.map_source,
-      s.reduce_source_step,
-      s.has_signal,
+      s.map_source_step_name,
+      s.reduce_source_step_name,
+      s.signal,
       coalesce(array(
-        SELECT d.dependency_name
+        SELECT d.dependency_step_name
         FROM cb_step_dependencies d
         WHERE d.flow_name = %L
           AND d.step_name = s.name
@@ -670,7 +670,7 @@ BEGIN
         SELECT d.step_name
         FROM cb_step_dependencies d
         WHERE d.flow_name = %L
-          AND d.dependency_name = s.name
+          AND d.dependency_step_name = s.name
         ORDER BY d.idx
       ), '{}'::text[])
     FROM cb_steps s
@@ -694,20 +694,20 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- cb_early_exit_flow: complete a flow run early and cancel remaining work
-CREATE OR REPLACE FUNCTION cb_early_exit_flow(
+-- cb_complete_flow_early: complete a flow run early and cancel remaining work
+CREATE OR REPLACE FUNCTION cb_complete_flow_early(
     flow_name text,
     flow_run_id bigint,
     step_name text,
     output jsonb,
     reason text DEFAULT NULL
 )
-RETURNS TABLE(changed boolean, status text)
+RETURNS boolean
 LANGUAGE plpgsql AS $$
 DECLARE
-    _f_table text := cb_table_name(cb_early_exit_flow.flow_name, 'f');
-    _s_table text := cb_table_name(cb_early_exit_flow.flow_name, 's');
-    _m_table text := cb_table_name(cb_early_exit_flow.flow_name, 'm');
+  _f_table text := cb_table_name(cb_complete_flow_early.flow_name, 'f');
+  _s_table text := cb_table_name(cb_complete_flow_early.flow_name, 's');
+  _m_table text := cb_table_name(cb_complete_flow_early.flow_name, 'm');
     _status text;
 BEGIN
     EXECUTE format(
@@ -722,20 +722,19 @@ BEGIN
       $QUERY$,
       _f_table
     )
-    USING cb_early_exit_flow.flow_run_id, cb_early_exit_flow.output
+    USING cb_complete_flow_early.flow_run_id, cb_complete_flow_early.output
     INTO _status;
 
     IF _status IS NULL THEN
       EXECUTE format('SELECT status FROM %I WHERE id = $1', _f_table)
-      USING cb_early_exit_flow.flow_run_id
+      USING cb_complete_flow_early.flow_run_id
       INTO _status;
 
       IF _status IS NULL THEN
-        RETURN;
+        RETURN false;
       END IF;
 
-      RETURN QUERY SELECT false, _status;
-      RETURN;
+      RETURN true;
     END IF;
 
     EXECUTE format(
@@ -748,7 +747,7 @@ BEGIN
       $QUERY$,
       _s_table
     )
-    USING cb_early_exit_flow.flow_run_id;
+    USING cb_complete_flow_early.flow_run_id;
 
     EXECUTE format(
       $QUERY$
@@ -760,9 +759,9 @@ BEGIN
       $QUERY$,
       _m_table
     )
-    USING cb_early_exit_flow.flow_run_id;
+    USING cb_complete_flow_early.flow_run_id;
 
-    RETURN QUERY SELECT true, 'completed';
+    RETURN true;
 END;
 $$;
 -- +goose statementend
@@ -817,17 +816,17 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_request_flow_cancellation(
+CREATE OR REPLACE FUNCTION cb_cancel_flow(
     name text,
     run_id bigint,
     reason text DEFAULT NULL
 )
-RETURNS TABLE(changed boolean, final_status text)
+RETURNS boolean
 LANGUAGE plpgsql AS $$
 DECLARE
-    _f_table text := cb_table_name(cb_request_flow_cancellation.name, 'f');
-    _s_table text := cb_table_name(cb_request_flow_cancellation.name, 's');
-    _m_table text := cb_table_name(cb_request_flow_cancellation.name, 'm');
+  _f_table text := cb_table_name(cb_cancel_flow.name, 'f');
+  _s_table text := cb_table_name(cb_cancel_flow.name, 's');
+  _m_table text := cb_table_name(cb_cancel_flow.name, 'm');
     _status text;
 BEGIN
     EXECUTE format(
@@ -847,18 +846,17 @@ BEGIN
       $QUERY$,
       _f_table
     )
-    USING cb_request_flow_cancellation.run_id, cb_request_flow_cancellation.reason
+    USING cb_cancel_flow.run_id, cb_cancel_flow.reason
     INTO _status;
 
     IF _status IS NULL THEN
       EXECUTE format('SELECT status FROM %I WHERE id = $1', _f_table)
-      USING cb_request_flow_cancellation.run_id
+      USING cb_cancel_flow.run_id
       INTO _status;
       IF _status IS NULL THEN
-        RETURN;
+        RETURN false;
       END IF;
-      RETURN QUERY SELECT false, _status;
-      RETURN;
+      RETURN true;
     END IF;
 
     -- Cancel non-started step runs
@@ -872,7 +870,7 @@ BEGIN
       $QUERY$,
       _s_table
     )
-    USING cb_request_flow_cancellation.run_id;
+    USING cb_cancel_flow.run_id;
 
     -- Cancel non-started map tasks
     EXECUTE format(
@@ -885,15 +883,15 @@ BEGIN
       $QUERY$,
       _m_table
     )
-    USING cb_request_flow_cancellation.run_id;
+    USING cb_cancel_flow.run_id;
 
-    PERFORM cb_maybe_finalize_flow_cancellation(cb_request_flow_cancellation.name, cb_request_flow_cancellation.run_id);
+    PERFORM cb_maybe_finalize_flow_cancellation(cb_cancel_flow.name, cb_cancel_flow.run_id);
 
     EXECUTE format('SELECT status FROM %I WHERE id = $1', _f_table)
-    USING cb_request_flow_cancellation.run_id
+    USING cb_cancel_flow.run_id
     INTO _status;
 
-    RETURN QUERY SELECT true, coalesce(_status, 'canceling');
+    RETURN true;
 END;
 $$;
 -- +goose statementend
@@ -1046,7 +1044,7 @@ BEGIN
       WHERE flow_run_id = $1
         AND status = 'waiting_for_dependencies'
         AND remaining_dependencies = 0
-        AND has_signal = true
+        AND signal = true
         AND signal_input IS NULL
       $QUERY$,
       _s_table
@@ -1059,10 +1057,10 @@ BEGIN
     EXECUTE format(
       $QUERY$
                   SELECT sr.id, sr.step_name, sr.remaining_dependencies,
-              sr.dependency_names,
+              sr.dependency_step_names,
                     sr.dependent_step_names,
              CASE
-               WHEN cardinality(sr.dependency_names) = 0 THEN NULL
+               WHEN cardinality(sr.dependency_step_names) = 0 THEN NULL
                WHEN sr.step_type = 'reducer' AND sr.condition IS NULL THEN NULL
                ELSE (
                  SELECT jsonb_object_agg(deps.step_name, CASE
@@ -1077,18 +1075,18 @@ BEGIN
                  END)
                  FROM %I deps
                  WHERE deps.flow_run_id = $1
-                   AND deps.step_name = any(sr.dependency_names)
+                   AND deps.step_name = any(sr.dependency_step_names)
                    AND deps.status = 'completed'
                )
              END AS step_outputs,
              sr.signal_input,
              sr.condition,
                   sr.step_type,
-             sr.map_source
+             sr.map_source_step_name
       FROM %I sr
       WHERE sr.flow_run_id = $1
         AND (
-          (sr.status = 'waiting_for_dependencies' AND sr.remaining_dependencies = 0 AND (NOT sr.has_signal OR sr.signal_input IS NOT NULL))
+          (sr.status = 'waiting_for_dependencies' AND sr.remaining_dependencies = 0 AND (NOT sr.signal OR sr.signal_input IS NOT NULL))
           OR
           (sr.status = 'waiting_for_signal' AND sr.remaining_dependencies = 0 AND sr.signal_input IS NOT NULL)
         )
@@ -1103,7 +1101,7 @@ BEGIN
 
     IF _step_condition IS NOT NULL THEN
       -- Build step_inputs: combine flow input, dependency outputs, and signal input
-      -- Flow input accessible as input.*, dependency outputs as dependency_name.*, signal input as signal.*
+      -- Flow input accessible as input.*, dependency outputs as dependency step names, signal input as signal.*
       _step_inputs := jsonb_build_object('input', _flow_input);
 
       IF _step_to_process.step_outputs IS NOT NULL THEN
@@ -1139,7 +1137,7 @@ BEGIN
               status = CASE
                 WHEN remaining_dependencies - 1 = 0 THEN
                   CASE
-                    WHEN has_signal = true AND signal_input IS NULL THEN 'waiting_for_signal'
+                    WHEN signal = true AND signal_input IS NULL THEN 'waiting_for_signal'
                     ELSE 'waiting_for_dependencies'
                   END
                 ELSE status
@@ -1252,10 +1250,10 @@ BEGIN
 
     -- Map-step activation: spawn item-level map tasks coordinated in SQL
     IF _step_to_process.step_type = 'mapper' THEN
-      IF _step_to_process.map_source IS NULL THEN
+      IF _step_to_process.map_source_step_name IS NULL THEN
         _map_items := _flow_input;
       ELSE
-        _map_items := _step_to_process.step_outputs -> _step_to_process.map_source;
+        _map_items := _step_to_process.step_outputs -> _step_to_process.map_source_step_name;
       END IF;
 
       IF _map_items IS NULL OR jsonb_typeof(_map_items) <> 'array' THEN
@@ -1287,7 +1285,7 @@ BEGIN
       -- Spawn map tasks in deterministic order
       EXECUTE format(
         $QUERY$
-        INSERT INTO %I (flow_run_id, step_name, item_idx, flow_input, status, dependency_names, signal_input, item, visible_at)
+        INSERT INTO %I (flow_run_id, step_name, item_idx, flow_input, status, dependency_step_names, signal_input, item, visible_at)
         SELECT $1,
                $2,
                ordinality - 1,
@@ -1306,7 +1304,7 @@ BEGIN
             _step_to_process.step_name,
             cb_start_steps.initial_visible_at,
             _flow_input,
-            _step_to_process.dependency_names,
+            _step_to_process.dependency_step_names,
             _step_to_process.signal_input,
             _map_items;
 
@@ -1422,7 +1420,7 @@ BEGIN
                   m.attempts,
                   m.flow_input AS input,
                   CASE
-                    WHEN cardinality(m.dependency_names) = 0 THEN NULL
+                    WHEN cardinality(m.dependency_step_names) = 0 THEN NULL
                     WHEN m.step_type = 'reducer' THEN NULL
                     ELSE (
                       SELECT jsonb_object_agg(deps.step_name, CASE
@@ -1437,7 +1435,7 @@ BEGIN
                       END)
                       FROM %I deps
                       WHERE deps.flow_run_id = m.flow_run_id
-                        AND deps.step_name = any(m.dependency_names)
+                        AND deps.step_name = any(m.dependency_step_names)
                         AND deps.status = 'completed'
                     )
                   END AS step_outputs,
@@ -1571,7 +1569,7 @@ BEGIN
                 m.attempts,
                 m.flow_input AS input,
                 CASE
-                  WHEN cardinality(m.dependency_names) = 0 THEN NULL
+                  WHEN cardinality(m.dependency_step_names) = 0 THEN NULL
                   ELSE (
                     SELECT jsonb_object_agg(deps.step_name, CASE
                       WHEN deps.step_type IN ('mapper', 'generator') THEN (
@@ -1585,7 +1583,7 @@ BEGIN
                     END)
                     FROM %I deps
                     WHERE deps.flow_run_id = m.flow_run_id
-                      AND deps.step_name = any(m.dependency_names)
+                      AND deps.step_name = any(m.dependency_step_names)
                       AND deps.status = 'completed'
                   )
                 END AS step_outputs,
@@ -1661,7 +1659,7 @@ DECLARE
     _flow_run_id bigint;
     _spawn_offset int;
     _flow_input jsonb;
-    _dependency_names text[];
+    _dependency_step_names text[];
     _signal_input jsonb;
     _spawned int := 0;
 BEGIN
@@ -1675,7 +1673,7 @@ BEGIN
 
     EXECUTE format(
       $QUERY$
-      SELECT flow_run_id, map_tasks_spawned, flow_input, dependency_names, signal_input
+      SELECT flow_run_id, map_tasks_spawned, flow_input, dependency_step_names, signal_input
       FROM %I
       WHERE id = $1
         AND step_name = $2
@@ -1686,7 +1684,7 @@ BEGIN
       _s_table
     )
     USING cb_spawn_generator_map_tasks.step_id, cb_spawn_generator_map_tasks.step_name
-    INTO _flow_run_id, _spawn_offset, _flow_input, _dependency_names, _signal_input;
+    INTO _flow_run_id, _spawn_offset, _flow_input, _dependency_step_names, _signal_input;
 
     IF _flow_run_id IS NULL THEN
         RETURN 0;
@@ -1695,7 +1693,7 @@ BEGIN
     EXECUTE format(
       $QUERY$
       WITH ins AS (
-        INSERT INTO %I (flow_run_id, step_name, item_idx, flow_input, status, dependency_names, signal_input, item, visible_at)
+        INSERT INTO %I (flow_run_id, step_name, item_idx, flow_input, status, dependency_step_names, signal_input, item, visible_at)
         SELECT $1,
                $2,
                $3 + ordinality - 1,
@@ -1718,7 +1716,7 @@ BEGIN
           cb_spawn_generator_map_tasks.step_name,
           _spawn_offset,
           _flow_input,
-          _dependency_names,
+          _dependency_step_names,
           _signal_input,
           cb_spawn_generator_map_tasks.visible_at,
           cb_spawn_generator_map_tasks.items
@@ -2037,7 +2035,7 @@ BEGIN
         status = CASE
           WHEN remaining_dependencies - 1 = 0 THEN
             CASE
-              WHEN has_signal = true AND signal_input IS NULL THEN 'waiting_for_signal'
+              WHEN signal = true AND signal_input IS NULL THEN 'waiting_for_signal'
               ELSE 'waiting_for_dependencies'
             END
           ELSE status
@@ -2359,7 +2357,7 @@ CREATE OR REPLACE FUNCTION cb_fail_flow_on_fail(
     id bigint,
     error_message text,
     retry_exhausted boolean,
-    retry_delay_ms bigint
+  retry_delay bigint
 )
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -2383,7 +2381,7 @@ BEGIN
     USING cb_fail_flow_on_fail.id,
           cb_fail_flow_on_fail.error_message,
           cb_fail_flow_on_fail.retry_exhausted,
-          cb_fail_flow_on_fail.retry_delay_ms;
+          cb_fail_flow_on_fail.retry_delay;
 END;
 $$;
 -- +goose statementend
@@ -2414,7 +2412,7 @@ BEGIN
       AND sr.step_name = $2
       AND sr.status IN ('waiting_for_dependencies', 'waiting_for_signal')
       AND sr.signal_input IS NULL
-      AND sr.has_signal = true
+      AND sr.signal = true
     RETURNING true
     $QUERY$,
     _s_table
@@ -2712,12 +2710,12 @@ DROP FUNCTION IF EXISTS cb_cancel_step_run(text, bigint);
 DROP FUNCTION IF EXISTS cb_flow_cancel_requested(text, bigint);
 DROP FUNCTION IF EXISTS cb_finalize_flow_cancellation(text, bigint);
 DROP FUNCTION IF EXISTS cb_maybe_finalize_flow_cancellation(text, bigint);
-DROP FUNCTION IF EXISTS cb_request_flow_cancellation(text, bigint, text);
+DROP FUNCTION IF EXISTS cb_cancel_flow(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_fail_flow_on_fail(text, bigint, text, boolean, bigint);
 DROP FUNCTION IF EXISTS cb_complete_flow_on_fail(text, bigint);
 DROP FUNCTION IF EXISTS cb_get_flow_step_output(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_poll_flow_on_fail(text, int);
-DROP FUNCTION IF EXISTS cb_early_exit_flow(text, bigint, text, jsonb, text);
+DROP FUNCTION IF EXISTS cb_complete_flow_early(text, bigint, text, jsonb, text);
 DROP FUNCTION IF EXISTS cb_wait_flow_step_output(text, bigint, text, int, int);
 DROP FUNCTION IF EXISTS cb_get_flow_step_status(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_wait_flow_output(text, bigint, int, int);

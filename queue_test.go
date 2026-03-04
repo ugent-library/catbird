@@ -488,7 +488,7 @@ func TestQueuePublish(t *testing.T) {
 	}
 
 	event := Event{EventType: "test_event", Data: "test_data"}
-	err = client.Publish(t.Context(), "event_topic", event)
+	_, err = client.Publish(t.Context(), "event_topic", event)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -523,7 +523,7 @@ func TestQueuePublishMany(t *testing.T) {
 		Data      string `json:"data"`
 	}
 
-	err = client.PublishMany(
+	_, err = client.PublishMany(
 		t.Context(),
 		"event_topic_many",
 		[]any{
@@ -579,7 +579,7 @@ func TestQueuePublishManyIdempotencyLengthMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = client.PublishMany(
+	_, err = client.PublishMany(
 		t.Context(),
 		"event_topic_mismatch",
 		[]any{"a", "b"},

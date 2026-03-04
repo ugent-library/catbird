@@ -321,22 +321,16 @@ func (h *TaskHandle) WaitForOutput(ctx context.Context, out any, opts ...WaitOpt
 	}
 }
 
-// CancelTaskRun requests cancellation for a task run.
-// Returns nil for idempotent no-op when the run is already terminal.
-func CancelTaskRun(ctx context.Context, conn Conn, taskName string, runID int64, opts ...CancelOpts) error {
-	q := `SELECT changed, final_status FROM cb_request_task_cancellation(name => $1, run_id => $2, reason => $3);`
-	var changed bool
-	var finalStatus string
-	err := conn.QueryRow(ctx, q, taskName, runID, resolveCancelReason(opts...)).Scan(&changed, &finalStatus)
+// CancelTaskRun cancels a task run.
+// Returns true when the run exists (including idempotent no-op), false when it does not exist.
+func CancelTaskRun(ctx context.Context, conn Conn, taskName string, runID int64, opts ...CancelOpts) (bool, error) {
+	q := `SELECT cb_cancel_task(name => $1, run_id => $2, reason => $3);`
+	var applied bool
+	err := conn.QueryRow(ctx, q, taskName, runID, resolveCancelReason(opts...)).Scan(&applied)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		}
-		return err
+		return false, err
 	}
-	_ = changed
-	_ = finalStatus
-	return nil
+	return applied, nil
 }
 
 func resolveCancelReason(opts ...CancelOpts) *string {

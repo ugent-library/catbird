@@ -18,9 +18,6 @@
 
 -- +goose up
 
-DROP FUNCTION IF EXISTS cb_send(text, jsonb[], text, text[], jsonb, timestamptz);
-DROP FUNCTION IF EXISTS cb_publish(text, jsonb[], text[], jsonb, timestamptz);
-
 -- +goose statementbegin
 -- cb_create_queue: Create a queue definition
 -- Creates the queue metadata and associated message table for enqueued messages
@@ -52,7 +49,7 @@ BEGIN
             deliveries int NOT NULL DEFAULT 0,
             created_at timestamptz NOT NULL DEFAULT now(),
             visible_at timestamptz NOT NULL DEFAULT now(),
-            CONSTRAINT headers_is_object CHECK (headers IS NULL OR jsonb_typeof(headers) = 'object')
+            CONSTRAINT cb_headers_is_object CHECK (headers IS NULL OR jsonb_typeof(headers) = 'object')
         )
         $QUERY$,
         _q_table
@@ -109,7 +106,7 @@ $$;
 --   payload: JSON message payload
 --   idempotency_key: Optional unique ID for idempotency (prevents duplicate messages)
 --   visible_at: Optional timestamp when message should become visible (default: now)
--- Returns: void
+-- Returns: int - number of queues that matched the topic
 CREATE OR REPLACE FUNCTION cb_publish(
     topic text,
     payload jsonb,
@@ -117,12 +114,13 @@ CREATE OR REPLACE FUNCTION cb_publish(
     headers jsonb = null,
     visible_at timestamptz = null
 )
-RETURNS void
+RETURNS int
 LANGUAGE plpgsql AS $$
 DECLARE
     _visible_at timestamptz = coalesce(cb_publish.visible_at, now());
     _rec record;
     _q_table text;
+    _matched_queues int := 0;
 BEGIN
     IF cb_publish.headers IS NOT NULL AND jsonb_typeof(cb_publish.headers) <> 'object' THEN
         RAISE EXCEPTION 'cb: headers must be a JSON object';
@@ -146,22 +144,26 @@ BEGIN
         BEGIN
             EXECUTE format(
                 $QUERY$
-                                INSERT INTO %I (topic, payload, idempotency_key, headers, visible_at)
-                                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (idempotency_key) DO NOTHING;
+                    INSERT INTO %I (topic, payload, idempotency_key, headers, visible_at)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (idempotency_key) DO NOTHING;
                 $QUERY$,
                 _q_table
             )
             USING cb_publish.topic,
                 cb_publish.payload,
                 cb_publish.idempotency_key,
-                                cb_publish.headers,
-                  _visible_at;
+                cb_publish.headers,
+                _visible_at;
+
+            _matched_queues := _matched_queues + 1;
         EXCEPTION WHEN undefined_table THEN
             -- Queue was deleted between SELECT and INSERT, skip it
             CONTINUE;
         END;
     END LOOP;
+
+    RETURN _matched_queues;
 END
 $$;
 -- +goose statementend
@@ -289,18 +291,19 @@ $$;
 -- Parameters:
 --   queue_name: Name of the queue
 --   pattern: Topic pattern to remove
--- Returns: void
+-- Returns: boolean - true if binding deleted, false if already absent
 CREATE OR REPLACE FUNCTION cb_unbind(queue_name text, pattern text)
-RETURNS void
+RETURNS boolean
 LANGUAGE plpgsql AS $$
+DECLARE
+        _deleted boolean := false;
 BEGIN
     DELETE FROM cb_bindings
     WHERE cb_bindings.queue_name = cb_unbind.queue_name
-      AND cb_bindings.pattern = cb_unbind.pattern;
+            AND cb_bindings.pattern = cb_unbind.pattern
+        RETURNING true INTO _deleted;
 
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'cb: binding not found for queue "%" and pattern "%"', cb_unbind.queue_name, cb_unbind.pattern;
-    END IF;
+        RETURN coalesce(_deleted, false);
 END;
 $$;
 -- +goose statementend
@@ -560,16 +563,17 @@ $$;
 --   queue: Queue name
 --   ids: Array of message IDs to hide
 --   hide_for: Duration in milliseconds to hide the messages (must be > 0)
--- Returns: void
+-- Returns: bigint[] - IDs actually hidden
 CREATE OR REPLACE FUNCTION cb_hide(
     queue text,
     ids bigint[],
     hide_for int
 )
-RETURNS void
+RETURNS bigint[]
 LANGUAGE plpgsql AS $$
 DECLARE
     _q_table text := cb_table_name(cb_hide.queue, 'q');
+    _ids bigint[];
 BEGIN
     IF cb_hide.hide_for <= 0 THEN
         RAISE EXCEPTION 'cb: hide_for must be greater than 0';
@@ -577,13 +581,21 @@ BEGIN
 
     EXECUTE format(
         $QUERY$
-        UPDATE %I
-        SET visible_at = (clock_timestamp() + $2)
-        WHERE id = any($1);
+        WITH updated AS (
+            UPDATE %I
+            SET visible_at = (clock_timestamp() + $2)
+            WHERE id = any($1)
+            RETURNING id
+        )
+        SELECT coalesce(array_agg(id ORDER BY id), '{}'::bigint[])
+        FROM updated;
         $QUERY$,
         _q_table
     )
-    USING cb_hide.ids, make_interval(secs => cb_hide.hide_for / 1000.0);
+    USING cb_hide.ids, make_interval(secs => cb_hide.hide_for / 1000.0)
+    INTO _ids;
+
+    RETURN _ids;
 END;
 $$;
 -- +goose statementend
@@ -618,19 +630,29 @@ $$ LANGUAGE plpgsql;
 -- Parameters:
 --   queue: Queue name
 --   ids: Array of message IDs to delete
--- Returns: void
+-- Returns: bigint[] - IDs actually deleted
 CREATE OR REPLACE FUNCTION cb_delete(queue text, ids bigint[])
-RETURNS void AS $$
+RETURNS bigint[] AS $$
 DECLARE
     _q_table text := cb_table_name(cb_delete.queue, 'q');
+    _ids bigint[];
 BEGIN
     EXECUTE format(
         $QUERY$
-        DELETE FROM %I WHERE id = any($1);
+        WITH deleted AS (
+            DELETE FROM %I
+            WHERE id = any($1)
+            RETURNING id
+        )
+        SELECT coalesce(array_agg(id ORDER BY id), '{}'::bigint[])
+        FROM deleted;
         $QUERY$,
         _q_table
     )
-    USING cb_delete.ids;
+    USING cb_delete.ids
+    INTO _ids;
+
+    RETURN _ids;
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -727,7 +749,7 @@ $$;
 --   payloads: JSONB array of message payloads
 --   idempotency_keys: Optional array of idempotency keys (must match payload count when provided)
 --   visible_at: Optional timestamp when messages should become visible (default: now)
--- Returns: void
+-- Returns: int - number of queues that matched the topic
 CREATE OR REPLACE FUNCTION cb_publish(
     topic text,
     payloads jsonb[],
@@ -735,12 +757,13 @@ CREATE OR REPLACE FUNCTION cb_publish(
     headers jsonb[] = null,
     visible_at timestamptz = null
 )
-RETURNS void
+RETURNS int
 LANGUAGE plpgsql AS $$
 DECLARE
     _visible_at timestamptz = coalesce(cb_publish.visible_at, now());
     _rec record;
     _q_table text;
+    _matched_queues int := 0;
 BEGIN
     IF cb_publish.idempotency_keys IS NOT NULL AND cardinality(cb_publish.idempotency_keys) <> cardinality(cb_publish.payloads) THEN
         RAISE EXCEPTION 'cb: idempotency_keys length must match payloads length';
@@ -798,10 +821,14 @@ BEGIN
                   cb_publish.payloads,
                   cb_publish.idempotency_keys,
                   cb_publish.headers;
+
+            _matched_queues := _matched_queues + 1;
         EXCEPTION WHEN undefined_table THEN
             CONTINUE;
         END;
     END LOOP;
+
+    RETURN _matched_queues;
 END
 $$;
 -- +goose statementend
@@ -827,8 +854,6 @@ DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_publish(text, jsonb[], text[], jsonb[], timestamptz);
 DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_send(text, jsonb[], text, text[], jsonb[], timestamptz);
-DROP FUNCTION IF EXISTS cb_send(text, jsonb[], text, text[], jsonb, timestamptz);
-DROP FUNCTION IF EXISTS cb_publish(text, jsonb[], text[], jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, text, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_read(text, int, int);
 DROP FUNCTION IF EXISTS cb_read_poll(text, int, int, int, int);

@@ -323,6 +323,11 @@ docker compose logs -f postgres
 - [tui/view.go](../tui/view.go): TUI rendering for overview, list, and detail views
 - [migrations/](../migrations/): Database schema (versioned)
 
+## Documentation Sync Requirement
+
+- Keep [docs/sql-api-reference.md](../docs/sql-api-reference.md) up to date whenever any SQL function signature, return type, or behavior contract changes in `migrations/*.sql`.
+- For SQL function changes, update docs in the same PR (do not defer).
+
 ## Common Patterns to Replicate
 
 1. **Errors**: Use `ErrTaskFailed`, `ErrFlowFailed` package-level errors

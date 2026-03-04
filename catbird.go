@@ -4,11 +4,25 @@ package catbird
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+)
+
+const (
+	StatusWaitingForDependencies = "waiting_for_dependencies"
+	StatusWaitingForSignal       = "waiting_for_signal"
+	StatusWaitingForMapTasks     = "waiting_for_map_tasks"
+	StatusQueued                 = "queued"
+	StatusStarted                = "started"
+	StatusCanceling              = "canceling"
+	StatusCompleted              = "completed"
+	StatusFailed                 = "failed"
+	StatusSkipped                = "skipped"
+	StatusCanceled               = "canceled"
 )
 
 var (
@@ -37,27 +51,52 @@ type Conn interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
+// GCInfo is the garbage collection report returned by cb_gc().
+type GCInfo struct {
+	ExpiredQueuesDeleted int `json:"expired_queues_deleted"`
+	StaleWorkersDeleted  int `json:"stale_workers_deleted"`
+	TaskRunsPurged       int `json:"task_runs_purged"`
+	FlowRunsPurged       int `json:"flow_runs_purged"`
+}
+
 // GC runs garbage collection to clean up expired queues and stale workers.
 // Note: Worker heartbeats automatically perform cleanup, so this is mainly
 // useful for deployments without workers or for manual control.
-func GC(ctx context.Context, conn Conn) error {
-	q := `SELECT cb_gc();`
-	_, err := conn.Exec(ctx, q)
-	return err
+func GC(ctx context.Context, conn Conn) (*GCInfo, error) {
+	var raw []byte
+	err := conn.QueryRow(ctx, `SELECT cb_gc();`).Scan(&raw)
+	if err != nil {
+		return nil, err
+	}
+
+	var info GCInfo
+	if err := json.Unmarshal(raw, &info); err != nil {
+		return nil, err
+	}
+
+	return &info, nil
 }
 
 // PurgeTaskRuns deletes terminal task runs (completed, failed, skipped, canceled)
 // older than the given duration. Useful for manual cleanup or targeted removal
 // independent of the configured retention period.
-func PurgeTaskRuns(ctx context.Context, conn Conn, taskName string, olderThan time.Duration) error {
-	_, err := conn.Exec(ctx, `SELECT cb_purge_task_runs($1, $2);`, taskName, olderThan)
-	return err
+func PurgeTaskRuns(ctx context.Context, conn Conn, taskName string, olderThan time.Duration) (int, error) {
+	var deletedCount int
+	err := conn.QueryRow(ctx, `SELECT cb_purge_task_runs($1, $2);`, taskName, olderThan).Scan(&deletedCount)
+	if err != nil {
+		return 0, err
+	}
+	return deletedCount, nil
 }
 
 // PurgeFlowRuns deletes terminal flow runs (completed, failed, canceled) older than
 // the given duration. Step runs and map tasks are deleted via cascade.
 // Useful for manual cleanup or targeted removal independent of the configured retention period.
-func PurgeFlowRuns(ctx context.Context, conn Conn, flowName string, olderThan time.Duration) error {
-	_, err := conn.Exec(ctx, `SELECT cb_purge_flow_runs($1, $2);`, flowName, olderThan)
-	return err
+func PurgeFlowRuns(ctx context.Context, conn Conn, flowName string, olderThan time.Duration) (int, error) {
+	var deletedCount int
+	err := conn.QueryRow(ctx, `SELECT cb_purge_flow_runs($1, $2);`, flowName, olderThan).Scan(&deletedCount)
+	if err != nil {
+		return 0, err
+	}
+	return deletedCount, nil
 }

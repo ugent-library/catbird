@@ -86,7 +86,7 @@ func TestPurgeTaskRuns(t *testing.T) {
 	}
 
 	// Purge with duration=0: deletes all terminal runs finished before now().
-	if err := client.PurgeTaskRuns(t.Context(), "retention_purge_task", 0); err != nil {
+	if _, err := client.PurgeTaskRuns(t.Context(), "retention_purge_task", 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -179,7 +179,7 @@ func TestPurgeFlowRuns(t *testing.T) {
 	}
 
 	// Purge with duration=0: deletes all terminal runs finished before now().
-	if err := client.PurgeFlowRuns(t.Context(), flowName, 0); err != nil {
+	if _, err := client.PurgeFlowRuns(t.Context(), flowName, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -236,7 +236,7 @@ func TestGCPurgesRetentionRuns(t *testing.T) {
 	// Small sleep to ensure finished_at is strictly before now().
 	time.Sleep(10 * time.Millisecond)
 
-	if err := GC(t.Context(), client.Conn); err != nil {
+	if _, err := GC(t.Context(), client.Conn); err != nil {
 		t.Fatal(err)
 	}
 

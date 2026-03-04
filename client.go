@@ -56,17 +56,17 @@ func (c *Client) Bind(ctx context.Context, queueName string, pattern string) err
 }
 
 // Unbind unsubscribes a queue from a topic pattern.
-func (c *Client) Unbind(ctx context.Context, queueName string, pattern string) error {
+func (c *Client) Unbind(ctx context.Context, queueName string, pattern string) (bool, error) {
 	return Unbind(ctx, c.Conn, queueName, pattern)
 }
 
 // Publish sends a message to all queues subscribed to the specified topic.
-func (c *Client) Publish(ctx context.Context, topic string, payload any, opts ...PublishOpts) error {
+func (c *Client) Publish(ctx context.Context, topic string, payload any, opts ...PublishOpts) (int, error) {
 	return Publish(ctx, c.Conn, topic, payload, opts...)
 }
 
 // PublishMany sends multiple messages to all queues subscribed to the specified topic.
-func (c *Client) PublishMany(ctx context.Context, topic string, payloads []any, opts ...PublishManyOpts) error {
+func (c *Client) PublishMany(ctx context.Context, topic string, payloads []any, opts ...PublishManyOpts) (int, error) {
 	return PublishMany(ctx, c.Conn, topic, payloads, opts...)
 }
 
@@ -90,7 +90,7 @@ func (c *Client) Hide(ctx context.Context, queueName string, id int64, hideFor t
 }
 
 // HideMany hides multiple messages from being read for the specified duration.
-func (c *Client) HideMany(ctx context.Context, queueName string, ids []int64, hideFor time.Duration) error {
+func (c *Client) HideMany(ctx context.Context, queueName string, ids []int64, hideFor time.Duration) ([]int64, error) {
 	return HideMany(ctx, c.Conn, queueName, ids, hideFor)
 }
 
@@ -101,7 +101,7 @@ func (c *Client) Delete(ctx context.Context, queueName string, id int64) (bool, 
 }
 
 // DeleteMany deletes multiple messages from the queue.
-func (c *Client) DeleteMany(ctx context.Context, queueName string, ids []int64) error {
+func (c *Client) DeleteMany(ctx context.Context, queueName string, ids []int64) ([]int64, error) {
 	return DeleteMany(ctx, c.Conn, queueName, ids)
 }
 
@@ -126,8 +126,8 @@ func (c *Client) RunTask(ctx context.Context, taskName string, input any, opts .
 	return RunTask(ctx, c.Conn, taskName, input, opts...)
 }
 
-// CancelTaskRun requests cancellation for a task run.
-func (c *Client) CancelTaskRun(ctx context.Context, taskName string, runID int64, opts ...CancelOpts) error {
+// CancelTaskRun cancels a task run.
+func (c *Client) CancelTaskRun(ctx context.Context, taskName string, runID int64, opts ...CancelOpts) (bool, error) {
 	return CancelTaskRun(ctx, c.Conn, taskName, runID, opts...)
 }
 
@@ -161,8 +161,8 @@ func (c *Client) RunFlow(ctx context.Context, flowName string, input any, opts .
 	return RunFlow(ctx, c.Conn, flowName, input, opts...)
 }
 
-// CancelFlowRun requests cancellation for a flow run.
-func (c *Client) CancelFlowRun(ctx context.Context, flowName string, runID int64, opts ...CancelOpts) error {
+// CancelFlowRun cancels a flow run.
+func (c *Client) CancelFlowRun(ctx context.Context, flowName string, runID int64, opts ...CancelOpts) (bool, error) {
 	return CancelFlowRun(ctx, c.Conn, flowName, runID, opts...)
 }
 
@@ -190,14 +190,19 @@ func (c *Client) SignalFlow(ctx context.Context, flowName string, flowRunID int6
 
 // PurgeTaskRuns deletes terminal task runs older than the given duration.
 // See PurgeTaskRuns for details.
-func (c *Client) PurgeTaskRuns(ctx context.Context, taskName string, olderThan time.Duration) error {
+func (c *Client) PurgeTaskRuns(ctx context.Context, taskName string, olderThan time.Duration) (int, error) {
 	return PurgeTaskRuns(ctx, c.Conn, taskName, olderThan)
 }
 
 // PurgeFlowRuns deletes terminal flow runs older than the given duration.
 // See PurgeFlowRuns for details.
-func (c *Client) PurgeFlowRuns(ctx context.Context, flowName string, olderThan time.Duration) error {
+func (c *Client) PurgeFlowRuns(ctx context.Context, flowName string, olderThan time.Duration) (int, error) {
 	return PurgeFlowRuns(ctx, c.Conn, flowName, olderThan)
+}
+
+// GC runs garbage collection and returns a summary report.
+func (c *Client) GC(ctx context.Context) (*GCInfo, error) {
+	return GC(ctx, c.Conn)
 }
 
 // NewWorker creates a new worker that processes task and flow executions.
