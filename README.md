@@ -85,47 +85,15 @@ err = client.CreateFlow(ctx, flowB)
 taskHandle, err := catbird.RunTask(ctx, tx, "send-email", "hello")
 ```
 
-# Controlling Migrations
-
-If your application already uses Goose migrations, you can register Catbird's schema migration as a normal app migration:
-
-Create a migration file such as `00003_add_catbird.go`:
-
-```go
-package migrations
-
-import (
-    "context"
-    "database/sql"
-
-    "github.com/pressly/goose/v3"
-    "github.com/ugent-library/catbird"
-)
-
-func init() {
-    goose.AddMigrationNoTxContext(addCatbirdUp, addCatbirdDown)
-}
-
-func addCatbirdUp(ctx context.Context, db *sql.DB) error {
-    return catbird.MigrateUpTo(ctx, db, 13)
-}
-
-func addCatbirdDown(ctx context.Context, db *sql.DB) error {
-    return catbird.MigrateDownTo(ctx, db, 0)
-}
-```
-
-Keep an explicit pinned version (for example `13`) in this migration file. Do not use `catbird.SchemaVersion`.
-
-# Deduplication Strategies
+## Deduplication Strategies
 
 Catbird supports two deduplication strategies for tasks and flows.
 
-## ConcurrencyKey (Temporary)
+### ConcurrencyKey (Temporary)
 
 Prevents overlapping runs; allows re-runs after completion or failure.
 
-## IdempotencyKey (Permanent)
+### IdempotencyKey (Permanent)
 
 Ensures exactly-once execution; blocks reuse after completion.
 
@@ -141,7 +109,7 @@ _, err = client.RunTask(ctx, "charge-payment", payment, catbird.RunTaskOpts{
 })
 ```
 
-### Comparison Table
+#### Comparison Table
 
 | Feature | ConcurrencyKey | IdempotencyKey |
 |---------|----------------|----------------|
@@ -151,7 +119,7 @@ _, err = client.RunTask(ctx, "charge-payment", payment, catbird.RunTaskOpts{
 | **After failure** | Allows retry | Allows retry |
 | **Use for** | Rate limiting, resource locking, scheduled tasks | Payments, orders, webhooks, audit logs |
 
-## Important Notes
+### Important Notes
 
 - **Mutually exclusive**: You cannot provide both `ConcurrencyKey` and `IdempotencyKey` for the same run (returns error)
 - **Return value on duplicate**: `RunTask()`/`RunFlow()` return a handle to the existing run ID
@@ -159,7 +127,7 @@ _, err = client.RunTask(ctx, "charge-payment", payment, catbird.RunTaskOpts{
 - **No key = no deduplication**: If you don't provide either key, duplicates are allowed
 - **Queue messages**: Use `IdempotencyKey` in `SendOpts` for exactly-once message delivery
 
-# Topic-Based Routing
+## Topic-Based Routing
 
 ```go
 err := client.CreateQueue(ctx, "user-events")
@@ -182,7 +150,7 @@ Wildcard rules:
 - `#` must appear as `.#` at the end of the pattern, or as `#` by itself
 - Tokens are separated by `.` and can contain `a-z`, `A-Z`, `0-9`, `_`, `-`
 
-# Task Execution
+## Task Execution
 
 ```go
 // Define task (scheduling is separate)
@@ -233,7 +201,7 @@ var result EmailResponse
 err = handle.WaitForOutput(ctx, &result)
 ```
 
-## OnFail Handlers
+### OnFail Handlers
 
 On-fail handlers run after a task reaches a failed state (after its own retries).
 They execute with their own `HandlerOpt` retry and backoff settings, and receive the
@@ -258,11 +226,11 @@ task := catbird.NewTask("charge-payment").Do(func(ctx context.Context, input Cha
     )
 ```
 
-# Flow Execution
+## Flow Execution
 
 A **flow** is a **directed acyclic graph (DAG)** of steps that execute when their dependencies are satisfied.
 
-## Summary
+### Summary
 
 - Steps with no dependencies start immediately; independent branches run in parallel.
 - Flow output is selected by output priority (configured with `OutputPriority(...)` or inferred from terminal steps).
@@ -270,7 +238,7 @@ A **flow** is a **directed acyclic graph (DAG)** of steps that execute when thei
 - A step with a signal waits for both its dependencies and the signal input.
 - `WaitForOutput()` returns the selected flow output once the flow completes.
 
-## Examples: Workflows
+### Examples: Workflows
 
 ```go
 flow := catbird.NewFlow("order-processing")
@@ -318,7 +286,7 @@ worker.AddFlow(flow)
 go worker.Start(ctx)
 ```
 
-## Example: Multi-branch Output Ownership
+### Example: Multi-branch Output Ownership
 
 Flows can have multiple terminal steps.
 
@@ -352,7 +320,7 @@ flow.AddStep(catbird.NewStep("right").DependsOn("a").Do(func(ctx context.Context
 // Effective priority: left, then right.
 ```
 
-## OnFail Handlers
+### OnFail Handlers
 
 On-fail handlers run after a flow reaches a failed state (after its own retries).
 They execute with their own `HandlerOpt` retry and backoff settings, and receive the
@@ -378,7 +346,7 @@ flow.OnFail(func(ctx context.Context, order Order, failure catbird.FlowFailure) 
 })
 ```
 
-## Example: Signals & Human-in-the-Loop
+### Example: Signals & Human-in-the-Loop
 
 Signals enable workflows that wait for external input before proceeding, such as approval workflows or webhooks.
 
@@ -410,7 +378,7 @@ flow.AddStep(catbird.NewStep("publish").
 
 A step with both dependencies and a signal waits for **both** conditions: all dependencies must complete **and** the signal must be delivered before the step executes.
 
-## Example: Early Completion
+### Example: Early Completion
 
 Use `CompleteEarly(ctx, output, reason)` inside a flow step handler when you already have the final business output and want to stop remaining branches.
 
@@ -434,7 +402,7 @@ flow.AddStep(catbird.NewStep("final").
 
 When early completion wins the race, the flow run becomes `completed` with the provided output, and in-flight sibling work is stopped cooperatively.
 
-## Map Steps
+### Map Steps
 
 Map steps fan out array processing into per-item SQL-coordinated work and aggregate results back in item order.
 
@@ -444,7 +412,7 @@ Map steps fan out array processing into per-item SQL-coordinated work and aggreg
 - Each mapped item runs as its own task, so retries happen per item instead of rerunning the whole step.
 - To fold mapped item outputs without materializing a full `[]Out`, add an explicit reducer step with `AddStep(NewStep("name").ReduceStep("mapped_step").Reduce(initial, fn))`.
 
-### Map flow input
+#### Map flow input
 
 ```go
 flow := catbird.NewFlow("double-input")
@@ -460,7 +428,7 @@ _ = handle.WaitForOutput(ctx, &out)
 // out == []int{2, 4, 6}
 ```
 
-### Map dependency output
+#### Map dependency output
 
 ```go
 flow := catbird.NewFlow("double-numbers")
@@ -490,7 +458,7 @@ flow.AddStep(catbird.NewStep("sum").
 }))
 ```
 
-## Generator Steps
+### Generator Steps
 
 Generator steps act like normal flow steps with an extra trailing `yield` callback for streaming items; yielded items are processed by a per-item handler.
 
@@ -562,7 +530,7 @@ _ = handle.WaitForOutput(ctx, &out)
 // out == 20
 ```
 
-## Status Values
+### Status Values
 
 | Status | Meaning | Used by |
 |--------|---------|---------|
@@ -577,7 +545,7 @@ _ = handle.WaitForOutput(ctx, &out)
 | `canceling` | Cancellation requested; run is transitioning to canceled | Task runs, flow runs |
 | `canceled` | Run was canceled before completing normally | Task runs, flow runs |
 
-## Advanced: Step Communication at Runtime
+### Advanced: Step Communication at Runtime
 
 ```go
 flow := catbird.NewFlow("parallel_watch_flow")
@@ -626,11 +594,11 @@ flow.AddStep(catbird.NewStep("worker_loop").Do(func(ctx context.Context, in stri
 
 This pattern keeps `worker_loop` alive until `controller` reaches any terminal state, then exits cleanly.
 
-# Conditional Execution
+## Conditional Execution
 
 Both tasks and flow steps support conditional execution via `WithCondition` on the builder methods. If the condition evaluates to false (or a referenced field is missing), the task/step is marked `skipped` and its handler does not run.
 
-## Rules at a Glance
+### Rules at a Glance
 
 - **Prefixes**: tasks use `input.*`; flow steps use `input.*`, `step_name.*`, or `signal.*`.
 - **Operators**: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `exists`, `contains`, plus `not <expr>`.
@@ -638,7 +606,7 @@ Both tasks and flow steps support conditional execution via `WithCondition` on t
 - **Map steps**: define with `AddStep(NewStep("name")...)`, then use `MapFlowInput()` or `MapStepOutput("step_name")`; map source values must be arrays.
 - **No AND/OR**: only one expression per task/step; compute a derived field upstream if needed.
 
-## Tasks with Conditions
+### Tasks with Conditions
 
 Tasks can use conditions to skip execution based on input fields.
 
@@ -662,7 +630,7 @@ client.RunTask(ctx, "premium_processing", ProcessRequest{UserID: 123, IsPremium:
 // This task run will be skipped (is_premium = false)
 ```
 
-## Flows with Conditions
+### Flows with Conditions
 
 Flow steps can branch based on prior outputs. Use `Optional[T]` to handle skipped dependencies.
 
@@ -685,18 +653,18 @@ flow.AddStep(catbird.NewStep("free_order").
 }))
 ```
 
-# Resiliency
+## Resiliency
 
 Catbird includes multiple resiliency layers for runtime failures. Handler-level retries are configured with `HandlerOpt` values such as `WithMaxRetries(...)` and `WithFullJitterBackoff(...)`, and external calls can be protected with `WithCircuitBreaker(failureThreshold, openTimeout)` to avoid cascading outages. In worker database paths, PostgreSQL reads/writes are retried with bounded attempts and full-jitter backoff; retries stop immediately on context cancellation or deadline expiry.
 
 For reducer-step workflows, retries are two-phase: item handlers retry first per item, then reducer-step finalization retries at the reducer step.
 If retries are exhausted in either phase, the parent step fails and task/flow `OnFail` handlers run with the same terminal failure semantics as non-reduced steps.
 
-## Be aware of side effects
+### Be aware of side effects
 
 Catbird deduplication (`ConcurrencyKey`/`IdempotencyKey`) controls duplicate run creation, while handler retries can still re-attempt the same run after transient failures. For non-repeatable side effects (payments, email, webhooks), use idempotent write patterns or upstream idempotency keys so retry attempts remain safe.
 
-# Cancellation
+## Cancellation
 
 `Cancellation` semantics:
 - Cancellation is a distinct terminal outcome (`canceled`), separate from `failed` and `completed`.
@@ -740,12 +708,12 @@ flow.AddStep(catbird.NewStep("guard").Do(func(ctx context.Context, input Order) 
 }))
 ```
 
-# Naming Rules
+## Naming Rules
 
 - **Queue, task, flow, and step names**: Lowercase letters, digits, and underscores only (`a-z`, `0-9`, `_`). Max 58 characters. Step names must be unique within a flow. Reserved step names: `input`, `signal`.
 - **Topics/Patterns**: Letters (upper/lower), digits, dots, underscores, and hyphens (`a-z`, `A-Z`, `0-9`, `.`, `_`, `-`, plus wildcards `*`, `#`).
 
-# Query Helpers
+## Query Helpers
 
 Use query builders when you want SQL + args directly (for `pgx.Batch` or custom execution):
 
@@ -764,13 +732,13 @@ if err != nil {
 batch.Queue(q1, args1...)
 ```
 
-# PostgreSQL API Reference
+## PostgreSQL API Reference
 
 Catbird is built on PostgreSQL functions, so you can use the API directly from any language or tool with PostgreSQL support (psql, Python, Node.js, Ruby, etc.).
 
 For the full SQL function reference and practical SQL examples (queues, tasks, workflows, and run monitoring), see the [SQL API reference](docs/sql-api-reference.md).
 
-# Dashboard
+## Dashboard
 
 The dashboard provides a web UI for monitoring queues, tasks, flows, and workers. You can run it standalone with the `cb` CLI or embed it as an `http.Handler`.
 
@@ -802,7 +770,7 @@ func main() {
 }
 ```
 
-# Terminal UI
+## Terminal UI
 
 The terminal UI provides an interactive dashboard-like view in your terminal.
 
@@ -818,7 +786,7 @@ You can also start it from the root command using interactive mode:
 cb -i
 ```
 
-# Data Retention
+## Data Retention
 
 Set a retention period on a task or flow definition to have `cb_gc()` automatically
 delete terminal runs older than that duration. GC runs opportunistically from the
@@ -855,7 +823,7 @@ flow.AddStep(catbird.NewStep("step1").Do(func(ctx context.Context, in OrderInput
 - **Flow runs cleaned up**: `completed`, `failed`, `canceled` older than the retention period; associated step runs and map tasks are removed automatically via cascade
 - **Non-terminal rows are never touched**: `queued`, `started`, `waiting_*`, `canceling` are left alone
 
-## Purge helpers
+### Purge helpers
 
 For targeted or ad-hoc cleanup independent of the retention period:
 
@@ -871,18 +839,50 @@ _ = flowPurged
 
 ```
 
-## External archiving
+### External archiving
 
 For SQL-based archiving patterns and example queries, see the
 `External archiving` section in the [SQL API reference](docs/sql-api-reference.md).
 
-# Documentation
+## Migrations
+
+If your application already uses Goose migrations, you can register Catbird's schema migration as a normal app migration:
+
+Create a migration file such as `00003_add_catbird.go`:
+
+```go
+package migrations
+
+import (
+    "context"
+    "database/sql"
+
+    "github.com/pressly/goose/v3"
+    "github.com/ugent-library/catbird"
+)
+
+func init() {
+    goose.AddMigrationNoTxContext(addCatbirdUp, addCatbirdDown)
+}
+
+func addCatbirdUp(ctx context.Context, db *sql.DB) error {
+    return catbird.MigrateUpTo(ctx, db, 13)
+}
+
+func addCatbirdDown(ctx context.Context, db *sql.DB) error {
+    return catbird.MigrateDownTo(ctx, db, 0)
+}
+```
+
+Keep an explicit pinned version (for example `13`) in this migration file. Do not use `catbird.SchemaVersion`.
+
+## Documentation
 
 - **[Go API Documentation](https://pkg.go.dev/github.com/ugent-library/catbird)**
 - **[SQL API Reference](docs/sql-api-reference.md)**: SQL function reference and practical SQL usage examples
 - **[Testing Guide](docs/testing.md)**
 - **[Copilot Instructions](.github/copilot-instructions.md)**
 
-# Acknowledgments
+## Acknowledgments
 
 SQL code is taken from or inspired by the excellent [pgmq](https://github.com/pgmq) and [pgflow](https://github.com/pgflow-dev/pgflow) projects.
