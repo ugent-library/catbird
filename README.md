@@ -15,6 +15,7 @@ A PostgreSQL-powered message queue and task execution engine. Catbird brings rel
 - **Exactly-once within a visibility window**: safe retries after crashes, no duplicate processing.
 - **Database as coordinator**: horizontal workers, PostgreSQL handles distribution and state.
 - **Workflows as DAGs**: dependencies, branching, and data passing between steps.
+- **Definition separate from implementation**: define and start tasks and flows in one place, implement them elsewhere.
 - **Persistence and auditability**: queues, runs, and results live in PostgreSQL.
 - **Resiliency baked in**: retries, backoff, optional circuit breakers.
 - **Operational UX**: web dashboard and tui for runs, queues, and workers.
