@@ -2,6 +2,10 @@
 
 > Priority: `!!!` high · `!!` medium · `!` low
 
+## Schema
+
+- [ ] [!!] Configurable table prefix and schema. Basis for multitenancy support.
+
 ## Reliability
 
 - [ ] [!!] Replay failed runs — `client.RetryTaskRun(ctx, name, id)` / `client.RetryFlowRun(ctx, name, id)` re-enqueues a failed run using its original input; no new schema needed since failed rows already persist in the live tables (distinct from on-fail handlers, which run automatically — this is manual operator-initiated replay).
