@@ -85,6 +85,38 @@ err = client.CreateFlow(ctx, flowB)
 taskHandle, err := catbird.RunTask(ctx, tx, "send-email", "hello")
 ```
 
+# Controlling Migrations
+
+If your application already uses Goose migrations, you can register Catbird's schema migration as a normal app migration:
+
+Create a migration file such as `00003_add_catbird.go`:
+
+```go
+package migrations
+
+import (
+    "context"
+    "database/sql"
+
+    "github.com/pressly/goose/v3"
+    "github.com/ugent-library/catbird"
+)
+
+func init() {
+    goose.AddMigrationNoTxContext(addCatbirdUp, addCatbirdDown)
+}
+
+func addCatbirdUp(ctx context.Context, db *sql.DB) error {
+    return catbird.MigrateUpTo(ctx, db, 13)
+}
+
+func addCatbirdDown(ctx context.Context, db *sql.DB) error {
+    return catbird.MigrateDownTo(ctx, db, 0)
+}
+```
+
+Keep an explicit pinned version (for example `13`) in this migration file. Do not use `catbird.SchemaVersion`.
+
 # Deduplication Strategies
 
 Catbird supports two deduplication strategies for tasks and flows.
