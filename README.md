@@ -878,13 +878,10 @@ For SQL-based archiving patterns and example queries, see the
 
 # Documentation
 
-- **[Go API Documentation](https://pkg.go.dev/github.com/ugent-library/catbird)**: Complete reference for all public types and functions
-- **[Testing Guide](docs/testing.md)**: Local and CI testing workflow, Docker setup, benchmarks, and migration notes
-- **[SQL API Reference](docs/sql-api-reference.md)**: SQL function catalog and practical SQL usage examples
-- **[Event Emission Design](docs/event-emission.md)**: Opt-in runtime event publication design
-- **[Event Triggers Design](docs/event-triggers.md)**: Event-triggered task/flow execution design
-- **[Project TODO](docs/TODO.md)**: Roadmap and backlog priorities
-- **[Copilot Instructions](/catbird-instructions.md)**: Architecture overview and developer guidance
+- **[Go API Documentation](https://pkg.go.dev/github.com/ugent-library/catbird)**
+- **[SQL API Reference](docs/sql-api-reference.md)**: SQL function reference and practical SQL usage examples
+- **[Testing Guide](docs/testing.md)**
+- **[Copilot Instructions](.github/copilot-instructions.md)**
 
 # Acknowledgments
 
