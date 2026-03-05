@@ -1,5 +1,5 @@
 {{ define "flow_runs_table" }}
-<div id="flow-runs-table" hx-get="/flow/{{ .Flow.Name }}/runs" hx-trigger="every 2s [!document.querySelector('.modal.show')]" hx-swap="outerHTML">
+<div id="flow-runs-table" hx-get="{{ route `flow` .Flow.Name `runs` }}" hx-trigger="every 2s [!document.querySelector('.modal.show')]" hx-swap="outerHTML">
 <table class="table">
   <tbody>
     <tr>

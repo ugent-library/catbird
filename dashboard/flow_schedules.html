@@ -3,13 +3,13 @@
   <h1>Flow Schedules</h1>
 </div>
 
-<div id="flow-schedules-table" hx-get="/flow-schedules/table" hx-trigger="every 2s" hx-swap="outerHTML">
+<div id="flow-schedules-table" hx-get="{{ route `flow-schedules` `table` }}" hx-trigger="every 2s" hx-swap="outerHTML">
   {{ template "flow_schedules_table" . }}
 </div>
 {{ end }}
 
 {{ define "flow_schedules_table" }}
-<div id="flow-schedules-table" hx-get="/flow-schedules/table" hx-trigger="every 2s" hx-swap="outerHTML">
+<div id="flow-schedules-table" hx-get="{{ route `flow-schedules` `table` }}" hx-trigger="every 2s" hx-swap="outerHTML">
 <table class="table">
   <tbody>
     <tr>

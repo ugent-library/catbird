@@ -3,13 +3,13 @@
   <h1>Task Schedules</h1>
 </div>
 
-<div id="task-schedules-table" hx-get="/task-schedules/table" hx-trigger="every 2s" hx-swap="outerHTML">
+<div id="task-schedules-table" hx-get="{{ route `task-schedules` `table` }}" hx-trigger="every 2s" hx-swap="outerHTML">
   {{ template "task_schedules_table" . }}
 </div>
 {{ end }}
 
 {{ define "task_schedules_table" }}
-<div id="task-schedules-table" hx-get="/task-schedules/table" hx-trigger="every 2s" hx-swap="outerHTML">
+<div id="task-schedules-table" hx-get="{{ route `task-schedules` `table` }}" hx-trigger="every 2s" hx-swap="outerHTML">
 <table class="table">
   <tbody>
     <tr>

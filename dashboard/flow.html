@@ -17,9 +17,9 @@
 {{ template "flow_runs_table" . }}
 
 <!-- Start Flow Run Modal -->
-<div id="start-flow-modal" class="modal" tabindex="-1" hx-get="/flow/{{ .Flow.Name }}/form" hx-trigger="show.bs.modal" hx-target="#start-flow-modal" hx-swap="innerHTML">
+<div id="start-flow-modal" class="modal" tabindex="-1" hx-get="{{ route `flow` .Flow.Name `form` }}" hx-trigger="show.bs.modal" hx-target="#start-flow-modal" hx-swap="innerHTML">
   <div id="start-flow-modal-content">
-    <form id="start-flow-form" hx-post="/flow/{{ .Flow.Name }}/run" hx-target="#start-flow-modal" hx-swap="innerHTML">
+    <form id="start-flow-form" hx-post="{{ route `flow` .Flow.Name `run` }}" hx-target="#start-flow-modal" hx-swap="innerHTML">
       <div class="modal-dialog">
         <div class="modal-content">
           <div class="modal-header">
@@ -78,7 +78,7 @@
 {{ end }}
 
 {{ define "start_flow_run_form" }}
-<form id="start-flow-form" hx-post="/flow/{{ .Flow.Name }}/run" hx-target="#start-flow-modal" hx-swap="innerHTML">
+<form id="start-flow-form" hx-post="{{ route `flow` .Flow.Name `run` }}" hx-target="#start-flow-modal" hx-swap="innerHTML">
   <div class="modal-dialog">
     <div class="modal-content">
       <div class="modal-header">

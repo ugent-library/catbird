@@ -11,13 +11,13 @@
     integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
   <link rel="stylesheet"
     href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.11.1/build/styles/default.min.css">
-  <link rel="stylesheet" href="/dark.css">
+  <link rel="stylesheet" href="{{ route `dark.css` }}">
   <meta name="theme-color" content="#7952b3">
 </head>
 
 <body>
   <header class="navbar navbar-dark sticky-top bg-dark flex-md-nowrap p-0 shadow">
-    <a class="navbar-brand col-md-3 col-lg-2 me-0 px-3 d-flex align-items-center" href="#" hx-get="/" hx-target="main" hx-push-url="true">
+    <a class="navbar-brand col-md-3 col-lg-2 me-0 px-3 d-flex align-items-center" href="#" hx-get="{{ route }}" hx-target="main" hx-push-url="true">
       <svg width="32" height="32" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg" class="me-2">
         <path d="M51.2003 21.141C35.1222 21.141 22.0884 34.1748 22.0884 50.2529C22.0884 66.3309 35.1222 79.3647 51.2003 79.3647L51.2003 21.141Z" fill="#9747FF"/>
         <path d="M24.3702 13.0002C16.4338 26.7465 21.1436 44.3239 34.8899 52.2603L49.2601 27.3704L24.3702 13.0002Z" fill="#9747FF"/>

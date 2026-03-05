@@ -17,19 +17,19 @@
   </div>
 </div>
 
-<div id="queues-table" hx-get="/queues/table" hx-trigger="every 2s [!document.querySelector('.modal.show')]" hx-swap="outerHTML">
+<div id="queues-table" hx-get="{{ route `queues` `table` }}" hx-trigger="every 2s [!document.querySelector('.modal.show')]" hx-swap="outerHTML">
   {{ template "queues_table" . }}
 </div>
 
 <!-- Create Queue Modal -->
-<div id="create-queue-modal" class="modal" tabindex="-1" hx-get="/queue/create-form" hx-trigger="show.bs.modal" hx-target="#create-queue-modal" hx-swap="innerHTML">
+<div id="create-queue-modal" class="modal" tabindex="-1" hx-get="{{ route `queue` `create-form` }}" hx-trigger="show.bs.modal" hx-target="#create-queue-modal" hx-swap="innerHTML">
   <div id="create-queue-modal-content"></div>
 </div>
 
 <!-- Send Message Modal -->
-<div id="send-message-modal" class="modal" tabindex="-1" hx-get="/queue/send-form" hx-trigger="show.bs.modal" hx-target="#send-message-modal" hx-swap="innerHTML">
+<div id="send-message-modal" class="modal" tabindex="-1" hx-get="{{ route `queue` `send-form` }}" hx-trigger="show.bs.modal" hx-target="#send-message-modal" hx-swap="innerHTML">
   <div id="send-message-modal-content">
-    <form id="send-message-form" hx-post="/queue/send" hx-target="#send-message-modal" hx-swap="innerHTML">
+    <form id="send-message-form" hx-post="{{ route `queue` `send` }}" hx-target="#send-message-modal" hx-swap="innerHTML">
       <div class="modal-dialog">
         <div class="modal-content">
           <div class="modal-header">
@@ -76,7 +76,7 @@
       Message sent successfully!
     </div>
     <div class="modal-footer">
-      <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" hx-get="/queues" hx-target="main" hx-swap="innerHTML" hx-push-url="true">OK</button>
+      <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" hx-get="{{ route `queues` }}" hx-target="main" hx-swap="innerHTML" hx-push-url="true">OK</button>
     </div>
   </div>
 </div>
@@ -100,7 +100,7 @@
 {{ end }}
 
 {{ define "send_message_form" }}
-<form id="send-message-form" hx-post="/queue/send" hx-target="#send-message-modal" hx-swap="innerHTML">
+<form id="send-message-form" hx-post="{{ route `queue` `send` }}" hx-target="#send-message-modal" hx-swap="innerHTML">
   <div class="modal-dialog">
     <div class="modal-content">
       <div class="modal-header">
@@ -135,7 +135,7 @@
 {{ end }}
 
 {{ define "create_queue_form" }}
-<form id="create-queue-form" hx-post="/queue/create" hx-target="#create-queue-modal" hx-swap="innerHTML">
+<form id="create-queue-form" hx-post="{{ route `queue` `create` }}" hx-target="#create-queue-modal" hx-swap="innerHTML">
   <div class="modal-dialog">
     <div class="modal-content">
       <div class="modal-header">
@@ -172,7 +172,7 @@
       Queue created successfully!
     </div>
     <div class="modal-footer">
-      <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" hx-get="/queues" hx-target="main" hx-swap="innerHTML" hx-push-url="true">OK</button>
+      <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" hx-get="{{ route `queues` }}" hx-target="main" hx-swap="innerHTML" hx-push-url="true">OK</button>
     </div>
   </div>
 </div>
@@ -196,7 +196,7 @@
 {{ end }}
 
 {{ define "queues_table" }}
-<div id="queues-table" hx-get="/queues/table" hx-trigger="every 2s [!document.querySelector('.modal.show')]" hx-swap="outerHTML">
+<div id="queues-table" hx-get="{{ route `queues` `table` }}" hx-trigger="every 2s [!document.querySelector('.modal.show')]" hx-swap="outerHTML">
 <table class="table">
   <tbody>
     <tr>

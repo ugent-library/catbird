@@ -15,9 +15,9 @@
 {{ template "task_runs_table" . }}
 
 <!-- Start Task Run Modal -->
-<div id="start-task-modal" class="modal" tabindex="-1" hx-get="/task/{{ .Task.Name }}/form" hx-trigger="show.bs.modal" hx-target="#start-task-modal" hx-swap="innerHTML">
+<div id="start-task-modal" class="modal" tabindex="-1" hx-get="{{ route `task` .Task.Name `form` }}" hx-trigger="show.bs.modal" hx-target="#start-task-modal" hx-swap="innerHTML">
   <div id="start-task-modal-content">
-    <form id="start-task-form" hx-post="/task/{{ .Task.Name }}/run" hx-target="#start-task-modal" hx-swap="innerHTML">
+    <form id="start-task-form" hx-post="{{ route `task` .Task.Name `run` }}" hx-target="#start-task-modal" hx-swap="innerHTML">
       <div class="modal-dialog">
         <div class="modal-content">
           <div class="modal-header">
@@ -76,7 +76,7 @@
 {{ end }}
 
 {{ define "start_task_run_form" }}
-<form id="start-task-form" hx-post="/task/{{ .Task.Name }}/run" hx-target="#start-task-modal" hx-swap="innerHTML">
+<form id="start-task-form" hx-post="{{ route `task` .Task.Name `run` }}" hx-target="#start-task-modal" hx-swap="innerHTML">
   <div class="modal-dialog">
     <div class="modal-content">
       <div class="modal-header">

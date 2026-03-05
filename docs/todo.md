@@ -18,7 +18,7 @@ Start reply from dashboard and tui.
 - [ ] [!] Partitioned run tables — partition `cb_t_*` / `cb_f_*` by `created_at` for large-volume deployments; GC just drops old partitions (consider pg_partman for lifecycle management)
 - [ ] [!] `pop()` — atomic read+delete in one operation; at-most-once delivery semantics for use cases where redelivery is never wanted
 - [ ] [!] `peek()` — non-destructive read (no hide, no delete) for diagnostics/inspection; returns visible messages without altering delivery state
-- [ ] [!!] `PG_NOTIFY` wakeup — replace polling sleep with `LISTEN`/`NOTIFY` on queue insert to reduce latency on low-volume queues; fall back to polling when no notification arrives within the poll interval
+- [ ] [!!] `PG_NOTIFY` wakeup — replace polling sleep with `LISTEN`/`NOTIFY` on queue insert to reduce latency on low-volume queues; fall back to polling when no notification arrives within the poll interval. Investigate which other call sites could benefit.
 
 ## Flow DSL
 

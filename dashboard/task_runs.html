@@ -1,5 +1,5 @@
 {{ define "task_runs_table" }}
-<div id="task-runs-table" hx-get="/task/{{ .Task.Name }}/runs" hx-trigger="every 2s [!document.querySelector('.modal.show')]" hx-swap="outerHTML">
+<div id="task-runs-table" hx-get="{{ route `task` .Task.Name `runs` }}" hx-trigger="every 2s [!document.querySelector('.modal.show')]" hx-swap="outerHTML">
 <table class="table">
   <tbody>
     <tr>

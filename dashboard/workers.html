@@ -3,7 +3,7 @@
   <h1>Workers</h1>
 </div>
 
-<div id="workers-table" hx-get="/workers/table" hx-trigger="every 2s" hx-swap="innerHTML">
+<div id="workers-table" hx-get="{{ route `workers` `table` }}" hx-trigger="every 2s" hx-swap="innerHTML">
   {{ template "workers_table" . }}
 </div>
 {{ end }}
