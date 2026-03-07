@@ -9,15 +9,15 @@ import (
 	"github.com/ugent-library/catbird/tui"
 )
 
-func newUICmd(conn *string) *cobra.Command {
+func newUICmd(cfg *Config) *cobra.Command {
 	return &cobra.Command{
 		Use:   "ui",
 		Short: "Start the terminal UI",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if *conn == "" {
+			if cfg.Conn == "" {
 				return errors.New("connection string required (--conn or $CB_CONN)")
 			}
-			pool, err := pgxpool.New(cmd.Context(), *conn)
+			pool, err := pgxpool.New(cmd.Context(), cfg.Conn)
 			if err != nil {
 				return err
 			}

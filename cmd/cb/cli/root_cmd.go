@@ -12,7 +12,7 @@ var logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 }))
 
 func NewRootCmd() *cobra.Command {
-	var conn string
+	cfg := defaultConfig()
 
 	root := &cobra.Command{
 		Use:           "cb",
@@ -24,10 +24,10 @@ func NewRootCmd() *cobra.Command {
 		},
 	}
 
-	root.PersistentFlags().StringVar(&conn, "conn", os.Getenv("CB_CONN"), "PostgreSQL connection string [$CB_CONN]")
+	root.PersistentFlags().StringVar(&cfg.Conn, "conn", cfg.Conn, "PostgreSQL connection string [$CB_CONN]")
 
-	root.AddCommand(newUICmd(&conn))
-	root.AddCommand(newDashboardCmd(&conn))
+	root.AddCommand(newUICmd(&cfg))
+	root.AddCommand(newDashboardCmd(&cfg))
 
 	return root
 }

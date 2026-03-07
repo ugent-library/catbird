@@ -11,17 +11,17 @@ import (
 	"github.com/ugent-library/catbird/dashboard"
 )
 
-func newDashboardCmd(conn *string) *cobra.Command {
+func newDashboardCmd(cfg *Config) *cobra.Command {
 	var port int
 
 	cmd := &cobra.Command{
 		Use:   "dashboard",
 		Short: "Start the dashboard server",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if *conn == "" {
+			if cfg.Conn == "" {
 				return errors.New("connection string required (--conn or $CB_CONN)")
 			}
-			pool, err := pgxpool.New(cmd.Context(), *conn)
+			pool, err := pgxpool.New(cmd.Context(), cfg.Conn)
 			if err != nil {
 				return err
 			}
