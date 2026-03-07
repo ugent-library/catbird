@@ -2,15 +2,11 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"os"
 
+	"github.com/spf13/cobra"
 	"github.com/ugent-library/catbird/cmd/cb/cli"
 )
 
 func main() {
-	if err := cli.NewRootCmd().ExecuteContext(context.Background()); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
+	cobra.CheckErr(cli.NewRootCmd().ExecuteContext(context.Background()))
 }
