@@ -27,6 +27,7 @@ Start reply from dashboard and tui.
 ## Flow DSL
 
 - [ ] [!!] Event-triggered task/flow runs — `worker.AddTaskTrigger(name, pattern)` / `worker.AddFlowTrigger(name, pattern)`; worker creates internal queue + binding at startup, polls it, dispatches `RunTask`/`RunFlow` per message (see `docs/event-triggers.md`)
+- [ ] Return a stream of results (for example llm streaming chat repsonses)
 
 ## Observability
 
