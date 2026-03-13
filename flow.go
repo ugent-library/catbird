@@ -225,6 +225,7 @@ type Step struct {
 	reduceSourceStep     string
 	condition            string
 	signal               bool
+	done                 bool
 	handler              func(context.Context, []byte, map[string][]byte, []byte) ([]byte, error)
 	handlerOpts          *handlerOpts
 }
@@ -239,12 +240,20 @@ func (s *Step) WithDescription(description string) *Step {
 	if s.configErr != nil {
 		return s
 	}
+	if s.done {
+		s.setConfigErr(fmt.Errorf("step %s: cannot call WithDescription() after Do()", s.name))
+		return s
+	}
 	s.description = description
 	return s
 }
 
 func (s *Step) DependsOn(deps ...string) *Step {
 	if s.configErr != nil {
+		return s
+	}
+	if s.done {
+		s.setConfigErr(fmt.Errorf("step %s: cannot call DependsOn() after Do()", s.name))
 		return s
 	}
 	s.dependencies = append(s.dependencies, deps...)
@@ -255,12 +264,20 @@ func (s *Step) WithCondition(condition string) *Step {
 	if s.configErr != nil {
 		return s
 	}
+	if s.done {
+		s.setConfigErr(fmt.Errorf("step %s: cannot call WithCondition() after Do()", s.name))
+		return s
+	}
 	s.condition = condition
 	return s
 }
 
 func (s *Step) WithSignal() *Step {
 	if s.configErr != nil {
+		return s
+	}
+	if s.done {
+		s.setConfigErr(fmt.Errorf("step %s: cannot call WithSignal() after Do()", s.name))
 		return s
 	}
 	s.signal = true
@@ -271,12 +288,21 @@ func (s *Step) Do(fn any, opts ...HandlerOpt) *Step {
 	if s.configErr != nil {
 		return s
 	}
+	if s.done {
+		s.setConfigErr(fmt.Errorf("step %s: Do() already called", s.name))
+		return s
+	}
+	s.done = true
 	s.applyHandler(fn, opts...)
 	return s
 }
 
 func (s *Step) MapFlowInput() *Step {
 	if s.configErr != nil {
+		return s
+	}
+	if s.done {
+		s.setConfigErr(fmt.Errorf("step %s: cannot call MapFlowInput() after Do()", s.name))
 		return s
 	}
 	if s.stepType == StepTypeNormal {
@@ -296,6 +322,10 @@ func (s *Step) MapFlowInput() *Step {
 
 func (s *Step) MapStepOutput(stepName string) *Step {
 	if s.configErr != nil {
+		return s
+	}
+	if s.done {
+		s.setConfigErr(fmt.Errorf("step %s: cannot call MapStepOutput() after Do()", s.name))
 		return s
 	}
 	if s.stepType == StepTypeNormal {
@@ -325,6 +355,10 @@ func (s *Step) MapStepOutput(stepName string) *Step {
 
 func (s *Step) Generate(fn any) *Step {
 	if s.configErr != nil {
+		return s
+	}
+	if s.done {
+		s.setConfigErr(fmt.Errorf("step %s: cannot call Generate() after Do()", s.name))
 		return s
 	}
 	if s.stepType == StepTypeNormal {
@@ -367,6 +401,10 @@ func (s *Step) Generate(fn any) *Step {
 
 func (s *Step) ReduceStep(stepName string) *Step {
 	if s.configErr != nil {
+		return s
+	}
+	if s.done {
+		s.setConfigErr(fmt.Errorf("step %s: cannot call ReduceStep() after Do()", s.name))
 		return s
 	}
 	if s.stepType == StepTypeNormal {

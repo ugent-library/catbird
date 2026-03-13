@@ -553,14 +553,15 @@ func TestFlowMapMetadataInInfo(t *testing.T) {
 
 	flow := NewFlow(flowName)
 	flow.WithDescription("Flow metadata description")
-	flow.AddStep(NewStep("numbers").Do(func(ctx context.Context, in string) ([]int, error) {
+	flow.AddStep(NewStep("numbers").WithDescription("Numbers source").Do(func(ctx context.Context, in string) ([]int, error) {
 		return []int{1, 2, 3}, nil
-	}).WithDescription("Numbers source"))
+	}))
 	flow.AddStep(NewStep("double").
+		WithDescription("Multiply by two").
 		MapStepOutput("numbers").
 		Do(func(ctx context.Context, in string, n int) (int, error) {
 			return n * 2, nil
-		}).WithDescription("Multiply by two"))
+		}))
 
 	if err := client.CreateFlow(t.Context(), flow); err != nil {
 		t.Fatal(err)
