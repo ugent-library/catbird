@@ -6,14 +6,14 @@
 CREATE OR REPLACE FUNCTION cb_create_task_schedule(task_name text, cron_spec text, input jsonb DEFAULT '{}'::jsonb)
 RETURNS void
 LANGUAGE plpgsql AS $$
-#variable_conflict use_column
 BEGIN
-    PERFORM pg_advisory_xact_lock(hashtext('cb_task_schedules:' || task_name));
+    PERFORM pg_advisory_xact_lock(hashtext('cb_task_schedules:' || cb_create_task_schedule.task_name));
 
     -- Return early if schedule already exists
     IF EXISTS (
-        SELECT 1 FROM cb_task_schedules
-        WHERE task_name = task_name
+        SELECT 1
+        FROM cb_task_schedules s
+        WHERE s.task_name = cb_create_task_schedule.task_name
     ) THEN
         RETURN;
     END IF;
@@ -27,10 +27,10 @@ BEGIN
         updated_at
     )
     VALUES (
-        task_name,
-        cron_spec,
-        cb_next_cron_tick(cron_spec, now()),
-        input,
+        cb_create_task_schedule.task_name,
+        cb_create_task_schedule.cron_spec,
+        cb_next_cron_tick(cb_create_task_schedule.cron_spec, now()),
+        cb_create_task_schedule.input,
         true,
         now()
     );
@@ -42,14 +42,14 @@ $$;
 CREATE OR REPLACE FUNCTION cb_create_flow_schedule(flow_name text, cron_spec text, input jsonb DEFAULT '{}'::jsonb)
 RETURNS void
 LANGUAGE plpgsql AS $$
-#variable_conflict use_column
 BEGIN
-    PERFORM pg_advisory_xact_lock(hashtext('cb_flow_schedules:' || flow_name));
+    PERFORM pg_advisory_xact_lock(hashtext('cb_flow_schedules:' || cb_create_flow_schedule.flow_name));
 
     -- Return early if schedule already exists
     IF EXISTS (
-        SELECT 1 FROM cb_flow_schedules
-        WHERE flow_name = flow_name
+        SELECT 1
+        FROM cb_flow_schedules s
+        WHERE s.flow_name = cb_create_flow_schedule.flow_name
     ) THEN
         RETURN;
     END IF;
@@ -63,10 +63,10 @@ BEGIN
         updated_at
     )
     VALUES (
-        flow_name,
-        cron_spec,
-        cb_next_cron_tick(cron_spec, now()),
-        input,
+        cb_create_flow_schedule.flow_name,
+        cb_create_flow_schedule.cron_spec,
+        cb_next_cron_tick(cb_create_flow_schedule.cron_spec, now()),
+        cb_create_flow_schedule.input,
         true,
         now()
     );

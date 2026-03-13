@@ -251,12 +251,15 @@ func TestSchedulerFlowIdempotency(t *testing.T) {
 // TestSchedulerTaskScheduleCreation verifies the basic schedule creation API is available.
 func TestSchedulerEnqueueRollback(t *testing.T) {
 	client := getTestClient(t)
+	suffix := fmt.Sprintf("_%d", time.Now().UnixNano())
+	taskName := "test_sched_task" + suffix
+	flowName := "test_sched_flow" + suffix
 
 	// Just verify that we can call the client-level schedule functions without it being part of a worker
 	// This tests the new decoupled scheduling API
 
 	// Create a task first
-	task := NewTask("test_sched_task").Do(func(ctx context.Context, in string) (string, error) {
+	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
 		return "done", nil
 	})
 
@@ -265,13 +268,50 @@ func TestSchedulerEnqueueRollback(t *testing.T) {
 	}
 
 	// Now create a schedule independently
-	err := client.CreateTaskSchedule(t.Context(), "test_sched_task", "@hourly")
+	err := client.CreateTaskSchedule(t.Context(), taskName, "@hourly")
 	if err != nil {
 		t.Fatalf("CreateTaskSchedule failed: %v", err)
 	}
 
+	taskSchedules, err := client.ListTaskSchedules(t.Context())
+	if err != nil {
+		t.Fatalf("ListTaskSchedules failed: %v", err)
+	}
+
+	taskScheduleCount := 0
+	for _, schedule := range taskSchedules {
+		if schedule.TaskName == taskName {
+			taskScheduleCount++
+		}
+	}
+
+	if taskScheduleCount != 1 {
+		t.Fatalf("expected exactly 1 task schedule for %q, got %d", taskName, taskScheduleCount)
+	}
+
+	err = client.CreateTaskSchedule(t.Context(), taskName, "@hourly")
+	if err != nil {
+		t.Fatalf("CreateTaskSchedule duplicate create failed: %v", err)
+	}
+
+	taskSchedules, err = client.ListTaskSchedules(t.Context())
+	if err != nil {
+		t.Fatalf("ListTaskSchedules after duplicate create failed: %v", err)
+	}
+
+	taskScheduleCount = 0
+	for _, schedule := range taskSchedules {
+		if schedule.TaskName == taskName {
+			taskScheduleCount++
+		}
+	}
+
+	if taskScheduleCount != 1 {
+		t.Fatalf("expected idempotent task schedule creation for %q, got %d rows", taskName, taskScheduleCount)
+	}
+
 	// Similarly for flows
-	flow := NewFlow("test_sched_flow")
+	flow := NewFlow(flowName)
 	flow.AddStep(NewStep("s1").Do(func(ctx context.Context, in int) (int, error) {
 		return in, nil
 	}))
@@ -280,9 +320,46 @@ func TestSchedulerEnqueueRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = client.CreateFlowSchedule(t.Context(), "test_sched_flow", "@daily")
+	err = client.CreateFlowSchedule(t.Context(), flowName, "@daily")
 	if err != nil {
 		t.Fatalf("CreateFlowSchedule failed: %v", err)
+	}
+
+	flowSchedules, err := client.ListFlowSchedules(t.Context())
+	if err != nil {
+		t.Fatalf("ListFlowSchedules failed: %v", err)
+	}
+
+	flowScheduleCount := 0
+	for _, schedule := range flowSchedules {
+		if schedule.FlowName == flowName {
+			flowScheduleCount++
+		}
+	}
+
+	if flowScheduleCount != 1 {
+		t.Fatalf("expected exactly 1 flow schedule for %q, got %d", flowName, flowScheduleCount)
+	}
+
+	err = client.CreateFlowSchedule(t.Context(), flowName, "@daily")
+	if err != nil {
+		t.Fatalf("CreateFlowSchedule duplicate create failed: %v", err)
+	}
+
+	flowSchedules, err = client.ListFlowSchedules(t.Context())
+	if err != nil {
+		t.Fatalf("ListFlowSchedules after duplicate create failed: %v", err)
+	}
+
+	flowScheduleCount = 0
+	for _, schedule := range flowSchedules {
+		if schedule.FlowName == flowName {
+			flowScheduleCount++
+		}
+	}
+
+	if flowScheduleCount != 1 {
+		t.Fatalf("expected idempotent flow schedule creation for %q, got %d rows", flowName, flowScheduleCount)
 	}
 }
 
