@@ -411,7 +411,7 @@ Map steps fan out array processing into per-item SQL-coordinated work and aggreg
 - Use `MapFlowInput()` to map over flow input (flow input must be a JSON array)
 - Use `MapStepOutput("step_name")` to map over a dependency step output array
 - Each mapped item runs as its own task, so retries happen per item instead of rerunning the whole step.
-- To fold mapped item outputs without materializing a full `[]Out`, add an explicit reducer step with `AddStep(NewStep("name").ReduceStep("mapped_step").Reduce(initial, fn))`.
+- To fold mapped item outputs without materializing a full `[]Out`, add an explicit reducer step with `AddStep(NewStep("name").ReduceStep("mapped_step").Do(fn))`.
 
 #### Map flow input
 
@@ -419,7 +419,7 @@ Map steps fan out array processing into per-item SQL-coordinated work and aggreg
 flow := catbird.NewFlow("double-input")
 flow.AddStep(catbird.NewStep("double").
     MapFlowInput().
-    Map(func(ctx context.Context, n int) (int, error) {
+    Do(func(ctx context.Context, n int) (int, error) {
     return n * 2, nil
 }))
 
@@ -438,7 +438,7 @@ flow.AddStep(catbird.NewStep("numbers").Do(func(ctx context.Context, _ string) (
 }))
 flow.AddStep(catbird.NewStep("double").
     MapStepOutput("numbers").
-    Map(func(ctx context.Context, _ string, n int) (int, error) {
+    Do(func(ctx context.Context, _ string, n int) (int, error) {
     return n * 2, nil
 }))
 
@@ -449,12 +449,12 @@ flow.AddStep(catbird.NewStep("numbers").Do(func(ctx context.Context, _ string) (
 }))
 flow.AddStep(catbird.NewStep("double").
     MapStepOutput("numbers").
-    Map(func(ctx context.Context, _ string, n int) (int, error) {
+    Do(func(ctx context.Context, _ string, n int) (int, error) {
     return n * 2, nil
 }))
 flow.AddStep(catbird.NewStep("sum").
     ReduceStep("double").
-    Reduce(0, func(ctx context.Context, acc int, out int) (int, error) {
+    Do(func(ctx context.Context, acc int, out int) (int, error) {
     return acc + out, nil
 }))
 ```
@@ -463,11 +463,11 @@ flow.AddStep(catbird.NewStep("sum").
 
 Generator steps act like normal flow steps with an extra trailing `yield` callback for streaming items; yielded items are processed by a per-item handler.
 
-- Define the step with `flow.AddStep(NewStep("name").Generate(...).Map(...))`
+- Define the step with `flow.AddStep(NewStep("name").Generate(...).Do(...))`
 - Optionally add `DependsOn(...)` and/or `WithSignal()` like a normal step
 - Provide a generator with signature `func(context.Context, In[, Signal][, Dep1, Dep2, ...], func(ItemType) error) error`
 - Provide an item handler with signature `func(context.Context, ItemType) (OutType, error)`
-- To fold yielded item outputs, add an explicit reducer step with `AddStep(NewStep(...).ReduceStep("generator_step").Reduce(...))`
+- To fold yielded item outputs, add an explicit reducer step with `AddStep(NewStep(...).ReduceStep("generator_step").Do(fn))`
 - Generator steps do not support `MapFlowInput()` or `MapStepOutput()`
 
 ```go
@@ -485,7 +485,7 @@ flow.AddStep(catbird.NewStep("generate").
     }
     return nil
 }).
-    Map(func(ctx context.Context, item int) (int, error) {
+    Do(func(ctx context.Context, item int) (int, error) {
     return item * 2, nil
 }))
 flow.AddStep(catbird.NewStep("sum").
@@ -516,12 +516,12 @@ flow.AddStep(catbird.NewStep("generate").
     }
     return nil
 }).
-    Map(func(ctx context.Context, item int) (int, error) {
+    Do(func(ctx context.Context, item int) (int, error) {
     return item * 2, nil
 }))
 flow.AddStep(catbird.NewStep("sum").
     ReduceStep("generate").
-    Reduce(0, func(ctx context.Context, acc int, out int) (int, error) {
+    Do(func(ctx context.Context, acc int, out int) (int, error) {
     return acc + out, nil
 }))
 

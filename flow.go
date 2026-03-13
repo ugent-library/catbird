@@ -365,14 +365,6 @@ func (s *Step) Generate(fn any) *Step {
 	return s
 }
 
-func (s *Step) Map(fn any, opts ...HandlerOpt) *Step {
-	if s.configErr != nil {
-		return s
-	}
-	s.applyHandler(fn, opts...)
-	return s
-}
-
 func (s *Step) ReduceStep(stepName string) *Step {
 	if s.configErr != nil {
 		return s
@@ -398,67 +390,34 @@ func (s *Step) ReduceStep(stepName string) *Step {
 	return s
 }
 
-func (s *Step) Reduce(initial any, fn any) *Step {
-	if s.configErr != nil {
-		return s
-	}
-	if s.stepType == StepTypeNormal {
-		s.stepType = StepTypeReducer
-	}
-	if s.stepType != StepTypeReducer {
-		s.setConfigErr(fmt.Errorf("step %s: Reduce() is only valid for reducer steps", s.name))
-		return s
-	}
-
-	accType, itemType, err := parseGeneratorReducerFn(fn, s.name)
-	if err != nil {
-		s.setConfigErr(err)
-		return s
-	}
-
-	if initial == nil {
-		s.setConfigErr(fmt.Errorf("step %s: reducer initial value must not be nil", s.name))
-		return s
-	}
-
-	initType := reflect.TypeOf(initial)
-	if !initType.AssignableTo(accType) {
-		s.setConfigErr(fmt.Errorf("step %s: reducer initial type %v is not assignable to accumulator type %v", s.name, initType, accType))
-		return s
-	}
-
-	initJSON, err := json.Marshal(initial)
-	if err != nil {
-		s.setConfigErr(fmt.Errorf("step %s: reducer initial value is not JSON serializable: %v", s.name, err))
-		return s
-	}
-
-	s.reducerFn = fn
-	s.reducerInit = initJSON
-	s.reducerAcc = accType
-	s.reducerItem = itemType
-	s.outputType = accType
-
-	if sourceStep := s.sourceStepForReducer(); sourceStep != nil {
-		sourceOutputType := sourceStep.outputType
-		if sourceStep.stepType == StepTypeGenerator {
-			sourceOutputType = sourceStep.generatorOutputType
-		}
-		if sourceOutputType != nil && sourceOutputType != itemType {
-			s.setConfigErr(fmt.Errorf("step %s: reducer item type %v does not match source step %q output type %v", s.name, itemType, sourceStep.name, sourceOutputType))
-			return s
-		}
-	}
-
-	if s.handlerOpts == nil {
-		s.handlerOpts = applyDefaultHandlerOpts()
-	}
-	return s
-}
-
 func (s *Step) applyHandler(fn any, opts ...HandlerOpt) {
 	if s.stepType == StepTypeReducer {
-		s.setConfigErr(fmt.Errorf("step %s: reducer steps use Reduce(...) instead of Map/Handler", s.name))
+		accType, itemType, err := parseGeneratorReducerFn(fn, s.name)
+		if err != nil {
+			s.setConfigErr(err)
+			return
+		}
+		initJSON, err := json.Marshal(reflect.Zero(accType).Interface())
+		if err != nil {
+			s.setConfigErr(fmt.Errorf("step %s: reducer accumulator type %v zero value is not JSON serializable: %v", s.name, accType, err))
+			return
+		}
+		s.reducerFn = fn
+		s.reducerInit = initJSON
+		s.reducerAcc = accType
+		s.reducerItem = itemType
+		s.outputType = accType
+		if sourceStep := s.sourceStepForReducer(); sourceStep != nil {
+			sourceOutputType := sourceStep.outputType
+			if sourceStep.stepType == StepTypeGenerator {
+				sourceOutputType = sourceStep.generatorOutputType
+			}
+			if sourceOutputType != nil && sourceOutputType != itemType {
+				s.setConfigErr(fmt.Errorf("step %s: reducer item type %v does not match source step %q output type %v", s.name, itemType, sourceStep.name, sourceOutputType))
+				return
+			}
+		}
+		s.handlerOpts = applyDefaultHandlerOpts(opts...)
 		return
 	}
 
@@ -1002,7 +961,7 @@ func validateGeneratorStepDefinition(flowName string, step *Step) error {
 		return fmt.Errorf("flow %q: step %q generator step is missing Generate(fn)", flowName, step.name)
 	}
 	if step.generatorHandler == nil {
-		return fmt.Errorf("flow %q: step %q generator step is missing Map(fn)", flowName, step.name)
+		return fmt.Errorf("flow %q: step %q generator step is missing Do(fn)", flowName, step.name)
 	}
 	return validateGeneratorFnForStep(step, flowName)
 }

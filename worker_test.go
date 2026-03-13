@@ -566,7 +566,7 @@ func TestFlowOnFailMapStepInputIntegration(t *testing.T) {
 	flow := NewFlow("flow_on_fail_map_input")
 	flow.AddStep(NewStep("map_fail").
 		MapFlowInput().
-		Map(func(_ context.Context, in Item) (string, error) {
+		Do(func(_ context.Context, in Item) (string, error) {
 			return "", fmt.Errorf("map item failed: %d", in.ID)
 		},
 			WithConcurrency(1),
