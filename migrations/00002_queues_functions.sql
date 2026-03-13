@@ -178,7 +178,6 @@ $$;
 CREATE OR REPLACE FUNCTION cb_bind(queue_name text, pattern text)
 RETURNS void
 LANGUAGE plpgsql AS $$
-#variable_conflict use_column
 DECLARE
     p_type text;
     p_prefix text;
@@ -281,7 +280,7 @@ BEGIN
     -- Insert or update binding
     INSERT INTO cb_bindings(queue_name, pattern, pattern_type, prefix, regex)
     VALUES (cb_bind.queue_name, cb_bind.pattern, p_type, p_prefix, p_regex)
-    ON CONFLICT (queue_name, pattern) DO NOTHING;
+    ON CONFLICT ON CONSTRAINT cb_bindings_pkey DO NOTHING;
 END;
 $$;
 -- +goose statementend

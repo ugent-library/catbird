@@ -25,7 +25,6 @@
 CREATE OR REPLACE FUNCTION cb_create_task(name text, description text = null, condition text = null, retention_period interval = null)
 RETURNS void
 LANGUAGE plpgsql AS $$
-#variable_conflict use_column
 DECLARE
     _t_table text := cb_table_name(cb_create_task.name, 't');
     _condition jsonb;
@@ -204,7 +203,6 @@ CREATE OR REPLACE FUNCTION cb_run_task(
 )
 RETURNS bigint
 LANGUAGE plpgsql AS $$
-#variable_conflict use_column
 DECLARE
     _t_table text := cb_table_name(cb_run_task.name, 't');
     _id bigint;

@@ -339,8 +339,7 @@ docker compose logs -f postgres
 7. **Conditional execution**: Use `.WithCondition("expression")` on tasks/steps. Tasks use `input.field` syntax (e.g., `"input.is_premium"`), flow steps use `step_name.field` syntax (e.g., `"validate.score gte 50"`)
 8. **Optional dependencies**: Use `Optional[T]` + `OptionalDependency()` pair when depending on conditional steps. Validation at flow construction time enforces type safety.
 9. **Status constants in Go**: Use shared status constants from `statuses.go` (e.g., `StatusQueued`, `StatusStarted`, `StatusWaitingForDependencies`) instead of raw status string literals in Go code and tests.
-10. **SQL parameter/column conflicts**: Use `#variable_conflict use_column` directive in PL/pgSQL when parameter names match column names (prevents "column ambiguous" errors)
-11. **Atomic deduplication with UNION ALL**: For `RunTask()` and `RunFlow()` deduplication (concurrency_key / idempotency_key), use the atomic ON CONFLICT DO UPDATE pattern with UNION ALL fallback. **DO NOT remove the UNION ALL or simplify to plain `RETURNING id`**. The pattern is:
+10. **Atomic deduplication with UNION ALL**: For `RunTask()` and `RunFlow()` deduplication (concurrency_key / idempotency_key), use the atomic ON CONFLICT DO UPDATE pattern with UNION ALL fallback. **DO NOT remove the UNION ALL or simplify to plain `RETURNING id`**. The pattern is:
 ```sql
 WITH ins AS (
     INSERT INTO table_name (key_col, data_col)
@@ -360,6 +359,6 @@ LIMIT 1
 - The UNION ALL fallback returns the conflicting row's ID if INSERT fails, handling the conflict case
 - Together they guarantee exactly one row ID is returned atomically—no race window between INSERT and SELECT
 - Simplifying to bare `DO UPDATE ... WHERE FALSE RETURNING id` causes NULL returns on conflict (RETURNING doesn't fire in DO UPDATE branch)
-- Plain `DO UPDATE SET col = col RETURNING id` has ambiguous column references under `#variable_conflict use_column` directive
+- Plain `DO UPDATE SET col = col RETURNING id` can produce ambiguous column references when identifiers are not explicitly qualified
 **Used in**: `cb_run_task()`, `cb_run_flow()`, `cb_send()` for both concurrency_key and idempotency_key variants
 **Reference**: https://stackoverflow.com/a/35953488

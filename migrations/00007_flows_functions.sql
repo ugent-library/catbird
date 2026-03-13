@@ -46,7 +46,6 @@ END$$;
 -- Returns: void
 CREATE OR REPLACE FUNCTION cb_create_flow(name text, description text DEFAULT NULL, steps jsonb DEFAULT '[]'::jsonb, output_priority text[] DEFAULT NULL, retention_period interval DEFAULT NULL)
 RETURNS void AS $$
-#variable_conflict use_column
 DECLARE
     _step jsonb;
     _dep jsonb;
@@ -103,7 +102,7 @@ BEGIN
 
     INSERT INTO cb_flows (name, description, output_priority, step_count, retention_period)
     VALUES (cb_create_flow.name, cb_create_flow.description, coalesce(_output_priority, ARRAY['__pending_output_priority__']), 0, cb_create_flow.retention_period)
-    ON CONFLICT (name) DO UPDATE
+    ON CONFLICT ON CONSTRAINT cb_flows_pkey DO UPDATE
     SET description = EXCLUDED.description,
         output_priority = coalesce(EXCLUDED.output_priority, ARRAY['__pending_output_priority__']),
         step_count = 0,
@@ -545,7 +544,6 @@ CREATE OR REPLACE FUNCTION cb_run_flow(
 )
 RETURNS bigint
 LANGUAGE plpgsql AS $$
-#variable_conflict use_column
 DECLARE
     _f_table text := cb_table_name(cb_run_flow.name, 'f');
     _s_table text := cb_table_name(cb_run_flow.name, 's');
