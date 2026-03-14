@@ -1,15 +1,8 @@
 package cli
 
 import (
-	"log/slog"
-	"os"
-
 	"github.com/spf13/cobra"
 )
-
-var logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-	Level: slog.LevelInfo,
-}))
 
 func NewRootCmd() *cobra.Command {
 	cfg := defaultConfig()

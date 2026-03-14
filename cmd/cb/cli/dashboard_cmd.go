@@ -3,8 +3,10 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 
+	"charm.land/log/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/spf13/cobra"
 	"github.com/ugent-library/catbird"
@@ -12,6 +14,7 @@ import (
 )
 
 func newDashboardCmd(cfg *Config) *cobra.Command {
+	var host string
 	var port int
 
 	cmd := &cobra.Command{
@@ -27,17 +30,22 @@ func newDashboardCmd(cfg *Config) *cobra.Command {
 			}
 			defer pool.Close()
 
+			logger := slog.New(log.New(cmd.OutOrStdout()))
+
 			h := dashboard.New(dashboard.Config{
 				Client: catbird.New(pool),
 				Logger: logger,
 			}).Handler()
 
-			logger.Info("starting dashboard", "port", port)
+			addr := fmt.Sprintf("%s:%d", host, port)
 
-			return http.ListenAndServe(fmt.Sprintf(":%d", port), h)
+			logger.Info("starting dashboard", "addr", addr)
+
+			return http.ListenAndServe(addr, h)
 		},
 	}
 
+	cmd.Flags().StringVar(&host, "host", "localhost", "host to listen on")
 	cmd.Flags().IntVar(&port, "port", 8080, "port to listen on")
 
 	return cmd
