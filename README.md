@@ -630,7 +630,7 @@ When a worker restarts after downtime, the catch-up policy controls how missed t
 |--------|--------|------------------------------|----------|
 | **skip** | `WithSkipCatchUp()` | Skip all missed ticks, jump to future | 0 runs |
 | **one** (default) | — | Enqueue one catch-up run (oldest), jump to future | 1 run |
-| **all** | `WithCatchUpAll()` | Replay every missed tick, one at a time | Up to batch_size per poll |
+| **all** | `WithCatchUpAll()` | Replay every missed tick, one at a time | All runs |
 
 ## Conditional Execution
 
