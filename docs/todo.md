@@ -2,6 +2,8 @@
 
 > Priority: `!!!` high · `!!` medium · `!` low
 
+- [ ] [!!] MCP server
+
 ## Schema
 
 - [ ] [!!] Configurable table prefix and schema. Basis for multitenancy support.
