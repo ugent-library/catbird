@@ -440,6 +440,127 @@ func TestSchedulerConcurrentWorkers(t *testing.T) {
 	t.Logf("INFO: concurrent workers test completed - task executed %d times with 3 workers", executedCount)
 }
 
+// TestSchedulerSkipsMissedTicks verifies that after downtime, the scheduler
+// enqueues at most one catch-up run and jumps next_run_at to the future,
+// rather than replaying every missed tick.
+func TestSchedulerSkipsMissedTicks(t *testing.T) {
+	client := getTestClient(t)
+	suffix := fmt.Sprintf("_%d", time.Now().UnixNano())
+	taskName := "skip_missed" + suffix
+
+	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
+		return "ok", nil
+	})
+
+	if err := CreateTask(t.Context(), client.Conn, task); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a per-minute schedule
+	if err := client.CreateTaskSchedule(t.Context(), taskName, "* * * * *"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate 5 minutes of downtime by pushing next_run_at 5 minutes into the past
+	pastTime := time.Now().UTC().Add(-5 * time.Minute)
+	if _, err := client.Conn.Exec(t.Context(),
+		`UPDATE cb_task_schedules SET next_run_at = $1 WHERE task_name = $2`,
+		pastTime, taskName,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Execute due schedules (this is what the worker poll calls)
+	var executed int
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT cb_execute_due_task_schedules(ARRAY[$1]::text[], 32)`, taskName,
+	).Scan(&executed); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should execute exactly 1 catch-up run, not 5
+	if executed != 1 {
+		t.Fatalf("expected 1 catch-up run, got %d", executed)
+	}
+
+	// Verify next_run_at is now in the future
+	var nextRunAt time.Time
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT next_run_at FROM cb_task_schedules WHERE task_name = $1`, taskName,
+	).Scan(&nextRunAt); err != nil {
+		t.Fatal(err)
+	}
+
+	if !nextRunAt.After(time.Now()) {
+		t.Fatalf("expected next_run_at to be in the future, got %s", nextRunAt.Format(time.RFC3339))
+	}
+
+	// Run again — should find nothing due
+	var executed2 int
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT cb_execute_due_task_schedules(ARRAY[$1]::text[], 32)`, taskName,
+	).Scan(&executed2); err != nil {
+		t.Fatal(err)
+	}
+
+	if executed2 != 0 {
+		t.Fatalf("expected 0 runs on second poll, got %d", executed2)
+	}
+}
+
+// TestFlowSchedulerSkipsMissedTicks verifies the same skip-missed-ticks
+// behavior for flow schedules.
+func TestFlowSchedulerSkipsMissedTicks(t *testing.T) {
+	client := getTestClient(t)
+	suffix := fmt.Sprintf("_%d", time.Now().UnixNano())
+	flowName := "skip_missed_flow" + suffix
+
+	flow := NewFlow(flowName)
+	flow.AddStep(NewStep("s1").Do(func(ctx context.Context, in string) (string, error) {
+		return "ok", nil
+	}))
+
+	if err := CreateFlow(t.Context(), client.Conn, flow); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.CreateFlowSchedule(t.Context(), flowName, "* * * * *"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate 5 minutes of downtime
+	pastTime := time.Now().UTC().Add(-5 * time.Minute)
+	if _, err := client.Conn.Exec(t.Context(),
+		`UPDATE cb_flow_schedules SET next_run_at = $1 WHERE flow_name = $2`,
+		pastTime, flowName,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	var executed int
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT cb_execute_due_flow_schedules(ARRAY[$1]::text[], 32)`, flowName,
+	).Scan(&executed); err != nil {
+		t.Fatal(err)
+	}
+
+	if executed != 1 {
+		t.Fatalf("expected 1 catch-up run, got %d", executed)
+	}
+
+	// Verify next_run_at is now in the future
+	var nextRunAt time.Time
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT next_run_at FROM cb_flow_schedules WHERE flow_name = $1`, flowName,
+	).Scan(&nextRunAt); err != nil {
+		t.Fatal(err)
+	}
+
+	if !nextRunAt.After(time.Now()) {
+		t.Fatalf("expected next_run_at to be in the future, got %s", nextRunAt.Format(time.RFC3339))
+	}
+}
+
 func TestCronNextTick(t *testing.T) {
 	client := getTestClient(t)
 

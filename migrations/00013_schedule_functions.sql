@@ -81,7 +81,7 @@ LANGUAGE plpgsql AS $$
 BEGIN
     UPDATE cb_task_schedules s
     SET
-        next_run_at = cb_next_cron_tick(s.cron_spec, s.next_run_at),
+        next_run_at = cb_next_cron_tick(s.cron_spec, GREATEST(s.next_run_at, now())),
         last_run_at = s.next_run_at,
         last_enqueued_at = now(),
         updated_at = now()
@@ -97,7 +97,7 @@ LANGUAGE plpgsql AS $$
 BEGIN
     UPDATE cb_flow_schedules s
     SET
-        next_run_at = cb_next_cron_tick(s.cron_spec, s.next_run_at),
+        next_run_at = cb_next_cron_tick(s.cron_spec, GREATEST(s.next_run_at, now())),
         last_run_at = s.next_run_at,
         last_enqueued_at = now(),
         updated_at = now()

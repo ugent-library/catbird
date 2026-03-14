@@ -164,17 +164,6 @@ task := catbird.NewTask("send-email").Do(func(ctx context.Context, input EmailRe
         catbird.WithCircuitBreaker(5, 30*time.Second),
     )
 
-// Create a schedule for the task (optional; can run manually via RunTask)
-client.CreateTaskSchedule(ctx, "send-email", "@hourly")
-
-// Or with static input
-client.CreateTaskSchedule(
-    ctx,
-    "send-report",
-    "@hourly",
-    catbird.WithInput(EmailRequest{To: "ops@example.com", Subject: "Hourly report"}),
-)
-
 // Define a task with a condition (skipped when condition is false)
 conditionalTask := catbird.NewTask("premium-processing").
     WithCondition("input.is_premium"). // Skipped if is_premium = false
@@ -276,9 +265,6 @@ flow.AddStep(catbird.NewStep("ship").
         EstimatedDays:  3,
     }, nil
 }))
-
-    // Create a schedule for the flow (optional; can run manually via RunFlow)
-    client.CreateFlowSchedule(ctx, "order-processing", "0 2 * * *") // Daily at 2 AM
 
 // Create worker
 worker := client.NewWorker()
@@ -594,6 +580,45 @@ flow.AddStep(catbird.NewStep("worker_loop").Do(func(ctx context.Context, in stri
 ```
 
 This pattern keeps `worker_loop` alive until `controller` reaches any terminal state, then exits cleanly.
+
+## Scheduling
+
+Tasks and flows can be scheduled with cron expressions using `CreateTaskSchedule` and `CreateFlowSchedule`. Schedules are stored in PostgreSQL and polled by workers — no external cron daemon needed.
+
+```go
+// Schedule a task
+client.CreateTaskSchedule(ctx, "send-email", "@hourly")
+
+// Schedule with static input
+client.CreateTaskSchedule(ctx, "send-report", "*/15 * * * *",
+    catbird.WithInput(EmailRequest{To: "ops@example.com", Subject: "Report"}),
+)
+
+// Schedule a flow
+client.CreateFlowSchedule(ctx, "order-processing", "0 2 * * *")
+```
+
+### Cron Syntax
+
+Standard 5-field cron format: `minute hour day-of-month month day-of-week`
+
+| Field | Values | Wildcards |
+|-------|--------|-----------|
+| Minute | 0-59 | `*`, `*/N`, `N-M`, `N-M/S`, comma-separated |
+| Hour | 0-23 | same |
+| Day of month | 1-31 | same |
+| Month | 1-12 | same |
+| Day of week | 0-6 (0 = Sunday, 7 also accepted as Sunday) | same |
+
+When both day-of-month and day-of-week are restricted (not `*`), the date matches if **either** field matches (standard cron OR semantics).
+
+Shorthand descriptors: `@yearly` / `@annually`, `@monthly`, `@weekly`, `@daily` / `@midnight`, `@hourly`.
+
+All cron evaluation is in **UTC**.
+
+### Missed Ticks
+
+Schedules skip missed ticks. If a worker restarts after downtime, at most one catch-up run is enqueued and the schedule advances to the next future tick. Missed intermediate ticks are not replayed.
 
 ## Conditional Execution
 
