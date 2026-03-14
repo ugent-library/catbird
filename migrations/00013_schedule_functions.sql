@@ -3,7 +3,7 @@
 -- +goose up
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_create_task_schedule(task_name text, cron_spec text, input jsonb DEFAULT '{}'::jsonb)
+CREATE OR REPLACE FUNCTION cb_create_task_schedule(task_name text, cron_spec text, input jsonb DEFAULT '{}'::jsonb, catch_up text DEFAULT 'one')
 RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -23,6 +23,7 @@ BEGIN
         cron_spec,
         next_run_at,
         input,
+        catch_up,
         enabled,
         updated_at
     )
@@ -31,6 +32,7 @@ BEGIN
         cb_create_task_schedule.cron_spec,
         cb_next_cron_tick(cb_create_task_schedule.cron_spec, now()),
         cb_create_task_schedule.input,
+        cb_create_task_schedule.catch_up,
         true,
         now()
     );
@@ -39,7 +41,7 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_create_flow_schedule(flow_name text, cron_spec text, input jsonb DEFAULT '{}'::jsonb)
+CREATE OR REPLACE FUNCTION cb_create_flow_schedule(flow_name text, cron_spec text, input jsonb DEFAULT '{}'::jsonb, catch_up text DEFAULT 'one')
 RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -59,6 +61,7 @@ BEGIN
         cron_spec,
         next_run_at,
         input,
+        catch_up,
         enabled,
         updated_at
     )
@@ -67,6 +70,7 @@ BEGIN
         cb_create_flow_schedule.cron_spec,
         cb_next_cron_tick(cb_create_flow_schedule.cron_spec, now()),
         cb_create_flow_schedule.input,
+        cb_create_flow_schedule.catch_up,
         true,
         now()
     );
@@ -75,33 +79,57 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_advance_task_schedule(id bigint)
+CREATE OR REPLACE FUNCTION cb_advance_task_schedule(id bigint, policy text DEFAULT 'one')
 RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
-    UPDATE cb_task_schedules s
-    SET
-        next_run_at = cb_next_cron_tick(s.cron_spec, GREATEST(s.next_run_at, now())),
-        last_run_at = s.next_run_at,
-        last_enqueued_at = now(),
-        updated_at = now()
-    WHERE s.id = cb_advance_task_schedule.id;
+    IF cb_advance_task_schedule.policy = 'all' THEN
+        -- Advance one tick at a time; stays in the past until caught up
+        UPDATE cb_task_schedules s
+        SET
+            next_run_at = cb_next_cron_tick(s.cron_spec, s.next_run_at),
+            last_run_at = s.next_run_at,
+            last_enqueued_at = now(),
+            updated_at = now()
+        WHERE s.id = cb_advance_task_schedule.id;
+    ELSE
+        -- skip / one: jump to the future
+        UPDATE cb_task_schedules s
+        SET
+            next_run_at = cb_next_cron_tick(s.cron_spec, GREATEST(s.next_run_at, now())),
+            last_run_at = s.next_run_at,
+            last_enqueued_at = now(),
+            updated_at = now()
+        WHERE s.id = cb_advance_task_schedule.id;
+    END IF;
 END;
 $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_advance_flow_schedule(id bigint)
+CREATE OR REPLACE FUNCTION cb_advance_flow_schedule(id bigint, policy text DEFAULT 'one')
 RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
-    UPDATE cb_flow_schedules s
-    SET
-        next_run_at = cb_next_cron_tick(s.cron_spec, GREATEST(s.next_run_at, now())),
-        last_run_at = s.next_run_at,
-        last_enqueued_at = now(),
-        updated_at = now()
-    WHERE s.id = cb_advance_flow_schedule.id;
+    IF cb_advance_flow_schedule.policy = 'all' THEN
+        -- Advance one tick at a time; stays in the past until caught up
+        UPDATE cb_flow_schedules s
+        SET
+            next_run_at = cb_next_cron_tick(s.cron_spec, s.next_run_at),
+            last_run_at = s.next_run_at,
+            last_enqueued_at = now(),
+            updated_at = now()
+        WHERE s.id = cb_advance_flow_schedule.id;
+    ELSE
+        -- skip / one: jump to the future
+        UPDATE cb_flow_schedules s
+        SET
+            next_run_at = cb_next_cron_tick(s.cron_spec, GREATEST(s.next_run_at, now())),
+            last_run_at = s.next_run_at,
+            last_enqueued_at = now(),
+            updated_at = now()
+        WHERE s.id = cb_advance_flow_schedule.id;
+    END IF;
 END;
 $$;
 -- +goose statementend
@@ -117,11 +145,12 @@ DECLARE
     v_input jsonb;
     v_scheduled_at timestamptz;
     v_key text;
+    v_policy text;
 BEGIN
     FOR i IN 1..cb_execute_due_task_schedules.batch_size LOOP
         -- Claim one due schedule with FOR UPDATE SKIP LOCKED
-        SELECT s.id, s.task_name, s.input, s.next_run_at
-        INTO v_id, v_task_name, v_input, v_scheduled_at
+        SELECT s.id, s.task_name, s.input, s.next_run_at, s.catch_up
+        INTO v_id, v_task_name, v_input, v_scheduled_at, v_policy
         FROM cb_task_schedules s
         WHERE
             s.enabled = true
@@ -134,16 +163,19 @@ BEGIN
         -- No more due schedules in this batch
         EXIT WHEN v_id IS NULL;
 
-        v_key := 'schedule:' || EXTRACT(EPOCH FROM v_scheduled_at)::text;
-        v_input := COALESCE(v_input, '{}'::jsonb);
+        IF v_policy = 'skip' THEN
+            -- Skip: advance without enqueuing
+            PERFORM cb_advance_task_schedule(v_id, v_policy);
+        ELSE
+            -- one / all: enqueue + advance (difference is in advance function)
+            v_key := 'schedule:' || EXTRACT(EPOCH FROM v_scheduled_at)::text;
+            v_input := COALESCE(v_input, '{}'::jsonb);
 
-        -- Enqueue task
-        PERFORM cb_run_task(v_task_name, v_input, v_key);
+            PERFORM cb_run_task(v_task_name, v_input, v_key);
+            PERFORM cb_advance_task_schedule(v_id, v_policy);
 
-        -- Advance schedule to next tick
-        PERFORM cb_advance_task_schedule(v_id);
-
-        v_executed := v_executed + 1;
+            v_executed := v_executed + 1;
+        END IF;
     END LOOP;
 
     RETURN v_executed;
@@ -162,11 +194,12 @@ DECLARE
     v_input jsonb;
     v_scheduled_at timestamptz;
     v_key text;
+    v_policy text;
 BEGIN
     FOR i IN 1..cb_execute_due_flow_schedules.batch_size LOOP
         -- Claim one due schedule with FOR UPDATE SKIP LOCKED
-        SELECT s.id, s.flow_name, s.input, s.next_run_at
-        INTO v_id, v_flow_name, v_input, v_scheduled_at
+        SELECT s.id, s.flow_name, s.input, s.next_run_at, s.catch_up
+        INTO v_id, v_flow_name, v_input, v_scheduled_at, v_policy
         FROM cb_flow_schedules s
         WHERE
             s.enabled = true
@@ -179,16 +212,19 @@ BEGIN
         -- No more due schedules in this batch
         EXIT WHEN v_id IS NULL;
 
-        v_key := 'schedule:' || EXTRACT(EPOCH FROM v_scheduled_at)::text;
-        v_input := COALESCE(v_input, '{}'::jsonb);
+        IF v_policy = 'skip' THEN
+            -- Skip: advance without enqueuing
+            PERFORM cb_advance_flow_schedule(v_id, v_policy);
+        ELSE
+            -- one / all: enqueue + advance (difference is in advance function)
+            v_key := 'schedule:' || EXTRACT(EPOCH FROM v_scheduled_at)::text;
+            v_input := COALESCE(v_input, '{}'::jsonb);
 
-        -- Enqueue flow
-        PERFORM cb_run_flow(v_flow_name, v_input, v_key);
+            PERFORM cb_run_flow(v_flow_name, v_input, v_key);
+            PERFORM cb_advance_flow_schedule(v_id, v_policy);
 
-        -- Advance schedule to next tick
-        PERFORM cb_advance_flow_schedule(v_id);
-
-        v_executed := v_executed + 1;
+            v_executed := v_executed + 1;
+        END IF;
     END LOOP;
 
     RETURN v_executed;
@@ -200,7 +236,7 @@ $$;
 
 DROP FUNCTION IF EXISTS cb_execute_due_flow_schedules(text[], int);
 DROP FUNCTION IF EXISTS cb_execute_due_task_schedules(text[], int);
-DROP FUNCTION IF EXISTS cb_advance_flow_schedule(bigint);
-DROP FUNCTION IF EXISTS cb_advance_task_schedule(bigint);
-DROP FUNCTION IF EXISTS cb_create_flow_schedule(text, text);
-DROP FUNCTION IF EXISTS cb_create_task_schedule(text, text);
+DROP FUNCTION IF EXISTS cb_advance_flow_schedule(bigint, text);
+DROP FUNCTION IF EXISTS cb_advance_task_schedule(bigint, text);
+DROP FUNCTION IF EXISTS cb_create_flow_schedule(text, text, jsonb, text);
+DROP FUNCTION IF EXISTS cb_create_task_schedule(text, text, jsonb, text);

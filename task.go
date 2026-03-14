@@ -205,6 +205,7 @@ type TaskScheduleInfo struct {
 	LastRunAt      time.Time `json:"last_run_at,omitzero"`
 	LastEnqueuedAt time.Time `json:"last_enqueued_at,omitzero"`
 	Enabled        bool      `json:"enabled"`
+	CatchUp        string    `json:"catch_up"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
@@ -579,7 +580,7 @@ func CreateTaskSchedule(ctx context.Context, conn Conn, taskName, cronSpec strin
 		}
 	}
 
-	_, err = conn.Exec(ctx, `SELECT cb_create_task_schedule($1, $2, $3);`, taskName, cronSpec, inputJSON)
+	_, err = conn.Exec(ctx, `SELECT cb_create_task_schedule($1, $2, $3, $4);`, taskName, cronSpec, inputJSON, resolved.catchUp)
 	if err != nil {
 		return fmt.Errorf("failed to create task schedule %q: %w", taskName, err)
 	}
@@ -588,7 +589,7 @@ func CreateTaskSchedule(ctx context.Context, conn Conn, taskName, cronSpec strin
 
 // ListTaskSchedules returns all task schedules ordered by next_run_at.
 func ListTaskSchedules(ctx context.Context, conn Conn) ([]*TaskScheduleInfo, error) {
-	q := `SELECT task_name, cron_spec, next_run_at, last_run_at, last_enqueued_at, enabled, created_at, updated_at
+	q := `SELECT task_name, cron_spec, next_run_at, last_run_at, last_enqueued_at, enabled, catch_up, created_at, updated_at
 		FROM cb_task_schedules
 		ORDER BY next_run_at ASC;`
 	rows, err := conn.Query(ctx, q)
@@ -599,7 +600,7 @@ func ListTaskSchedules(ctx context.Context, conn Conn) ([]*TaskScheduleInfo, err
 		var s TaskScheduleInfo
 		var lastRunAt *time.Time
 		var lastEnqueuedAt *time.Time
-		err := row.Scan(&s.TaskName, &s.CronSpec, &s.NextRunAt, &lastRunAt, &lastEnqueuedAt, &s.Enabled, &s.CreatedAt, &s.UpdatedAt)
+		err := row.Scan(&s.TaskName, &s.CronSpec, &s.NextRunAt, &lastRunAt, &lastEnqueuedAt, &s.Enabled, &s.CatchUp, &s.CreatedAt, &s.UpdatedAt)
 		if lastRunAt != nil {
 			s.LastRunAt = *lastRunAt
 		}

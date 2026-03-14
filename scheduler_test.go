@@ -440,10 +440,9 @@ func TestSchedulerConcurrentWorkers(t *testing.T) {
 	t.Logf("INFO: concurrent workers test completed - task executed %d times with 3 workers", executedCount)
 }
 
-// TestSchedulerSkipsMissedTicks verifies that after downtime, the scheduler
-// enqueues at most one catch-up run and jumps next_run_at to the future,
-// rather than replaying every missed tick.
-func TestSchedulerSkipsMissedTicks(t *testing.T) {
+// TestSchedulerOnePolicy verifies the default "one" catch-up policy: after downtime,
+// the scheduler enqueues exactly one catch-up run and jumps next_run_at to the future.
+func TestSchedulerOnePolicy(t *testing.T) {
 	client := getTestClient(t)
 	suffix := fmt.Sprintf("_%d", time.Now().UnixNano())
 	taskName := "skip_missed" + suffix
@@ -508,9 +507,8 @@ func TestSchedulerSkipsMissedTicks(t *testing.T) {
 	}
 }
 
-// TestFlowSchedulerSkipsMissedTicks verifies the same skip-missed-ticks
-// behavior for flow schedules.
-func TestFlowSchedulerSkipsMissedTicks(t *testing.T) {
+// TestFlowSchedulerOnePolicy verifies the default "one" catch-up policy for flow schedules.
+func TestFlowSchedulerOnePolicy(t *testing.T) {
 	client := getTestClient(t)
 	suffix := fmt.Sprintf("_%d", time.Now().UnixNano())
 	flowName := "skip_missed_flow" + suffix
@@ -558,6 +556,295 @@ func TestFlowSchedulerSkipsMissedTicks(t *testing.T) {
 
 	if !nextRunAt.After(time.Now()) {
 		t.Fatalf("expected next_run_at to be in the future, got %s", nextRunAt.Format(time.RFC3339))
+	}
+}
+
+// TestSchedulerSkipPolicy verifies that with WithSkipCatchUp(), 5 minutes of downtime
+// produces 0 enqueued runs and next_run_at jumps to the future.
+func TestSchedulerSkipPolicy(t *testing.T) {
+	client := getTestClient(t)
+	suffix := fmt.Sprintf("_%d", time.Now().UnixNano())
+	taskName := "skip_policy" + suffix
+
+	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
+		return "ok", nil
+	})
+
+	if err := CreateTask(t.Context(), client.Conn, task); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.CreateTaskSchedule(t.Context(), taskName, "* * * * *", WithSkipCatchUp()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate 5 minutes of downtime
+	pastTime := time.Now().UTC().Add(-5 * time.Minute)
+	if _, err := client.Conn.Exec(t.Context(),
+		`UPDATE cb_task_schedules SET next_run_at = $1 WHERE task_name = $2`,
+		pastTime, taskName,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	var executed int
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT cb_execute_due_task_schedules(ARRAY[$1]::text[], 32)`, taskName,
+	).Scan(&executed); err != nil {
+		t.Fatal(err)
+	}
+
+	// Skip policy: 0 runs enqueued
+	if executed != 0 {
+		t.Fatalf("expected 0 runs with skip policy, got %d", executed)
+	}
+
+	// Verify next_run_at jumped to the future
+	var nextRunAt time.Time
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT next_run_at FROM cb_task_schedules WHERE task_name = $1`, taskName,
+	).Scan(&nextRunAt); err != nil {
+		t.Fatal(err)
+	}
+
+	if !nextRunAt.After(time.Now()) {
+		t.Fatalf("expected next_run_at in the future, got %s", nextRunAt.Format(time.RFC3339))
+	}
+}
+
+// TestSchedulerAllPolicy verifies that with WithCatchUpAll(), 5 minutes of downtime
+// replays all 5 missed ticks.
+func TestSchedulerAllPolicy(t *testing.T) {
+	client := getTestClient(t)
+	suffix := fmt.Sprintf("_%d", time.Now().UnixNano())
+	taskName := "all_policy" + suffix
+
+	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
+		return "ok", nil
+	})
+
+	if err := CreateTask(t.Context(), client.Conn, task); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.CreateTaskSchedule(t.Context(), taskName, "* * * * *", WithCatchUpAll()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate 5 minutes of downtime
+	pastTime := time.Now().UTC().Add(-5 * time.Minute)
+	if _, err := client.Conn.Exec(t.Context(),
+		`UPDATE cb_task_schedules SET next_run_at = $1 WHERE task_name = $2`,
+		pastTime, taskName,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Execute with a large batch to get all missed ticks
+	var executed int
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT cb_execute_due_task_schedules(ARRAY[$1]::text[], 32)`, taskName,
+	).Scan(&executed); err != nil {
+		t.Fatal(err)
+	}
+
+	// All policy: should replay all missed ticks (5-6 depending on timing)
+	if executed < 5 || executed > 6 {
+		t.Fatalf("expected 5-6 catch-up runs with all policy, got %d", executed)
+	}
+
+	// After catching up, next poll should find nothing
+	var executed2 int
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT cb_execute_due_task_schedules(ARRAY[$1]::text[], 32)`, taskName,
+	).Scan(&executed2); err != nil {
+		t.Fatal(err)
+	}
+
+	if executed2 != 0 {
+		t.Fatalf("expected 0 runs after catching up, got %d", executed2)
+	}
+}
+
+// TestSchedulerAllPolicyBatchBound verifies that the all policy respects batch_size.
+func TestSchedulerAllPolicyBatchBound(t *testing.T) {
+	client := getTestClient(t)
+	suffix := fmt.Sprintf("_%d", time.Now().UnixNano())
+	taskName := "all_batch" + suffix
+
+	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
+		return "ok", nil
+	})
+
+	if err := CreateTask(t.Context(), client.Conn, task); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.CreateTaskSchedule(t.Context(), taskName, "* * * * *", WithCatchUpAll()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate 50 minutes of downtime
+	pastTime := time.Now().UTC().Add(-50 * time.Minute)
+	if _, err := client.Conn.Exec(t.Context(),
+		`UPDATE cb_task_schedules SET next_run_at = $1 WHERE task_name = $2`,
+		pastTime, taskName,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Execute with batch_size=10
+	var executed int
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT cb_execute_due_task_schedules(ARRAY[$1]::text[], 10)`, taskName,
+	).Scan(&executed); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should be capped at batch_size
+	if executed != 10 {
+		t.Fatalf("expected 10 runs (batch_size bound), got %d", executed)
+	}
+}
+
+// TestSchedulerDefaultPolicy verifies that no option produces "one" behavior.
+func TestSchedulerDefaultPolicy(t *testing.T) {
+	client := getTestClient(t)
+	suffix := fmt.Sprintf("_%d", time.Now().UnixNano())
+	taskName := "default_policy" + suffix
+
+	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
+		return "ok", nil
+	})
+
+	if err := CreateTask(t.Context(), client.Conn, task); err != nil {
+		t.Fatal(err)
+	}
+
+	// No catch-up option — should default to "one"
+	if err := client.CreateTaskSchedule(t.Context(), taskName, "* * * * *"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the stored policy
+	var policy string
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT catch_up FROM cb_task_schedules WHERE task_name = $1`, taskName,
+	).Scan(&policy); err != nil {
+		t.Fatal(err)
+	}
+
+	if policy != CatchUpOne {
+		t.Fatalf("expected default policy %q, got %q", CatchUpOne, policy)
+	}
+
+	// Simulate 5 minutes of downtime
+	pastTime := time.Now().UTC().Add(-5 * time.Minute)
+	if _, err := client.Conn.Exec(t.Context(),
+		`UPDATE cb_task_schedules SET next_run_at = $1 WHERE task_name = $2`,
+		pastTime, taskName,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	var executed int
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT cb_execute_due_task_schedules(ARRAY[$1]::text[], 32)`, taskName,
+	).Scan(&executed); err != nil {
+		t.Fatal(err)
+	}
+
+	if executed != 1 {
+		t.Fatalf("expected 1 catch-up run with default policy, got %d", executed)
+	}
+}
+
+// TestFlowSchedulerSkipPolicy verifies skip catch-up policy for flow schedules.
+func TestFlowSchedulerSkipPolicy(t *testing.T) {
+	client := getTestClient(t)
+	suffix := fmt.Sprintf("_%d", time.Now().UnixNano())
+	flowName := "skip_flow" + suffix
+
+	flow := NewFlow(flowName)
+	flow.AddStep(NewStep("s1").Do(func(ctx context.Context, in string) (string, error) {
+		return "ok", nil
+	}))
+
+	if err := CreateFlow(t.Context(), client.Conn, flow); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.CreateFlowSchedule(t.Context(), flowName, "* * * * *", WithSkipCatchUp()); err != nil {
+		t.Fatal(err)
+	}
+
+	pastTime := time.Now().UTC().Add(-5 * time.Minute)
+	if _, err := client.Conn.Exec(t.Context(),
+		`UPDATE cb_flow_schedules SET next_run_at = $1 WHERE flow_name = $2`,
+		pastTime, flowName,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	var executed int
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT cb_execute_due_flow_schedules(ARRAY[$1]::text[], 32)`, flowName,
+	).Scan(&executed); err != nil {
+		t.Fatal(err)
+	}
+
+	if executed != 0 {
+		t.Fatalf("expected 0 runs with skip policy, got %d", executed)
+	}
+
+	var nextRunAt time.Time
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT next_run_at FROM cb_flow_schedules WHERE flow_name = $1`, flowName,
+	).Scan(&nextRunAt); err != nil {
+		t.Fatal(err)
+	}
+
+	if !nextRunAt.After(time.Now()) {
+		t.Fatalf("expected next_run_at in the future, got %s", nextRunAt.Format(time.RFC3339))
+	}
+}
+
+// TestFlowSchedulerAllPolicy verifies all catch-up policy for flow schedules.
+func TestFlowSchedulerAllPolicy(t *testing.T) {
+	client := getTestClient(t)
+	suffix := fmt.Sprintf("_%d", time.Now().UnixNano())
+	flowName := "all_flow" + suffix
+
+	flow := NewFlow(flowName)
+	flow.AddStep(NewStep("s1").Do(func(ctx context.Context, in string) (string, error) {
+		return "ok", nil
+	}))
+
+	if err := CreateFlow(t.Context(), client.Conn, flow); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.CreateFlowSchedule(t.Context(), flowName, "* * * * *", WithCatchUpAll()); err != nil {
+		t.Fatal(err)
+	}
+
+	pastTime := time.Now().UTC().Add(-5 * time.Minute)
+	if _, err := client.Conn.Exec(t.Context(),
+		`UPDATE cb_flow_schedules SET next_run_at = $1 WHERE flow_name = $2`,
+		pastTime, flowName,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	var executed int
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT cb_execute_due_flow_schedules(ARRAY[$1]::text[], 32)`, flowName,
+	).Scan(&executed); err != nil {
+		t.Fatal(err)
+	}
+
+	if executed < 5 || executed > 6 {
+		t.Fatalf("expected 5-6 catch-up runs with all policy, got %d", executed)
 	}
 }
 

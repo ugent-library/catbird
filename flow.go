@@ -949,6 +949,7 @@ type FlowScheduleInfo struct {
 	LastRunAt      time.Time `json:"last_run_at,omitzero"`
 	LastEnqueuedAt time.Time `json:"last_enqueued_at,omitzero"`
 	Enabled        bool      `json:"enabled"`
+	CatchUp        string    `json:"catch_up"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
@@ -1795,7 +1796,7 @@ func CreateFlowSchedule(ctx context.Context, conn Conn, flowName, cronSpec strin
 		}
 	}
 
-	_, err = conn.Exec(ctx, `SELECT cb_create_flow_schedule($1, $2, $3);`, flowName, cronSpec, inputJSON)
+	_, err = conn.Exec(ctx, `SELECT cb_create_flow_schedule($1, $2, $3, $4);`, flowName, cronSpec, inputJSON, resolved.catchUp)
 	if err != nil {
 		return fmt.Errorf("failed to create flow schedule %q: %w", flowName, err)
 	}
@@ -1804,7 +1805,7 @@ func CreateFlowSchedule(ctx context.Context, conn Conn, flowName, cronSpec strin
 
 // ListFlowSchedules returns all flow schedules ordered by next_run_at.
 func ListFlowSchedules(ctx context.Context, conn Conn) ([]*FlowScheduleInfo, error) {
-	q := `SELECT flow_name, cron_spec, next_run_at, last_run_at, last_enqueued_at, enabled, created_at, updated_at
+	q := `SELECT flow_name, cron_spec, next_run_at, last_run_at, last_enqueued_at, enabled, catch_up, created_at, updated_at
 		FROM cb_flow_schedules
 		ORDER BY next_run_at ASC;`
 	rows, err := conn.Query(ctx, q)
@@ -1815,7 +1816,7 @@ func ListFlowSchedules(ctx context.Context, conn Conn) ([]*FlowScheduleInfo, err
 		var s FlowScheduleInfo
 		var lastRunAt *time.Time
 		var lastEnqueuedAt *time.Time
-		err := row.Scan(&s.FlowName, &s.CronSpec, &s.NextRunAt, &lastRunAt, &lastEnqueuedAt, &s.Enabled, &s.CreatedAt, &s.UpdatedAt)
+		err := row.Scan(&s.FlowName, &s.CronSpec, &s.NextRunAt, &lastRunAt, &lastEnqueuedAt, &s.Enabled, &s.CatchUp, &s.CreatedAt, &s.UpdatedAt)
 		if lastRunAt != nil {
 			s.LastRunAt = *lastRunAt
 		}

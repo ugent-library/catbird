@@ -17,6 +17,7 @@
       <th scope="col">Cron Spec</th>
       <th scope="col">Next Run</th>
       <th scope="col">Last Run</th>
+      <th scope="col">Catch-Up</th>
       <th scope="col">Enabled</th>
       <th scope="col">Created</th>
     </tr>
@@ -26,6 +27,7 @@
       <td><code>{{ .CronSpec }}</code></td>
       <td>{{ formatTime .NextRunAt }}</td>
       <td>{{ formatTime .LastRunAt }}</td>
+      <td><code>{{ .CatchUp }}</code></td>
       <td>
         <span class="badge bg-{{ if .Enabled }}success{{ else }}secondary{{ end }}">
           {{ if .Enabled }}Enabled{{ else }}Disabled{{ end }}

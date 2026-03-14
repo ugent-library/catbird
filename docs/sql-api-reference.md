@@ -293,14 +293,16 @@ These are the functions most app code and external clients care about.
 **Scheduling setup**
 
 ### `cb_create_task_schedule`
-- **What it does**: Create or replace a cron schedule for a task with static JSON input.
-- **Inputs**: `cb_create_task_schedule(task_name text, cron_spec text, input jsonb DEFAULT '{}'::jsonb)`
+- **What it does**: Create or replace a cron schedule for a task with static JSON input and catch-up policy.
+- **Inputs**: `cb_create_task_schedule(task_name text, cron_spec text, input jsonb DEFAULT '{}'::jsonb, catch_up text DEFAULT 'one')`
 - **Returns**: `RETURNS void`
+- **Catch-up policies**: `'skip'` (skip all missed ticks), `'one'` (enqueue one catch-up, default), `'all'` (replay every missed tick)
 
 ### `cb_create_flow_schedule`
-- **What it does**: Create or replace a cron schedule for a flow with static JSON input.
-- **Inputs**: `cb_create_flow_schedule(flow_name text, cron_spec text, input jsonb DEFAULT '{}'::jsonb)`
+- **What it does**: Create or replace a cron schedule for a flow with static JSON input and catch-up policy.
+- **Inputs**: `cb_create_flow_schedule(flow_name text, cron_spec text, input jsonb DEFAULT '{}'::jsonb, catch_up text DEFAULT 'one')`
 - **Returns**: `RETURNS void`
+- **Catch-up policies**: `'skip'` (skip all missed ticks), `'one'` (enqueue one catch-up, default), `'all'` (replay every missed tick)
 
 **Maintenance**
 
@@ -494,13 +496,13 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 **Scheduler internals**
 
 ### `cb_advance_task_schedule`
-- **What it does**: Move a task schedule’s `next_run_at` to its next cron tick.
-- **Inputs**: `cb_advance_task_schedule(id bigint)`
+- **What it does**: Move a task schedule’s `next_run_at` to its next cron tick, respecting the catch-up policy.
+- **Inputs**: `cb_advance_task_schedule(id bigint, policy text DEFAULT ‘one’)`
 - **Returns**: `RETURNS void`
 
 ### `cb_advance_flow_schedule`
-- **What it does**: Move a flow schedule’s `next_run_at` to its next cron tick.
-- **Inputs**: `cb_advance_flow_schedule(id bigint)`
+- **What it does**: Move a flow schedule’s `next_run_at` to its next cron tick, respecting the catch-up policy.
+- **Inputs**: `cb_advance_flow_schedule(id bigint, policy text DEFAULT ‘one’)`
 - **Returns**: `RETURNS void`
 
 ### `cb_execute_due_task_schedules`

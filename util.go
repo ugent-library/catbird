@@ -23,8 +23,16 @@ type CancelOpts struct {
 	Reason string
 }
 
+// Catch-up policy constants control how the scheduler handles missed ticks after downtime.
+const (
+	CatchUpSkip = "skip" // Skip all missed ticks, jump to future
+	CatchUpOne  = "one"  // Enqueue one catch-up run (oldest), jump to future (default)
+	CatchUpAll  = "all"  // Replay every missed tick, one at a time
+)
+
 type scheduleOpts struct {
-	input any
+	input   any
+	catchUp string
 }
 
 // ScheduleOpt configures scheduled task/flow behavior.
@@ -37,8 +45,22 @@ func WithInput(input any) ScheduleOpt {
 	}
 }
 
+// WithSkipCatchUp configures the schedule to skip all missed ticks on recovery.
+func WithSkipCatchUp() ScheduleOpt {
+	return func(opts *scheduleOpts) {
+		opts.catchUp = CatchUpSkip
+	}
+}
+
+// WithCatchUpAll configures the schedule to replay every missed tick on recovery.
+func WithCatchUpAll() ScheduleOpt {
+	return func(opts *scheduleOpts) {
+		opts.catchUp = CatchUpAll
+	}
+}
+
 func applyDefaultScheduleOpts(opts ...ScheduleOpt) *scheduleOpts {
-	resolved := scheduleOpts{}
+	resolved := scheduleOpts{catchUp: CatchUpOne}
 	for _, opt := range opts {
 		opt(&resolved)
 	}

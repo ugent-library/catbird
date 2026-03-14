@@ -596,6 +596,12 @@ client.CreateTaskSchedule(ctx, "send-report", "*/15 * * * *",
 
 // Schedule a flow
 client.CreateFlowSchedule(ctx, "order-processing", "0 2 * * *")
+
+// Skip all missed ticks on recovery (no catch-up runs)
+client.CreateTaskSchedule(ctx, "stats", "@hourly", catbird.WithSkipCatchUp())
+
+// Replay every missed tick on recovery
+client.CreateTaskSchedule(ctx, "billing", "0 * * * *", catbird.WithCatchUpAll())
 ```
 
 ### Cron Syntax
@@ -616,9 +622,15 @@ Shorthand descriptors: `@yearly` / `@annually`, `@monthly`, `@weekly`, `@daily` 
 
 All cron evaluation is in **UTC**.
 
-### Missed Ticks
+### Catch-Up Policies
 
-Schedules skip missed ticks. If a worker restarts after downtime, at most one catch-up run is enqueued and the schedule advances to the next future tick. Missed intermediate ticks are not replayed.
+When a worker restarts after downtime, the catch-up policy controls how missed ticks are handled:
+
+| Policy | Option | On recovery (5 missed ticks) | Enqueues |
+|--------|--------|------------------------------|----------|
+| **skip** | `WithSkipCatchUp()` | Skip all missed ticks, jump to future | 0 runs |
+| **one** (default) | — | Enqueue one catch-up run (oldest), jump to future | 1 run |
+| **all** | `WithCatchUpAll()` | Replay every missed tick, one at a time | Up to batch_size per poll |
 
 ## Conditional Execution
 
