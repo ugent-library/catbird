@@ -1251,11 +1251,13 @@ type RunFlowOpts struct {
 	IdempotencyKey string // Prevents all duplicate runs; permanent across all statuses
 	Headers        map[string]any
 	VisibleAt      time.Time
+	Priority       int
 }
 
 // FlowRunInfo represents the details of a flow execution.
 type FlowRunInfo struct {
 	ID                int64           `json:"id"`
+	Priority          int             `json:"priority"`
 	ConcurrencyKey    string          `json:"concurrency_key,omitempty"`
 	IdempotencyKey    string          `json:"idempotency_key,omitempty"`
 	Status            string          `json:"status"`
@@ -1444,8 +1446,8 @@ func RunFlowQuery(flowName string, input any, opts ...RunFlowOpts) (string, []an
 		return "", nil, err
 	}
 
-	q := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, headers => $5, visible_at => $6);`
-	args := []any{flowName, b, ptrOrNil(resolved.ConcurrencyKey), ptrOrNil(resolved.IdempotencyKey), headers, ptrOrNil(resolved.VisibleAt)}
+	q := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, headers => $5, visible_at => $6, priority => $7);`
+	args := []any{flowName, b, ptrOrNil(resolved.ConcurrencyKey), ptrOrNil(resolved.IdempotencyKey), headers, ptrOrNil(resolved.VisibleAt), resolved.Priority}
 
 	return q, args, nil
 }
@@ -1453,7 +1455,7 @@ func RunFlowQuery(flowName string, input any, opts ...RunFlowOpts) (string, []an
 // GetFlowRun retrieves a specific flow run result by ID.
 func GetFlowRun(ctx context.Context, conn Conn, flowName string, flowRunID int64) (*FlowRunInfo, error) {
 	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
-	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, priority, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
 	run, err := scanFlowRun(conn.QueryRow(ctx, query, flowRunID))
 	if err != nil {
 		return nil, wrapNotDefinedErr(err, "flow", flowName)
@@ -1464,7 +1466,7 @@ func GetFlowRun(ctx context.Context, conn Conn, flowName string, flowRunID int64
 // ListFlowRuns returns recent flow runs for the specified flow.
 func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunInfo, error) {
 	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
-	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, priority, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, wrapNotDefinedErr(err, "flow", flowName)
@@ -1493,6 +1495,7 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 
 	if err := row.Scan(
 		&rec.ID,
+		&rec.Priority,
 		&concurrencyKey,
 		&idempotencyKey,
 		&rec.Status,
@@ -1553,6 +1556,7 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 // StepRunInfo represents the execution state of a single step within a flow run.
 type StepRunInfo struct {
 	ID           int64           `json:"id"`
+	Priority     int             `json:"priority"`
 	StepName     string          `json:"step_name"`
 	Status       string          `json:"status"`
 	Attempts     int             `json:"attempts"`
@@ -1641,7 +1645,7 @@ func getStepStatus(ctx context.Context, conn Conn, flowName string, flowRunID in
 func GetFlowRunSteps(ctx context.Context, conn Conn, flowName string, flowRunID int64) ([]*StepRunInfo, error) {
 	tableName := fmt.Sprintf("cb_s_%s", strings.ToLower(flowName))
 	query := fmt.Sprintf(`
-		SELECT id, step_name, status, attempts, output, error_message, created_at, visible_at, started_at, completed_at, failed_at, skipped_at, canceled_at
+		SELECT id, priority, step_name, status, attempts, output, error_message, created_at, visible_at, started_at, completed_at, failed_at, skipped_at, canceled_at
 		FROM %s
 		WHERE flow_run_id = $1
 		ORDER BY id;`, pgx.Identifier{tableName}.Sanitize())
@@ -1657,6 +1661,7 @@ func GetFlowRunSteps(ctx context.Context, conn Conn, flowName string, flowRunID 
 
 		err := row.Scan(
 			&s.ID,
+			&s.Priority,
 			&s.StepName,
 			&s.Status,
 			&s.Attempts,

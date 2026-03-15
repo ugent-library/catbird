@@ -29,13 +29,13 @@ func TestSendQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedQuery := `SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, headers => $5::jsonb, visible_at => $6);`
+	expectedQuery := `SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, headers => $5::jsonb, visible_at => $6, priority => $7);`
 	if query != expectedQuery {
 		t.Fatalf("unexpected query: %s", query)
 	}
 
-	if len(args) != 6 {
-		t.Fatalf("expected 6 args, got %d", len(args))
+	if len(args) != 7 {
+		t.Fatalf("expected 7 args, got %d", len(args))
 	}
 
 	if gotQueue, ok := args[0].(string); !ok || gotQueue != "test_queue" {
@@ -66,8 +66,8 @@ func TestSendQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nilArgs) != 6 {
-		t.Fatalf("expected 6 args for nil opts, got %d", len(nilArgs))
+	if len(nilArgs) != 7 {
+		t.Fatalf("expected 7 args for nil opts, got %d", len(nilArgs))
 	}
 	if gotTopic, ok := nilArgs[2].(*string); !ok || gotTopic != nil {
 		t.Fatalf("expected nil *string topic arg for nil opts, got %#v", nilArgs[2])
@@ -102,13 +102,13 @@ func TestSendManyQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedQuery := `SELECT cb_send(queue => $1, payloads => $2, topic => $3, idempotency_keys => $4, headers => $5::jsonb[], visible_at => $6);`
+	expectedQuery := `SELECT cb_send(queue => $1, payloads => $2, topic => $3, idempotency_keys => $4, headers => $5::jsonb[], visible_at => $6, priority => $7);`
 	if query != expectedQuery {
 		t.Fatalf("unexpected query: %s", query)
 	}
 
-	if len(args) != 6 {
-		t.Fatalf("expected 6 args, got %d", len(args))
+	if len(args) != 7 {
+		t.Fatalf("expected 7 args, got %d", len(args))
 	}
 
 	if gotQueue, ok := args[0].(string); !ok || gotQueue != "test_queue" {
@@ -139,8 +139,8 @@ func TestSendManyQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nilArgs) != 6 {
-		t.Fatalf("expected 6 args for nil opts, got %d", len(nilArgs))
+	if len(nilArgs) != 7 {
+		t.Fatalf("expected 7 args for nil opts, got %d", len(nilArgs))
 	}
 	if gotPayloads, ok := nilArgs[1].(pgtype.FlatArray[json.RawMessage]); !ok || len(gotPayloads) != 0 {
 		t.Fatalf("expected [] payloads for nil input, got %#v", nilArgs[1])

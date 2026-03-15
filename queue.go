@@ -15,6 +15,7 @@ type Message struct {
 	Topic          string          `json:"topic"`
 	Payload        json.RawMessage `json:"payload"`
 	Headers        json.RawMessage `json:"headers,omitempty"`
+	Priority       int             `json:"priority"`
 	Deliveries     int             `json:"deliveries"`
 	CreatedAt      time.Time       `json:"created_at"`
 	VisibleAt      time.Time       `json:"visible_at"`
@@ -76,6 +77,7 @@ type SendOpts struct {
 	IdempotencyKey string
 	Headers        map[string]any
 	VisibleAt      time.Time
+	Priority       int
 }
 
 // Send enqueues a message to the specified queue.
@@ -107,8 +109,8 @@ func SendQuery(queueName string, payload any, opts ...SendOpts) (string, []any, 
 		return "", nil, err
 	}
 
-	q := `SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, headers => $5::jsonb, visible_at => $6);`
-	args := []any{queueName, b, ptrOrNil(resolved.Topic), ptrOrNil(resolved.IdempotencyKey), headers, ptrOrNil(resolved.VisibleAt)}
+	q := `SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, headers => $5::jsonb, visible_at => $6, priority => $7);`
+	args := []any{queueName, b, ptrOrNil(resolved.Topic), ptrOrNil(resolved.IdempotencyKey), headers, ptrOrNil(resolved.VisibleAt), resolved.Priority}
 
 	return q, args, nil
 }
@@ -118,6 +120,7 @@ type SendManyOpts struct {
 	IdempotencyKeys []string
 	Headers         []map[string]any
 	VisibleAt       time.Time
+	Priority        int
 }
 
 // SendMany enqueues multiple messages to the specified queue.
@@ -153,8 +156,8 @@ func SendManyQuery(queueName string, payloads []any, opts ...SendManyOpts) (stri
 		return "", nil, err
 	}
 
-	q := `SELECT cb_send(queue => $1, payloads => $2, topic => $3, idempotency_keys => $4, headers => $5::jsonb[], visible_at => $6);`
-	args := []any{queueName, encodedPayloads, ptrOrNil(resolved.Topic), resolved.IdempotencyKeys, headers, ptrOrNil(resolved.VisibleAt)}
+	q := `SELECT cb_send(queue => $1, payloads => $2, topic => $3, idempotency_keys => $4, headers => $5::jsonb[], visible_at => $6, priority => $7);`
+	args := []any{queueName, encodedPayloads, ptrOrNil(resolved.Topic), resolved.IdempotencyKeys, headers, ptrOrNil(resolved.VisibleAt), resolved.Priority}
 
 	return q, args, nil
 }
@@ -378,6 +381,7 @@ func scanMessage(row pgx.Row) (Message, error) {
 		&topic,
 		&rec.Payload,
 		&headers,
+		&rec.Priority,
 		&rec.Deliveries,
 		&rec.CreatedAt,
 		&rec.VisibleAt,

@@ -35,13 +35,13 @@ func TestRunFlowQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedQuery := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, headers => $5, visible_at => $6);`
+	expectedQuery := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, headers => $5, visible_at => $6, priority => $7);`
 	if query != expectedQuery {
 		t.Fatalf("unexpected query: %s", query)
 	}
 
-	if len(args) != 6 {
-		t.Fatalf("expected 6 args, got %d", len(args))
+	if len(args) != 7 {
+		t.Fatalf("expected 7 args, got %d", len(args))
 	}
 
 	if gotName, ok := args[0].(string); !ok || gotName != "test_flow" {
@@ -72,8 +72,8 @@ func TestRunFlowQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nilArgs) != 6 {
-		t.Fatalf("expected 6 args for nil opts, got %d", len(nilArgs))
+	if len(nilArgs) != 7 {
+		t.Fatalf("expected 7 args for nil opts, got %d", len(nilArgs))
 	}
 	if gotConcurrencyKey, ok := nilArgs[2].(*string); !ok || gotConcurrencyKey != nil {
 		t.Fatalf("expected nil *string concurrency key arg for nil opts, got %#v", nilArgs[2])

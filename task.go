@@ -213,6 +213,7 @@ type TaskScheduleInfo struct {
 // TaskRunInfo represents the details of a task execution.
 type TaskRunInfo struct {
 	ID                int64           `json:"id"`
+	Priority          int             `json:"priority"`
 	ConcurrencyKey    string          `json:"concurrency_key,omitempty"`
 	IdempotencyKey    string          `json:"idempotency_key,omitempty"`
 	Status            string          `json:"status"`
@@ -393,6 +394,7 @@ type RunTaskOpts struct {
 	IdempotencyKey string // Prevents all duplicate runs; permanent across all statuses
 	Headers        map[string]any
 	VisibleAt      time.Time
+	Priority       int
 }
 
 // RunTask enqueues a task execution and returns a handle for monitoring
@@ -429,8 +431,8 @@ func RunTaskQuery(taskName string, input any, opts ...RunTaskOpts) (string, []an
 		return "", nil, err
 	}
 
-	q := `SELECT * FROM cb_run_task(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, headers => $5, visible_at => $6);`
-	args := []any{taskName, b, ptrOrNil(resolved.ConcurrencyKey), ptrOrNil(resolved.IdempotencyKey), headers, ptrOrNil(resolved.VisibleAt)}
+	q := `SELECT * FROM cb_run_task(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, headers => $5, visible_at => $6, priority => $7);`
+	args := []any{taskName, b, ptrOrNil(resolved.ConcurrencyKey), ptrOrNil(resolved.IdempotencyKey), headers, ptrOrNil(resolved.VisibleAt), resolved.Priority}
 
 	return q, args, nil
 }
@@ -438,7 +440,7 @@ func RunTaskQuery(taskName string, input any, opts ...RunTaskOpts) (string, []an
 // GetTaskRun retrieves a specific task run result by ID.
 func GetTaskRun(ctx context.Context, conn Conn, taskName string, taskRunID int64) (*TaskRunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(taskName))
-	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at, skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, priority, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at, skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
 	run, err := scanTaskRun(conn.QueryRow(ctx, query, taskRunID))
 	if err != nil {
 		return nil, wrapNotDefinedErr(err, "task", taskName)
@@ -449,7 +451,7 @@ func GetTaskRun(ctx context.Context, conn Conn, taskName string, taskRunID int64
 // ListTaskRuns returns recent task runs for the specified task.
 func ListTaskRuns(ctx context.Context, conn Conn, taskName string) ([]*TaskRunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(taskName))
-	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at, skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, priority, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at, skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, wrapNotDefinedErr(err, "task", taskName)
@@ -479,6 +481,7 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 
 	if err := row.Scan(
 		&rec.ID,
+		&rec.Priority,
 		&concurrencyKey,
 		&idempotencyKey,
 		&rec.Status,

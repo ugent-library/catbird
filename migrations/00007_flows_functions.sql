@@ -405,6 +405,7 @@ BEGIN
       completed_at timestamptz,
       failed_at timestamptz,
       canceled_at timestamptz,
+      priority int NOT NULL DEFAULT 0,
       cancel_reason text,
       CONSTRAINT cb_status_valid CHECK (status IN ('started', 'canceling', 'completed', 'failed', 'canceled')),
       CONSTRAINT cb_remaining_steps_valid CHECK (remaining_steps >= 0),
@@ -455,6 +456,7 @@ BEGIN
       error_message text,
       signal_input jsonb,
       remaining_dependencies int NOT NULL DEFAULT 0,
+      priority int NOT NULL DEFAULT 0,
       visible_at timestamptz NOT NULL DEFAULT now(),
       created_at timestamptz NOT NULL DEFAULT now(),
       started_at timestamptz,
@@ -479,7 +481,7 @@ BEGIN
     );
 
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, status);', _s_table || '_flow_run_id_status_idx', _s_table);
-    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (step_name, visible_at, id) WHERE status IN (''queued'', ''started'');', _s_table || '_poll_step_visible_id_idx', _s_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (step_name, visible_at, priority DESC, id) WHERE status IN (''queued'', ''started'');', _s_table || '_poll_step_visible_id_idx', _s_table);
     EXECUTE format('DROP INDEX IF EXISTS %I;', _s_table || '_visible_at_idx');
 
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (status, generator_status) WHERE status IN (''waiting_for_dependencies'', ''waiting_for_signal'', ''started'', ''waiting_for_map_tasks'');', _s_table || '_generator_status_idx', _s_table);
@@ -500,6 +502,7 @@ BEGIN
       item jsonb NOT NULL,
       output jsonb,
       error_message text,
+      priority int NOT NULL DEFAULT 0,
       visible_at timestamptz NOT NULL DEFAULT now(),
       created_at timestamptz NOT NULL DEFAULT now(),
       started_at timestamptz,
@@ -516,7 +519,7 @@ BEGIN
     _create_table_stmt, _m_table, _s_table
     );
 
-    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (step_name, visible_at, id) WHERE status IN (''queued'', ''started'');', _m_table || '_poll_step_visible_id_idx', _m_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (step_name, visible_at, priority DESC, id) WHERE status IN (''queued'', ''started'');', _m_table || '_poll_step_visible_id_idx', _m_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (flow_run_id, step_name, status, item_idx);', _m_table || '_flow_step_status_item_idx', _m_table);
     EXECUTE format('DROP INDEX IF EXISTS %I;', _m_table || '_step_status_visible_idx');
     EXECUTE format('DROP INDEX IF EXISTS %I;', _m_table || '_flow_step_status_idx');
@@ -540,7 +543,8 @@ CREATE OR REPLACE FUNCTION cb_run_flow(
     concurrency_key text DEFAULT NULL,
     idempotency_key text DEFAULT NULL,
     headers jsonb DEFAULT NULL,
-    visible_at timestamptz DEFAULT NULL
+    visible_at timestamptz DEFAULT NULL,
+    priority int DEFAULT 0
 )
 RETURNS bigint
 LANGUAGE plpgsql AS $$
@@ -575,8 +579,8 @@ BEGIN
         EXECUTE format(
             $QUERY$
             WITH ins AS (
-              INSERT INTO %I (concurrency_key, input, headers, remaining_steps, output_priority, status)
-              VALUES ($1, $2, $3, $4, $5, 'started')
+              INSERT INTO %I (concurrency_key, input, headers, remaining_steps, output_priority, status, priority)
+              VALUES ($1, $2, $3, $4, $5, 'started', $6)
                 ON CONFLICT (concurrency_key) WHERE concurrency_key IS NOT NULL AND status = 'started'
                 DO UPDATE SET status = EXCLUDED.status WHERE FALSE
                 RETURNING id
@@ -589,15 +593,15 @@ BEGIN
             $QUERY$,
             _f_table, _f_table
         )
-        USING cb_run_flow.concurrency_key, cb_run_flow.input, cb_run_flow.headers, _remaining_steps, _output_priority
+        USING cb_run_flow.concurrency_key, cb_run_flow.input, cb_run_flow.headers, _remaining_steps, _output_priority, cb_run_flow.priority
         INTO _id;
     ELSIF cb_run_flow.idempotency_key IS NOT NULL THEN
         -- Idempotency: dedupe started/completed
         EXECUTE format(
             $QUERY$
             WITH ins AS (
-              INSERT INTO %I (idempotency_key, input, headers, remaining_steps, output_priority, status)
-              VALUES ($1, $2, $3, $4, $5, 'started')
+              INSERT INTO %I (idempotency_key, input, headers, remaining_steps, output_priority, status, priority)
+              VALUES ($1, $2, $3, $4, $5, 'started', $6)
                 ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('started', 'completed')
                 DO UPDATE SET status = EXCLUDED.status WHERE FALSE
                 RETURNING id
@@ -610,19 +614,19 @@ BEGIN
             $QUERY$,
             _f_table, _f_table
         )
-        USING cb_run_flow.idempotency_key, cb_run_flow.input, cb_run_flow.headers, _remaining_steps, _output_priority
+        USING cb_run_flow.idempotency_key, cb_run_flow.input, cb_run_flow.headers, _remaining_steps, _output_priority, cb_run_flow.priority
         INTO _id;
     ELSE
         -- No deduplication
         EXECUTE format(
             $QUERY$
-          INSERT INTO %I (input, headers, remaining_steps, output_priority, status)
-          VALUES ($1, $2, $3, $4, 'started')
+          INSERT INTO %I (input, headers, remaining_steps, output_priority, status, priority)
+          VALUES ($1, $2, $3, $4, 'started', $5)
             RETURNING id
             $QUERY$,
             _f_table
         )
-        USING cb_run_flow.input, cb_run_flow.headers, _remaining_steps, _output_priority
+        USING cb_run_flow.input, cb_run_flow.headers, _remaining_steps, _output_priority, cb_run_flow.priority
         INTO _id;
     END IF;
 
@@ -641,7 +645,8 @@ BEGIN
       reduce_source_step_name,
       signal,
       dependency_step_names,
-      dependent_step_names
+      dependent_step_names,
+      priority
     )
     SELECT
       %L,
@@ -670,7 +675,8 @@ BEGIN
         WHERE d.flow_name = %L
           AND d.dependency_step_name = s.name
         ORDER BY d.idx
-      ), '{}'::text[])
+      ), '{}'::text[]),
+      %L
     FROM cb_steps s
     WHERE s.flow_name = %L
     ON CONFLICT (flow_run_id, step_name) DO NOTHING
@@ -680,6 +686,7 @@ BEGIN
     cb_run_flow.input,
     cb_run_flow.name,
     cb_run_flow.name,
+    cb_run_flow.priority,
     cb_run_flow.name
     );
 
@@ -1068,7 +1075,8 @@ BEGIN
              sr.signal_input,
              sr.condition,
                   sr.step_type,
-             sr.map_source_step_name
+             sr.map_source_step_name,
+             sr.priority
       FROM %I sr
       WHERE sr.flow_run_id = $1
         AND (
@@ -1271,7 +1279,7 @@ BEGIN
       -- Spawn map tasks in deterministic order
       EXECUTE format(
         $QUERY$
-        INSERT INTO %I (flow_run_id, step_name, item_idx, flow_input, status, dependency_step_names, signal_input, item, visible_at)
+        INSERT INTO %I (flow_run_id, step_name, item_idx, flow_input, status, dependency_step_names, signal_input, item, visible_at, priority)
         SELECT $1,
                $2,
                ordinality - 1,
@@ -1280,7 +1288,8 @@ BEGIN
                $5,
                $6,
                value,
-               coalesce($3, now())
+               coalesce($3, now()),
+               $8
         FROM jsonb_array_elements($7) WITH ORDINALITY
         ON CONFLICT (flow_run_id, step_name, item_idx) DO NOTHING
         $QUERY$,
@@ -1292,7 +1301,8 @@ BEGIN
             _flow_input,
             _step_to_process.dependency_step_names,
             _step_to_process.signal_input,
-            _map_items;
+            _map_items,
+            _step_to_process.priority;
 
       -- Empty map completes immediately with []
       IF _map_item_count = 0 THEN
@@ -1372,7 +1382,7 @@ BEGIN
                 WHERE f.id = m.flow_run_id
                   AND f.status = 'started'
             )
-          ORDER BY m.id ASC
+          ORDER BY m.priority DESC, m.id ASC
           LIMIT $2
           FOR UPDATE SKIP LOCKED
         )
@@ -1489,7 +1499,7 @@ BEGIN
               WHERE f.id = m.flow_run_id
                 AND f.status = 'started'
           )
-        ORDER BY m.id ASC
+        ORDER BY m.priority DESC, m.id ASC
         LIMIT $2
         FOR UPDATE SKIP LOCKED
       )
@@ -1585,6 +1595,7 @@ DECLARE
     _flow_input jsonb;
     _dependency_step_names text[];
     _signal_input jsonb;
+    _priority int;
     _spawned int := 0;
 BEGIN
     IF cb_spawn_generator_map_tasks.items IS NULL OR jsonb_typeof(cb_spawn_generator_map_tasks.items) <> 'array' THEN
@@ -1597,7 +1608,7 @@ BEGIN
 
     EXECUTE format(
       $QUERY$
-      SELECT flow_run_id, map_tasks_spawned, flow_input, dependency_step_names, signal_input
+      SELECT flow_run_id, map_tasks_spawned, flow_input, dependency_step_names, signal_input, priority
       FROM %I
       WHERE id = $1
         AND step_name = $2
@@ -1608,7 +1619,7 @@ BEGIN
       _s_table
     )
     USING cb_spawn_generator_map_tasks.id, cb_spawn_generator_map_tasks.step_name
-    INTO _flow_run_id, _spawn_offset, _flow_input, _dependency_step_names, _signal_input;
+    INTO _flow_run_id, _spawn_offset, _flow_input, _dependency_step_names, _signal_input, _priority;
 
     IF _flow_run_id IS NULL THEN
         RETURN 0;
@@ -1617,7 +1628,7 @@ BEGIN
     EXECUTE format(
       $QUERY$
       WITH ins AS (
-        INSERT INTO %I (flow_run_id, step_name, item_idx, flow_input, status, dependency_step_names, signal_input, item, visible_at)
+        INSERT INTO %I (flow_run_id, step_name, item_idx, flow_input, status, dependency_step_names, signal_input, item, visible_at, priority)
         SELECT $1,
                $2,
                $3 + ordinality - 1,
@@ -1626,7 +1637,8 @@ BEGIN
                $5,
                $6,
                value,
-               coalesce($7, now())
+               coalesce($7, now()),
+               $9
         FROM jsonb_array_elements($8) WITH ORDINALITY
         ON CONFLICT (flow_run_id, step_name, item_idx) DO NOTHING
         RETURNING 1
@@ -1643,7 +1655,8 @@ BEGIN
           _dependency_step_names,
           _signal_input,
           cb_spawn_generator_map_tasks.visible_at,
-          cb_spawn_generator_map_tasks.items
+          cb_spawn_generator_map_tasks.items,
+          _priority
     INTO _spawned;
 
     IF _spawned > 0 THEN
@@ -2674,5 +2687,5 @@ DROP FUNCTION IF EXISTS cb_claim_map_tasks(text, text, int, int);
 DROP FUNCTION IF EXISTS cb_hide_steps(text, text, bigint[], int);
 DROP FUNCTION IF EXISTS cb_claim_steps(text, text, int, int);
 DROP FUNCTION IF EXISTS cb_start_steps(text, bigint, timestamptz);
-DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text, text, jsonb, timestamptz);
+DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text, text, jsonb, timestamptz, int);
 DROP FUNCTION IF EXISTS cb_create_flow(text, text, jsonb, text[]);

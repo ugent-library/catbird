@@ -30,13 +30,13 @@ func TestRunTaskQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedQuery := `SELECT * FROM cb_run_task(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, headers => $5, visible_at => $6);`
+	expectedQuery := `SELECT * FROM cb_run_task(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, headers => $5, visible_at => $6, priority => $7);`
 	if query != expectedQuery {
 		t.Fatalf("unexpected query: %s", query)
 	}
 
-	if len(args) != 6 {
-		t.Fatalf("expected 6 args, got %d", len(args))
+	if len(args) != 7 {
+		t.Fatalf("expected 7 args, got %d", len(args))
 	}
 
 	if gotName, ok := args[0].(string); !ok || gotName != "test_task" {
@@ -67,8 +67,8 @@ func TestRunTaskQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nilArgs) != 6 {
-		t.Fatalf("expected 6 args for nil opts, got %d", len(nilArgs))
+	if len(nilArgs) != 7 {
+		t.Fatalf("expected 7 args for nil opts, got %d", len(nilArgs))
 	}
 	if gotConcurrencyKey, ok := nilArgs[2].(*string); !ok || gotConcurrencyKey != nil {
 		t.Fatalf("expected nil *string concurrency key arg for nil opts, got %#v", nilArgs[2])
@@ -140,6 +140,67 @@ func TestTaskRunAndWait(t *testing.T) {
 
 	if result != 42 {
 		t.Fatalf("expected 42, got %d", result)
+	}
+}
+
+func TestTaskPriority(t *testing.T) {
+	client := getTestClient(t)
+
+	taskName := fmt.Sprintf("priority_task_%d", time.Now().UnixNano())
+
+	// Track processing order
+	var mu sync.Mutex
+	var order []int
+
+	task := NewTask(taskName).Do(func(ctx context.Context, in int) (int, error) {
+		mu.Lock()
+		order = append(order, in)
+		mu.Unlock()
+		return in, nil
+	}, WithConcurrency(1)) // concurrency 1 ensures sequential processing
+
+	// Create task definition without starting worker
+	if err := CreateTask(t.Context(), testPool, task); err != nil {
+		t.Fatal(err)
+	}
+
+	// Enqueue 3 tasks with different priorities before worker starts
+	if _, err := client.RunTask(t.Context(), taskName, 1, RunTaskOpts{Priority: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.RunTask(t.Context(), taskName, 2, RunTaskOpts{Priority: 10}); err != nil {
+		t.Fatal(err)
+	}
+	h, err := client.RunTask(t.Context(), taskName, 3, RunTaskOpts{Priority: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Now start worker — it should claim highest priority first
+	worker := NewWorker(testPool).AddTask(task)
+	startTestWorker(t, worker)
+
+	// Wait for all to complete (the last-enqueued has priority 5, middle priority)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	var out int
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	// Give a moment for all processing to finish
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(order) != 3 {
+		t.Fatalf("expected 3 processed tasks, got %d", len(order))
+	}
+
+	// Priority 10 (input=2) first, then priority 5 (input=3), then priority 0 (input=1)
+	if order[0] != 2 || order[1] != 3 || order[2] != 1 {
+		t.Fatalf("expected processing order [2 3 1] (by priority 10, 5, 0), got %v", order)
 	}
 }
 

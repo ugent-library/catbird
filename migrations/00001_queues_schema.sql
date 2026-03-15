@@ -13,6 +13,7 @@ BEGIN
         topic text,
         payload jsonb,
         headers jsonb,
+        priority int,
         deliveries int,
         created_at timestamptz,
         visible_at timestamptz

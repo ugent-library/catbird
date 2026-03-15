@@ -80,6 +80,7 @@ BEGIN
             on_fail_error_message text,
             on_fail_started_at timestamptz,
             on_fail_completed_at timestamptz,
+            priority int NOT NULL DEFAULT 0,
             visible_at timestamptz NOT NULL DEFAULT now(),
             started_at timestamptz NOT NULL DEFAULT now(),
             cancel_requested_at timestamptz,
@@ -106,7 +107,7 @@ BEGIN
 
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (concurrency_key) WHERE concurrency_key IS NOT NULL AND status IN (''queued'', ''started'')', _t_table || '_concurrency_key_idx', _t_table);
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN (''queued'', ''started'', ''completed'')', _t_table || '_idempotency_key_idx', _t_table);
-    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at, id) WHERE status IN (''queued'', ''started'');', _t_table || '_poll_visible_id_idx', _t_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at, priority DESC, id) WHERE status IN (''queued'', ''started'');', _t_table || '_poll_visible_id_idx', _t_table);
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (on_fail_visible_at, id) WHERE status = ''failed'' AND on_fail_status IN (''queued'', ''failed'');', _t_table || '_on_fail_poll_idx', _t_table);
     EXECUTE format('DROP INDEX IF EXISTS %I;', _t_table || '_visible_at_idx');
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (GREATEST(completed_at, failed_at, skipped_at, canceled_at)) WHERE status IN (''completed'', ''failed'', ''skipped'', ''canceled'');', _t_table || '_retention_idx', _t_table);
@@ -183,7 +184,8 @@ CREATE OR REPLACE FUNCTION cb_run_task(
     concurrency_key text DEFAULT NULL,
     idempotency_key text DEFAULT NULL,
     headers jsonb DEFAULT NULL,
-    visible_at timestamptz DEFAULT NULL
+    visible_at timestamptz DEFAULT NULL,
+    priority int DEFAULT 0
 )
 RETURNS bigint
 LANGUAGE plpgsql AS $$
@@ -209,8 +211,8 @@ BEGIN
         EXECUTE format(
             $QUERY$
             WITH ins AS (
-                INSERT INTO %I (input, concurrency_key, headers, visible_at)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO %I (input, concurrency_key, headers, visible_at, priority)
+                VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (concurrency_key) WHERE concurrency_key IS NOT NULL AND status IN ('queued', 'started')
                 DO UPDATE SET status = EXCLUDED.status WHERE FALSE
                 RETURNING id
@@ -223,15 +225,15 @@ BEGIN
             $QUERY$,
             _t_table, _t_table
         )
-        USING cb_run_task.input, cb_run_task.concurrency_key, cb_run_task.headers, coalesce(cb_run_task.visible_at, now())
+        USING cb_run_task.input, cb_run_task.concurrency_key, cb_run_task.headers, coalesce(cb_run_task.visible_at, now()), cb_run_task.priority
         INTO _id;
     ELSIF cb_run_task.idempotency_key IS NOT NULL THEN
         -- Idempotency: dedupe queued/started/completed
         EXECUTE format(
             $QUERY$
             WITH ins AS (
-                INSERT INTO %I (input, idempotency_key, headers, visible_at)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO %I (input, idempotency_key, headers, visible_at, priority)
+                VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('queued', 'started', 'completed')
                 DO UPDATE SET status = EXCLUDED.status WHERE FALSE
                 RETURNING id
@@ -244,19 +246,19 @@ BEGIN
             $QUERY$,
             _t_table, _t_table
         )
-        USING cb_run_task.input, cb_run_task.idempotency_key, cb_run_task.headers, coalesce(cb_run_task.visible_at, now())
+        USING cb_run_task.input, cb_run_task.idempotency_key, cb_run_task.headers, coalesce(cb_run_task.visible_at, now()), cb_run_task.priority
         INTO _id;
     ELSE
         -- No deduplication
         EXECUTE format(
             $QUERY$
-            INSERT INTO %I (input, headers, visible_at)
-            VALUES ($1, $2, $3)
+            INSERT INTO %I (input, headers, visible_at, priority)
+            VALUES ($1, $2, $3, $4)
             RETURNING id
             $QUERY$,
             _t_table
         )
-        USING cb_run_task.input, cb_run_task.headers, coalesce(cb_run_task.visible_at, now())
+        USING cb_run_task.input, cb_run_task.headers, coalesce(cb_run_task.visible_at, now()), cb_run_task.priority
         INTO _id;
     END IF;
 
@@ -300,7 +302,7 @@ BEGIN
           FROM %I
           WHERE visible_at <= clock_timestamp()
             AND status IN ('queued', 'started')
-          ORDER BY id ASC
+          ORDER BY priority DESC, id ASC
           LIMIT $1
           FOR UPDATE SKIP LOCKED
         )
@@ -673,5 +675,5 @@ DROP FUNCTION IF EXISTS cb_complete_task(text, bigint, jsonb);
 DROP FUNCTION IF EXISTS cb_wait_task_output(text, bigint, int, int);
 DROP FUNCTION IF EXISTS cb_hide_tasks(text, bigint[], int);
 DROP FUNCTION IF EXISTS cb_claim_tasks(text, int, int);
-DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text, text, jsonb, timestamptz);
+DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text, text, jsonb, timestamptz, int);
 DROP FUNCTION IF EXISTS cb_create_task(text, text, text);

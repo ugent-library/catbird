@@ -74,6 +74,9 @@ err = flowHandle.WaitForOutput(ctx, &flowOut)
 client.RunTask(ctx, "process-user", userID, catbird.RunTaskOpts{VisibleAt: time.Now().Add(5 * time.Minute)})
 client.RunFlow(ctx, "order_processing", map[string]any{"order_id": 123}, catbird.RunFlowOpts{VisibleAt: time.Now().Add(30 * time.Second)})
 
+// Priority (higher = claimed first, default 0)
+client.RunTask(ctx, "send-email", email, catbird.RunTaskOpts{Priority: 10})
+
 // Ensure definitions exist before usage; this is not necessary if you
 // just want to run a worker, definitions will be created for you on
 // Start

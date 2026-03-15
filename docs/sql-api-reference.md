@@ -172,12 +172,12 @@ These are the functions most app code and external clients care about.
 
 ### `cb_send` (single message)
 - **What it does**: Send one message to a specific queue.
-- **Inputs**: `cb_send(queue text, payload jsonb, topic text DEFAULT NULL, idempotency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL)`
+- **Inputs**: `cb_send(queue text, payload jsonb, topic text DEFAULT NULL, idempotency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0)`
 - **Returns**: `RETURNS bigint`
 
 ### `cb_send` (batch)
 - **What it does**: Send multiple messages to a specific queue in one call.
-- **Inputs**: `cb_send(queue text, payloads jsonb[], topic text DEFAULT NULL, idempotency_keys text[] DEFAULT NULL, headers jsonb[] DEFAULT NULL, visible_at timestamptz DEFAULT NULL)`
+- **Inputs**: `cb_send(queue text, payloads jsonb[], topic text DEFAULT NULL, idempotency_keys text[] DEFAULT NULL, headers jsonb[] DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0)`
 - **Returns**: `RETURNS bigint[]`
 
 ### `cb_publish` (single message)
@@ -234,7 +234,7 @@ These are the functions most app code and external clients care about.
 
 ### `cb_run_task`
 - **What it does**: Create a task run (enqueue a task execution).
-- **Inputs**: `cb_run_task(name text, input jsonb, concurrency_key text DEFAULT NULL, idempotency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL)`
+- **Inputs**: `cb_run_task(name text, input jsonb, concurrency_key text DEFAULT NULL, idempotency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0)`
 - **Returns**: `RETURNS bigint`
 
 ### `cb_wait_task_output`
@@ -272,7 +272,7 @@ These are the functions most app code and external clients care about.
 
 ### `cb_run_flow`
 - **What it does**: Create a flow run (enqueue a flow execution).
-- **Inputs**: `cb_run_flow(name text, input jsonb, concurrency_key text DEFAULT NULL, idempotency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL)`
+- **Inputs**: `cb_run_flow(name text, input jsonb, concurrency_key text DEFAULT NULL, idempotency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0)`
 - **Returns**: `RETURNS bigint`
 
 ### `cb_wait_flow_output`

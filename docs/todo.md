@@ -14,8 +14,6 @@ Start reply from dashboard and tui.
 
 ## Performance
 
-- [ ] [!!] Priority queues — per-task/flow priority column with weighted polling
-- [ ] [!] Fair queueing (see https://docs.hatchet.run/blog/multi-tenant-queues)
 - [ ] [!] Partitioned run tables — partition `cb_t_*` / `cb_f_*` by `created_at` for large-volume deployments; GC just drops old partitions (consider pg_partman for lifecycle management)
 - [ ] [!] `pop()` — atomic read+delete in one operation; at-most-once delivery semantics for use cases where redelivery is never wanted
 - [ ] [!] `peek()` — non-destructive read (no hide, no delete) for diagnostics/inspection; returns visible messages without altering delivery state

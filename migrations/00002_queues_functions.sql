@@ -46,6 +46,7 @@ BEGIN
             topic text,
             payload jsonb NOT NULL,
             headers jsonb,
+            priority int NOT NULL DEFAULT 0,
             deliveries int NOT NULL DEFAULT 0,
             created_at timestamptz NOT NULL DEFAULT now(),
             visible_at timestamptz NOT NULL DEFAULT now(),
@@ -56,7 +57,7 @@ BEGIN
     );
 
     EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (idempotency_key);', _q_table || '_idempotency_key_idx', _q_table);
-    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at, id);', _q_table || '_poll_visible_id_idx', _q_table);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (visible_at, priority DESC, id);', _q_table || '_poll_visible_id_idx', _q_table);
     EXECUTE format('DROP INDEX IF EXISTS %I;', _q_table || '_visible_at_idx');
 
     -- Insert queue metadata
@@ -144,8 +145,8 @@ BEGIN
         BEGIN
             EXECUTE format(
                 $QUERY$
-                    INSERT INTO %I (topic, payload, idempotency_key, headers, visible_at)
-                    VALUES ($1, $2, $3, $4, $5)
+                    INSERT INTO %I (topic, payload, idempotency_key, headers, visible_at, priority)
+                    VALUES ($1, $2, $3, $4, $5, 0)
                     ON CONFLICT (idempotency_key) DO NOTHING;
                 $QUERY$,
                 _q_table
@@ -323,7 +324,8 @@ CREATE OR REPLACE FUNCTION cb_send(
     topic text DEFAULT NULL,
     idempotency_key text DEFAULT NULL,
     headers jsonb DEFAULT NULL,
-    visible_at timestamptz DEFAULT NULL
+    visible_at timestamptz DEFAULT NULL,
+    priority int DEFAULT 0
 )
 RETURNS bigint
 LANGUAGE plpgsql AS $$
@@ -342,8 +344,8 @@ BEGIN
     EXECUTE format(
         $QUERY$
         WITH ins AS (
-            INSERT INTO %I (topic, payload, idempotency_key, headers, visible_at)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO %I (topic, payload, idempotency_key, headers, visible_at, priority)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
             DO UPDATE SET visible_at = EXCLUDED.visible_at WHERE FALSE
             RETURNING id
@@ -360,7 +362,8 @@ BEGIN
           cb_send.payload,
           cb_send.idempotency_key,
             cb_send.headers,
-          _visible_at
+          _visible_at,
+          cb_send.priority
     INTO _id;
 
     PERFORM pg_notify(current_schema || '.cb_q_' || cb_send.queue, to_char(coalesce(cb_send.visible_at, now()) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
@@ -401,7 +404,7 @@ BEGIN
           SELECT id
           FROM %I
           WHERE visible_at <= clock_timestamp()
-          ORDER BY id ASC
+          ORDER BY priority DESC, id ASC
           LIMIT $1
           FOR UPDATE SKIP LOCKED
         )
@@ -415,6 +418,7 @@ BEGIN
                   m.topic,
                   m.payload,
                   m.headers,
+                  m.priority,
                   m.deliveries,
                   m.created_at,
                   m.visible_at;
@@ -484,7 +488,7 @@ BEGIN
                 SELECT id
                 FROM %I
                 WHERE visible_at <= clock_timestamp()
-                ORDER BY id ASC
+                ORDER BY priority DESC, id ASC
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
             )
@@ -498,6 +502,7 @@ BEGIN
                       m.topic,
                       m.payload,
                       m.headers,
+                      m.priority,
                       m.deliveries,
                       m.created_at,
                       m.visible_at;
@@ -674,7 +679,8 @@ CREATE OR REPLACE FUNCTION cb_send(
     topic text DEFAULT NULL,
     idempotency_keys text[] DEFAULT NULL,
     headers jsonb[] DEFAULT NULL,
-    visible_at timestamptz DEFAULT NULL
+    visible_at timestamptz DEFAULT NULL,
+    priority int DEFAULT 0
 )
 RETURNS bigint[]
 LANGUAGE plpgsql AS $$
@@ -718,8 +724,8 @@ BEGIN
             FROM unnest($1) WITH ORDINALITY AS t(payload, ordinality)
         ),
         ins AS (
-            INSERT INTO %I (topic, payload, idempotency_key, headers, visible_at)
-            SELECT $2, payload, idempotency_key, headers, $4
+            INSERT INTO %I (topic, payload, idempotency_key, headers, visible_at, priority)
+            SELECT $2, payload, idempotency_key, headers, $4, $6
             FROM payload_list
             ORDER BY ordinality
             ON CONFLICT (idempotency_key) DO NOTHING
@@ -734,7 +740,8 @@ BEGIN
           cb_send.topic,
             cb_send.headers,
           _visible_at,
-          cb_send.idempotency_keys
+          cb_send.idempotency_keys,
+          cb_send.priority
     INTO _ids;
 
     PERFORM pg_notify(current_schema || '.cb_q_' || cb_send.queue, to_char(coalesce(cb_send.visible_at, now()) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
@@ -801,7 +808,7 @@ BEGIN
         BEGIN
             EXECUTE format(
                 $QUERY$
-                INSERT INTO %I (topic, payload, idempotency_key, headers, visible_at)
+                INSERT INTO %I (topic, payload, idempotency_key, headers, visible_at, priority)
                 SELECT
                     $1,
                     payload,
@@ -813,7 +820,8 @@ BEGIN
                         WHEN $5 IS NULL THEN NULL
                         ELSE $5[ordinality]
                     END,
-                    $2
+                    $2,
+                    0
                 FROM unnest($3) WITH ORDINALITY AS t(payload, ordinality)
                 ON CONFLICT (idempotency_key) DO NOTHING;
                 $QUERY$,
@@ -855,8 +863,8 @@ DROP FUNCTION IF EXISTS cb_create_queue(text, timestamptz, text);
 DROP FUNCTION IF EXISTS cb_delete_queue(text);
 DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_publish(text, jsonb[], text[], jsonb[], timestamptz);
-DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, jsonb, timestamptz);
-DROP FUNCTION IF EXISTS cb_send(text, jsonb[], text, text[], jsonb[], timestamptz);
+DROP FUNCTION IF EXISTS cb_send(text, jsonb, text, text, jsonb, timestamptz, int);
+DROP FUNCTION IF EXISTS cb_send(text, jsonb[], text, text[], jsonb[], timestamptz, int);
 DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, text, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_read(text, int, int);
 DROP FUNCTION IF EXISTS cb_read_poll(text, int, int, int, int);
