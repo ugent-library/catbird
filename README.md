@@ -57,7 +57,7 @@ flow.AddStep(catbird.NewStep("add").
     return doubled + 1, nil
 }))
 
-worker := client.NewWorker().
+worker := catbird.NewWorker(pool).
     AddTask(task).
     AddFlow(flow)
 go worker.Start(ctx)
@@ -171,13 +171,12 @@ conditionalTask := catbird.NewTask("premium-processing").
         return "processed", nil
     })
 
-// Create worker
-worker := client.NewWorker().
+// Create worker (requires *pgxpool.Pool)
+worker := catbird.NewWorker(pool).
     WithLogger(slog.Default()).
-    WithShutdownTimeout(10 * time.Second)
-// Add tasks
-worker.AddTask(task)
-worker.AddTask(conditionalTask)
+    WithShutdownTimeout(10 * time.Second).
+    AddTask(task).
+    AddTask(conditionalTask)
 go worker.Start(ctx)
 
 // Run the task
@@ -267,9 +266,8 @@ flow.AddStep(catbird.NewStep("ship").
 }))
 
 // Create worker
-worker := client.NewWorker()
-// Add flow
-worker.AddFlow(flow)
+worker := catbird.NewWorker(pool).
+    AddFlow(flow)
 go worker.Start(ctx)
 ```
 

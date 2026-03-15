@@ -363,6 +363,8 @@ BEGIN
           _visible_at
     INTO _id;
 
+    PERFORM pg_notify('cb_q_' || cb_send.queue, to_char(coalesce(cb_send.visible_at, now()) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+
     RETURN _id;
 END
 $$;
@@ -734,6 +736,8 @@ BEGIN
           _visible_at,
           cb_send.idempotency_keys
     INTO _ids;
+
+    PERFORM pg_notify('cb_q_' || cb_send.queue, to_char(coalesce(cb_send.visible_at, now()) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
 
     RETURN _ids;
 END

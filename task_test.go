@@ -119,7 +119,7 @@ func TestTaskRunAndWait(t *testing.T) {
 		return in.Value * 2, nil
 	})
 
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 
 	startTestWorker(t, worker)
 
@@ -151,7 +151,7 @@ func TestTaskRunDelayedVisibleAt(t *testing.T) {
 		return in + " processed", nil
 	})
 
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 	startTestWorker(t, worker)
 
 	time.Sleep(100 * time.Millisecond)
@@ -238,7 +238,7 @@ func TestTaskPanicRecovery(t *testing.T) {
 		panic("intentional panic in task")
 	})
 
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 
 	startTestWorker(t, worker)
 
@@ -300,7 +300,7 @@ func TestTaskCircuitBreaker(t *testing.T) {
 		WithCircuitBreaker(1, openTimeout),
 	)
 
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 
 	startTestWorker(t, worker)
 
@@ -371,7 +371,7 @@ func TestTaskConcurrencyKey(t *testing.T) {
 		return in * 2, nil
 	})
 
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -429,7 +429,7 @@ func TestTaskIdempotencyKey(t *testing.T) {
 		return in * 3, nil
 	})
 
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -501,7 +501,7 @@ func TestTaskDeduplicationRetryOnFailure(t *testing.T) {
 		return "success", nil
 	})
 
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -556,7 +556,7 @@ func TestFlowConcurrencyKey(t *testing.T) {
 		return in + " processed", nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -603,7 +603,7 @@ func TestFlowIdempotencyKey(t *testing.T) {
 		return in * 5, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -662,7 +662,7 @@ func TestTaskBothKeysRejected(t *testing.T) {
 		return in, nil
 	})
 
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -684,7 +684,7 @@ func TestFlowBothKeysRejected(t *testing.T) {
 		return in, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -765,7 +765,7 @@ func TestTaskCancelStartedRun(t *testing.T) {
 		return "", ctx.Err()
 	})
 
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -799,7 +799,7 @@ func TestTaskInternalCancelCurrentRun(t *testing.T) {
 		return "", ctx.Err()
 	})
 
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -834,7 +834,7 @@ func TestTaskHandleWaitForOutput(t *testing.T) {
 		return in + ":ok", nil
 	})
 
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 

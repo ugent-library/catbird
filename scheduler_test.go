@@ -18,7 +18,7 @@ func TestSchedulerIdempotencyKeyGeneration(t *testing.T) {
 			return in + " processed", nil
 		})
 
-	worker := client.NewWorker().
+	worker := NewWorker(testPool).
 		AddTask(task)
 
 	startTestWorker(t, worker)
@@ -65,7 +65,7 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 	})
 
 	// Create and run worker to execute task (must create task before running)
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 
 	startTestWorker(t, worker)
 	time.Sleep(200 * time.Millisecond)
@@ -121,7 +121,7 @@ func TestSchedulerIdempotencyPersists(t *testing.T) {
 		return in * 2, nil
 	})
 
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -207,7 +207,7 @@ func TestSchedulerFlowIdempotency(t *testing.T) {
 		return 42, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
@@ -408,7 +408,7 @@ func TestSchedulerConcurrentWorkers(t *testing.T) {
 	workers := make([]*Worker, 3)
 
 	for i := 0; i < 3; i++ {
-		w := client.NewWorker().AddTask(task)
+		w := NewWorker(testPool).AddTask(task)
 		w.shutdownTimeout = 0
 
 		workers[i] = w

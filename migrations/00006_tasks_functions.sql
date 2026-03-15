@@ -160,27 +160,11 @@ BEGIN
             END IF;
         END IF;
 
+        IF _status = 'canceled' THEN
+            PERFORM pg_notify('cb_task_stop_' || cb_cancel_task.name, '');
+        END IF;
+
         RETURN true;
-END;
-$$;
--- +goose statementend
-
--- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_task_cancel_requested(name text, run_id bigint)
-RETURNS boolean
-LANGUAGE plpgsql AS $$
-DECLARE
-    _t_table text := cb_table_name(cb_task_cancel_requested.name, 't');
-        _requested boolean;
-BEGIN
-        EXECUTE format(
-            'SELECT status IN (''canceling'', ''canceled'') FROM %I WHERE id = $1',
-            _t_table
-        )
-        USING cb_task_cancel_requested.run_id
-        INTO _requested;
-
-        RETURN coalesce(_requested, false);
 END;
 $$;
 -- +goose statementend
@@ -276,6 +260,8 @@ BEGIN
         INTO _id;
     END IF;
 
+    PERFORM pg_notify('cb_t_' || cb_run_task.name, to_char(coalesce(cb_run_task.visible_at, now()) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+
     RETURN _id;
 END;
 $$;
@@ -290,44 +276,24 @@ $$;
 --   poll_for: Total duration in milliseconds to poll before timing out (must be > 0)
 --   poll_interval: Duration in milliseconds between poll attempts (must be > 0 and < poll_for)
 -- Returns: Set of cb_task_claim records
-CREATE OR REPLACE FUNCTION cb_poll_tasks(
+CREATE OR REPLACE FUNCTION cb_claim_tasks(
     name text,
     quantity int,
-    hide_for int,
-    poll_for int,
-    poll_interval int
+    hide_for int
 )
 RETURNS SETOF cb_task_claim
 LANGUAGE plpgsql AS $$
 DECLARE
-    _m cb_task_claim;
-    _sleep_for double precision;
-    _stop_at timestamp;
-    _q text;
-    _t_table text := cb_table_name(cb_poll_tasks.name, 't');
+    _t_table text := cb_table_name(cb_claim_tasks.name, 't');
 BEGIN
-    IF cb_poll_tasks.quantity <= 0 THEN
+    IF cb_claim_tasks.quantity <= 0 THEN
         RAISE EXCEPTION 'cb: quantity must be greater than 0';
     END IF;
-    IF cb_poll_tasks.hide_for <= 0 THEN
+    IF cb_claim_tasks.hide_for <= 0 THEN
         RAISE EXCEPTION 'cb: hide_for must be greater than 0';
     END IF;
-    IF cb_poll_tasks.poll_for <= 0 THEN
-        RAISE EXCEPTION 'cb: poll_for must be greater than 0';
-    END IF;
-    IF cb_poll_tasks.poll_interval <= 0 THEN
-        RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
-    END IF;
 
-    _sleep_for := cb_poll_tasks.poll_interval / 1000.0;
-
-    IF _sleep_for >= cb_poll_tasks.poll_for / 1000.0 THEN
-        RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
-    END IF;
-
-    _stop_at := clock_timestamp() + make_interval(secs => cb_poll_tasks.poll_for / 1000.0);
-
-    _q := FORMAT(
+    RETURN QUERY EXECUTE format(
         $QUERY$
         WITH runs AS (
           SELECT id
@@ -350,24 +316,8 @@ BEGIN
                   m.input;
         $QUERY$,
         _t_table, _t_table
-      );
-
-    LOOP
-      IF (SELECT clock_timestamp() >= _stop_at) THEN
-        RETURN;
-      END IF;
-
-      FOR _m IN
-        EXECUTE _q USING cb_poll_tasks.quantity, make_interval(secs => cb_poll_tasks.hide_for / 1000.0)
-      LOOP
-        RETURN NEXT _m;
-      END LOOP;
-      IF FOUND THEN
-        RETURN;
-      ELSE
-        PERFORM pg_sleep(_sleep_for);
-      END IF;
-    END LOOP;
+    )
+    USING cb_claim_tasks.quantity, make_interval(secs => cb_claim_tasks.hide_for / 1000.0);
 END;
 $$;
 -- +goose statementend
@@ -399,6 +349,8 @@ BEGIN
     )
     USING cb_hide_tasks.ids,
           make_interval(secs => cb_hide_tasks.hide_for / 1000.0);
+
+    PERFORM pg_notify('cb_t_' || cb_hide_tasks.name, to_char((clock_timestamp() + make_interval(secs => cb_hide_tasks.hide_for / 1000.0)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
 END;
 $$;
 -- +goose statementend
@@ -466,17 +418,19 @@ BEGIN
     )
     USING cb_fail_task.id,
           cb_fail_task.error_message;
+
+    PERFORM pg_notify('cb_t_onfail_' || cb_fail_task.name, '');
 END;
 $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- cb_poll_task_on_fail: Claim failed task runs for on-fail handling
+-- cb_claim_task_on_fail: Claim failed task runs for on-fail handling
 -- Parameters:
 --   name: Task name
 --   quantity: Number of failed task runs to claim (must be > 0)
 -- Returns: Task runs claimed for on-fail processing
-CREATE OR REPLACE FUNCTION cb_poll_task_on_fail(name text, quantity int)
+CREATE OR REPLACE FUNCTION cb_claim_task_on_fail(name text, quantity int)
 RETURNS TABLE(
         id bigint,
         input jsonb,
@@ -490,9 +444,9 @@ RETURNS TABLE(
 )
 LANGUAGE plpgsql AS $$
 DECLARE
-        _t_table text := cb_table_name(cb_poll_task_on_fail.name, 't');
+        _t_table text := cb_table_name(cb_claim_task_on_fail.name, 't');
 BEGIN
-        IF cb_poll_task_on_fail.quantity <= 0 THEN
+        IF cb_claim_task_on_fail.quantity <= 0 THEN
                 RAISE EXCEPTION 'cb: quantity must be greater than 0';
         END IF;
 
@@ -527,7 +481,7 @@ BEGIN
             _t_table,
             _t_table
         )
-        USING cb_poll_task_on_fail.quantity;
+        USING cb_claim_task_on_fail.quantity;
 END;
 $$;
 -- +goose statementend
@@ -710,15 +664,14 @@ $$;
 -- +goose statementend
 
 DROP FUNCTION IF EXISTS cb_delete_task(text);
-DROP FUNCTION IF EXISTS cb_task_cancel_requested(text, bigint);
 DROP FUNCTION IF EXISTS cb_cancel_task(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_fail_task_on_fail(text, bigint, text, boolean, bigint);
 DROP FUNCTION IF EXISTS cb_complete_task_on_fail(text, bigint);
-DROP FUNCTION IF EXISTS cb_poll_task_on_fail(text, int);
+DROP FUNCTION IF EXISTS cb_claim_task_on_fail(text, int);
 DROP FUNCTION IF EXISTS cb_fail_task(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_task(text, bigint, jsonb);
 DROP FUNCTION IF EXISTS cb_wait_task_output(text, bigint, int, int);
 DROP FUNCTION IF EXISTS cb_hide_tasks(text, bigint[], integer);
-DROP FUNCTION IF EXISTS cb_poll_tasks(text, int, int, int, int);
+DROP FUNCTION IF EXISTS cb_claim_tasks(text, int, int);
 DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text, text, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_create_task(text, text, text);

@@ -329,9 +329,9 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 
 **Task worker runtime**
 
-### `cb_poll_tasks`
-- **What it does**: Poll for task runs from the queue.
-- **Inputs**: `cb_poll_tasks(name text, quantity int, hide_for int, poll_for int, poll_interval int)`
+### `cb_claim_tasks`
+- **What it does**: Claim task runs from the queue.
+- **Inputs**: `cb_claim_tasks(name text, quantity int, hide_for int)`
 - **Returns**: `RETURNS SETOF cb_task_claim`
 
 ### `cb_hide_tasks`
@@ -349,12 +349,7 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 - **Inputs**: `cb_fail_task(name text, id bigint, error_message text)`
 - **Returns**: `RETURNS void`
 
-### `cb_task_cancel_requested`
-- **What it does**: Check whether cancellation has been requested for a task run.
-- **Inputs**: `cb_task_cancel_requested(name text, run_id bigint)`
-- **Returns**: `RETURNS boolean`
-
-### `cb_poll_task_on_fail`
+### `cb_claim_task_on_fail`
 - **What it does**: Claim failed task runs for on-fail handling.
 - **Inputs**: `cb_poll_task_on_fail(name text, quantity int)`
 - **Returns**: `RETURNS TABLE(id bigint, input jsonb, error_message text, attempts int, on_fail_attempts int, started_at timestamptz, failed_at timestamptz, concurrency_key text, idempotency_key text)`
@@ -376,9 +371,9 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 - **Inputs**: `cb_start_steps(flow_name text, flow_run_id bigint, initial_visible_at timestamptz DEFAULT NULL)`
 - **Returns**: `RETURNS void`
 
-### `cb_poll_steps`
-- **What it does**: Poll for step runs from a flow.
-- **Inputs**: `cb_poll_steps(flow_name text, step_name text, quantity int, hide_for int, poll_for int, poll_interval int)`
+### `cb_claim_steps`
+- **What it does**: Claim step runs from a flow.
+- **Inputs**: `cb_claim_steps(flow_name text, step_name text, quantity int, hide_for int)`
 - **Returns**: `RETURNS SETOF cb_step_claim`
 
 ### `cb_hide_steps`
@@ -396,9 +391,9 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 - **Inputs**: `cb_fail_step(flow_name text, step_name text, step_id bigint, error_message text)`
 - **Returns**: `RETURNS void`
 
-### `cb_poll_map_tasks`
-- **What it does**: Poll map-item tasks for a specific map step.
-- **Inputs**: `cb_poll_map_tasks(flow_name text, step_name text, quantity int, hide_for int, poll_for int, poll_interval int)`
+### `cb_claim_map_tasks`
+- **What it does**: Claim map-item tasks for a specific map step.
+- **Inputs**: `cb_claim_map_tasks(flow_name text, step_name text, quantity int, hide_for int)`
 - **Returns**: `RETURNS TABLE(id bigint, flow_run_id bigint, attempts int, input jsonb, step_outputs jsonb, signal_input jsonb, item jsonb)`
 
 ### `cb_hide_map_tasks`
@@ -451,7 +446,7 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 - **Inputs**: `cb_complete_flow_early(flow_name text, flow_run_id bigint, step_name text, output jsonb, reason text DEFAULT NULL)`
 - **Returns**: `RETURNS boolean` (`true` when the run exists, `false` when the run does not exist)
 
-### `cb_poll_flow_on_fail`
+### `cb_claim_flow_on_fail`
 - **What it does**: Claim failed flow runs for on-fail handling.
 - **Inputs**: `cb_poll_flow_on_fail(name text, quantity int)`
 - **Returns**: `RETURNS TABLE(id bigint, input jsonb, error_message text, on_fail_attempts int, started_at timestamptz, failed_at timestamptz, concurrency_key text, idempotency_key text, failed_step_name text, failed_step_input jsonb, failed_step_signal_input jsonb, failed_step_attempts int)`
@@ -476,11 +471,6 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 ### `cb_finalize_flow_cancellation`
 - **What it does**: Force final cancellation state for a flow run and stop remaining pending work.
 - **Inputs**: `cb_finalize_flow_cancellation(name text, run_id bigint)`
-- **Returns**: `RETURNS boolean`
-
-### `cb_flow_cancel_requested`
-- **What it does**: Check whether cancellation has been requested for a flow run.
-- **Inputs**: `cb_flow_cancel_requested(name text, run_id bigint)`
 - **Returns**: `RETURNS boolean`
 
 ### `cb_cancel_step_run`

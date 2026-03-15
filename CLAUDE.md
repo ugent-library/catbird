@@ -36,11 +36,12 @@ There is no Makefile. Tests use a hardcoded DSN (`postgres://postgres:postgres@l
 **Two independent systems:**
 
 1. **Generic Message Queues** — `Send()`, `Publish()`, `Read()` operations (SQS-like). Topic routing via bindings with wildcard support (`?` single token, `*` multi-token tail).
-2. **Task & Flow Execution** — Tasks are single handlers; Flows are DAGs of steps with dependencies. `RunTask()`/`RunFlow()` create run entries; workers poll and execute handlers.
+2. **Task & Flow Execution** — Tasks are single handlers; Flows are DAGs of steps with dependencies. `RunTask()`/`RunFlow()` create run entries; workers claim and execute handlers via NOTIFY-driven scheduling.
 
 **Key components:**
-- `client.go` — Public API facade
-- `worker.go` — Polls and executes task/flow handlers
+- `client.go` — Public API facade; uses `Conn` interface (pool, conn, or tx)
+- `worker.go` — Claims and executes task/flow handlers; requires `*pgxpool.Pool`
+- `notifier.go` — Internal NOTIFY listener; manages dedicated LISTEN connection and timed wakeups
 - `flow.go` — Flow DSL, step construction, dependency validation
 - `task.go` — Task builder and handler reflection
 - `queue.go` — Queue send/read/publish/bind operations
@@ -51,6 +52,13 @@ There is no Makefile. Tests use a hardcoded DSN (`postgres://postgres:postgres@l
 
 **Dynamic table naming:** Runtime tables are created per queue/task/flow:
 - `cb_q_{name}` (queues), `cb_t_{name}` (tasks), `cb_f_{name}` (flows), `cb_s_{name}` (steps), `cb_m_{name}` (map tasks)
+
+## Worker Architecture
+
+- **`NewWorker(pool *pgxpool.Pool)`** — workers require a pool, not the `Conn` interface. The pool is used for normal operations; one dedicated connection is acquired for `LISTEN`.
+- **Client and Worker are separate** — `Client` wraps `Conn` for client operations (send, run, read). Workers are created directly via `catbird.NewWorker(pool)`, not through the client.
+- **NOTIFY-driven scheduling** — SQL functions fire `pg_notify` with `visible_at` timestamps on insert, retry, and cancel. The Go notifier parses the timestamp and either signals immediately or schedules a single timer per target for the earliest future `visible_at`. Fallback polling (2s claim, 5s cancel) is a safety net for missed notifications only.
+- **Engine logic stays in SQL** — claim semantics (`FOR UPDATE SKIP LOCKED`), state transitions, cascading cancels, and finalization live in SQL functions for cross-client reuse. Only trivial reads (e.g., `SELECT status WHERE id = $1`) are inlined in Go.
 
 ## Design Constraints
 
@@ -97,3 +105,7 @@ When adding migrations:
 ## Status Constants
 
 Use Go constants (`StatusQueued`, `StatusStarted`, `StatusCompleted`, `StatusFailed`, `StatusSkipped`, `StatusCanceled`, etc.) — not raw string literals.
+
+## Error Sentinels
+
+All sentinel errors are prefixed with `catbird:` for log grep-ability. Key errors: `ErrRunFailed`, `ErrRunCanceled`, `ErrNotFound`, `ErrNotDefined`, `ErrRunSkipped`, `ErrRunNotCompleted`, `ErrSignalNotDelivered`. Use `errors.Is()` for checking — do not match on string content.

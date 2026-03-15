@@ -686,6 +686,8 @@ BEGIN
     -- Start steps with no dependencies
     PERFORM cb_start_steps(cb_run_flow.name, _id, cb_run_flow.visible_at);
 
+    PERFORM pg_notify('cb_s_' || cb_run_flow.name, to_char(coalesce(cb_run_flow.visible_at, now()) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+
     RETURN _id;
 END;
 $$;
@@ -758,6 +760,8 @@ BEGIN
       _m_table
     )
     USING cb_complete_flow_early.flow_run_id;
+
+    PERFORM pg_notify('cb_flow_stop_' || cb_complete_flow_early.flow_name, '');
 
     RETURN true;
 END;
@@ -857,6 +861,10 @@ BEGIN
       RETURN true;
     END IF;
 
+    IF _status = 'canceling' THEN
+        PERFORM pg_notify('cb_flow_stop_' || cb_cancel_flow.name, '');
+    END IF;
+
     -- Cancel non-started step runs
     EXECUTE format(
       $QUERY$
@@ -900,26 +908,6 @@ RETURNS boolean
 LANGUAGE plpgsql AS $$
 BEGIN
     RETURN cb_maybe_finalize_flow_cancellation(cb_finalize_flow_cancellation.name, cb_finalize_flow_cancellation.run_id);
-END;
-$$;
--- +goose statementend
-
--- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_flow_cancel_requested(name text, run_id bigint)
-RETURNS boolean
-LANGUAGE plpgsql AS $$
-DECLARE
-    _f_table text := cb_table_name(cb_flow_cancel_requested.name, 'f');
-    _requested boolean;
-BEGIN
-    EXECUTE format(
-      'SELECT status IN (''canceling'', ''canceled'') FROM %I WHERE id = $1',
-      _f_table
-    )
-    USING cb_flow_cancel_requested.run_id
-    INTO _requested;
-
-    RETURN coalesce(_requested, false);
 END;
 $$;
 -- +goose statementend
@@ -1334,6 +1322,8 @@ BEGIN
     -- Exit outer loop if no steps were processed in this iteration
     EXIT WHEN _steps_processed_this_iteration = 0;
     END LOOP;
+
+    PERFORM pg_notify('cb_s_' || cb_start_steps.flow_name, '');
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -1348,47 +1338,27 @@ $$ LANGUAGE plpgsql;
 --   poll_for: Total duration in milliseconds to poll before timing out (must be > 0)
 --   poll_interval: Duration in milliseconds between poll attempts (must be > 0 and < poll_for)
 -- Returns: Set of cb_step_claim records
-CREATE OR REPLACE FUNCTION cb_poll_steps(
+CREATE OR REPLACE FUNCTION cb_claim_steps(
     flow_name text,
     step_name text,
     quantity int,
-    hide_for int,
-    poll_for int,
-    poll_interval int
+    hide_for int
 )
 RETURNS SETOF cb_step_claim
 LANGUAGE plpgsql AS $$
 DECLARE
-    _m cb_step_claim;
-    _sleep_for double precision;
-    _stop_at timestamp;
-    _q text;
-    _s_table text := cb_table_name(cb_poll_steps.flow_name, 's');
-    _m_table text := cb_table_name(cb_poll_steps.flow_name, 'm');
-    _f_table text := cb_table_name(cb_poll_steps.flow_name, 'f');
+    _s_table text := cb_table_name(cb_claim_steps.flow_name, 's');
+    _m_table text := cb_table_name(cb_claim_steps.flow_name, 'm');
+    _f_table text := cb_table_name(cb_claim_steps.flow_name, 'f');
 BEGIN
-    IF cb_poll_steps.quantity <= 0 THEN
+    IF cb_claim_steps.quantity <= 0 THEN
         RAISE EXCEPTION 'cb: quantity must be greater than 0';
     END IF;
-    IF cb_poll_steps.hide_for <= 0 THEN
+    IF cb_claim_steps.hide_for <= 0 THEN
         RAISE EXCEPTION 'cb: hide_for must be greater than 0';
     END IF;
-    IF cb_poll_steps.poll_for <= 0 THEN
-        RAISE EXCEPTION 'cb: poll_for must be greater than 0';
-    END IF;
-    IF cb_poll_steps.poll_interval <= 0 THEN
-        RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
-    END IF;
 
-    _sleep_for := cb_poll_steps.poll_interval / 1000.0;
-
-    IF _sleep_for >= cb_poll_steps.poll_for / 1000.0 THEN
-        RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
-    END IF;
-
-    _stop_at := clock_timestamp() + make_interval(secs => cb_poll_steps.poll_for / 1000.0);
-
-    _q := FORMAT(
+    RETURN QUERY EXECUTE format(
         $QUERY$
         WITH runs AS (
           SELECT m.id
@@ -1440,24 +1410,8 @@ BEGIN
                   m.signal_input;
         $QUERY$,
         _s_table, _f_table, _s_table, _m_table, _s_table
-      );
-
-    LOOP
-      IF (SELECT clock_timestamp() >= _stop_at) THEN
-        RETURN;
-      END IF;
-
-      FOR _m IN
-        EXECUTE _q USING cb_poll_steps.step_name, cb_poll_steps.quantity, make_interval(secs => cb_poll_steps.hide_for / 1000.0)
-      LOOP
-        RETURN NEXT _m;
-      END LOOP;
-      IF FOUND THEN
-        RETURN;
-      ELSE
-        PERFORM pg_sleep(_sleep_for);
-      END IF;
-    END LOOP;
+    )
+    USING cb_claim_steps.step_name, cb_claim_steps.quantity, make_interval(secs => cb_claim_steps.hide_for / 1000.0);
 END;
 $$;
 -- +goose statementend
@@ -1493,51 +1447,35 @@ BEGIN
     USING cb_hide_steps.ids,
           make_interval(secs => cb_hide_steps.hide_for / 1000.0),
           cb_hide_steps.step_name;
+
+    PERFORM pg_notify('cb_s_' || cb_hide_steps.flow_name, to_char((clock_timestamp() + make_interval(secs => cb_hide_steps.hide_for / 1000.0)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
 END;
 $$;
 -- +goose statementend
 
 -- +goose statementbegin
 -- cb_poll_map_tasks: Poll map-item tasks for a specific map step
-CREATE OR REPLACE FUNCTION cb_poll_map_tasks(
+CREATE OR REPLACE FUNCTION cb_claim_map_tasks(
     flow_name text,
     step_name text,
     quantity int,
-    hide_for int,
-    poll_for int,
-    poll_interval int
+    hide_for int
 )
 RETURNS TABLE(id bigint, flow_run_id bigint, attempts int, input jsonb, step_outputs jsonb, signal_input jsonb, item jsonb)
 LANGUAGE plpgsql AS $$
 DECLARE
-    _sleep_for double precision;
-    _stop_at timestamp;
-    _q text;
-    _s_table text := cb_table_name(cb_poll_map_tasks.flow_name, 's');
-    _m_table text := cb_table_name(cb_poll_map_tasks.flow_name, 'm');
-    _f_table text := cb_table_name(cb_poll_map_tasks.flow_name, 'f');
+    _s_table text := cb_table_name(cb_claim_map_tasks.flow_name, 's');
+    _m_table text := cb_table_name(cb_claim_map_tasks.flow_name, 'm');
+    _f_table text := cb_table_name(cb_claim_map_tasks.flow_name, 'f');
 BEGIN
-    IF cb_poll_map_tasks.quantity <= 0 THEN
+    IF cb_claim_map_tasks.quantity <= 0 THEN
         RAISE EXCEPTION 'cb: quantity must be greater than 0';
     END IF;
-    IF cb_poll_map_tasks.hide_for <= 0 THEN
+    IF cb_claim_map_tasks.hide_for <= 0 THEN
         RAISE EXCEPTION 'cb: hide_for must be greater than 0';
     END IF;
-    IF cb_poll_map_tasks.poll_for <= 0 THEN
-        RAISE EXCEPTION 'cb: poll_for must be greater than 0';
-    END IF;
-    IF cb_poll_map_tasks.poll_interval <= 0 THEN
-        RAISE EXCEPTION 'cb: poll_interval must be greater than 0';
-    END IF;
 
-    _sleep_for := cb_poll_map_tasks.poll_interval / 1000.0;
-    IF _sleep_for >= cb_poll_map_tasks.poll_for / 1000.0 THEN
-        RAISE EXCEPTION 'cb: poll_interval must be smaller than poll_for';
-    END IF;
-
-    _stop_at := clock_timestamp() + make_interval(secs => cb_poll_map_tasks.poll_for / 1000.0);
-
-    _q := format(
+    RETURN QUERY EXECUTE format(
       $QUERY$
       WITH runs AS (
         SELECT m.id, m.flow_run_id, m.item
@@ -1589,24 +1527,10 @@ BEGIN
                 m.item;
       $QUERY$,
       _m_table, _f_table, _m_table, _m_table, _s_table
-    );
-
-    LOOP
-      IF clock_timestamp() >= _stop_at THEN
-        RETURN;
-      END IF;
-
-      RETURN QUERY EXECUTE _q
-        USING cb_poll_map_tasks.step_name,
-              cb_poll_map_tasks.quantity,
-              make_interval(secs => cb_poll_map_tasks.hide_for / 1000.0);
-
-      IF FOUND THEN
-        RETURN;
-      END IF;
-
-      PERFORM pg_sleep(_sleep_for);
-    END LOOP;
+    )
+    USING cb_claim_map_tasks.step_name,
+          cb_claim_map_tasks.quantity,
+          make_interval(secs => cb_claim_map_tasks.hide_for / 1000.0);
 END;
 $$;
 -- +goose statementend
@@ -1636,6 +1560,8 @@ BEGIN
     USING cb_hide_map_tasks.ids,
           make_interval(secs => cb_hide_map_tasks.hide_for / 1000.0),
           cb_hide_map_tasks.step_name;
+
+    PERFORM pg_notify('cb_s_' || cb_hide_map_tasks.flow_name, to_char((clock_timestamp() + make_interval(secs => cb_hide_map_tasks.hide_for / 1000.0)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
 END;
 $$;
 -- +goose statementend
@@ -1732,6 +1658,10 @@ BEGIN
         _s_table
       )
       USING cb_spawn_generator_map_tasks.step_id, _spawned;
+    END IF;
+
+    IF _spawned > 0 THEN
+        PERFORM pg_notify('cb_s_' || cb_spawn_generator_map_tasks.flow_name, '');
     END IF;
 
     RETURN coalesce(_spawned, 0);
@@ -2176,6 +2106,9 @@ BEGIN
     )
     USING _flow_run_id, cb_fail_step.error_message, cb_fail_step.step_name, cb_fail_step.step_id;
 
+    PERFORM pg_notify('cb_flow_stop_' || cb_fail_step.flow_name, '');
+    PERFORM pg_notify('cb_f_onfail_' || cb_fail_step.flow_name, '');
+
     -- Propagate terminal failure to all remaining step runs for this flow run.
     EXECUTE format(
     $QUERY$
@@ -2208,12 +2141,12 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- cb_poll_flow_on_fail: Claim failed flow runs for on-fail handling
+-- cb_claim_flow_on_fail: Claim failed flow runs for on-fail handling
 -- Parameters:
 --   name: Flow name
 --   quantity: Number of failed flow runs to claim (must be > 0)
 -- Returns: Flow runs claimed for on-fail processing with failure context
-CREATE OR REPLACE FUNCTION cb_poll_flow_on_fail(name text, quantity int)
+CREATE OR REPLACE FUNCTION cb_claim_flow_on_fail(name text, quantity int)
 RETURNS TABLE(
     id bigint,
     input jsonb,
@@ -2230,9 +2163,9 @@ RETURNS TABLE(
 )
 LANGUAGE plpgsql AS $$
 DECLARE
-    _f_table text := cb_table_name(cb_poll_flow_on_fail.name, 'f');
+    _f_table text := cb_table_name(cb_claim_flow_on_fail.name, 'f');
 BEGIN
-    IF cb_poll_flow_on_fail.quantity <= 0 THEN
+    IF cb_claim_flow_on_fail.quantity <= 0 THEN
         RAISE EXCEPTION 'cb: quantity must be greater than 0';
     END IF;
 
@@ -2270,7 +2203,7 @@ BEGIN
       _f_table,
       _f_table
     )
-    USING cb_poll_flow_on_fail.quantity;
+    USING cb_claim_flow_on_fail.quantity;
 END;
 $$;
 -- +goose statementend
@@ -2705,14 +2638,13 @@ $$;
 DROP FUNCTION IF EXISTS cb_delete_flow(text);
 DROP FUNCTION IF EXISTS cb_cancel_map_task_run(text, bigint);
 DROP FUNCTION IF EXISTS cb_cancel_step_run(text, bigint);
-DROP FUNCTION IF EXISTS cb_flow_cancel_requested(text, bigint);
 DROP FUNCTION IF EXISTS cb_finalize_flow_cancellation(text, bigint);
 DROP FUNCTION IF EXISTS cb_maybe_finalize_flow_cancellation(text, bigint);
 DROP FUNCTION IF EXISTS cb_cancel_flow(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_fail_flow_on_fail(text, bigint, text, boolean, bigint);
 DROP FUNCTION IF EXISTS cb_complete_flow_on_fail(text, bigint);
 DROP FUNCTION IF EXISTS cb_get_flow_step_output(text, bigint, text);
-DROP FUNCTION IF EXISTS cb_poll_flow_on_fail(text, int);
+DROP FUNCTION IF EXISTS cb_claim_flow_on_fail(text, int);
 DROP FUNCTION IF EXISTS cb_complete_flow_early(text, bigint, text, jsonb, text);
 DROP FUNCTION IF EXISTS cb_wait_flow_step_output(text, bigint, text, int, int);
 DROP FUNCTION IF EXISTS cb_get_flow_step_status(text, bigint, text);
@@ -2726,9 +2658,9 @@ DROP FUNCTION IF EXISTS cb_fail_generator_step(text, text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_generator_step(text, text, bigint);
 DROP FUNCTION IF EXISTS cb_spawn_generator_map_tasks(text, text, bigint, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_hide_map_tasks(text, text, bigint[], int);
-DROP FUNCTION IF EXISTS cb_poll_map_tasks(text, text, int, int, int, int);
+DROP FUNCTION IF EXISTS cb_claim_map_tasks(text, text, int, int);
 DROP FUNCTION IF EXISTS cb_hide_steps(text, text, bigint[], integer);
-DROP FUNCTION IF EXISTS cb_poll_steps(text, text, int, int, int, int);
+DROP FUNCTION IF EXISTS cb_claim_steps(text, text, int, int);
 DROP FUNCTION IF EXISTS cb_start_steps(text, bigint, timestamptz);
 DROP FUNCTION IF EXISTS cb_run_flow(text, jsonb, text, text, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_create_flow(text, text, jsonb, text[]);

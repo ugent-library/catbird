@@ -136,7 +136,7 @@ func BenchmarkTaskThroughput(b *testing.B) {
 		return in + 1, nil
 	})
 
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 	startBenchmarkWorker(b, worker)
 
 	b.ReportAllocs()
@@ -172,7 +172,7 @@ func BenchmarkFlowThroughput(b *testing.B) {
 		return in + 1, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startBenchmarkWorker(b, worker)
 
 	b.ReportAllocs()
@@ -207,7 +207,7 @@ func BenchmarkTaskThroughputPipelined(b *testing.B) {
 		return in + 1, nil
 	})
 
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 	startBenchmarkWorker(b, worker)
 
 	waitOpts := WaitOpts{PollFor: 30 * time.Second, PollInterval: time.Millisecond}
@@ -316,7 +316,7 @@ func BenchmarkFlowThroughputPipelined(b *testing.B) {
 		return in + 1, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startBenchmarkWorker(b, worker)
 
 	waitOpts := WaitOpts{PollFor: 30 * time.Second, PollInterval: time.Millisecond}
@@ -365,7 +365,7 @@ func BenchmarkTaskThroughputPipelinedTuned(b *testing.B) {
 		return in + 1, nil
 	}, benchmarkTunedHandlerOpts...)
 
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 	startBenchmarkWorker(b, worker)
 
 	waitOpts := WaitOpts{PollFor: 30 * time.Second, PollInterval: time.Millisecond}
@@ -414,7 +414,7 @@ func BenchmarkTaskEngineThroughputTuned(b *testing.B) {
 		return in + 1, nil
 	}, benchmarkTunedHandlerOpts...)
 
-	worker := client.NewWorker().AddTask(task)
+	worker := NewWorker(testPool).AddTask(task)
 	startBenchmarkWorker(b, worker)
 
 	b.ReportAllocs()
@@ -448,7 +448,7 @@ func BenchmarkFlowThroughputPipelinedTuned(b *testing.B) {
 		return in + 1, nil
 	}, benchmarkTunedHandlerOpts...))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startBenchmarkWorker(b, worker)
 
 	waitOpts := WaitOpts{PollFor: 30 * time.Second, PollInterval: time.Millisecond}

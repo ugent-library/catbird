@@ -20,14 +20,14 @@ Catbird is a PostgreSQL-based message queue with task and workflow execution eng
 
 **Main Components**:
 1. **Client** (`client.go`): Facade delegating to standalone functions; call `catbird.New(conn)` to create
-2. **Worker** (`worker.go`): Runs tasks and flows; initialized with `catbird.NewWorker(conn)` or `client.NewWorker()`, then configured via builder methods (e.g., `.WithLogger(...)`, `.WithShutdownTimeout(...)`, `.AddTask(...)`, `.AddFlow(...)`). Multiple workers can run concurrently; DB ensures each message is processed exactly once.
+2. **Worker** (`worker.go`): Runs tasks and flows; initialized with `catbird.NewWorker(pool)` where pool is a `*pgxpool.Pool`, then configured via builder methods (e.g., `.WithLogger(...)`, `.WithShutdownTimeout(...)`, `.AddTask(...)`, `.AddFlow(...)`). Multiple workers can run concurrently; DB ensures each message is processed exactly once.
 3. **Scheduler** (`scheduler.go`): Manages cron-based task and flow scheduling using robfig/cron; created internally by worker when registering tasks/flows with `Schedule` method. Can also be used standalone.
 4. **Dashboard** (`dashboard/`): Web UI for starting task/flow runs, monitoring progress in real-time, and viewing results; served via CLI `cb dashboard`
 5. **TUI** (`tui/`): Terminal UI built with Bubble Tea for read-only operational visibility (queues, tasks, flows, workers, and recent runs); launched via CLI `cb tui`
 
 **Two Independent Systems**:
 1. **Generic Message Queues**: `Send()`, `Publish()`, `Read()` operations similar to pgmq/SQS. Messages stored in queue tables; independent from tasks/flows. **Topic routing** via explicit bindings with wildcard support (`?` for single token, `*` for multi-token tail). Bindings stored in `cb_bindings` table with pattern type (exact/wildcard), prefix extraction for indexed filtering, and precompiled regexes.
-2. **Task & Flow Execution**: Task/flow definitions describe shape; `RunTask()` or `RunFlow()` create entries in task_run/step_run tables (which act as queues themselves). Worker reads from these tables and executes handlers. State tracked via constants (created, started, completed, failed).
+2. **Task & Flow Execution**: Task/flow definitions describe shape; `RunTask()` or `RunFlow()` create entries in task_run/step_run tables (which act as queues themselves). Workers claim from these tables via NOTIFY-driven scheduling and execute handlers. State tracked via constants (queued, started, completed, failed, skipped, canceled).
 
 ## Database Schema
 
@@ -37,8 +37,8 @@ All schema is version-controlled in `migrations/` (goose-managed):
 - **Condition Functions** (v3): Condition system (`cb_parse_condition`, `cb_parse_condition_value`, `cb_evaluate_condition`, `cb_get_jsonb_field`, `cb_evaluate_condition_expr`) for task/step conditional execution
 - **Tasks Schema** (v4): `cb_task_claim` type, `cb_tasks` table
 - **Flows Schema** (v5): `cb_step_claim` type, `cb_flows`, `cb_steps`, `cb_step_dependencies` tables; `cb_flow_info` view
-- **Tasks Functions** (v6): Task operations (`cb_create_task`, `cb_run_task`, `cb_poll_tasks`, `cb_hide_tasks`, `cb_complete_task`, `cb_fail_task`, `cb_delete_task`)
-- **Flows Functions** (v7): Flow operations (`cb_create_flow`, `cb_run_flow`, `cb_start_steps`, `cb_poll_steps`, `cb_hide_steps`, `cb_complete_step`, `cb_fail_step`, `cb_signal_flow`, `cb_delete_flow`)
+- **Tasks Functions** (v6): Task operations (`cb_create_task`, `cb_run_task`, `cb_claim_tasks`, `cb_hide_tasks`, `cb_complete_task`, `cb_fail_task`, `cb_delete_task`)
+- **Flows Functions** (v7): Flow operations (`cb_create_flow`, `cb_run_flow`, `cb_start_steps`, `cb_claim_steps`, `cb_hide_steps`, `cb_complete_step`, `cb_fail_step`, `cb_signal_flow`, `cb_delete_flow`)
 - **GC** (v8): Garbage collection (`cb_gc`) for stale workers and expired queues
 - **Workers Schema** (v9): `cb_workers` table + `cb_task_handlers` and `cb_step_handlers` tables (worker-to-task and worker-to-step mappings; depends on workers/tasks/flows)
 - **Workers Functions** (v10): Worker management (`cb_worker_started`, `cb_worker_heartbeat`) and `cb_worker_info` view
@@ -157,14 +157,20 @@ NewFlow("workflow").
 - **Validation**: Flow construction panics if a step depends on a conditional step without using `.OptionalDependency()` variant and `Optional[T]` parameter type
 - **Builder methods**: All construction through chainable methods: `flow.AddStep(name).DependsOn(...).WithCondition(...).WithSignal().Do(fn, opts...)`
 
+## Worker Architecture
+
+- **Client and Worker are separate**: `Client` wraps `Conn` for client operations. Workers are created directly via `catbird.NewWorker(pool)` with a `*pgxpool.Pool`.
+- **NOTIFY-driven scheduling**: SQL functions fire `pg_notify` with `visible_at` timestamps. The Go notifier parses the timestamp and either signals immediately or schedules a single timer per target. Fallback polling (2s claim, 5s cancel) is a safety net only.
+- **Engine logic stays in SQL**: Claim semantics (`FOR UPDATE SKIP LOCKED`), state transitions, cascading cancels, and finalization live in SQL functions for cross-client reuse. Only trivial reads are inlined in Go.
+
 ## Key Conventions
 
 - **Idempotent API semantics**: For idempotent operations, if the requested effect is already true, return success (no-op) rather than an error. Reserve errors for invalid input, missing targets, or runtime/storage failures.
 
-- **Worker lifecycle**: `client.NewWorker()` followed by builder methods like `.WithLogger(...)`, `.WithShutdownTimeout(...)`, `.AddTask(task)`, and `.AddFlow(flow)`, then `worker.Start(ctx)` (graceful shutdown with configurable timeout). Scheduling is decoupled: create schedules separately via `client.CreateTaskSchedule(ctx, name, cronSpec, scheduleOpts...)` or `client.CreateFlowSchedule(ctx, name, cronSpec, scheduleOpts...)`.
+- **Worker lifecycle**: `catbird.NewWorker(pool)` followed by builder methods like `.WithLogger(...)`, `.WithShutdownTimeout(...)`, `.AddTask(task)`, and `.AddFlow(flow)`, then `worker.Start(ctx)` (graceful shutdown with configurable timeout). Scheduling is decoupled: create schedules separately via `client.CreateTaskSchedule(ctx, name, cronSpec, scheduleOpts...)` or `client.CreateFlowSchedule(ctx, name, cronSpec, scheduleOpts...)`.
 - **Handler options validation**: Worker validates all task and flow step handler options at initialization time. Invalid configs (negative concurrency/batch size, invalid backoff, invalid circuit breaker) are caught immediately with descriptive errors before reaching database operations. This ensures type safety at construction time.
 - **Options pattern**: Handler execution uses functional `HandlerOpt` values (e.g., `WithConcurrency`, `WithBatchSize`, `WithMaxRetries`, `WithFullJitterBackoff`, `WithCircuitBreaker`). Worker configuration uses builder methods on `Worker` (`WithLogger`, `WithShutdownTimeout`). Scheduling uses functional `ScheduleOpt` values (e.g., `WithScheduleInput`).
-- **Conn interface**: Abstracts pgx; accepts `*pgxpool.Pool`, `*pgx.Conn` or `pgx.Tx`
+- **Conn interface**: Abstracts pgx; accepts `*pgxpool.Pool`, `*pgx.Conn` or `pgx.Tx`. Note: Workers require `*pgxpool.Pool` directly (not the Conn interface)
 - **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `worker.WithLogger(...)`
 - **Scheduled tasks/flows**: Decoupled from task/flow definitions. Create via `client.CreateTaskSchedule(ctx, taskName, cronSpec, opts...)` and `client.CreateFlowSchedule(ctx, flowName, cronSpec, opts...)`. Pass optional `WithScheduleInput(value)` for static JSON input (defaults to `{}`). Example: `client.CreateTaskSchedule(ctx, "mytask", "@hourly", WithScheduleInput(MyInput{...}))`. Worker polls for due schedules automatically and enqueues them with idempotency deduplication.
 - **Automatic garbage collection**: Worker heartbeats (every 10 seconds) opportunistically clean up stale workers and expired queues; no configuration needed. Manual cleanup available via `client.GC(ctx)` for deployments without workers.
@@ -313,9 +319,10 @@ docker compose logs -f postgres
 
 ## Critical Files
 
-- [catbird.go](../catbird.go): Message, Task, Flow, Step, Options definitions
+- [catbird.go](../catbird.go): Message, Task, Flow, Step, Options definitions, sentinel errors
 - [flow.go](../flow.go): Flow DSL, step constructors, dependency validation
-- [worker.go](../worker.go): Worker struct, task/flow execution, polling logic
+- [worker.go](../worker.go): Worker struct, task/flow execution, NOTIFY-driven claim scheduling
+- [notifier.go](../notifier.go): LISTEN/NOTIFY infrastructure, timed wakeups, signal fan-out
 - [client.go](../client.go): Public API (delegation layer)
 - [dashboard/handler.go](../dashboard/handler.go): HTTP routes & templating
 - [tui/model.go](../tui/model.go): Bubble Tea state model and selection state
@@ -330,7 +337,7 @@ docker compose logs -f postgres
 
 ## Common Patterns to Replicate
 
-1. **Errors**: Use `ErrTaskFailed`, `ErrFlowFailed` package-level errors
+1. **Errors**: Use `catbird:`-prefixed sentinel errors (`ErrRunFailed`, `ErrRunCanceled`, `ErrNotFound`, `ErrNotDefined`, `ErrRunSkipped`, `ErrRunNotCompleted`, `ErrSignalNotDelivered`). Check with `errors.Is()`.
 2. **Context propagation**: All DB ops accept `context.Context` first param
 3. **JSON payloads**: Custom types → JSON via handler reflection; validation happens in handler
 4. **Retries**: Built-in with configurable exponential backoff with full jitter (see `NewFullJitterBackoff(min, max)`)

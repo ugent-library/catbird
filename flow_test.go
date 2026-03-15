@@ -102,7 +102,7 @@ func TestFlowCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
@@ -133,7 +133,7 @@ func TestFlowSingleStep(t *testing.T) {
 		return in + " processed by step 1", nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
@@ -166,7 +166,7 @@ func TestFlowRunDelayedVisibleAt(t *testing.T) {
 		return in + " processed", nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 
 	time.Sleep(100 * time.Millisecond)
@@ -293,7 +293,7 @@ func TestFlowWithDependencies(t *testing.T) {
 		return step2Out + " and by step 3", nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
@@ -370,7 +370,7 @@ func TestFlowOutputPrioritySelection(t *testing.T) {
 		return base + 100, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -409,7 +409,7 @@ func TestFlowOutputDefaultPriorityUsesTerminalOrder(t *testing.T) {
 		return base + 2, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -448,7 +448,7 @@ func TestFlowFailsWhenNoOutputCandidateCompleted(t *testing.T) {
 		return "done", nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -483,7 +483,7 @@ func TestFlowMapInput(t *testing.T) {
 			return n * 2, nil
 		}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -526,7 +526,7 @@ func TestFlowMapStepOutput(t *testing.T) {
 		return sum, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -645,7 +645,7 @@ func TestFlowMapStepReducerRuntime(t *testing.T) {
 			return acc + out, nil
 		}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(120 * time.Millisecond)
 
@@ -734,7 +734,7 @@ func TestFlowMapParentCompletesAfterAllMapTasks(t *testing.T) {
 		return items, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(120 * time.Millisecond)
 
@@ -838,7 +838,7 @@ func TestFlowMapTaskFailureFailsParentAndFlow(t *testing.T) {
 		return items, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(120 * time.Millisecond)
 
@@ -932,7 +932,7 @@ func TestFlowMapStepConcurrentWorkersSlow(t *testing.T) {
 
 	// Start multiple workers for same flow to stress DB claim concurrency.
 	for i := 0; i < 4; i++ {
-		worker := client.NewWorker().
+		worker := NewWorker(testPool).
 			WithLogger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))).
 			AddFlow(flow)
 		startTestWorker(t, worker)
@@ -1090,7 +1090,7 @@ func TestFlowGeneratorStepRuntime(t *testing.T) {
 		return total, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(120 * time.Millisecond)
 
@@ -1136,7 +1136,7 @@ func TestFlowGeneratorStepFailure(t *testing.T) {
 			return item * 2, nil
 		}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(120 * time.Millisecond)
 
@@ -1191,7 +1191,7 @@ func TestFlowGeneratorStepNoDependencies(t *testing.T) {
 		return total, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(120 * time.Millisecond)
 
@@ -1247,7 +1247,7 @@ func TestFlowGeneratorStepWithSignalAndDependency(t *testing.T) {
 		return total, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(120 * time.Millisecond)
 
@@ -1296,7 +1296,7 @@ func TestFlowGeneratorStepReducerRuntime(t *testing.T) {
 			return acc + out, nil
 		}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(120 * time.Millisecond)
 
@@ -1346,7 +1346,7 @@ func TestFlowListFlows(t *testing.T) {
 	}
 
 	// Start worker to execute flows
-	worker := client.NewWorker().
+	worker := NewWorker(testPool).
 		AddFlow(flow1).
 		AddFlow(flow2)
 
@@ -1458,7 +1458,7 @@ func TestFlowComplexDependencies(t *testing.T) {
 	}
 
 	// Start worker to execute flow
-	worker := client.NewWorker().
+	worker := NewWorker(testPool).
 		WithLogger(logger).
 		AddFlow(flow)
 
@@ -1498,7 +1498,7 @@ func TestStepPanicRecovery(t *testing.T) {
 		panic("intentional panic in flow step")
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
@@ -1557,7 +1557,7 @@ func TestStepCircuitBreaker(t *testing.T) {
 		WithCircuitBreaker(1, openTimeout),
 	))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
@@ -1623,7 +1623,7 @@ func TestFlowWithSignal(t *testing.T) {
 		return "published: " + approveResult, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
@@ -1679,7 +1679,7 @@ func TestFlowWithInitialSignal(t *testing.T) {
 		return startResult + " - processed", nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
@@ -1739,7 +1739,7 @@ func TestFlowSignalAlreadyDelivered(t *testing.T) {
 		return approveResult + " - completed", nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 
 	startTestWorker(t, worker)
 
@@ -2032,7 +2032,7 @@ func TestFlowCondition(t *testing.T) {
 			return result, nil
 		}))
 
-		worker := client.NewWorker().AddFlow(flow)
+		worker := NewWorker(testPool).AddFlow(flow)
 		startTestWorker(t, worker)
 
 		handle, err := client.RunFlow(t.Context(), flowName, 95)
@@ -2085,7 +2085,7 @@ func TestFlowCondition(t *testing.T) {
 			return result, nil
 		}))
 
-		worker := client.NewWorker().AddFlow(flow)
+		worker := NewWorker(testPool).AddFlow(flow)
 		startTestWorker(t, worker)
 
 		handle, err := client.RunFlow(t.Context(), flowName, 75)
@@ -2129,7 +2129,7 @@ func TestFlowCondition(t *testing.T) {
 			return result, nil
 		}))
 
-		worker := client.NewWorker().AddFlow(flow)
+		worker := NewWorker(testPool).AddFlow(flow)
 		startTestWorker(t, worker)
 
 		handle, err := client.RunFlow(t.Context(), flowName, 95)
@@ -2181,7 +2181,7 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 			return result, nil
 		}))
 
-		worker := client.NewWorker().AddFlow(flow)
+		worker := NewWorker(testPool).AddFlow(flow)
 		startTestWorker(t, worker)
 
 		handle, err := client.RunFlow(t.Context(), flowName, map[string]interface{}{"other": "data"})
@@ -2222,7 +2222,7 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 			return result, nil
 		}))
 
-		worker := client.NewWorker().AddFlow(flow)
+		worker := NewWorker(testPool).AddFlow(flow)
 		startTestWorker(t, worker)
 
 		handle, err := client.RunFlow(t.Context(), flowName, map[string]interface{}{"field": nil})
@@ -2266,7 +2266,7 @@ func TestFlowConditionEdgeCases(t *testing.T) {
 			return result, nil
 		}))
 
-		worker := client.NewWorker().AddFlow(flow)
+		worker := NewWorker(testPool).AddFlow(flow)
 		startTestWorker(t, worker)
 
 		handle, err := client.RunFlow(t.Context(), flowName, map[string]interface{}{
@@ -2323,7 +2323,7 @@ func TestFlowOptionalDependency(t *testing.T) {
 		return 0, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 
 	handle, err := client.RunFlow(t.Context(), flowName, 40)
@@ -2434,7 +2434,7 @@ func TestFlowCancelStartedRun(t *testing.T) {
 		return "", ctx.Err()
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -2469,7 +2469,7 @@ func TestFlowInternalCancelCurrentRun(t *testing.T) {
 		return "", ctx.Err()
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -2527,7 +2527,7 @@ func TestFlowFailStopsInFlightParallelStep(t *testing.T) {
 		return longOut + ":" + failOut, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -2579,7 +2579,7 @@ func TestFlowCompleteEarlyFromStep(t *testing.T) {
 		return longOut + ":" + fastOut, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -2638,7 +2638,7 @@ func TestStepCanCheckOtherStepFinishedFromHandler(t *testing.T) {
 		return step1Out + ":" + watchOut, nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -2673,7 +2673,7 @@ func TestStepStatusAndWaitForOutput(t *testing.T) {
 		return step1Out + ":s2", nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
@@ -2755,7 +2755,7 @@ func TestStepWaitForOutputSkipped(t *testing.T) {
 		return "done", nil
 	}))
 
-	worker := client.NewWorker().AddFlow(flow)
+	worker := NewWorker(testPool).AddFlow(flow)
 	startTestWorker(t, worker)
 	time.Sleep(100 * time.Millisecond)
 
