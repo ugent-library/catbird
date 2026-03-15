@@ -79,11 +79,11 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_advance_task_schedule(id bigint, policy text DEFAULT 'one')
+CREATE OR REPLACE FUNCTION cb_advance_task_schedule(id bigint, catch_up text DEFAULT 'one')
 RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
-    IF cb_advance_task_schedule.policy = 'all' THEN
+    IF cb_advance_task_schedule.catch_up = 'all' THEN
         -- Advance one tick at a time; stays in the past until caught up
         UPDATE cb_task_schedules s
         SET
@@ -107,11 +107,11 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE OR REPLACE FUNCTION cb_advance_flow_schedule(id bigint, policy text DEFAULT 'one')
+CREATE OR REPLACE FUNCTION cb_advance_flow_schedule(id bigint, catch_up text DEFAULT 'one')
 RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
-    IF cb_advance_flow_schedule.policy = 'all' THEN
+    IF cb_advance_flow_schedule.catch_up = 'all' THEN
         -- Advance one tick at a time; stays in the past until caught up
         UPDATE cb_flow_schedules s
         SET

@@ -38,11 +38,11 @@ SELECT cb_delete(
 
 -- Bind queue to topic pattern
 SELECT cb_bind(
-	queue_name => 'user_events',
+	queue => 'user_events',
 	pattern => 'events.user.*'
 );
 SELECT cb_unbind(
-	queue_name => 'user_events',
+	queue => 'user_events',
 	pattern => 'events.user.*'
 );
 ```
@@ -152,7 +152,7 @@ These are the functions most app code and external clients care about.
 
 ### `cb_create_queue`
 - **What it does**: Create a queue definition.
-- **Inputs**: `cb_create_queue(name text, expires_at timestamptz = null, description text = null)`
+- **Inputs**: `cb_create_queue(name text, expires_at timestamptz DEFAULT NULL, description text DEFAULT NULL)`
 - **Returns**: `RETURNS void`
 
 ### `cb_delete_queue`
@@ -162,32 +162,32 @@ These are the functions most app code and external clients care about.
 
 ### `cb_bind`
 - **What it does**: Subscribe a queue to a topic pattern.
-- **Inputs**: `cb_bind(queue_name text, pattern text)`
+- **Inputs**: `cb_bind(queue text, pattern text)`
 - **Returns**: `RETURNS void`
 
 ### `cb_unbind`
 - **What it does**: Unsubscribe a queue from a topic pattern.
-- **Inputs**: `cb_unbind(queue_name text, pattern text)`
+- **Inputs**: `cb_unbind(queue text, pattern text)`
 - **Returns**: `RETURNS boolean`
 
 ### `cb_send` (single message)
 - **What it does**: Send one message to a specific queue.
-- **Inputs**: `cb_send(queue text, payload jsonb, topic text = null, idempotency_key text = null, headers jsonb = null, visible_at timestamptz = null)`
+- **Inputs**: `cb_send(queue text, payload jsonb, topic text DEFAULT NULL, idempotency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL)`
 - **Returns**: `RETURNS bigint`
 
 ### `cb_send` (batch)
 - **What it does**: Send multiple messages to a specific queue in one call.
-- **Inputs**: `cb_send(queue text, payloads jsonb[], topic text = null, idempotency_keys text[] = null, headers jsonb[] = null, visible_at timestamptz = null)`
+- **Inputs**: `cb_send(queue text, payloads jsonb[], topic text DEFAULT NULL, idempotency_keys text[] DEFAULT NULL, headers jsonb[] DEFAULT NULL, visible_at timestamptz DEFAULT NULL)`
 - **Returns**: `RETURNS bigint[]`
 
 ### `cb_publish` (single message)
 - **What it does**: Publish one message to all queues matching a topic.
-- **Inputs**: `cb_publish(topic text, payload jsonb, idempotency_key text = null, headers jsonb = null, visible_at timestamptz = null)`
+- **Inputs**: `cb_publish(topic text, payload jsonb, idempotency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL)`
 - **Returns**: `RETURNS int`
 
 ### `cb_publish` (batch)
 - **What it does**: Publish multiple messages to all queues matching a topic.
-- **Inputs**: `cb_publish(topic text, payloads jsonb[], idempotency_keys text[] = null, headers jsonb[] = null, visible_at timestamptz = null)`
+- **Inputs**: `cb_publish(topic text, payloads jsonb[], idempotency_keys text[] DEFAULT NULL, headers jsonb[] DEFAULT NULL, visible_at timestamptz DEFAULT NULL)`
 - **Returns**: `RETURNS int`
 
 ### `cb_read`
@@ -224,7 +224,7 @@ These are the functions most app code and external clients care about.
 
 ### `cb_create_task`
 - **What it does**: Create a task definition.
-- **Inputs**: `cb_create_task(name text, description text = null, condition text = null, retention_period interval = null)`
+- **Inputs**: `cb_create_task(name text, description text DEFAULT NULL, condition text DEFAULT NULL, retention_period interval DEFAULT NULL)`
 - **Returns**: `RETURNS void`
 
 ### `cb_delete_task`
@@ -234,12 +234,12 @@ These are the functions most app code and external clients care about.
 
 ### `cb_run_task`
 - **What it does**: Create a task run (enqueue a task execution).
-- **Inputs**: `cb_run_task(name text, input jsonb, concurrency_key text = NULL, idempotency_key text = NULL, headers jsonb = NULL, visible_at timestamptz = NULL)`
+- **Inputs**: `cb_run_task(name text, input jsonb, concurrency_key text DEFAULT NULL, idempotency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL)`
 - **Returns**: `RETURNS bigint`
 
 ### `cb_wait_task_output`
 - **What it does**: Long-poll for task completion without client-side polling loops.
-- **Inputs**: `cb_wait_task_output(task_name text, run_id bigint, poll_for int DEFAULT 5000, poll_interval int DEFAULT 200)`
+- **Inputs**: `cb_wait_task_output(name text, run_id bigint, poll_for int DEFAULT 5000, poll_interval int DEFAULT 200)`
 - **Returns**: `RETURNS TABLE(status text, output jsonb, error_message text)`
 
 ### `cb_cancel_task`
@@ -272,7 +272,7 @@ These are the functions most app code and external clients care about.
 
 ### `cb_run_flow`
 - **What it does**: Create a flow run (enqueue a flow execution).
-- **Inputs**: `cb_run_flow(name text, input jsonb, concurrency_key text = NULL, idempotency_key text = NULL, headers jsonb = NULL, visible_at timestamptz = NULL)`
+- **Inputs**: `cb_run_flow(name text, input jsonb, concurrency_key text DEFAULT NULL, idempotency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL)`
 - **Returns**: `RETURNS bigint`
 
 ### `cb_wait_flow_output`
@@ -282,7 +282,7 @@ These are the functions most app code and external clients care about.
 
 ### `cb_signal_flow`
 - **What it does**: Deliver a signal to a waiting step run.
-- **Inputs**: `cb_signal_flow(flow_name text, flow_run_id bigint, step_name text, input jsonb)`
+- **Inputs**: `cb_signal_flow(flow_name text, run_id bigint, step_name text, input jsonb)`
 - **Returns**: `RETURNS boolean`
 
 ### `cb_cancel_flow`
@@ -336,17 +336,17 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 
 ### `cb_hide_tasks`
 - **What it does**: Hide task runs from being read by workers.
-- **Inputs**: `cb_hide_tasks(name text, ids bigint[], hide_for integer)`
+- **Inputs**: `cb_hide_tasks(name text, ids bigint[], hide_for int)`
 - **Returns**: `RETURNS void`
 
 ### `cb_complete_task`
 - **What it does**: Mark a task run as completed.
-- **Inputs**: `cb_complete_task(name text, id bigint, output jsonb)`
+- **Inputs**: `cb_complete_task(name text, run_id bigint, output jsonb)`
 - **Returns**: `RETURNS void`
 
 ### `cb_fail_task`
 - **What it does**: Mark a task run as failed.
-- **Inputs**: `cb_fail_task(name text, id bigint, error_message text)`
+- **Inputs**: `cb_fail_task(name text, run_id bigint, error_message text)`
 - **Returns**: `RETURNS void`
 
 ### `cb_claim_task_on_fail`
@@ -356,19 +356,19 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 
 ### `cb_complete_task_on_fail`
 - **What it does**: Mark on-fail handling as completed for a task run.
-- **Inputs**: `cb_complete_task_on_fail(name text, id bigint)`
+- **Inputs**: `cb_complete_task_on_fail(name text, run_id bigint)`
 - **Returns**: `RETURNS void`
 
 ### `cb_fail_task_on_fail`
 - **What it does**: Mark on-fail handling as failed and schedule retry (`retry_delay` is in milliseconds).
-- **Inputs**: `cb_fail_task_on_fail(name text, id bigint, error_message text, retry_exhausted boolean, retry_delay bigint)`
+- **Inputs**: `cb_fail_task_on_fail(name text, run_id bigint, error_message text, retry_exhausted boolean, retry_delay bigint)`
 - **Returns**: `RETURNS void`
 
 **Flow worker runtime**
 
 ### `cb_start_steps`
 - **What it does**: Start steps in a flow that are ready to run.
-- **Inputs**: `cb_start_steps(flow_name text, flow_run_id bigint, initial_visible_at timestamptz DEFAULT NULL)`
+- **Inputs**: `cb_start_steps(flow_name text, run_id bigint, initial_visible_at timestamptz DEFAULT NULL)`
 - **Returns**: `RETURNS void`
 
 ### `cb_claim_steps`
@@ -378,17 +378,17 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 
 ### `cb_hide_steps`
 - **What it does**: Hide step runs from being read by workers.
-- **Inputs**: `cb_hide_steps(flow_name text, step_name text, ids bigint[], hide_for integer)`
+- **Inputs**: `cb_hide_steps(flow_name text, step_name text, ids bigint[], hide_for int)`
 - **Returns**: `RETURNS void`
 
 ### `cb_complete_step`
 - **What it does**: Mark a step run as completed.
-- **Inputs**: `cb_complete_step(flow_name text, step_name text, step_id bigint, output jsonb)`
+- **Inputs**: `cb_complete_step(flow_name text, step_name text, id bigint, output jsonb)`
 - **Returns**: `RETURNS void`
 
 ### `cb_fail_step`
 - **What it does**: Mark a step run as failed.
-- **Inputs**: `cb_fail_step(flow_name text, step_name text, step_id bigint, error_message text)`
+- **Inputs**: `cb_fail_step(flow_name text, step_name text, id bigint, error_message text)`
 - **Returns**: `RETURNS void`
 
 ### `cb_claim_map_tasks`
@@ -403,27 +403,27 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 
 ### `cb_spawn_generator_map_tasks`
 - **What it does**: Spawn map tasks for a generator step batch.
-- **Inputs**: `cb_spawn_generator_map_tasks(flow_name text, step_name text, step_id bigint, items jsonb, visible_at timestamptz DEFAULT NULL)`
+- **Inputs**: `cb_spawn_generator_map_tasks(flow_name text, step_name text, id bigint, items jsonb, visible_at timestamptz DEFAULT NULL)`
 - **Returns**: `RETURNS int`
 
 ### `cb_complete_generator_step`
 - **What it does**: Mark generator as complete and finalize parent step if all map tasks are complete.
-- **Inputs**: `cb_complete_generator_step(flow_name text, step_name text, step_id bigint)`
+- **Inputs**: `cb_complete_generator_step(flow_name text, step_name text, id bigint)`
 - **Returns**: `RETURNS void`
 
 ### `cb_fail_generator_step`
 - **What it does**: Mark generator as failed and fail parent step/flow.
-- **Inputs**: `cb_fail_generator_step(flow_name text, step_name text, step_id bigint, error_message text)`
+- **Inputs**: `cb_fail_generator_step(flow_name text, step_name text, id bigint, error_message text)`
 - **Returns**: `RETURNS void`
 
 ### `cb_complete_map_task`
 - **What it does**: Complete one map task and complete parent step when all items finish.
-- **Inputs**: `cb_complete_map_task(flow_name text, step_name text, map_task_id bigint, output jsonb)`
+- **Inputs**: `cb_complete_map_tasks(flow_name text, step_name text, ids bigint[], outputs jsonb[])`
 - **Returns**: `RETURNS void`
 
 ### `cb_fail_map_task`
 - **What it does**: Fail one map task and fail parent step/flow.
-- **Inputs**: `cb_fail_map_task(flow_name text, step_name text, map_task_id bigint, error_message text)`
+- **Inputs**: `cb_fail_map_task(flow_name text, step_name text, id bigint, error_message text)`
 - **Returns**: `RETURNS void`
 
 ### `cb_wait_flow_step_output`
@@ -433,7 +433,7 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 
 ### `cb_get_flow_step_output`
 - **What it does**: Fetch a completed step output on demand.
-- **Inputs**: `cb_get_flow_step_output(flow_name text, flow_run_id bigint, step_name text)`
+- **Inputs**: `cb_get_flow_step_output(flow_name text, run_id bigint, step_name text)`
 - **Returns**: `RETURNS jsonb`
 
 ### `cb_get_flow_step_status`
@@ -443,7 +443,7 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 
 ### `cb_complete_flow_early`
 - **What it does**: Complete a flow run early and cancel remaining work.
-- **Inputs**: `cb_complete_flow_early(flow_name text, flow_run_id bigint, step_name text, output jsonb, reason text DEFAULT NULL)`
+- **Inputs**: `cb_complete_flow_early(flow_name text, run_id bigint, step_name text, output jsonb, reason text DEFAULT NULL)`
 - **Returns**: `RETURNS boolean` (`true` when the run exists, `false` when the run does not exist)
 
 ### `cb_claim_flow_on_fail`
@@ -453,12 +453,12 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 
 ### `cb_complete_flow_on_fail`
 - **What it does**: Mark on-fail handling as completed for a flow run.
-- **Inputs**: `cb_complete_flow_on_fail(name text, id bigint)`
+- **Inputs**: `cb_complete_flow_on_fail(name text, run_id bigint)`
 - **Returns**: `RETURNS void`
 
 ### `cb_fail_flow_on_fail`
 - **What it does**: Mark on-fail handling as failed and schedule retry (`retry_delay` is in milliseconds).
-- **Inputs**: `cb_fail_flow_on_fail(name text, id bigint, error_message text, retry_exhausted boolean, retry_delay bigint)`
+- **Inputs**: `cb_fail_flow_on_fail(name text, run_id bigint, error_message text, retry_exhausted boolean, retry_delay bigint)`
 - **Returns**: `RETURNS void`
 
 **Flow cancellation internals**
@@ -475,24 +475,24 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 
 ### `cb_cancel_step_run`
 - **What it does**: Cancel a specific step run within a flow.
-- **Inputs**: `cb_cancel_step_run(flow_name text, step_id bigint)`
+- **Inputs**: `cb_cancel_step_run(flow_name text, id bigint)`
 - **Returns**: `RETURNS bigint`
 
 ### `cb_cancel_map_task_run`
 - **What it does**: Cancel a specific map task run for a flow step.
-- **Inputs**: `cb_cancel_map_task_run(flow_name text, map_task_id bigint)`
+- **Inputs**: `cb_cancel_map_task_run(flow_name text, id bigint)`
 - **Returns**: `RETURNS bigint`
 
 **Scheduler internals**
 
 ### `cb_advance_task_schedule`
 - **What it does**: Move a task schedule’s `next_run_at` to its next cron tick, respecting the catch-up policy.
-- **Inputs**: `cb_advance_task_schedule(id bigint, policy text DEFAULT ‘one’)`
+- **Inputs**: `cb_advance_task_schedule(id bigint, catch_up text DEFAULT ‘one’)`
 - **Returns**: `RETURNS void`
 
 ### `cb_advance_flow_schedule`
 - **What it does**: Move a flow schedule’s `next_run_at` to its next cron tick, respecting the catch-up policy.
-- **Inputs**: `cb_advance_flow_schedule(id bigint, policy text DEFAULT ‘one’)`
+- **Inputs**: `cb_advance_flow_schedule(id bigint, catch_up text DEFAULT ‘one’)`
 - **Returns**: `RETURNS void`
 
 ### `cb_execute_due_task_schedules`

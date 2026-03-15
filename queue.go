@@ -163,7 +163,7 @@ func SendManyQuery(queueName string, payloads []any, opts ...SendManyOpts) (stri
 // Pattern supports exact topics and wildcards: * (single token), # (multi-token tail).
 // Examples: "foo.bar", "foo.*.bar", "foo.bar.#"
 func Bind(ctx context.Context, conn Conn, queueName string, pattern string) error {
-	q := `SELECT cb_bind(queue_name => $1, pattern => $2);`
+	q := `SELECT cb_bind(queue => $1, pattern => $2);`
 	_, err := conn.Exec(ctx, q, queueName, pattern)
 	return wrapNotDefinedErr(err, "queue", queueName)
 }
@@ -171,7 +171,7 @@ func Bind(ctx context.Context, conn Conn, queueName string, pattern string) erro
 // Unbind unsubscribes a queue from a topic pattern.
 // Returns true if a binding was removed, false if it was already absent.
 func Unbind(ctx context.Context, conn Conn, queueName string, pattern string) (bool, error) {
-	q := `SELECT cb_unbind(queue_name => $1, pattern => $2);`
+	q := `SELECT cb_unbind(queue => $1, pattern => $2);`
 	deleted := false
 	err := conn.QueryRow(ctx, q, queueName, pattern).Scan(&deleted)
 	if err != nil {

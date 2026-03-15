@@ -22,7 +22,7 @@
 --   condition: Optional condition expression for task execution
 --   retention_period: Optional retention period; completed/failed/skipped/canceled runs older than this are deleted by cb_gc()
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_create_task(name text, description text = null, condition text = null, retention_period interval = null)
+CREATE OR REPLACE FUNCTION cb_create_task(name text, description text DEFAULT NULL, condition text DEFAULT NULL, retention_period interval DEFAULT NULL)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -180,10 +180,10 @@ $$;
 CREATE OR REPLACE FUNCTION cb_run_task(
     name text,
     input jsonb,
-    concurrency_key text = NULL,
-    idempotency_key text = NULL,
-    headers jsonb = NULL,
-    visible_at timestamptz = NULL
+    concurrency_key text DEFAULT NULL,
+    idempotency_key text DEFAULT NULL,
+    headers jsonb DEFAULT NULL,
+    visible_at timestamptz DEFAULT NULL
 )
 RETURNS bigint
 LANGUAGE plpgsql AS $$
@@ -329,7 +329,7 @@ $$;
 --   ids: Array of task run IDs to hide
 --   hide_for: Duration in milliseconds to hide the task runs (must be > 0)
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_hide_tasks(name text, ids bigint[], hide_for integer)
+CREATE OR REPLACE FUNCTION cb_hide_tasks(name text, ids bigint[], hide_for int)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -363,7 +363,7 @@ $$;
 --   id: Task run ID
 --   output: JSON output data from the task execution
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_complete_task(name text, id bigint, output jsonb)
+CREATE OR REPLACE FUNCTION cb_complete_task(name text, run_id bigint, output jsonb)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -380,7 +380,7 @@ BEGIN
       $QUERY$,
       _t_table
     )
-    USING cb_complete_task.id,
+    USING cb_complete_task.run_id,
           cb_complete_task.output;
 END;
 $$;
@@ -394,7 +394,7 @@ $$;
 --   id: Task run ID
 --   error_message: Description of the error that occurred
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_fail_task(name text, id bigint, error_message text)
+CREATE OR REPLACE FUNCTION cb_fail_task(name text, run_id bigint, error_message text)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -416,7 +416,7 @@ BEGIN
       $QUERY$,
       _t_table
     )
-    USING cb_fail_task.id,
+    USING cb_fail_task.run_id,
           cb_fail_task.error_message;
 
     PERFORM pg_notify(current_schema || '.cb_t_onfail_' || cb_fail_task.name, '');
@@ -488,7 +488,7 @@ $$;
 
 -- +goose statementbegin
 -- cb_complete_task_on_fail: Mark on-fail handling as completed for a task run
-CREATE OR REPLACE FUNCTION cb_complete_task_on_fail(name text, id bigint)
+CREATE OR REPLACE FUNCTION cb_complete_task_on_fail(name text, run_id bigint)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -505,7 +505,7 @@ BEGIN
             $QUERY$,
             _t_table
         )
-        USING cb_complete_task_on_fail.id;
+        USING cb_complete_task_on_fail.run_id;
 END;
 $$;
 -- +goose statementend
@@ -513,7 +513,7 @@ $$;
 -- +goose statementbegin
 CREATE OR REPLACE FUNCTION cb_fail_task_on_fail(
         name text,
-        id bigint,
+        run_id bigint,
         error_message text,
         retry_exhausted boolean,
         retry_delay bigint
@@ -537,7 +537,7 @@ BEGIN
             $QUERY$,
             _t_table
         )
-        USING cb_fail_task_on_fail.id,
+        USING cb_fail_task_on_fail.run_id,
                     cb_fail_task_on_fail.error_message,
                     cb_fail_task_on_fail.retry_exhausted,
                     cb_fail_task_on_fail.retry_delay;
@@ -554,7 +554,7 @@ $$;
 --   poll_interval: Duration in milliseconds between poll attempts (must be > 0 and < poll_for)
 -- Returns: status/output/error_message once run reaches terminal state, or no rows on timeout
 CREATE OR REPLACE FUNCTION cb_wait_task_output(
-    task_name text,
+    name text,
     run_id bigint,
     poll_for int DEFAULT 5000,
     poll_interval int DEFAULT 200
@@ -562,7 +562,7 @@ CREATE OR REPLACE FUNCTION cb_wait_task_output(
 RETURNS TABLE(status text, output jsonb, error_message text)
 LANGUAGE plpgsql AS $$
 DECLARE
-    _t_table text := cb_table_name(cb_wait_task_output.task_name, 't');
+    _t_table text := cb_table_name(cb_wait_task_output.name, 't');
     _status text;
     _output jsonb;
     _error_message text;
@@ -606,7 +606,7 @@ BEGIN
                 INTO _status, _output, _error_message;
 
         IF _status IS NULL THEN
-            RAISE EXCEPTION 'cb: task run % not found for task %', cb_wait_task_output.run_id, cb_wait_task_output.task_name;
+            RAISE EXCEPTION 'cb: task run % not found for task %', cb_wait_task_output.run_id, cb_wait_task_output.name;
         END IF;
 
         IF _status IN ('completed', 'failed', 'skipped', 'canceled') THEN
@@ -671,7 +671,7 @@ DROP FUNCTION IF EXISTS cb_claim_task_on_fail(text, int);
 DROP FUNCTION IF EXISTS cb_fail_task(text, bigint, text);
 DROP FUNCTION IF EXISTS cb_complete_task(text, bigint, jsonb);
 DROP FUNCTION IF EXISTS cb_wait_task_output(text, bigint, int, int);
-DROP FUNCTION IF EXISTS cb_hide_tasks(text, bigint[], integer);
+DROP FUNCTION IF EXISTS cb_hide_tasks(text, bigint[], int);
 DROP FUNCTION IF EXISTS cb_claim_tasks(text, int, int);
 DROP FUNCTION IF EXISTS cb_run_task(text, jsonb, text, text, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_create_task(text, text, text);

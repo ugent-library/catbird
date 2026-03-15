@@ -1451,14 +1451,14 @@ func hideTaskRuns(ctx context.Context, conn Conn, logger *slog.Logger, taskName 
 }
 
 func completeTaskRun(ctx context.Context, conn Conn, logger *slog.Logger, taskName string, runID int64, output []byte) {
-	q := `SELECT * FROM cb_complete_task(name => $1, id => $2, output => $3);`
+	q := `SELECT * FROM cb_complete_task(name => $1, run_id => $2, output => $3);`
 	if _, err := execWithRetry(ctx, conn, q, taskName, runID, output); err != nil {
 		logger.ErrorContext(ctx, "worker: cannot mark task as completed", "task", taskName, "error", err)
 	}
 }
 
 func failTaskRun(ctx context.Context, conn Conn, logger *slog.Logger, taskName string, runID int64, errorMessage string) {
-	q := `SELECT * FROM cb_fail_task(name => $1, id => $2, error_message => $3);`
+	q := `SELECT * FROM cb_fail_task(name => $1, run_id => $2, error_message => $3);`
 	if _, err := execWithRetry(ctx, conn, q, taskName, runID, errorMessage); err != nil {
 		logger.ErrorContext(ctx, "worker: cannot mark task as failed", "task", taskName, "error", err)
 	}
@@ -1473,16 +1473,23 @@ func hideStepRuns(ctx context.Context, conn Conn, logger *slog.Logger, flowName,
 }
 
 func completeStepRun(ctx context.Context, conn Conn, logger *slog.Logger, flowName, stepName string, stepID int64, output []byte) {
-	q := `SELECT * FROM cb_complete_step(flow_name => $1, step_name => $2, step_id => $3, output => $4);`
+	q := `SELECT * FROM cb_complete_step(flow_name => $1, step_name => $2, id => $3, output => $4);`
 	if _, err := execWithRetry(ctx, conn, q, flowName, stepName, stepID, output); err != nil {
 		logger.ErrorContext(ctx, "worker: cannot mark step as completed", "flow", flowName, "step", stepName, "error", err)
 	}
 }
 
 func failStepRun(ctx context.Context, conn Conn, logger *slog.Logger, flowName, stepName string, stepID int64, errorMessage string) {
-	q := `SELECT * FROM cb_fail_step(flow_name => $1, step_name => $2, step_id => $3, error_message => $4);`
+	q := `SELECT * FROM cb_fail_step(flow_name => $1, step_name => $2, id => $3, error_message => $4);`
 	if _, err := execWithRetry(ctx, conn, q, flowName, stepName, stepID, errorMessage); err != nil {
 		logger.ErrorContext(ctx, "worker: cannot mark step as failed", "flow", flowName, "step", stepName, "error", err)
+	}
+}
+
+func completeMapTaskRun(ctx context.Context, conn Conn, logger *slog.Logger, flowName, stepName string, mapTaskID int64, output []byte) {
+	q := `SELECT * FROM cb_complete_map_tasks(flow_name => $1, step_name => $2, ids => $3, outputs => $4);`
+	if _, err := execWithRetry(ctx, conn, q, flowName, stepName, []int64{mapTaskID}, []json.RawMessage{output}); err != nil {
+		logger.ErrorContext(ctx, "worker: cannot mark map task as completed", "flow", flowName, "step", stepName, "error", err)
 	}
 }
 
@@ -1494,22 +1501,15 @@ func hideMapTaskRuns(ctx context.Context, conn Conn, logger *slog.Logger, flowNa
 	}
 }
 
-func completeMapTaskRun(ctx context.Context, conn Conn, logger *slog.Logger, flowName, stepName string, mapTaskID int64, output []byte) {
-	q := `SELECT * FROM cb_complete_map_task(flow_name => $1, step_name => $2, map_task_id => $3, output => $4);`
-	if _, err := execWithRetry(ctx, conn, q, flowName, stepName, mapTaskID, output); err != nil {
-		logger.ErrorContext(ctx, "worker: cannot mark map task as completed", "flow", flowName, "step", stepName, "error", err)
-	}
-}
-
 func failMapTaskRun(ctx context.Context, conn Conn, logger *slog.Logger, flowName, stepName string, mapTaskID int64, errorMessage string) {
-	q := `SELECT * FROM cb_fail_map_task(flow_name => $1, step_name => $2, map_task_id => $3, error_message => $4);`
+	q := `SELECT * FROM cb_fail_map_task(flow_name => $1, step_name => $2, id => $3, error_message => $4);`
 	if _, err := execWithRetry(ctx, conn, q, flowName, stepName, mapTaskID, errorMessage); err != nil {
 		logger.ErrorContext(ctx, "worker: cannot mark map task as failed", "flow", flowName, "step", stepName, "error", err)
 	}
 }
 
 func spawnGeneratorMapTasks(ctx context.Context, conn Conn, flowName, stepName string, stepID int64, items []byte) (int, error) {
-	q := `SELECT * FROM cb_spawn_generator_map_tasks(flow_name => $1, step_name => $2, step_id => $3, items => $4);`
+	q := `SELECT * FROM cb_spawn_generator_map_tasks(flow_name => $1, step_name => $2, id => $3, items => $4);`
 	var spawned int
 	if err := conn.QueryRow(ctx, q, flowName, stepName, stepID, items).Scan(&spawned); err != nil {
 		return 0, fmt.Errorf("spawn generator map tasks: %w", err)
@@ -1518,7 +1518,7 @@ func spawnGeneratorMapTasks(ctx context.Context, conn Conn, flowName, stepName s
 }
 
 func completeGeneratorStep(ctx context.Context, conn Conn, flowName, stepName string, stepID int64) error {
-	q := `SELECT * FROM cb_complete_generator_step(flow_name => $1, step_name => $2, step_id => $3);`
+	q := `SELECT * FROM cb_complete_generator_step(flow_name => $1, step_name => $2, id => $3);`
 	if _, err := execWithRetry(ctx, conn, q, flowName, stepName, stepID); err != nil {
 		return fmt.Errorf("mark generator complete: %w", err)
 	}
@@ -1609,7 +1609,7 @@ func getStepFlowRunIDForReduction(ctx context.Context, conn Conn, flowName strin
 }
 
 func failGeneratorStep(ctx context.Context, conn Conn, logger *slog.Logger, flowName, stepName string, stepID int64, errorMessage string) {
-	q := `SELECT * FROM cb_fail_generator_step(flow_name => $1, step_name => $2, step_id => $3, error_message => $4);`
+	q := `SELECT * FROM cb_fail_generator_step(flow_name => $1, step_name => $2, id => $3, error_message => $4);`
 	if _, err := execWithRetry(ctx, conn, q, flowName, stepName, stepID, errorMessage); err != nil {
 		logger.ErrorContext(ctx, "worker: cannot fail generator step", "flow", flowName, "step", stepName, "id", stepID, "error", err)
 	}
@@ -1645,7 +1645,7 @@ func completeFlowEarly(ctx context.Context, conn Conn, flowName string, runID in
 		return false, fmt.Errorf("marshal early completion output: %w", err)
 	}
 
-	q := `SELECT cb_complete_flow_early(flow_name => $1, flow_run_id => $2, step_name => $3, output => $4, reason => $5);`
+	q := `SELECT cb_complete_flow_early(flow_name => $1, run_id => $2, step_name => $3, output => $4, reason => $5);`
 	var applied bool
 	err = conn.QueryRow(ctx, q, flowName, runID, stepName, payload, reason).Scan(&applied)
 	if err != nil {
@@ -1840,13 +1840,13 @@ func finalizeFlowCancelIfRequested(ctx context.Context, conn Conn, logger *slog.
 }
 
 func cancelStepRun(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, stepID int64) {
-	if _, err := execWithRetry(ctx, conn, `SELECT cb_cancel_step_run(flow_name => $1, step_id => $2);`, flowName, stepID); err != nil {
+	if _, err := execWithRetry(ctx, conn, `SELECT cb_cancel_step_run(flow_name => $1, id => $2);`, flowName, stepID); err != nil {
 		logger.DebugContext(ctx, "worker: cannot cancel step run", "flow", flowName, "step_id", stepID, "error", err)
 	}
 }
 
 func cancelMapTaskRun(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, mapTaskID int64) {
-	if _, err := execWithRetry(ctx, conn, `SELECT cb_cancel_map_task_run(flow_name => $1, map_task_id => $2);`, flowName, mapTaskID); err != nil {
+	if _, err := execWithRetry(ctx, conn, `SELECT cb_cancel_map_task_run(flow_name => $1, id => $2);`, flowName, mapTaskID); err != nil {
 		logger.DebugContext(ctx, "worker: cannot cancel map task run", "flow", flowName, "map_task_id", mapTaskID, "error", err)
 	}
 }

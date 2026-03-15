@@ -14,7 +14,6 @@ Start reply from dashboard and tui.
 
 ## Performance
 
-- [ ] [!!] Batch step completion — complete multiple map tasks in a single `cb_complete_map_tasks(ids[], outputs[])` call to reduce round-trips on large map steps
 - [ ] [!!] Priority queues — per-task/flow priority column with weighted polling
 - [ ] [!] Fair queueing (see https://docs.hatchet.run/blog/multi-tenant-queues)
 - [ ] [!] Partitioned run tables — partition `cb_t_*` / `cb_f_*` by `created_at` for large-volume deployments; GC just drops old partitions (consider pg_partman for lifecycle management)
@@ -25,7 +24,7 @@ Start reply from dashboard and tui.
 ## Flow DSL
 
 - [ ] [!!] Event-triggered task/flow runs — `worker.AddTaskTrigger(name, pattern)` / `worker.AddFlowTrigger(name, pattern)`; worker creates internal queue + binding at startup, polls it, dispatches `RunTask`/`RunFlow` per message (see `docs/event-triggers.md`)
-- [ ] Return a stream of results (for example llm streaming chat repsonses)
+- [ ] [!] Return a stream of results (for example llm streaming chat responses)
 
 ## Observability
 

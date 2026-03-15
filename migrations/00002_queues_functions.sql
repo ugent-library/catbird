@@ -28,8 +28,8 @@
 -- Returns: void
 CREATE OR REPLACE FUNCTION cb_create_queue(
     name text,
-    expires_at timestamptz = null,
-    description text = null
+    expires_at timestamptz DEFAULT NULL,
+    description text DEFAULT NULL
 )
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -110,9 +110,9 @@ $$;
 CREATE OR REPLACE FUNCTION cb_publish(
     topic text,
     payload jsonb,
-    idempotency_key text = null,
-    headers jsonb = null,
-    visible_at timestamptz = null
+    idempotency_key text DEFAULT NULL,
+    headers jsonb DEFAULT NULL,
+    visible_at timestamptz DEFAULT NULL
 )
 RETURNS int
 LANGUAGE plpgsql AS $$
@@ -175,7 +175,7 @@ $$;
 --   queue_name: Name of the queue to bind
 --   pattern: Topic pattern (e.g., 'foo.bar', 'foo.*.bar', 'foo.bar.#')
 -- Returns: void
-CREATE OR REPLACE FUNCTION cb_bind(queue_name text, pattern text)
+CREATE OR REPLACE FUNCTION cb_bind(queue text, pattern text)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -279,7 +279,7 @@ BEGIN
 
     -- Insert or update binding
     INSERT INTO cb_bindings(queue_name, pattern, pattern_type, prefix, regex)
-    VALUES (cb_bind.queue_name, cb_bind.pattern, p_type, p_prefix, p_regex)
+    VALUES (cb_bind.queue, cb_bind.pattern, p_type, p_prefix, p_regex)
     ON CONFLICT ON CONSTRAINT cb_bindings_pkey DO NOTHING;
 END;
 $$;
@@ -291,14 +291,14 @@ $$;
 --   queue_name: Name of the queue
 --   pattern: Topic pattern to remove
 -- Returns: boolean - true if binding deleted, false if already absent
-CREATE OR REPLACE FUNCTION cb_unbind(queue_name text, pattern text)
+CREATE OR REPLACE FUNCTION cb_unbind(queue text, pattern text)
 RETURNS boolean
 LANGUAGE plpgsql AS $$
 DECLARE
         _deleted boolean := false;
 BEGIN
     DELETE FROM cb_bindings
-    WHERE cb_bindings.queue_name = cb_unbind.queue_name
+    WHERE cb_bindings.queue_name = cb_unbind.queue
             AND cb_bindings.pattern = cb_unbind.pattern
         RETURNING true INTO _deleted;
 
@@ -320,10 +320,10 @@ $$;
 CREATE OR REPLACE FUNCTION cb_send(
     queue text,
     payload jsonb,
-    topic text = null,
-    idempotency_key text = null,
-    headers jsonb = null,
-    visible_at timestamptz = null
+    topic text DEFAULT NULL,
+    idempotency_key text DEFAULT NULL,
+    headers jsonb DEFAULT NULL,
+    visible_at timestamptz DEFAULT NULL
 )
 RETURNS bigint
 LANGUAGE plpgsql AS $$
@@ -671,10 +671,10 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION cb_send(
     queue text,
     payloads jsonb[],
-    topic text = null,
-    idempotency_keys text[] = null,
-    headers jsonb[] = null,
-    visible_at timestamptz = null
+    topic text DEFAULT NULL,
+    idempotency_keys text[] DEFAULT NULL,
+    headers jsonb[] DEFAULT NULL,
+    visible_at timestamptz DEFAULT NULL
 )
 RETURNS bigint[]
 LANGUAGE plpgsql AS $$
@@ -756,9 +756,9 @@ $$;
 CREATE OR REPLACE FUNCTION cb_publish(
     topic text,
     payloads jsonb[],
-    idempotency_keys text[] = null,
-    headers jsonb[] = null,
-    visible_at timestamptz = null
+    idempotency_keys text[] DEFAULT NULL,
+    headers jsonb[] DEFAULT NULL,
+    visible_at timestamptz DEFAULT NULL
 )
 RETURNS int
 LANGUAGE plpgsql AS $$
@@ -860,7 +860,7 @@ DROP FUNCTION IF EXISTS cb_send(text, jsonb[], text, text[], jsonb[], timestampt
 DROP FUNCTION IF EXISTS cb_publish(text, jsonb, text, text, jsonb, timestamptz);
 DROP FUNCTION IF EXISTS cb_read(text, int, int);
 DROP FUNCTION IF EXISTS cb_read_poll(text, int, int, int, int);
-DROP FUNCTION IF EXISTS cb_hide(text, bigint, integer);
-DROP FUNCTION IF EXISTS cb_hide(text, bigint[], integer);
+DROP FUNCTION IF EXISTS cb_hide(text, bigint, int);
+DROP FUNCTION IF EXISTS cb_hide(text, bigint[], int);
 DROP FUNCTION IF EXISTS cb_delete(text, bigint);
 DROP FUNCTION IF EXISTS cb_delete(text, bigint[]);

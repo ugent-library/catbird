@@ -284,7 +284,7 @@ func (h *TaskHandle) WaitForOutput(ctx context.Context, out any, opts ...WaitOpt
 
 	q := `
 		SELECT status, output, error_message
-		FROM cb_wait_task_output(task_name => $1, run_id => $2, poll_for => $3, poll_interval => $4);
+		FROM cb_wait_task_output(name => $1, run_id => $2, poll_for => $3, poll_interval => $4);
 	`
 
 	for {
