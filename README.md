@@ -78,8 +78,7 @@ client.RunFlow(ctx, "order_processing", map[string]any{"order_id": 123}, catbird
 client.RunTask(ctx, "send-email", email, catbird.RunTaskOpts{Priority: 10})
 
 // Ensure definitions exist before usage; this is not necessary if you
-// just want to run a worker, definitions will be created for you on
-// Start
+// just want to run a worker, definitions will be created for you.
 err := client.CreateTask(ctx, taskA)
 err = client.CreateTask(ctx, taskB)
 err = client.CreateFlow(ctx, flowA)

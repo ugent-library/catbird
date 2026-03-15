@@ -14,7 +14,7 @@ Start reply from dashboard and tui.
 
 ## Performance
 
-- [ ] [!] Partitioned run tables — partition `cb_t_*` / `cb_f_*` by `created_at` for large-volume deployments; GC just drops old partitions (consider pg_partman for lifecycle management)
+
 - [ ] [!] `pop()` — atomic read+delete in one operation; at-most-once delivery semantics for use cases where redelivery is never wanted
 - [ ] [!] `peek()` — non-destructive read (no hide, no delete) for diagnostics/inspection; returns visible messages without altering delivery state
 - [ ] [!] Long-lived queue consumer — `Read`/`ReadPoll` with `pg_sleep` are correct for one-shot thin-client use. For long-lived consumers (outbox readers, event forwarders), a lightweight LISTEN-based reader would benefit from the existing `cb_send` NOTIFY. Should be a simple standalone construct, not coupled to the worker.
