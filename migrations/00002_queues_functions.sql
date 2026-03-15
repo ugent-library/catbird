@@ -363,7 +363,7 @@ BEGIN
           _visible_at
     INTO _id;
 
-    PERFORM pg_notify('cb_q_' || cb_send.queue, to_char(coalesce(cb_send.visible_at, now()) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+    PERFORM pg_notify(current_schema || '.cb_q_' || cb_send.queue, to_char(coalesce(cb_send.visible_at, now()) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
 
     RETURN _id;
 END
@@ -737,7 +737,7 @@ BEGIN
           cb_send.idempotency_keys
     INTO _ids;
 
-    PERFORM pg_notify('cb_q_' || cb_send.queue, to_char(coalesce(cb_send.visible_at, now()) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+    PERFORM pg_notify(current_schema || '.cb_q_' || cb_send.queue, to_char(coalesce(cb_send.visible_at, now()) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
 
     RETURN _ids;
 END
@@ -841,7 +841,7 @@ $$;
 -- +goose statementbegin
 DO $$
 BEGIN
-    IF to_regclass('public.cb_queues') IS NOT NULL THEN
+    IF to_regclass('cb_queues') IS NOT NULL THEN
         PERFORM cb_delete_queue(name)
         FROM cb_queues;
     END IF;

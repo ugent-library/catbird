@@ -181,8 +181,8 @@ func signal(ch chan struct{}) {
 	}
 }
 
-// channelName builds a NOTIFY channel name from components.
-// PostgreSQL channel names are case-insensitive; we lowercase everything.
-func channelName(parts ...string) string {
-	return strings.ToLower(strings.Join(parts, ""))
+// channelName builds a schema-qualified NOTIFY channel name.
+// Matches the SQL pattern: current_schema || '.cb_...'
+func channelName(schema string, parts ...string) string {
+	return strings.ToLower(schema + "." + strings.Join(parts, ""))
 }

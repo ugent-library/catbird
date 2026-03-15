@@ -108,8 +108,8 @@ BEGIN
         step_count = 0,
         retention_period = EXCLUDED.retention_period;
 
-    IF to_regclass('public.cb_step_handlers') IS NOT NULL THEN
-      EXECUTE 'DELETE FROM public.cb_step_handlers WHERE flow_name = $1'
+    IF to_regclass('cb_step_handlers') IS NOT NULL THEN
+      EXECUTE 'DELETE FROM cb_step_handlers WHERE flow_name = $1'
       USING cb_create_flow.name;
     END IF;
 
@@ -117,8 +117,8 @@ BEGIN
       DELETE FROM cb_step_dependencies WHERE flow_name = cb_create_flow.name;
       DELETE FROM cb_steps WHERE flow_name = cb_create_flow.name;
     EXCEPTION WHEN foreign_key_violation THEN
-      IF to_regclass('public.cb_step_handlers') IS NOT NULL THEN
-        EXECUTE 'DELETE FROM public.cb_step_handlers WHERE flow_name = $1'
+      IF to_regclass('cb_step_handlers') IS NOT NULL THEN
+        EXECUTE 'DELETE FROM cb_step_handlers WHERE flow_name = $1'
         USING cb_create_flow.name;
       END IF;
       DELETE FROM cb_step_dependencies WHERE flow_name = cb_create_flow.name;
@@ -686,7 +686,7 @@ BEGIN
     -- Start steps with no dependencies
     PERFORM cb_start_steps(cb_run_flow.name, _id, cb_run_flow.visible_at);
 
-    PERFORM pg_notify('cb_s_' || cb_run_flow.name, to_char(coalesce(cb_run_flow.visible_at, now()) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+    PERFORM pg_notify(current_schema || '.cb_s_' || cb_run_flow.name, to_char(coalesce(cb_run_flow.visible_at, now()) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
 
     RETURN _id;
 END;
@@ -761,7 +761,7 @@ BEGIN
     )
     USING cb_complete_flow_early.flow_run_id;
 
-    PERFORM pg_notify('cb_flow_stop_' || cb_complete_flow_early.flow_name, '');
+    PERFORM pg_notify(current_schema || '.cb_flow_stop_' || cb_complete_flow_early.flow_name, '');
 
     RETURN true;
 END;
@@ -862,7 +862,7 @@ BEGIN
     END IF;
 
     IF _status = 'canceling' THEN
-        PERFORM pg_notify('cb_flow_stop_' || cb_cancel_flow.name, '');
+        PERFORM pg_notify(current_schema || '.cb_flow_stop_' || cb_cancel_flow.name, '');
     END IF;
 
     -- Cancel non-started step runs
@@ -1323,7 +1323,7 @@ BEGIN
     EXIT WHEN _steps_processed_this_iteration = 0;
     END LOOP;
 
-    PERFORM pg_notify('cb_s_' || cb_start_steps.flow_name, '');
+    PERFORM pg_notify(current_schema || '.cb_s_' || cb_start_steps.flow_name, '');
 END;
 $$ LANGUAGE plpgsql;
 -- +goose statementend
@@ -1448,7 +1448,7 @@ BEGIN
           make_interval(secs => cb_hide_steps.hide_for / 1000.0),
           cb_hide_steps.step_name;
 
-    PERFORM pg_notify('cb_s_' || cb_hide_steps.flow_name, to_char((clock_timestamp() + make_interval(secs => cb_hide_steps.hide_for / 1000.0)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+    PERFORM pg_notify(current_schema || '.cb_s_' || cb_hide_steps.flow_name, to_char((clock_timestamp() + make_interval(secs => cb_hide_steps.hide_for / 1000.0)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
 END;
 $$;
 -- +goose statementend
@@ -1561,7 +1561,7 @@ BEGIN
           make_interval(secs => cb_hide_map_tasks.hide_for / 1000.0),
           cb_hide_map_tasks.step_name;
 
-    PERFORM pg_notify('cb_s_' || cb_hide_map_tasks.flow_name, to_char((clock_timestamp() + make_interval(secs => cb_hide_map_tasks.hide_for / 1000.0)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+    PERFORM pg_notify(current_schema || '.cb_s_' || cb_hide_map_tasks.flow_name, to_char((clock_timestamp() + make_interval(secs => cb_hide_map_tasks.hide_for / 1000.0)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
 END;
 $$;
 -- +goose statementend
@@ -1661,7 +1661,7 @@ BEGIN
     END IF;
 
     IF _spawned > 0 THEN
-        PERFORM pg_notify('cb_s_' || cb_spawn_generator_map_tasks.flow_name, '');
+        PERFORM pg_notify(current_schema || '.cb_s_' || cb_spawn_generator_map_tasks.flow_name, '');
     END IF;
 
     RETURN coalesce(_spawned, 0);
@@ -2106,8 +2106,8 @@ BEGIN
     )
     USING _flow_run_id, cb_fail_step.error_message, cb_fail_step.step_name, cb_fail_step.step_id;
 
-    PERFORM pg_notify('cb_flow_stop_' || cb_fail_step.flow_name, '');
-    PERFORM pg_notify('cb_f_onfail_' || cb_fail_step.flow_name, '');
+    PERFORM pg_notify(current_schema || '.cb_flow_stop_' || cb_fail_step.flow_name, '');
+    PERFORM pg_notify(current_schema || '.cb_f_onfail_' || cb_fail_step.flow_name, '');
 
     -- Propagate terminal failure to all remaining step runs for this flow run.
     EXECUTE format(
@@ -2627,7 +2627,7 @@ $$;
 -- +goose statementbegin
 DO $$
 BEGIN
-    IF to_regclass('public.cb_flows') IS NOT NULL THEN
+    IF to_regclass('cb_flows') IS NOT NULL THEN
     PERFORM cb_delete_flow(name)
     FROM cb_flows;
     END IF;

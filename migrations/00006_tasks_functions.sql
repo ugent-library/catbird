@@ -161,7 +161,7 @@ BEGIN
         END IF;
 
         IF _status = 'canceled' THEN
-            PERFORM pg_notify('cb_task_stop_' || cb_cancel_task.name, '');
+            PERFORM pg_notify(current_schema || '.cb_task_stop_' || cb_cancel_task.name, '');
         END IF;
 
         RETURN true;
@@ -260,7 +260,7 @@ BEGIN
         INTO _id;
     END IF;
 
-    PERFORM pg_notify('cb_t_' || cb_run_task.name, to_char(coalesce(cb_run_task.visible_at, now()) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+    PERFORM pg_notify(current_schema || '.cb_t_' || cb_run_task.name, to_char(coalesce(cb_run_task.visible_at, now()) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
 
     RETURN _id;
 END;
@@ -350,7 +350,7 @@ BEGIN
     USING cb_hide_tasks.ids,
           make_interval(secs => cb_hide_tasks.hide_for / 1000.0);
 
-    PERFORM pg_notify('cb_t_' || cb_hide_tasks.name, to_char((clock_timestamp() + make_interval(secs => cb_hide_tasks.hide_for / 1000.0)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+    PERFORM pg_notify(current_schema || '.cb_t_' || cb_hide_tasks.name, to_char((clock_timestamp() + make_interval(secs => cb_hide_tasks.hide_for / 1000.0)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
 END;
 $$;
 -- +goose statementend
@@ -419,7 +419,7 @@ BEGIN
     USING cb_fail_task.id,
           cb_fail_task.error_message;
 
-    PERFORM pg_notify('cb_t_onfail_' || cb_fail_task.name, '');
+    PERFORM pg_notify(current_schema || '.cb_t_onfail_' || cb_fail_task.name, '');
 END;
 $$;
 -- +goose statementend
@@ -655,7 +655,7 @@ $$;
 -- +goose statementbegin
 DO $$
 BEGIN
-    IF to_regclass('public.cb_tasks') IS NOT NULL THEN
+    IF to_regclass('cb_tasks') IS NOT NULL THEN
         PERFORM cb_delete_task(name)
         FROM cb_tasks;
     END IF;

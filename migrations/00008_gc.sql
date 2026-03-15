@@ -16,7 +16,7 @@ DECLARE
     _table text := cb_table_name(cb_purge_task_runs.name, 't');
     _deleted int := 0;
 BEGIN
-    IF to_regclass('public.' || _table) IS NULL THEN
+    IF to_regclass(_table) IS NULL THEN
         RETURN 0;
     END IF;
     EXECUTE format(
@@ -45,7 +45,7 @@ DECLARE
     _table text := cb_table_name(cb_purge_flow_runs.name, 'f');
     _deleted int := 0;
 BEGIN
-    IF to_regclass('public.' || _table) IS NULL THEN
+    IF to_regclass(_table) IS NULL THEN
         RETURN 0;
     END IF;
     EXECUTE format(

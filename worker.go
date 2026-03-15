@@ -176,21 +176,21 @@ func shouldStartMapStepWorker(step *Step) bool {
 	return step.stepType == StepTypeGenerator || step.stepType == StepTypeMapper
 }
 
-func (w *Worker) startTaskWorkers(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup, n *notifier) []*TaskHandlerInfo {
+func (w *Worker) startTaskWorkers(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup, n *notifier, schema string) []*TaskHandlerInfo {
 	taskHandlers := make([]*TaskHandlerInfo, 0)
 
 	for _, t := range w.tasks {
 		if t.handlerOpts != nil {
 			taskHandlers = append(taskHandlers, &TaskHandlerInfo{TaskName: t.name})
 			wakeup := make(chan struct{}, 1)
-			n.subscribe(channelName("cb_t_", t.name), wakeup)
+			n.subscribe(channelName(schema, "cb_t_", t.name), wakeup)
 			worker := newTaskWorker(w.pool, w.logger, t, wakeup)
 			worker.start(shutdownCtx, handlerCtx, wg)
 		}
 
 		if t.onFailOpts != nil {
 			wakeup := make(chan struct{}, 1)
-			n.subscribe(channelName("cb_t_onfail_", t.name), wakeup)
+			n.subscribe(channelName(schema, "cb_t_onfail_", t.name), wakeup)
 			onFailWorker := newTaskOnFailWorker(w.pool, w.logger, t, wakeup)
 			onFailWorker.start(shutdownCtx, handlerCtx, wg)
 		}
@@ -199,19 +199,19 @@ func (w *Worker) startTaskWorkers(shutdownCtx, handlerCtx context.Context, wg *s
 	return taskHandlers
 }
 
-func (w *Worker) startFlowWorkers(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup, n *notifier) []*StepHandlerInfo {
+func (w *Worker) startFlowWorkers(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup, n *notifier, schema string) []*StepHandlerInfo {
 	stepHandlers := make([]*StepHandlerInfo, 0)
 
 	for _, f := range w.flows {
 		if f.onFailOpts != nil {
 			wakeup := make(chan struct{}, 1)
-			n.subscribe(channelName("cb_f_onfail_", f.name), wakeup)
+			n.subscribe(channelName(schema, "cb_f_onfail_", f.name), wakeup)
 			onFailWorker := newFlowOnFailWorker(w.pool, w.logger, f, wakeup)
 			onFailWorker.start(shutdownCtx, handlerCtx, wg)
 		}
 
-		stepChannel := channelName("cb_s_", f.name)
-		stopChannel := channelName("cb_flow_stop_", f.name)
+		stepChannel := channelName(schema, "cb_s_", f.name)
+		stopChannel := channelName(schema, "cb_flow_stop_", f.name)
 
 		for _, s := range f.steps {
 			if s.handlerOpts == nil {
@@ -264,6 +264,13 @@ func (w *Worker) Start(ctx context.Context) error {
 		return err
 	}
 
+	// Discover the schema from the pool's search_path so NOTIFY channels
+	// match the schema-qualified names used by SQL functions.
+	var schema string
+	if err := w.pool.QueryRow(ctx, "SELECT current_schema").Scan(&schema); err != nil {
+		return fmt.Errorf("cannot determine current schema: %w", err)
+	}
+
 	// Create tasks in database
 	for _, task := range w.tasks {
 		if err := CreateTask(ctx, w.pool, task); err != nil {
@@ -310,8 +317,8 @@ func (w *Worker) Start(ctx context.Context) error {
 	})
 
 	// Register subscriptions and start claim loops
-	taskHandlers = w.startTaskWorkers(ctx, handlerCtx, &wg, n)
-	stepHandlers = w.startFlowWorkers(ctx, handlerCtx, &wg, n)
+	taskHandlers = w.startTaskWorkers(ctx, handlerCtx, &wg, n, schema)
+	stepHandlers = w.startFlowWorkers(ctx, handlerCtx, &wg, n, schema)
 
 	// Establish LISTEN on dedicated connection, then start notification read loop.
 	// This runs synchronously so LISTEN is active before any NOTIFY can fire.
