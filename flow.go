@@ -1296,7 +1296,7 @@ func (r *FlowRunInfo) OutputAs(out any) error {
 		return canceledRunError(r.CancelReason)
 	}
 	if r.Status != StatusCompleted {
-		return fmt.Errorf("run not completed: current status is %s", r.Status)
+		return fmt.Errorf("%w: current status is %s", ErrRunNotCompleted, r.Status)
 	}
 	return json.Unmarshal(r.Output, out)
 }
@@ -1366,7 +1366,7 @@ func CancelFlowRun(ctx context.Context, conn Conn, flowName string, runID int64,
 	var applied bool
 	err := conn.QueryRow(ctx, q, flowName, runID, resolveCancelReason(opts...)).Scan(&applied)
 	if err != nil {
-		return false, err
+		return false, wrapNotDefinedErr(err, "flow", flowName)
 	}
 	return applied, nil
 }
@@ -1422,7 +1422,7 @@ func RunFlow(ctx context.Context, conn Conn, flowName string, input any, opts ..
 	var id int64
 	err = conn.QueryRow(ctx, q, args...).Scan(&id)
 	if err != nil {
-		return nil, err
+		return nil, wrapNotDefinedErr(err, "flow", flowName)
 	}
 	return &FlowHandle{conn: conn, Name: flowName, ID: id}, nil
 }
@@ -1454,7 +1454,11 @@ func RunFlowQuery(flowName string, input any, opts ...RunFlowOpts) (string, []an
 func GetFlowRun(ctx context.Context, conn Conn, flowName string, flowRunID int64) (*FlowRunInfo, error) {
 	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
 	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
-	return scanFlowRun(conn.QueryRow(ctx, query, flowRunID))
+	run, err := scanFlowRun(conn.QueryRow(ctx, query, flowRunID))
+	if err != nil {
+		return nil, wrapNotDefinedErr(err, "flow", flowName)
+	}
+	return run, nil
 }
 
 // ListFlowRuns returns recent flow runs for the specified flow.
@@ -1463,7 +1467,7 @@ func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunIn
 	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
-		return nil, err
+		return nil, wrapNotDefinedErr(err, "flow", flowName)
 	}
 	return pgx.CollectRows(rows, scanCollectibleFlowRun)
 }
@@ -1643,7 +1647,7 @@ func GetFlowRunSteps(ctx context.Context, conn Conn, flowName string, flowRunID 
 		ORDER BY id;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query, flowRunID)
 	if err != nil {
-		return nil, err
+		return nil, wrapNotDefinedErr(err, "flow", flowName)
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (*StepRunInfo, error) {
 		var s StepRunInfo
@@ -1710,10 +1714,10 @@ func SignalFlow(ctx context.Context, conn Conn, flowName string, flowRunID int64
 	var delivered bool
 	err = conn.QueryRow(ctx, q, flowName, flowRunID, stepName, b).Scan(&delivered)
 	if err != nil {
-		return err
+		return wrapNotDefinedErr(err, "flow", flowName)
 	}
 	if !delivered {
-		return fmt.Errorf("signal not delivered: step may not require signal or signal already delivered")
+		return fmt.Errorf("%w: step may not require signal or signal already delivered", ErrSignalNotDelivered)
 	}
 	return nil
 }
@@ -1798,7 +1802,7 @@ func CreateFlowSchedule(ctx context.Context, conn Conn, flowName, cronSpec strin
 
 	_, err = conn.Exec(ctx, `SELECT cb_create_flow_schedule($1, $2, $3, $4);`, flowName, cronSpec, inputJSON, resolved.catchUp)
 	if err != nil {
-		return fmt.Errorf("failed to create flow schedule %q: %w", flowName, err)
+		return wrapNotDefinedErr(err, "flow", flowName)
 	}
 	return nil
 }

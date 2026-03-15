@@ -467,7 +467,7 @@ func TestFlowFailsWhenNoOutputCandidateCompleted(t *testing.T) {
 	if !errors.Is(err, ErrRunFailed) {
 		t.Fatalf("expected ErrRunFailed, got %v", err)
 	}
-	if !strings.Contains(err.Error(), ErrNoOutputCandidate.Error()) {
+	if !strings.Contains(err.Error(), "no output candidate produced output") {
 		t.Fatalf("expected no-output-candidate error, got %v", err)
 	}
 }

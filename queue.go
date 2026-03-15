@@ -87,7 +87,7 @@ func Send(ctx context.Context, conn Conn, queueName string, payload any, opts ..
 	}
 
 	_, err = conn.Exec(ctx, q, args...)
-	return err
+	return wrapNotDefinedErr(err, "queue", queueName)
 }
 
 // SendQuery builds the SQL query and args for a Send operation.
@@ -129,7 +129,7 @@ func SendMany(ctx context.Context, conn Conn, queueName string, payloads []any, 
 	}
 
 	_, err = conn.Exec(ctx, q, args...)
-	return err
+	return wrapNotDefinedErr(err, "queue", queueName)
 }
 
 // SendManyQuery builds the SQL query and args for a SendMany operation.
@@ -165,7 +165,7 @@ func SendManyQuery(queueName string, payloads []any, opts ...SendManyOpts) (stri
 func Bind(ctx context.Context, conn Conn, queueName string, pattern string) error {
 	q := `SELECT cb_bind(queue_name => $1, pattern => $2);`
 	_, err := conn.Exec(ctx, q, queueName, pattern)
-	return err
+	return wrapNotDefinedErr(err, "queue", queueName)
 }
 
 // Unbind unsubscribes a queue from a topic pattern.
@@ -175,7 +175,7 @@ func Unbind(ctx context.Context, conn Conn, queueName string, pattern string) (b
 	deleted := false
 	err := conn.QueryRow(ctx, q, queueName, pattern).Scan(&deleted)
 	if err != nil {
-		return false, err
+		return false, wrapNotDefinedErr(err, "queue", queueName)
 	}
 	return deleted, nil
 }
@@ -282,7 +282,7 @@ func Read(ctx context.Context, conn Conn, queueName string, quantity int, hideFo
 	q := `SELECT * FROM cb_read(queue => $1, quantity => $2, hide_for => $3);`
 	rows, err := conn.Query(ctx, q, queueName, quantity, hideFor.Milliseconds())
 	if err != nil {
-		return nil, err
+		return nil, wrapNotDefinedErr(err, "queue", queueName)
 	}
 	return pgx.CollectRows(rows, scanCollectibleMessage)
 }
@@ -313,7 +313,7 @@ func ReadPoll(ctx context.Context, conn Conn, queueName string, quantity int, hi
 
 	rows, err := conn.Query(ctx, q, queueName, quantity, hideFor.Milliseconds(), pollForMs, pollIntervalMs)
 	if err != nil {
-		return nil, err
+		return nil, wrapNotDefinedErr(err, "queue", queueName)
 	}
 
 	return pgx.CollectRows(rows, scanCollectibleMessage)
@@ -325,7 +325,7 @@ func Hide(ctx context.Context, conn Conn, queueName string, id int64, hideFor ti
 	q := `SELECT * FROM cb_hide(queue => $1, id => $2, hide_for => $3);`
 	exists := false
 	err := conn.QueryRow(ctx, q, queueName, id, hideFor.Milliseconds()).Scan(&exists)
-	return exists, err
+	return exists, wrapNotDefinedErr(err, "queue", queueName)
 }
 
 // HideMany hides multiple messages from being read for the specified duration.
@@ -335,7 +335,7 @@ func HideMany(ctx context.Context, conn Conn, queueName string, ids []int64, hid
 	var hiddenIDs []int64
 	err := conn.QueryRow(ctx, q, queueName, ids, hideFor.Milliseconds()).Scan(&hiddenIDs)
 	if err != nil {
-		return nil, err
+		return nil, wrapNotDefinedErr(err, "queue", queueName)
 	}
 	return hiddenIDs, nil
 }
@@ -346,7 +346,7 @@ func Delete(ctx context.Context, conn Conn, queueName string, id int64) (bool, e
 	q := `SELECT * FROM cb_delete(queue => $1, id => $2);`
 	existed := false
 	err := conn.QueryRow(ctx, q, queueName, id).Scan(&existed)
-	return existed, err
+	return existed, wrapNotDefinedErr(err, "queue", queueName)
 }
 
 // DeleteMany deletes multiple messages from the queue.
@@ -356,7 +356,7 @@ func DeleteMany(ctx context.Context, conn Conn, queueName string, ids []int64) (
 	var deletedIDs []int64
 	err := conn.QueryRow(ctx, q, queueName, ids).Scan(&deletedIDs)
 	if err != nil {
-		return nil, err
+		return nil, wrapNotDefinedErr(err, "queue", queueName)
 	}
 	return deletedIDs, nil
 }

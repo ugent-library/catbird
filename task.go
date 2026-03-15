@@ -254,10 +254,10 @@ func (r *TaskRunInfo) OutputAs(out any) error {
 		return canceledRunError(r.CancelReason)
 	}
 	if r.Status == StatusSkipped {
-		return fmt.Errorf("run skipped: condition not met")
+		return fmt.Errorf("%w: condition not met", ErrRunSkipped)
 	}
 	if r.Status != StatusCompleted {
-		return fmt.Errorf("run not completed: current status is %s", r.Status)
+		return fmt.Errorf("%w: current status is %s", ErrRunNotCompleted, r.Status)
 	}
 	return json.Unmarshal(r.Output, out)
 }
@@ -317,7 +317,7 @@ func (h *TaskHandle) WaitForOutput(ctx context.Context, out any, opts ...WaitOpt
 			}
 			return ErrRunCanceled
 		case StatusSkipped:
-			return fmt.Errorf("run skipped: condition not met")
+			return fmt.Errorf("%w: condition not met", ErrRunSkipped)
 		}
 	}
 }
@@ -329,7 +329,7 @@ func CancelTaskRun(ctx context.Context, conn Conn, taskName string, runID int64,
 	var applied bool
 	err := conn.QueryRow(ctx, q, taskName, runID, resolveCancelReason(opts...)).Scan(&applied)
 	if err != nil {
-		return false, err
+		return false, wrapNotDefinedErr(err, "task", taskName)
 	}
 	return applied, nil
 }
@@ -406,7 +406,7 @@ func RunTask(ctx context.Context, conn Conn, taskName string, input any, opts ..
 	var id int64
 	err = conn.QueryRow(ctx, q, args...).Scan(&id)
 	if err != nil {
-		return nil, err
+		return nil, wrapNotDefinedErr(err, "task", taskName)
 	}
 
 	return &TaskHandle{conn: conn, Name: taskName, ID: id}, nil
@@ -439,7 +439,11 @@ func RunTaskQuery(taskName string, input any, opts ...RunTaskOpts) (string, []an
 func GetTaskRun(ctx context.Context, conn Conn, taskName string, taskRunID int64) (*TaskRunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(taskName))
 	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at, skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
-	return scanTaskRun(conn.QueryRow(ctx, query, taskRunID))
+	run, err := scanTaskRun(conn.QueryRow(ctx, query, taskRunID))
+	if err != nil {
+		return nil, wrapNotDefinedErr(err, "task", taskName)
+	}
+	return run, nil
 }
 
 // ListTaskRuns returns recent task runs for the specified task.
@@ -448,7 +452,7 @@ func ListTaskRuns(ctx context.Context, conn Conn, taskName string) ([]*TaskRunIn
 	query := fmt.Sprintf(`SELECT id, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at, skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
-		return nil, err
+		return nil, wrapNotDefinedErr(err, "task", taskName)
 	}
 	return pgx.CollectRows(rows, scanCollectibleTaskRun)
 }
@@ -582,7 +586,7 @@ func CreateTaskSchedule(ctx context.Context, conn Conn, taskName, cronSpec strin
 
 	_, err = conn.Exec(ctx, `SELECT cb_create_task_schedule($1, $2, $3, $4);`, taskName, cronSpec, inputJSON, resolved.catchUp)
 	if err != nil {
-		return fmt.Errorf("failed to create task schedule %q: %w", taskName, err)
+		return wrapNotDefinedErr(err, "task", taskName)
 	}
 	return nil
 }

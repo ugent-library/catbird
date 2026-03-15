@@ -876,7 +876,7 @@ func TestTaskRunInfoOutputAsSkipped(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for skipped task run")
 	}
-	if !strings.Contains(err.Error(), "run skipped") {
-		t.Fatalf("expected skipped error message, got %v", err)
+	if !errors.Is(err, ErrRunSkipped) {
+		t.Fatalf("expected ErrRunSkipped, got %v", err)
 	}
 }

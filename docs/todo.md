@@ -41,7 +41,6 @@ Start reply from dashboard and tui.
 
 ## Developer Experience
 
-- [ ] [!!!] better error reporting when a definition is missing
 - [ ] [!!!] `catbird/testing` package — in-process synchronous worker harness; no Docker needed for unit tests against user-defined task/flow handlers (see `docs/testing-package-sketch.md`)
 - [ ] [!!] Schema drift detection on startup — warn if registered task/flow definitions drift from what's in `cb_tasks`/`cb_flows`/`cb_steps`
 - [ ] [!] `cb` CLI improvements — `cb flow replay <run-id>`, `cb task retry <run-id>`, `cb queue drain <name>`

@@ -27,21 +27,29 @@ const (
 
 var (
 	// ErrRunFailed is returned when you try to unmarshal the output of a failed task or flow run
-	ErrRunFailed = fmt.Errorf("run failed")
+	ErrRunFailed = fmt.Errorf("catbird: run failed")
 	// ErrRunCanceled is returned when you try to wait for output from a canceled task or flow run
-	ErrRunCanceled = fmt.Errorf("run canceled")
+	ErrRunCanceled = fmt.Errorf("catbird: run canceled")
 	// ErrNotFound is returned when a requested run or resource cannot be found
-	ErrNotFound = fmt.Errorf("not found")
+	ErrNotFound = fmt.Errorf("catbird: not found")
 	// ErrNoRunContext is returned when cancellation helpers are called outside handler run context
-	ErrNoRunContext = fmt.Errorf("no run context")
+	ErrNoRunContext = fmt.Errorf("catbird: no run context")
 	// ErrUnknownStepOutput is returned when a requested step output is not present in completed outputs.
-	ErrUnknownStepOutput = fmt.Errorf("unknown step output")
+	ErrUnknownStepOutput = fmt.Errorf("catbird: unknown step output")
 	// ErrNoFailedStepInput is returned when failed step input is not available.
-	ErrNoFailedStepInput = fmt.Errorf("failed step input not available")
+	ErrNoFailedStepInput = fmt.Errorf("catbird: failed step input not available")
 	// ErrNoFailedStepSignal is returned when failed step signal input is not available.
-	ErrNoFailedStepSignal = fmt.Errorf("failed step signal input not available")
+	ErrNoFailedStepSignal = fmt.Errorf("catbird: failed step signal input not available")
 	// ErrNoOutputCandidate is returned when a flow completes without any configured output candidate producing output.
-	ErrNoOutputCandidate = fmt.Errorf("no output candidate produced output")
+	ErrNoOutputCandidate = fmt.Errorf("catbird: no output candidate produced output")
+	// ErrNotDefined is returned when an operation references a queue, task, or flow that has not been created.
+	ErrNotDefined = fmt.Errorf("catbird: not defined")
+	// ErrRunSkipped is returned when waiting for output from a skipped task or flow run.
+	ErrRunSkipped = fmt.Errorf("catbird: run skipped")
+	// ErrRunNotCompleted is returned when waiting for output from a run that is still in progress.
+	ErrRunNotCompleted = fmt.Errorf("catbird: run not completed")
+	// ErrSignalNotDelivered is returned when a signal could not be delivered to a flow step.
+	ErrSignalNotDelivered = fmt.Errorf("catbird: signal not delivered")
 )
 
 // Conn is an interface for database connections compatible with pgx.Conn and pgx.Pool
@@ -84,7 +92,7 @@ func PurgeTaskRuns(ctx context.Context, conn Conn, taskName string, olderThan ti
 	var deletedCount int
 	err := conn.QueryRow(ctx, `SELECT cb_purge_task_runs($1, $2);`, taskName, olderThan).Scan(&deletedCount)
 	if err != nil {
-		return 0, err
+		return 0, wrapNotDefinedErr(err, "task", taskName)
 	}
 	return deletedCount, nil
 }
@@ -96,7 +104,7 @@ func PurgeFlowRuns(ctx context.Context, conn Conn, flowName string, olderThan ti
 	var deletedCount int
 	err := conn.QueryRow(ctx, `SELECT cb_purge_flow_runs($1, $2);`, flowName, olderThan).Scan(&deletedCount)
 	if err != nil {
-		return 0, err
+		return 0, wrapNotDefinedErr(err, "flow", flowName)
 	}
 	return deletedCount, nil
 }

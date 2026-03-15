@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"time"
@@ -192,6 +193,16 @@ func queryWithRetry(ctx context.Context, conn Conn, sql string, arguments ...any
 		}
 	}
 	return nil, lastErr
+}
+
+// wrapNotDefinedErr checks if err is a PostgreSQL "undefined_table" error (42P01)
+// and wraps it as ErrNotDefined with a clear message.
+func wrapNotDefinedErr(err error, resourceType, name string) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+		return fmt.Errorf("%s %q: %w", resourceType, name, ErrNotDefined)
+	}
+	return err
 }
 
 func marshalPayloads(payloads []any) (pgtype.FlatArray[json.RawMessage], error) {

@@ -9,7 +9,6 @@
 *.dylib
 ./cb
 
-
 # Test binary, built with `go test -c`
 *.test
 
@@ -33,3 +32,6 @@ go.work.sum
 .vscode/
 
 .DS_Store
+
+# Claude Code AI session memory (machine-local)
+.claude
