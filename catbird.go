@@ -108,3 +108,26 @@ func PurgeFlowRuns(ctx context.Context, conn Conn, flowName string, olderThan ti
 	}
 	return deletedCount, nil
 }
+
+// ClearTaskRuns deletes all runs for the given task regardless of status,
+// including in-progress runs. Use with caution — in-flight work will be lost.
+func ClearTaskRuns(ctx context.Context, conn Conn, taskName string) (int, error) {
+	var deletedCount int
+	err := conn.QueryRow(ctx, `SELECT cb_clear_task_runs($1);`, taskName).Scan(&deletedCount)
+	if err != nil {
+		return 0, wrapNotDefinedErr(err, "task", taskName)
+	}
+	return deletedCount, nil
+}
+
+// ClearFlowRuns deletes all runs for the given flow regardless of status,
+// including in-progress runs. Step runs and map tasks are deleted via cascade.
+// Use with caution — in-flight work will be lost.
+func ClearFlowRuns(ctx context.Context, conn Conn, flowName string) (int, error) {
+	var deletedCount int
+	err := conn.QueryRow(ctx, `SELECT cb_clear_flow_runs($1);`, flowName).Scan(&deletedCount)
+	if err != nil {
+		return 0, wrapNotDefinedErr(err, "flow", flowName)
+	}
+	return deletedCount, nil
+}

@@ -313,6 +313,16 @@ These are the functions most app code and external clients care about.
 - **Returned JSON shape**:
 	- `{ "expired_queues_deleted": int, "stale_workers_deleted": int, "task_runs_purged": int, "flow_runs_purged": int }`
 
+### `cb_clear_task_runs`
+- **What it does**: Delete all task runs regardless of status. In-flight work will be lost.
+- **Inputs**: `cb_clear_task_runs(name text)`
+- **Returns**: `RETURNS int`
+
+### `cb_clear_flow_runs`
+- **What it does**: Delete all flow runs regardless of status. Step runs and map tasks are deleted via cascade. In-flight work will be lost.
+- **Inputs**: `cb_clear_flow_runs(name text)`
+- **Returns**: `RETURNS int`
+
 ### `cb_purge_task_runs`
 - **What it does**: Delete terminal task runs older than a given duration.
 - **Inputs**: `cb_purge_task_runs(name text, older_than interval)`

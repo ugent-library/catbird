@@ -190,6 +190,99 @@ func TestPurgeFlowRuns(t *testing.T) {
 	}
 }
 
+// TestClearTaskRuns verifies that ClearTaskRuns deletes all runs including
+// non-terminal ones.
+func TestClearTaskRuns(t *testing.T) {
+	client := getTestClient(t)
+
+	task := NewTask("retention_clear_task").
+		Do(func(ctx context.Context, in string) (string, error) {
+			return in + " done", nil
+		})
+
+	worker := NewWorker(testPool).AddTask(task)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunTask(t.Context(), "retention_clear_task", "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	var out string
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	// Confirm the run exists before clearing.
+	if _, err := client.GetTaskRun(t.Context(), "retention_clear_task", h.ID); err != nil {
+		t.Fatalf("run should exist before clear: %v", err)
+	}
+
+	deleted, err := client.ClearTaskRuns(t.Context(), "retention_clear_task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted < 1 {
+		t.Fatalf("expected at least 1 deleted, got %d", deleted)
+	}
+
+	// Run should no longer exist.
+	_, err = client.GetTaskRun(t.Context(), "retention_clear_task", h.ID)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound after clear, got %v", err)
+	}
+}
+
+// TestClearFlowRuns verifies that ClearFlowRuns deletes all runs including
+// non-terminal ones.
+func TestClearFlowRuns(t *testing.T) {
+	client := getTestClient(t)
+
+	flowName := testFlowName(t, "retention_clear_flow")
+	flow := NewFlow(flowName)
+	flow.AddStep(NewStep("step1").Do(func(ctx context.Context, in string) (string, error) {
+		return in + " done", nil
+	}))
+
+	worker := NewWorker(testPool).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	var out string
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	// Confirm the run exists before clearing.
+	if _, err := client.GetFlowRun(t.Context(), flowName, h.ID); err != nil {
+		t.Fatalf("run should exist before clear: %v", err)
+	}
+
+	deleted, err := client.ClearFlowRuns(t.Context(), flowName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted < 1 {
+		t.Fatalf("expected at least 1 deleted, got %d", deleted)
+	}
+
+	// Run should no longer exist.
+	_, err = client.GetFlowRun(t.Context(), flowName, h.ID)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound after clear, got %v", err)
+	}
+}
+
 // TestGCPurgesRetentionRuns verifies the end-to-end path: a task/flow configured
 // with a 1ns retention period has its terminal runs deleted by GC.
 func TestGCPurgesRetentionRuns(t *testing.T) {

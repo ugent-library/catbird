@@ -200,6 +200,18 @@ func (c *Client) PurgeFlowRuns(ctx context.Context, flowName string, olderThan t
 	return PurgeFlowRuns(ctx, c.Conn, flowName, olderThan)
 }
 
+// ClearTaskRuns deletes all runs for the given task regardless of status.
+// See ClearTaskRuns for details.
+func (c *Client) ClearTaskRuns(ctx context.Context, taskName string) (int, error) {
+	return ClearTaskRuns(ctx, c.Conn, taskName)
+}
+
+// ClearFlowRuns deletes all runs for the given flow regardless of status.
+// See ClearFlowRuns for details.
+func (c *Client) ClearFlowRuns(ctx context.Context, flowName string) (int, error) {
+	return ClearFlowRuns(ctx, c.Conn, flowName)
+}
+
 // GC runs garbage collection and returns a summary report.
 func (c *Client) GC(ctx context.Context) (*GCInfo, error) {
 	return GC(ctx, c.Conn)
