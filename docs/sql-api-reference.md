@@ -263,6 +263,7 @@ These are the functions most app code and external clients care about.
 		- `step_type` (optional, string; default `"normal"`): one of `normal | mapper | generator | reducer`.
 		- `map_source_step_name` (optional, string): only valid when `step_type = "mapper"`; if set, it must also appear in `depends_on`.
 		- `reduce_source_step_name` (optional, string): required when `step_type = "reducer"`; must also appear in `depends_on`.
+		- `ignore_output` (optional, array of strings): dependency step names whose output should not be fetched at claim time. Named steps must appear in `depends_on`. Stored as `ignore_output` boolean on `cb_step_dependencies`.
 - **Returns**: `RETURNS void`
 
 ### `cb_delete_flow`

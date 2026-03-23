@@ -445,6 +445,19 @@ flow.AddStep(catbird.NewStep("sum").
 }))
 ```
 
+### Ignore Output
+
+Use `IgnoreOutput("step")` when a step must wait for a dependency but doesn't need its output. The dependency's output is never aggregated or transmitted — important for map steps with large fan-outs. The handler omits the parameter for that dependency.
+
+```go
+flow.AddStep(catbird.NewStep("finish").
+    DependsOn("expensive-map").
+    IgnoreOutput("expensive-map").
+    Do(func(ctx context.Context, in Input) (string, error) {
+    return "done", nil
+}))
+```
+
 ### Generator Steps
 
 Generator steps act like normal flow steps with an extra trailing `yield` callback for streaming items; yielded items are processed by a per-item handler.

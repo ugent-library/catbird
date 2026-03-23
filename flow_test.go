@@ -2769,3 +2769,160 @@ func TestStepWaitForOutputSkipped(t *testing.T) {
 		t.Fatalf("expected step1 status skipped, got %s", stepInfo.Status)
 	}
 }
+
+func TestFlowIgnoreOutput(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "ignore_output")
+
+	flow := NewFlow(flowName)
+	flow.AddStep(NewStep("producer").Do(func(ctx context.Context, in string) (string, error) {
+		return "produced", nil
+	}))
+	flow.AddStep(NewStep("consumer").
+		DependsOn("producer").
+		IgnoreOutput("producer").
+		Do(func(ctx context.Context, in string) (string, error) {
+			// No producer param — handler only takes flow input
+			return "done:" + in, nil
+		}))
+
+	worker := NewWorker(testPool).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out string
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	if out != "done:hello" {
+		t.Fatalf("unexpected output: %s", out)
+	}
+}
+
+func TestFlowIgnoreOutputMapper(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "ignore_output_map")
+
+	flow := NewFlow(flowName)
+	flow.AddStep(NewStep("fanout").
+		MapFlowInput().
+		Do(func(ctx context.Context, n int) (int, error) {
+			return n * 2, nil
+		}))
+	flow.AddStep(NewStep("finish").
+		DependsOn("fanout").
+		IgnoreOutput("fanout").
+		Do(func(ctx context.Context, in []int) (string, error) {
+			// Waits for fanout to complete but doesn't receive the aggregated array
+			return "all_done", nil
+		}))
+
+	worker := NewWorker(testPool).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, []int{1, 2, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out string
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	if out != "all_done" {
+		t.Fatalf("unexpected output: %s", out)
+	}
+}
+
+func TestFlowIgnoreOutputMixed(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "ignore_output_mixed")
+
+	flow := NewFlow(flowName)
+	flow.AddStep(NewStep("step_a").Do(func(ctx context.Context, in string) (string, error) {
+		return "a_result", nil
+	}))
+	flow.AddStep(NewStep("step_b").Do(func(ctx context.Context, in string) (int, error) {
+		return 42, nil
+	}))
+	flow.AddStep(NewStep("consumer").
+		DependsOn("step_a", "step_b").
+		IgnoreOutput("step_a").
+		Do(func(ctx context.Context, in string, bResult int) (string, error) {
+			// Only receives step_b output, not step_a
+			return fmt.Sprintf("got:%d", bResult), nil
+		}))
+
+	worker := NewWorker(testPool).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), flowName, "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out string
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.WaitForOutput(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	if out != "got:42" {
+		t.Fatalf("unexpected output: %s", out)
+	}
+}
+
+func TestFlowIgnoreOutputMustBeDependency(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "ignore_output_not_dep")
+
+	flow := NewFlow(flowName)
+	flow.AddStep(NewStep("step_a").Do(func(ctx context.Context, in string) (string, error) {
+		return in, nil
+	}))
+	flow.AddStep(NewStep("step_b").
+		IgnoreOutput("step_a"). // step_a is not in DependsOn
+		Do(func(ctx context.Context, in string) (string, error) {
+			return in, nil
+		}))
+
+	err := client.CreateFlow(t.Context(), flow)
+	if err == nil {
+		t.Fatal("expected validation error for IgnoreOutput on non-dependency")
+	}
+}
+
+func TestFlowIgnoreOutputCannotBeMapSource(t *testing.T) {
+	client := getTestClient(t)
+	flowName := testFlowName(t, "ignore_output_map_src")
+
+	flow := NewFlow(flowName)
+	flow.AddStep(NewStep("numbers").Do(func(ctx context.Context, in string) ([]int, error) {
+		return []int{1, 2, 3}, nil
+	}))
+	flow.AddStep(NewStep("mapper").
+		MapStepOutput("numbers").
+		IgnoreOutput("numbers"). // can't ignore the map source
+		Do(func(ctx context.Context, in string, n int) (int, error) {
+			return n * 2, nil
+		}))
+
+	err := client.CreateFlow(t.Context(), flow)
+	if err == nil {
+		t.Fatal("expected validation error for IgnoreOutput on map source")
+	}
+}

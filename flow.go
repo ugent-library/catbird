@@ -210,6 +210,7 @@ type Step struct {
 	configErr            error
 	description          string
 	dependencies         []string
+	ignoredDependencies  map[string]bool // tracks which dependencies have IgnoreOutput
 	optionalDependencies map[string]bool // tracks which dependencies are Optional[T]
 	generatorFn          any
 	generatorHandler     any
@@ -257,6 +258,23 @@ func (s *Step) DependsOn(deps ...string) *Step {
 		return s
 	}
 	s.dependencies = append(s.dependencies, deps...)
+	return s
+}
+
+func (s *Step) IgnoreOutput(deps ...string) *Step {
+	if s.configErr != nil {
+		return s
+	}
+	if s.done {
+		s.setConfigErr(fmt.Errorf("step %s: cannot call IgnoreOutput() after Do()", s.name))
+		return s
+	}
+	if s.ignoredDependencies == nil {
+		s.ignoredDependencies = make(map[string]bool)
+	}
+	for _, dep := range deps {
+		s.ignoredDependencies[dep] = true
+	}
 	return s
 }
 
@@ -495,7 +513,15 @@ func (s *Step) applyHandler(fn any, opts ...HandlerOpt) {
 		return
 	}
 
-	handler, optionalDeps, err := makeStepHandler(fn, s.name, s.dependencies, s.signal, s.stepType == StepTypeMapper, s.mapSource)
+	// Filter out ignored dependencies — handler only receives output for non-ignored deps
+	outputDependencies := make([]string, 0, len(s.dependencies))
+	for _, dep := range s.dependencies {
+		if !s.ignoredDependencies[dep] {
+			outputDependencies = append(outputDependencies, dep)
+		}
+	}
+
+	handler, optionalDeps, err := makeStepHandler(fn, s.name, outputDependencies, s.signal, s.stepType == StepTypeMapper, s.mapSource)
 	if err != nil {
 		s.setConfigErr(err)
 		return
@@ -1143,6 +1169,35 @@ func validateFlowDependencies(flow *Flow) error {
 		}
 	}
 
+	// Validate IgnoreOutput constraints
+	for _, step := range steps {
+		for depName := range step.ignoredDependencies {
+			// Ignored dep must be in DependsOn
+			found := false
+			for _, d := range step.dependencies {
+				if d == depName {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("flow %q: step %q calls IgnoreOutput(%q) but %q is not a dependency", flow.name, step.name, depName, depName)
+			}
+			// Ignored dep cannot be the map source
+			if step.mapSource == depName {
+				return fmt.Errorf("flow %q: step %q cannot IgnoreOutput(%q) because it is the map source", flow.name, step.name, depName)
+			}
+		}
+		// Conditions must not reference ignored dep outputs
+		if step.condition != "" {
+			for depName := range step.ignoredDependencies {
+				if strings.Contains(step.condition, depName+".") {
+					return fmt.Errorf("flow %q: step %q condition references ignored output %q", flow.name, step.name, depName)
+				}
+			}
+		}
+	}
+
 	// Validate that dependencies on conditional steps use Optional[T]
 	for _, step := range steps {
 		if step.stepType == StepTypeReducer {
@@ -1183,6 +1238,7 @@ func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 		ReduceSourceStepName string            `json:"reduce_source_step_name,omitempty"`
 		Signal               bool              `json:"signal"`
 		DependsOn            []*stepDependency `json:"depends_on,omitempty"`
+		IgnoreOutput         []string          `json:"ignore_output,omitempty"`
 	}
 
 	steps := flow.steps
@@ -1195,6 +1251,11 @@ func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 			deps[j] = &stepDependency{Name: depName}
 		}
 
+		var ignoreOutput []string
+		for depName := range s.ignoredDependencies {
+			ignoreOutput = append(ignoreOutput, depName)
+		}
+
 		serStep := serializableStep{
 			Name:                 s.name,
 			Description:          s.description,
@@ -1203,6 +1264,7 @@ func CreateFlow(ctx context.Context, conn Conn, flow *Flow) error {
 			ReduceSourceStepName: s.reduceSourceStep,
 			Signal:               s.signal,
 			DependsOn:            deps,
+			IgnoreOutput:         ignoreOutput,
 		}
 		serStep.Condition = s.condition
 		serSteps[i] = serStep
