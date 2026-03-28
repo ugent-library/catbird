@@ -334,6 +334,13 @@ These are the functions most app code and external clients care about.
 - **Inputs**: `cb_purge_flow_runs(name text, older_than interval)`
 - **Returns**: `RETURNS int`
 
+**Wire (SSE toolkit)**
+
+### `cb_notify`
+- **What it does**: Send a notification to Wire SSE subscribers via pg NOTIFY. Uses schema-qualified channel and JSON payload.
+- **Inputs**: `cb_notify(topic text, event text, data text DEFAULT NULL, node_id uuid DEFAULT NULL)`
+- **Returns**: `RETURNS void`
+
 ## Internal / runtime SQL API
 
 These are mostly used by Catbird workers and scheduler internals. Most users should not call them directly.
@@ -528,7 +535,7 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 - **Inputs**: `cb_worker_heartbeat(id uuid)`
 - **Returns**: `RETURNS jsonb`
 - **Returned JSON shape**:
-	- `{ "gc_info": { "expired_queues_deleted": int, "stale_workers_deleted": int, "task_runs_purged": int, "flow_runs_purged": int } }`
+	- `{ "gc_info": { "expired_queues_deleted": int, "stale_workers_deleted": int, "stale_wire_nodes_deleted": int, "task_runs_purged": int, "flow_runs_purged": int } }`
 
 **Utility helpers (advanced)**
 

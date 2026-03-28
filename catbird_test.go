@@ -87,6 +87,7 @@ func verifyMigrationsApplied(ctx context.Context, db *sql.DB) error {
 		10: {"cb_create_task", "cb_run_task", "cb_create_flow", "cb_gc", "cb_parse_condition", "cb_evaluate_condition"},
 		12: {"cb_next_cron_tick"},
 		13: {"cb_create_task_schedule", "cb_create_flow_schedule", "cb_advance_task_schedule", "cb_advance_flow_schedule", "cb_execute_due_task_schedules", "cb_execute_due_flow_schedules"},
+		16: {"cb_notify"},
 	}
 
 	for version, functions := range requiredFunctions {

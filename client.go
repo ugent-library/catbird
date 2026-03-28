@@ -212,6 +212,11 @@ func (c *Client) ClearFlowRuns(ctx context.Context, flowName string) (int, error
 	return ClearFlowRuns(ctx, c.Conn, flowName)
 }
 
+// Notify sends an ephemeral notification to Wire SSE subscribers.
+func (c *Client) Notify(ctx context.Context, topic, event, data string) error {
+	return Notify(ctx, c.Conn, topic, event, data)
+}
+
 // GC runs garbage collection and returns a summary report.
 func (c *Client) GC(ctx context.Context) (*GCInfo, error) {
 	return GC(ctx, c.Conn)
