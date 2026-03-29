@@ -176,7 +176,7 @@ func shouldStartMapStepWorker(step *Step) bool {
 	return step.stepType == StepTypeGenerator || step.stepType == StepTypeMapper
 }
 
-func (w *Worker) startTaskWorkers(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup, n *notifier, schema string) []*TaskHandlerInfo {
+func (w *Worker) startTaskWorkers(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup, n *workerNotifier, schema string) []*TaskHandlerInfo {
 	taskHandlers := make([]*TaskHandlerInfo, 0)
 
 	for _, t := range w.tasks {
@@ -199,7 +199,7 @@ func (w *Worker) startTaskWorkers(shutdownCtx, handlerCtx context.Context, wg *s
 	return taskHandlers
 }
 
-func (w *Worker) startFlowWorkers(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup, n *notifier, schema string) []*StepHandlerInfo {
+func (w *Worker) startFlowWorkers(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup, n *workerNotifier, schema string) []*StepHandlerInfo {
 	stepHandlers := make([]*StepHandlerInfo, 0)
 
 	for _, f := range w.flows {
@@ -298,7 +298,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	// Set up NOTIFY listener for wakeup and cancel signals.
 	// Subscriptions are registered in startTaskWorkers/startFlowWorkers,
 	// then listen() establishes LISTEN before claim loops begin.
-	n := newNotifier(w.pool, w.logger)
+	n := newWorkerNotifier(w.pool, w.logger)
 
 	wg.Go(func() {
 		ticker := time.NewTicker(10 * time.Second)
@@ -324,7 +324,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	// This runs synchronously so LISTEN is active before any NOTIFY can fire.
 	notifyLoop, listenErr := n.listen(ctx)
 	if listenErr != nil {
-		w.logger.WarnContext(ctx, "notifier: failed to establish listener, falling back to polling", "error", listenErr)
+		w.logger.WarnContext(ctx, "worker notifier: failed to establish listener, falling back to polling", "error", listenErr)
 		notifyLoop = func() {} // no-op; workers fall back to timer
 	}
 	wg.Go(notifyLoop)

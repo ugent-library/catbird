@@ -11,26 +11,26 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// notifyTarget wraps a signal channel with a single pending timer.
+// workerNotifyTarget wraps a signal channel with a single pending timer.
 // At most one timer is active per target — when a NOTIFY arrives with
 // a future visible_at, the timer is set (or reset if the new time is
 // earlier). Immediate signals bypass the timer entirely.
-type notifyTarget struct {
+type workerNotifyTarget struct {
 	ch    chan struct{}
 	mu    sync.Mutex
 	timer *time.Timer
 	next  time.Time // earliest pending visible_at
 }
 
-func newNotifyTarget(ch chan struct{}) *notifyTarget {
-	return &notifyTarget{ch: ch}
+func newWorkerNotifyTarget(ch chan struct{}) *workerNotifyTarget {
+	return &workerNotifyTarget{ch: ch}
 }
 
 // signalAt signals the target at the appropriate time based on visibleAt.
 // If visibleAt is in the past or zero, signals immediately.
 // If visibleAt is in the future, schedules (or reschedules) a single timer
 // to the earliest pending time.
-func (t *notifyTarget) signalAt(visibleAt time.Time) {
+func (t *workerNotifyTarget) signalAt(visibleAt time.Time) {
 	if visibleAt.IsZero() || !visibleAt.After(time.Now()) {
 		signal(t.ch)
 		return
@@ -59,43 +59,43 @@ func (t *notifyTarget) signalAt(visibleAt time.Time) {
 	})
 }
 
-// notifier manages a dedicated LISTEN connection and fans out
+// workerNotifier manages a dedicated LISTEN connection and fans out
 // PostgreSQL notifications to Go channels. It is internal to the worker.
 //
-// NOTIFY payloads carry a timestamp (visible_at). The notifier parses it
+// NOTIFY payloads carry a timestamp (visible_at). The workerNotifier parses it
 // and either signals targets immediately or schedules a single timer per
 // target for the earliest future visible_at.
-type notifier struct {
+type workerNotifier struct {
 	pool   *pgxpool.Pool
 	logger *slog.Logger
 
 	mu   sync.Mutex
-	subs map[string][]*notifyTarget // PG channel → list of targets
+	subs map[string][]*workerNotifyTarget // PG channel → list of targets
 }
 
-func newNotifier(pool *pgxpool.Pool, logger *slog.Logger) *notifier {
-	return &notifier{
+func newWorkerNotifier(pool *pgxpool.Pool, logger *slog.Logger) *workerNotifier {
+	return &workerNotifier{
 		pool:   pool,
 		logger: logger,
-		subs:   make(map[string][]*notifyTarget),
+		subs:   make(map[string][]*workerNotifyTarget),
 	}
 }
 
 // subscribe registers a target channel to receive signals when a
 // PostgreSQL NOTIFY arrives on the given channel name. The caller
-// owns the signal channel; the notifier manages timing internally.
-func (n *notifier) subscribe(channel string, target chan struct{}) {
+// owns the signal channel; the workerNotifier manages timing internally.
+func (n *workerNotifier) subscribe(channel string, target chan struct{}) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	n.subs[channel] = append(n.subs[channel], newNotifyTarget(target))
+	n.subs[channel] = append(n.subs[channel], newWorkerNotifyTarget(target))
 }
 
 // listen acquires a dedicated connection and issues LISTEN for all
 // subscribed channels. Returns a function that runs the notification
-// read loop (blocking until ctx is cancelled). Call listen() before
-// starting claim loops so LISTEN is established before any NOTIFY fires.
-func (n *notifier) listen(ctx context.Context) (run func(), err error) {
+// read loop with automatic reconnection. Call listen() before starting
+// claim loops so LISTEN is established before any NOTIFY fires.
+func (n *workerNotifier) listen(ctx context.Context) (run func(), err error) {
 	n.mu.Lock()
 	channels := make([]string, 0, len(n.subs))
 	for ch := range n.subs {
@@ -107,43 +107,53 @@ func (n *notifier) listen(ctx context.Context) (run func(), err error) {
 		return func() {}, nil
 	}
 
+	n.logger.InfoContext(ctx, "worker notifier: listening", "channels", len(channels))
+
+	return func() {
+		for {
+			if err := n.listenOnce(ctx, channels); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				n.logger.WarnContext(ctx, "worker notifier: connection lost, reconnecting", "error", err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+			}
+		}
+	}, nil
+}
+
+func (n *workerNotifier) listenOnce(ctx context.Context, channels []string) error {
 	conn, err := n.pool.Acquire(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
+	defer conn.Release()
 
 	pgConn := conn.Conn()
 
 	for _, ch := range channels {
 		if _, listenErr := pgConn.Exec(ctx, "LISTEN "+pgx.Identifier{ch}.Sanitize()); listenErr != nil {
-			conn.Release()
-			return nil, listenErr
+			return listenErr
 		}
 	}
 
-	n.logger.InfoContext(ctx, "notifier: listening", "channels", len(channels))
-
-	return func() {
-		defer conn.Release()
-
-		for {
-			notification, waitErr := pgConn.WaitForNotification(ctx)
-			if waitErr != nil {
-				if ctx.Err() != nil {
-					return // shutdown
-				}
-				n.logger.WarnContext(ctx, "notifier: connection error", "error", waitErr)
-				return
-			}
-
-			n.fanOut(notification.Channel, notification.Payload)
+	for {
+		notification, waitErr := pgConn.WaitForNotification(ctx)
+		if waitErr != nil {
+			return waitErr
 		}
-	}, nil
+
+		n.fanOut(notification.Channel, notification.Payload)
+	}
 }
 
 // fanOut parses the payload as a timestamp and signals all subscribers.
 // Empty payload or unparseable timestamp triggers an immediate signal.
-func (n *notifier) fanOut(channel, payload string) {
+func (n *workerNotifier) fanOut(channel, payload string) {
 	visibleAt := parseVisibleAt(payload)
 
 	n.mu.Lock()

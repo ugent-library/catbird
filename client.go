@@ -212,9 +212,9 @@ func (c *Client) ClearFlowRuns(ctx context.Context, flowName string) (int, error
 	return ClearFlowRuns(ctx, c.Conn, flowName)
 }
 
-// Notify sends an ephemeral notification to Wire SSE subscribers.
-func (c *Client) Notify(ctx context.Context, topic, event, data string) error {
-	return Notify(ctx, c.Conn, topic, event, data)
+// Notify sends an ephemeral notification via pg NOTIFY.
+func (c *Client) Notify(ctx context.Context, topic, message string, opts ...NotifyOpts) error {
+	return Notify(ctx, c.Conn, topic, message, opts...)
 }
 
 // GC runs garbage collection and returns a summary report.

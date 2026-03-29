@@ -47,15 +47,14 @@ type wireSubscriber struct {
 }
 
 type wireEvent struct {
-	name string
-	data string
+	topic   string
+	message string
 }
 
 type wireMessage struct {
-	NodeID *string `json:"node_id"`
-	Topic  string  `json:"topic"`
-	Event  string  `json:"event"`
-	Data   string  `json:"data"`
+	SentBy  *string `json:"sent_by"`
+	Topic   string  `json:"topic"`
+	Message string  `json:"message"`
 }
 
 // NewWire creates a new Wire instance.
@@ -96,7 +95,7 @@ func (w *Wire) Start(ctx context.Context) error {
 	var wg sync.WaitGroup
 
 	wg.Go(func() { w.heartbeatLoop(ctx) })
-	wg.Go(func() { w.listenLoop(ctx) })
+	wg.Go(func() { w.listen(ctx) })
 
 	<-ctx.Done()
 
@@ -177,15 +176,18 @@ func (w *Wire) Presence(ctx context.Context, topic string) ([]string, error) {
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
-// Notify delivers an event to SSE subscribers on the given topic.
-// Delivers locally first, then fires pg NOTIFY for cross-node delivery.
-func (w *Wire) Notify(ctx context.Context, topic, event, data string) error {
-	w.deliverLocal(topic, wireEvent{name: event, data: data})
+// ID returns the unique identifier for this Wire instance.
+// Pass to NotifyOpts.From to skip delivery to this Wire.
+func (w *Wire) ID() string {
+	return w.id
+}
 
-	_, err := w.pool.Exec(ctx,
-		`SELECT cb_notify(topic => $1, event => $2, data => $3, node_id => $4::uuid)`,
-		topic, event, ptrOrNil(data), w.id)
-	return err
+// Notify delivers a notification to SSE subscribers and Listeners on the given topic.
+// Delivers locally first, then fires pg NOTIFY for cross-node delivery.
+// The Wire's own LISTEN loop skips the echo (From is set automatically).
+func (w *Wire) Notify(ctx context.Context, topic, message string) error {
+	w.deliverLocal(topic, wireEvent{topic: topic, message: message})
+	return Notify(ctx, w.pool, topic, message, NotifyOpts{SentBy: w.id})
 }
 
 // --- Internal methods ---
@@ -193,11 +195,11 @@ func (w *Wire) Notify(ctx context.Context, topic, event, data string) error {
 // writeSSEEvent writes a single SSE event to w. Multi-line data is split
 // into separate "data:" fields per the SSE spec.
 func writeSSEEvent(w io.Writer, ev wireEvent) {
-	fmt.Fprintf(w, "event: %s\n", ev.name)
-	if ev.data == "" {
+	fmt.Fprintf(w, "event: %s\n", ev.topic)
+	if ev.message == "" {
 		fmt.Fprint(w, "data:\n")
 	} else {
-		for line := range strings.SplitSeq(ev.data, "\n") {
+		for line := range strings.SplitSeq(ev.message, "\n") {
 			fmt.Fprintf(w, "data: %s\n", line)
 		}
 	}
@@ -266,13 +268,13 @@ func (w *Wire) heartbeatLoop(ctx context.Context) {
 	}
 }
 
-func (w *Wire) listenLoop(ctx context.Context) {
+func (w *Wire) listen(ctx context.Context) {
 	for {
 		if err := w.listenOnce(ctx); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			w.logger.WarnContext(ctx, "wire: LISTEN connection lost, reconnecting", "error", err)
+			w.logger.WarnContext(ctx, "wire: connection lost, reconnecting", "error", err)
 			select {
 			case <-ctx.Done():
 				return
@@ -289,15 +291,17 @@ func (w *Wire) listenOnce(ctx context.Context) error {
 	}
 	defer conn.Release()
 
+	pgConn := conn.Conn()
+
 	ch := channelName(w.schema, "cb_wire")
-	if _, err := conn.Exec(ctx, "LISTEN "+pgx.Identifier{ch}.Sanitize()); err != nil {
+	if _, err := pgConn.Exec(ctx, "LISTEN "+pgx.Identifier{ch}.Sanitize()); err != nil {
 		return err
 	}
 
 	w.logger.InfoContext(ctx, "wire: listening", "channel", ch)
 
 	for {
-		notification, waitErr := conn.Conn().WaitForNotification(ctx)
+		notification, waitErr := pgConn.WaitForNotification(ctx)
 		if waitErr != nil {
 			return waitErr
 		}
@@ -309,11 +313,11 @@ func (w *Wire) listenOnce(ctx context.Context) error {
 		}
 
 		// Skip messages from this node (already delivered locally)
-		if msg.NodeID != nil && *msg.NodeID == w.id {
+		if msg.SentBy != nil && *msg.SentBy == w.id {
 			continue
 		}
 
-		w.deliverLocal(msg.Topic, wireEvent{name: msg.Event, data: msg.Data})
+		w.deliverLocal(msg.Topic, wireEvent{topic: msg.Topic, message: msg.Message})
 	}
 }
 
@@ -328,11 +332,11 @@ func (w *Wire) presenceJoin(ctx context.Context, sub *wireSubscriber) {
 
 	// Signal presence change
 	for _, topic := range sub.topics {
-		w.deliverLocal(topic, wireEvent{name: "presence"})
+		w.deliverLocal(topic, wireEvent{topic: topic})
 	}
 	for _, topic := range sub.topics {
 		_, _ = w.pool.Exec(ctx,
-			`SELECT cb_notify(topic => $1, event => 'presence', node_id => $2::uuid)`,
+			`SELECT cb_notify(topic => $1, "from" => $2::uuid)`,
 			topic, w.id)
 	}
 }
@@ -348,11 +352,11 @@ func (w *Wire) presenceLeave(sub *wireSubscriber) {
 	}
 
 	for _, topic := range sub.topics {
-		w.deliverLocal(topic, wireEvent{name: "presence"})
+		w.deliverLocal(topic, wireEvent{topic: topic})
 	}
 	for _, topic := range sub.topics {
 		_, _ = w.pool.Exec(ctx,
-			`SELECT cb_notify(topic => $1, event => 'presence', node_id => $2::uuid)`,
+			`SELECT cb_notify(topic => $1, "from" => $2::uuid)`,
 			topic, w.id)
 	}
 }

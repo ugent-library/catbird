@@ -24,18 +24,15 @@ CREATE INDEX IF NOT EXISTS cb_wire_presence_topic_idx ON cb_wire_presence (topic
 CREATE INDEX IF NOT EXISTS cb_wire_presence_node_id_idx ON cb_wire_presence (node_id);
 
 -- +goose statementbegin
--- cb_notify: Send a notification to Wire SSE subscribers via pg NOTIFY.
--- Uses the schema-qualified channel name and JSON payload.
+-- cb_notify: Send a notification via pg NOTIFY on the schema-qualified cb_wire channel.
 -- Parameters:
---   topic: SSE subscription topic
---   event: SSE event name
---   data: Optional event data (text)
---   node_id: Optional origin Wire node ID (NULL from Client, set from Wire to prevent double delivery)
+--   topic: Notification topic (also used as SSE event name)
+--   message: Optional message payload (text)
+--   sent_by: Optional sender ID (NULL from Client, set from Wire/Listener to skip self-delivery)
 CREATE OR REPLACE FUNCTION cb_notify(
     topic text,
-    event text,
-    data text DEFAULT NULL,
-    node_id uuid DEFAULT NULL
+    message text DEFAULT NULL,
+    sent_by text DEFAULT NULL
 )
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -43,10 +40,9 @@ BEGIN
     PERFORM pg_notify(
         current_schema || '.cb_wire',
         json_build_object(
-            'node_id', cb_notify.node_id,
+            'sent_by', cb_notify.sent_by,
             'topic', cb_notify.topic,
-            'event', cb_notify.event,
-            'data', cb_notify.data
+            'message', cb_notify.message
         )::text
     );
 END;
@@ -176,6 +172,8 @@ END;
 $$;
 -- +goose statementend
 
+DROP FUNCTION IF EXISTS cb_notify(text, text, uuid);
+-- Handle old signature if present
 DROP FUNCTION IF EXISTS cb_notify(text, text, text, uuid);
 DROP TABLE IF EXISTS cb_wire_presence CASCADE;
 DROP TABLE IF EXISTS cb_wire_nodes CASCADE;

@@ -52,7 +52,7 @@ func TestWireTokenMintVerify(t *testing.T) {
 	getTestClient(t)
 	wire := NewWire(testPool, testSecret)
 
-	token := wire.Token([]string{"work:01JABC", "user:01JXYZ"}, TokenOpts{
+	token := wire.Token([]string{"work.01JABC", "user.01JXYZ"}, TokenOpts{
 		Identity: "user-123",
 		ValidFor: time.Hour,
 	})
@@ -61,7 +61,7 @@ func TestWireTokenMintVerify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verifyToken: %v", err)
 	}
-	if len(payload.Topics) != 2 || payload.Topics[0] != "work:01JABC" || payload.Topics[1] != "user:01JXYZ" {
+	if len(payload.Topics) != 2 || payload.Topics[0] != "work.01JABC" || payload.Topics[1] != "user.01JXYZ" {
 		t.Errorf("topics = %v", payload.Topics)
 	}
 	if payload.Identity != "user-123" {
@@ -143,7 +143,7 @@ func TestWireNotifySSE(t *testing.T) {
 	wire := NewWire(testPool, testSecret)
 	startTestWire(t, wire)
 
-	topic := "test:" + uuid.NewString()[:8]
+	topic := "test." + uuid.NewString()[:8]
 	token := wire.Token([]string{topic})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -165,17 +165,17 @@ func TestWireNotifySSE(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Notify via Client (goes through pg_notify, cross-node path)
-	if err := cb.Notify(t.Context(), topic, "updated", ""); err != nil {
+	if err := cb.Notify(t.Context(), topic, ""); err != nil {
 		t.Fatal(err)
 	}
 
-	// Read SSE event
+	// Read SSE event — event name is the topic
 	events := readSSEEvents(t, resp, 1, 2*time.Second)
 	if len(events) == 0 {
 		t.Fatal("no SSE events received")
 	}
-	if events[0].event != "updated" {
-		t.Errorf("event = %q, want %q", events[0].event, "updated")
+	if events[0].event != topic {
+		t.Errorf("event = %q, want %q", events[0].event, topic)
 	}
 }
 
@@ -184,7 +184,7 @@ func TestWireNotifyWithData(t *testing.T) {
 	wire := NewWire(testPool, testSecret)
 	startTestWire(t, wire)
 
-	topic := "test:" + uuid.NewString()[:8]
+	topic := "test." + uuid.NewString()[:8]
 	token := wire.Token([]string{topic})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -201,7 +201,7 @@ func TestWireNotifyWithData(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	if err := cb.Notify(t.Context(), topic, "html", `<div>hello</div>`); err != nil {
+	if err := cb.Notify(t.Context(), topic, `<div>hello</div>`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -209,8 +209,8 @@ func TestWireNotifyWithData(t *testing.T) {
 	if len(events) == 0 {
 		t.Fatal("no SSE events received")
 	}
-	if events[0].event != "html" {
-		t.Errorf("event = %q, want %q", events[0].event, "html")
+	if events[0].event != topic {
+		t.Errorf("event = %q, want %q", events[0].event, topic)
 	}
 	if events[0].data != "<div>hello</div>" {
 		t.Errorf("data = %q, want %q", events[0].data, "<div>hello</div>")
@@ -222,7 +222,7 @@ func TestWireLocalNotify(t *testing.T) {
 	wire := NewWire(testPool, testSecret)
 	startTestWire(t, wire)
 
-	topic := "test:" + uuid.NewString()[:8]
+	topic := "test." + uuid.NewString()[:8]
 	token := wire.Token([]string{topic})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -240,7 +240,7 @@ func TestWireLocalNotify(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Notify via Wire (local + pg_notify)
-	if err := wire.Notify(t.Context(), topic, "local", ""); err != nil {
+	if err := wire.Notify(t.Context(), topic, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -248,8 +248,8 @@ func TestWireLocalNotify(t *testing.T) {
 	if len(events) == 0 {
 		t.Fatal("no SSE events received")
 	}
-	if events[0].event != "local" {
-		t.Errorf("event = %q, want %q", events[0].event, "local")
+	if events[0].event != topic {
+		t.Errorf("event = %q, want %q", events[0].event, topic)
 	}
 }
 
@@ -258,7 +258,7 @@ func TestWirePresence(t *testing.T) {
 	wire := NewWire(testPool, testSecret)
 	startTestWire(t, wire)
 
-	topic := "presence:" + uuid.NewString()[:8]
+	topic := "presence." + uuid.NewString()[:8]
 	token := wire.Token([]string{topic}, TokenOpts{Identity: "alice"})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -300,7 +300,7 @@ func TestWirePresenceMultipleConnections(t *testing.T) {
 	wire := NewWire(testPool, testSecret)
 	startTestWire(t, wire)
 
-	topic := "presence:" + uuid.NewString()[:8]
+	topic := "presence." + uuid.NewString()[:8]
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		wire.ServeSSE(w, r, r.URL.Query().Get("token"))
@@ -367,22 +367,22 @@ func TestWireDeliverLocal(t *testing.T) {
 	wire.addSubscriber(sub)
 	defer wire.removeSubscriber(sub)
 
-	wire.deliverLocal("topic-a", wireEvent{name: "ping", data: "pong"})
+	wire.deliverLocal("topic-a", wireEvent{topic: "topic-a", message: "pong"})
 
 	select {
 	case ev := <-sub.ch:
-		if ev.name != "ping" {
-			t.Errorf("event = %q, want %q", ev.name, "ping")
+		if ev.topic != "topic-a" {
+			t.Errorf("topic = %q, want %q", ev.topic, "topic-a")
 		}
-		if ev.data != "pong" {
-			t.Errorf("data = %q, want %q", ev.data, "pong")
+		if ev.message != "pong" {
+			t.Errorf("message = %q, want %q", ev.message, "pong")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout")
 	}
 
 	// Deliver to non-existent topic — should not panic
-	wire.deliverLocal("no-such-topic", wireEvent{name: "x"})
+	wire.deliverLocal("no-such-topic", wireEvent{topic: "no-such-topic", message: ""})
 
 	_ = ctx
 }

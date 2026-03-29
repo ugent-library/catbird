@@ -34,7 +34,7 @@ dedicated connection for LISTEN. Notify is available on both Client and Wire
 | `wire.Token(...)` | Wire | Mint a signed SSE connection token |
 | `wire.ServeSSE(w, r, token)` | Wire | Serve an SSE connection |
 | `wire.Presence(ctx, topic)` | Wire | Query who's connected to a topic |
-| `cb.Notify(ctx, topic, event, data)` | Client | Send an ephemeral notification to SSE subscribers |
+| `cb.Notify(ctx, topic, data)` | Client | Send an ephemeral notification |
 
 ## API sketch
 
@@ -61,7 +61,7 @@ connection URL — no per-request auth callback, no query params to tamper with.
 ```go
 // In your template handler — mint a token for this page/user.
 token := wire.Token(
-    []string{"work:01JABC", "user:01JXYZ"},
+    []string{"work.01JABC", "user.01JXYZ"},
     catbird.TokenOpts{
         Identity:  user.ID.String(),            // for presence (optional)
         ValidFor: 1 * time.Hour, // token expiry (optional)
@@ -86,7 +86,7 @@ type TokenOpts struct {
 Pass no opts to use defaults:
 
 ```go
-wire.Token([]string{"work:01JABC"})
+wire.Token([]string{"work.01JABC"})
 ```
 
 ### Token format
@@ -149,7 +149,7 @@ the old token is expired. The page needs a mechanism to obtain a fresh token
 Notify is available on both Client and Wire.
 
 ```go
-func (c *Client) Notify(ctx context.Context, topic, event string, data []byte) error
+func (c *Client) Notify(ctx context.Context, topic, data string) error
 ```
 
 **`Client.Notify`** is the primary API. It fires a pg NOTIFY; every Wire
@@ -158,12 +158,12 @@ subscribers. Works from anywhere — HTTP handlers, task handlers, CLI
 commands, separate processes. No reference to the Wire needed.
 
 ```go
-cb.Notify(ctx, "work:01JABC", "updated", nil)
-cb.Notify(ctx, "user:01JXYZ", "notification", nil)
-cb.Notify(ctx, "broadcast", "maintenance", nil)
+cb.Notify(ctx, "work.01JABC.updated", "")
+cb.Notify(ctx, "user.01JXYZ.notification", "")
+cb.Notify(ctx, "broadcast.maintenance", "")
 
 // With a data payload (HTML fragment, JSON, etc.)
-cb.Notify(ctx, "user:01JXYZ", "notification", []byte(`<div class="toast">Done</div>`))
+cb.Notify(ctx, "user.01JXYZ.notification", `<div class="toast">Done</div>`)
 ```
 
 **`Wire.Notify`** does the same thing but also delivers to local subscribers
@@ -180,7 +180,7 @@ task := catbird.NewTask("import-plato").Do(func(ctx context.Context, in ImportIn
     if err != nil {
         return result, err
     }
-    cb.Notify(ctx, "work:"+result.WorkID, "updated", nil)
+    cb.Notify(ctx, "work."+result.WorkID+".updated", "")
     return result, nil
 })
 ```
@@ -237,7 +237,7 @@ Notifications travel via pg NOTIFY on the schema-qualified channel
 **`Client.Notify`** — fires pg NOTIFY with no `node_id` (Client has no
 node identity). Every Wire node delivers to its local subscribers:
 
-1. `cb_notify(topic => $1, event => $2, data => $3)` — `node_id` is NULL
+1. `cb_notify(topic => $1, data => $2)` — `node_id` is NULL
 2. Each node's Wire LISTEN goroutine receives the notification
 3. `node_id` is NULL → no skip → all nodes deliver
 
@@ -245,7 +245,7 @@ node identity). Every Wire node delivers to its local subscribers:
 own `node_id`. Other nodes deliver; the origin node skips (already delivered):
 
 1. Deliver to local SSE subscribers immediately
-2. `cb_notify(node_id => $1, topic => $2, event => $3, data => $4)`
+2. `cb_notify(topic => $1, data => $2, node_id => $3)`
 3. Other nodes deliver; origin node sees its own `node_id` → skips
 
 The Wire acquires one dedicated connection from the pool for LISTEN (same
@@ -283,7 +283,7 @@ automatically when tokens include an identity (`TokenOpts{Identity: ...}`).
 ### Querying
 
 ```go
-identities, err := wire.Presence(ctx, "work:01JABC") // []string
+identities, err := wire.Presence(ctx, "work.01JABC") // []string
 ```
 
 Always cross-node — queries the `cb_wire_presence` table.
@@ -344,13 +344,13 @@ mux.Get("/events/{token}", func(w http.ResponseWriter, r *http.Request) {
 })
 
 // Mint tokens in your template handlers.
-token := wire.Token([]string{"work:01JABC"})
+token := wire.Token([]string{"work.01JABC"})
 
 // Notify from anywhere via Client.
-cb.Notify(ctx, "work:01JABC", "updated", nil)
+cb.Notify(ctx, "work.01JABC.updated", "")
 
 // Query presence.
-identities, err := wire.Presence(ctx, "work:01JABC")
+identities, err := wire.Presence(ctx, "work.01JABC")
 ```
 
 On shutdown (`ctx` cancelled):
@@ -482,7 +482,7 @@ Key properties:
 ```sql
 -- cb_notify wraps pg_notify with schema-qualified channel and JSON payload.
 -- node_id is NULL when called from Client.Notify (no self-skip).
-SELECT cb_notify(node_id => $1, topic => $2, event => $3, data => $4);
+SELECT cb_notify(topic => $1, data => $2, node_id => $3);
 ```
 
 On the receiving side, `Wire.Start` runs a LISTEN loop on a dedicated
