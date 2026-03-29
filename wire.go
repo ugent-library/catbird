@@ -22,13 +22,6 @@ const (
 	wireHeartbeatInterval   = 5 * time.Second
 )
 
-// Notification represents a message for SSE delivery, used by both
-// Notify (ephemeral) and Forward (durable) paths.
-type Notification struct {
-	Event string `json:"event"`
-	Data  string `json:"data,omitempty"`
-}
-
 // Wire is an SSE toolkit for notifying browser clients and tracking presence.
 // Create with NewWire, configure with builder methods, then call Start.
 type Wire struct {
@@ -40,19 +33,6 @@ type Wire struct {
 
 	mu     sync.RWMutex
 	topics map[string][]*wireSubscriber
-
-	forwards []wireForward
-}
-
-// ForwardOpts configures Forward polling behavior.
-// Zero values use the same defaults as ReadPoll.
-type ForwardOpts ReadPollOpts
-
-type wireForward struct {
-	queue    string
-	quantity int
-	hideFor  time.Duration
-	pollOpts ForwardOpts
 }
 
 type wireSubscriber struct {
@@ -99,18 +79,6 @@ func (w *Wire) WithLogger(logger *slog.Logger) *Wire {
 	return w
 }
 
-// Forward registers a queue to bridge to SSE subscribers.
-// Messages are read from the queue and delivered as SSE events.
-// Must be called before Start.
-func (w *Wire) Forward(queue string, quantity int, hideFor time.Duration, opts ...ForwardOpts) *Wire {
-	f := wireForward{queue: queue, quantity: quantity, hideFor: hideFor}
-	if len(opts) > 0 {
-		f.pollOpts = opts[0]
-	}
-	w.forwards = append(w.forwards, f)
-	return w
-}
-
 // Start runs the Wire's background loops: LISTEN relay, heartbeat, and
 // forward bridges. Blocks until ctx is cancelled.
 func (w *Wire) Start(ctx context.Context) error {
@@ -129,10 +97,6 @@ func (w *Wire) Start(ctx context.Context) error {
 
 	wg.Go(func() { w.heartbeatLoop(ctx) })
 	wg.Go(func() { w.listenLoop(ctx) })
-
-	for _, fwd := range w.forwards {
-		wg.Go(func() { w.forwardLoop(ctx, fwd) })
-	}
 
 	<-ctx.Done()
 
@@ -390,45 +354,5 @@ func (w *Wire) presenceLeave(sub *wireSubscriber) {
 		_, _ = w.pool.Exec(ctx,
 			`SELECT cb_notify(topic => $1, event => 'presence', node_id => $2::uuid)`,
 			topic, w.id)
-	}
-}
-
-func (w *Wire) forwardLoop(ctx context.Context, fwd wireForward) {
-	w.logger.InfoContext(ctx, "wire: forwarding", "queue", fwd.queue)
-
-	for {
-		msgs, err := ReadPoll(ctx, w.pool, fwd.queue, fwd.quantity, fwd.hideFor, ReadPollOpts(fwd.pollOpts))
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			w.logger.WarnContext(ctx, "wire: forward read failed", "queue", fwd.queue, "error", err)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Second):
-			}
-			continue
-		}
-
-		for _, msg := range msgs {
-			var n Notification
-			if err := json.Unmarshal(msg.Payload, &n); err != nil {
-				w.logger.WarnContext(ctx, "wire: forward unmarshal failed", "error", err)
-				_, _ = Delete(ctx, w.pool, fwd.queue, msg.ID)
-				continue
-			}
-
-			// Deliver locally and relay cross-node
-			w.deliverLocal(msg.Topic, wireEvent{name: n.Event, data: n.Data})
-
-			_, _ = w.pool.Exec(ctx,
-				`SELECT cb_notify(topic => $1, event => $2, data => $3, node_id => $4::uuid)`,
-				msg.Topic, n.Event, ptrOrNil(n.Data), w.id)
-
-			if _, err := Delete(ctx, w.pool, fwd.queue, msg.ID); err != nil {
-				w.logger.WarnContext(ctx, "wire: forward delete failed", "error", err)
-			}
-		}
 	}
 }

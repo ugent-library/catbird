@@ -34,7 +34,6 @@ dedicated connection for LISTEN. Notify is available on both Client and Wire
 | `wire.Token(...)` | Wire | Mint a signed SSE connection token |
 | `wire.ServeSSE(w, r, token)` | Wire | Serve an SSE connection |
 | `wire.Presence(ctx, topic)` | Wire | Query who's connected to a topic |
-| `wire.Forward(queue)` | Wire | Bridge a queue to SSE (durable notifications) |
 | `cb.Notify(ctx, topic, event, data)` | Client | Send an ephemeral notification to SSE subscribers |
 
 ## API sketch
@@ -318,57 +317,6 @@ func workPresence(w http.ResponseWriter, r *http.Request) {
 </aside>
 ```
 
-## Forward (durable notifications)
-
-`Notify` is ephemeral — if no SSE client is connected, the event is lost.
-For durable notifications, publish to a queue and let Wire forward them.
-
-### Notification struct
-
-The same struct is used by both paths:
-
-```go
-type Notification struct {
-    Event string `json:"event"`
-    Data  []byte `json:"data,omitempty"`
-}
-```
-
-### Ephemeral vs durable
-
-```go
-// Ephemeral — fire and forget
-cb.Notify(ctx, "work:01JABC", "updated", nil)
-
-// Durable — persisted in a queue until delivered
-cb.Publish(ctx, "work.01JABC", catbird.Notification{Event: "updated"})
-```
-
-### Setup
-
-```go
-// Create a queue for browser-bound notifications
-cb.CreateQueue(ctx, "browser-notifications")
-cb.Bind(ctx, "browser-notifications", "work.#")
-cb.Bind(ctx, "browser-notifications", "user.#")
-
-// Wire reads from the queue and delivers to SSE subscribers
-wire.Forward("browser-notifications")
-```
-
-`Forward` runs inside `wire.Start` alongside the LISTEN loop. It reads
-messages from the queue, uses `msg.Topic` directly as the SSE topic
-(no translation), and deserializes the payload as a `Notification`, then
-delivers via the same `deliverLocal` path. Messages are deleted after
-successful delivery.
-
-Multiple Wire nodes share the queue as competing consumers — each message
-is read by one node, which delivers locally and fires a pg NOTIFY so all
-other nodes' SSE clients receive it too.
-
-If no Wire is running, messages accumulate in the queue. When a Wire
-starts, it drains the backlog.
-
 ## Configuration
 
 ### Builder methods
@@ -631,8 +579,7 @@ under 1MB.
 ## What this does NOT do
 
 - **Message persistence**: `Notify` is ephemeral — if no SSE client is
-  connected, the event is lost. Use `Forward` to bridge durable queue
-  messages to SSE.
+  connected, the event is lost.
 - **Client-to-client messaging**: all messages originate from the server.
   Clients trigger server-side work via your app's HTTP handlers.
 - **Binary payloads**: SSE is text-only. Use base64 or link to a resource.
