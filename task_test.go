@@ -12,6 +12,24 @@ import (
 	"time"
 )
 
+func TestGetTaskRunID(t *testing.T) {
+	ctx := withTaskRunScope(context.Background(), nil, "my_task", 99, nil)
+	id, err := GetTaskRunID(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != 99 {
+		t.Fatalf("expected run ID 99, got %d", id)
+	}
+}
+
+func TestGetTaskRunIDNoContext(t *testing.T) {
+	_, err := GetTaskRunID(context.Background())
+	if !errors.Is(err, ErrNoRunContext) {
+		t.Fatalf("expected ErrNoRunContext, got %v", err)
+	}
+}
+
 func TestRunTaskQuery(t *testing.T) {
 	type input struct {
 		Value string `json:"value"`

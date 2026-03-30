@@ -323,6 +323,16 @@ func (h *TaskHandle) WaitForOutput(ctx context.Context, out any, opts ...WaitOpt
 	}
 }
 
+// GetTaskRunID returns the task run ID from inside a task handler.
+// Returns ErrNoRunContext if called outside a task handler.
+func GetTaskRunID(ctx context.Context) (int64, error) {
+	scope, _ := ctx.Value(taskRunScopeContextKey{}).(*taskRunScope)
+	if scope == nil {
+		return 0, ErrNoRunContext
+	}
+	return scope.runID, nil
+}
+
 // CancelTaskRun cancels a task run.
 // Returns true when the run exists (including idempotent no-op), false when it does not exist.
 func CancelTaskRun(ctx context.Context, conn Conn, taskName string, runID int64, opts ...CancelOpts) (bool, error) {

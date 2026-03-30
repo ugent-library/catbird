@@ -1435,6 +1435,16 @@ func CancelFlowRun(ctx context.Context, conn Conn, flowName string, runID int64,
 	return applied, nil
 }
 
+// GetFlowRunID returns the flow run ID from inside a flow step handler.
+// Returns ErrNoRunContext if called outside a flow step handler.
+func GetFlowRunID(ctx context.Context) (int64, error) {
+	scope, _ := ctx.Value(flowRunScopeContextKey{}).(*flowRunScope)
+	if scope == nil {
+		return 0, ErrNoRunContext
+	}
+	return scope.runID, nil
+}
+
 // GetStep retrieves status details for a step in the current flow run.
 // Intended for use inside flow step handlers.
 func GetStep(ctx context.Context, stepName string) (*StepRunInfo, error) {

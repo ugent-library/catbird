@@ -17,6 +17,24 @@ import (
 	"time"
 )
 
+func TestGetFlowRunID(t *testing.T) {
+	ctx := withFlowRunScope(context.Background(), nil, "my_flow", 42, nil)
+	id, err := GetFlowRunID(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != 42 {
+		t.Fatalf("expected run ID 42, got %d", id)
+	}
+}
+
+func TestGetFlowRunIDNoContext(t *testing.T) {
+	_, err := GetFlowRunID(context.Background())
+	if !errors.Is(err, ErrNoRunContext) {
+		t.Fatalf("expected ErrNoRunContext, got %v", err)
+	}
+}
+
 func TestRunFlowQuery(t *testing.T) {
 	type input struct {
 		Value string `json:"value"`
