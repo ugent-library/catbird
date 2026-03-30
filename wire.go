@@ -32,7 +32,7 @@ type Wire struct {
 	schema string
 
 	mu     sync.RWMutex
-	topics map[string][]*wireSubscriber
+	topics *topicTrie[*wireSubscriber]
 }
 
 type wireSubscriber struct {
@@ -68,7 +68,7 @@ func NewWire(pool *pgxpool.Pool, secret []byte) *Wire {
 		pool:   pool,
 		secret: secret,
 		logger: slog.Default(),
-		topics: make(map[string][]*wireSubscriber),
+		topics: newTopicTrie[*wireSubscriber](),
 	}
 }
 
@@ -210,7 +210,7 @@ func (w *Wire) addSubscriber(sub *wireSubscriber) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, topic := range sub.topics {
-		w.topics[topic] = append(w.topics[topic], sub)
+		w.topics.add(topic, sub)
 	}
 }
 
@@ -218,22 +218,13 @@ func (w *Wire) removeSubscriber(sub *wireSubscriber) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, topic := range sub.topics {
-		subs := w.topics[topic]
-		for i, s := range subs {
-			if s == sub {
-				w.topics[topic] = append(subs[:i], subs[i+1:]...)
-				break
-			}
-		}
-		if len(w.topics[topic]) == 0 {
-			delete(w.topics, topic)
-		}
+		w.topics.remove(topic, func(s *wireSubscriber) bool { return s == sub })
 	}
 }
 
 func (w *Wire) deliverLocal(topic string, ev wireEvent) {
 	w.mu.RLock()
-	subs := w.topics[topic]
+	subs := w.topics.match(topic, nil)
 	w.mu.RUnlock()
 
 	for _, sub := range subs {

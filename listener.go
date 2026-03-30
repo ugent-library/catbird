@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,20 +24,16 @@ type Listener struct {
 	pool     *pgxpool.Pool
 	logger   *slog.Logger
 	schema   string
-	handlers []listenerBinding
-}
-
-type listenerBinding struct {
-	pattern string
-	handler ListenerHandler
+	handlers *topicTrie[ListenerHandler]
 }
 
 // NewListener creates a new Listener.
 func NewListener(pool *pgxpool.Pool) *Listener {
 	return &Listener{
-		id:     uuid.NewString(),
-		pool:   pool,
-		logger: slog.Default(),
+		id:       uuid.NewString(),
+		pool:     pool,
+		logger:   slog.Default(),
+		handlers: newTopicTrie[ListenerHandler](),
 	}
 }
 
@@ -59,7 +54,7 @@ func (l *Listener) WithLogger(logger *slog.Logger) *Listener {
 // "*" matches one token, "#" matches zero or more trailing tokens.
 // Must be called before Start.
 func (l *Listener) Handle(pattern string, fn ListenerHandler) *Listener {
-	l.handlers = append(l.handlers, listenerBinding{pattern: pattern, handler: fn})
+	l.handlers.add(pattern, fn)
 	return l
 }
 
@@ -128,27 +123,9 @@ func (l *Listener) listenOnce(ctx context.Context) error {
 	}
 }
 
-var listenerDispatchPool = sync.Pool{
-	New: func() any {
-		s := make([]ListenerHandler, 0, 8)
-		return &s
-	},
-}
-
 func (l *Listener) dispatch(msg wireMessage) {
-	ptr := listenerDispatchPool.Get().(*[]ListenerHandler)
-	matched := (*ptr)[:0]
-
-	for i := range l.handlers {
-		if matchTopic(l.handlers[i].pattern, msg.Topic) {
-			matched = append(matched, l.handlers[i].handler)
-		}
-	}
-
+	matched := l.handlers.match(msg.Topic, nil)
 	for _, fn := range matched {
 		fn(msg.Topic, msg.Message)
 	}
-
-	*ptr = matched[:0]
-	listenerDispatchPool.Put(ptr)
 }

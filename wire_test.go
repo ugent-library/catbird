@@ -387,6 +387,90 @@ func TestWireDeliverLocal(t *testing.T) {
 	_ = ctx
 }
 
+func TestWireDeliverLocalWildcard(t *testing.T) {
+	getTestClient(t)
+	wire := NewWire(testPool, testSecret)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	sub := &wireSubscriber{
+		id:           uuid.NewString(),
+		ch:           make(chan wireEvent, wireChannelSize),
+		topics:       []string{"user.123.#"},
+		cancel:       cancel,
+		lastDelivery: time.Now(),
+	}
+
+	wire.addSubscriber(sub)
+	defer wire.removeSubscriber(sub)
+
+	// Publish to a subtopic — should match the # wildcard
+	wire.deliverLocal("user.123.batch_edit.done", wireEvent{topic: "user.123.batch_edit.done", message: "ok"})
+
+	select {
+	case ev := <-sub.ch:
+		if ev.topic != "user.123.batch_edit.done" {
+			t.Errorf("topic = %q, want %q", ev.topic, "user.123.batch_edit.done")
+		}
+		if ev.message != "ok" {
+			t.Errorf("message = %q, want %q", ev.message, "ok")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout — wildcard subscriber did not receive event")
+	}
+
+	// Non-matching topic should not deliver
+	wire.deliverLocal("user.456.notification", wireEvent{topic: "user.456.notification"})
+
+	select {
+	case ev := <-sub.ch:
+		t.Fatalf("unexpected event: %+v", ev)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	_ = ctx
+}
+
+func TestWireNotifySSEWildcard(t *testing.T) {
+	cb := getTestClient(t)
+	wire := NewWire(testPool, testSecret)
+	startTestWire(t, wire)
+
+	base := "user." + uuid.NewString()[:8]
+	token := wire.Token([]string{base + ".#"})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wire.ServeSSE(w, r, r.URL.Query().Get("token"))
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(srv.URL + "?token=" + token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	time.Sleep(100 * time.Millisecond)
+
+	subtopic := base + ".batch_edit.done"
+	if err := cb.Notify(t.Context(), subtopic, "finished"); err != nil {
+		t.Fatal(err)
+	}
+
+	events := readSSEEvents(t, resp, 1, 2*time.Second)
+	if len(events) == 0 {
+		t.Fatal("no SSE events received for wildcard subscription")
+	}
+	if events[0].event != subtopic {
+		t.Errorf("event = %q, want %q", events[0].event, subtopic)
+	}
+	if events[0].data != "finished" {
+		t.Errorf("data = %q, want %q", events[0].data, "finished")
+	}
+}
+
 // --- SSE test helpers ---
 
 type sseEvent struct {
