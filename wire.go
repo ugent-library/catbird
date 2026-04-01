@@ -26,14 +26,29 @@ const (
 // Handlers run synchronously in the dispatch goroutine — don't block.
 type ListenHandler = func(ctx context.Context, topic, message string)
 
-// RenderHandler transforms a Wire event before SSE dispatch to clients.
+// SSEEvent represents a fully rendered SSE event ready for client delivery.
+type SSEEvent struct {
+	Event string // SSE event name; empty = use original topic
+	Data  string // SSE data field
+	ID    string // SSE id field; empty = omit
+}
+
+// Write implements io.Writer, appending p to the Data field.
+// This allows SSEEvent to be used as a target for io.WriterTo (e.g. Templ components).
+func (e *SSEEvent) Write(p []byte) (int, error) {
+	e.Data += string(p)
+	return len(p), nil
+}
+
+// SSERenderHandler transforms a Wire event into an SSE event for client delivery.
 // It receives the SSE client's HTTP request for access to user context
-// (auth, language, etc). Return the transformed message string.
-type RenderHandler = func(r *http.Request, topic, message string) (string, error)
+// (auth, language, etc). Only topics with a registered renderer are
+// delivered to SSE clients — the renderer acts as an allowlist.
+type SSERenderHandler = func(r *http.Request, topic, message string) (SSEEvent, error)
 
 // Wire is a real-time pub/sub layer with SSE support and presence tracking.
 // It absorbs Listener's topic-matched dispatch, adds local delivery to
-// Notify, and serves SSE connections with optional Render transforms.
+// Notify, and serves SSE connections with per-transport rendering.
 // Create with NewWire, configure with builder methods, then call Start.
 type Wire struct {
 	id     string
@@ -42,10 +57,10 @@ type Wire struct {
 	logger *slog.Logger
 	schema string
 
-	mu        sync.RWMutex
-	topics    *topicTrie[*wireSubscriber]
-	listeners *topicTrie[ListenHandler]
-	renderers *topicTrie[RenderHandler]
+	mu           sync.RWMutex
+	topics       *topicTrie[*wireSubscriber]
+	listeners    *topicTrie[ListenHandler]
+	sseRenderers *topicTrie[SSERenderHandler]
 }
 
 type wireSubscriber struct {
@@ -78,13 +93,13 @@ func NewWire(pool *pgxpool.Pool, secret []byte) *Wire {
 		panic("catbird: Wire secret must be exactly 32 bytes")
 	}
 	return &Wire{
-		id:        uuid.NewString(),
-		pool:      pool,
-		secret:    secret,
-		logger:    slog.Default(),
-		topics:    newTopicTrie[*wireSubscriber](),
-		listeners: newTopicTrie[ListenHandler](),
-		renderers: newTopicTrie[RenderHandler](),
+		id:           uuid.NewString(),
+		pool:         pool,
+		secret:       secret,
+		logger:       slog.Default(),
+		topics:       newTopicTrie[*wireSubscriber](),
+		listeners:    newTopicTrie[ListenHandler](),
+		sseRenderers: newTopicTrie[SSERenderHandler](),
 	}
 }
 
@@ -105,13 +120,13 @@ func (w *Wire) Listen(pattern string, fn ListenHandler) *Wire {
 	return w
 }
 
-// Render registers a transform for the given topic pattern.
-// Render handlers run only on nodes with matching SSE clients, transforming
-// the raw event into what the client receives (e.g., JSON → HTML fragment).
-// Without a Render, clients get the raw message.
+// RenderSSE registers an SSE render handler for the given topic pattern.
+// Only topics with a registered renderer are delivered to SSE clients —
+// the renderer acts as an allowlist. Multiple renderers matching the same
+// topic each produce an SSE event (fan-out).
 // Must be called before Start.
-func (w *Wire) Render(pattern string, fn RenderHandler) *Wire {
-	w.renderers.add(pattern, fn)
+func (w *Wire) RenderSSE(pattern string, fn SSERenderHandler) *Wire {
+	w.sseRenderers.add(pattern, fn)
 	return w
 }
 
@@ -196,8 +211,13 @@ func (w *Wire) ServeSSE(rw http.ResponseWriter, r *http.Request, token string) {
 			sub.lastDelivery = time.Now()
 			sub.mu.Unlock()
 
-			writeSSEEvent(rw, ev)
-			flusher.Flush()
+			events := w.renderSSE(sub.request, ev)
+			for _, sse := range events {
+				writeSSEEvent(rw, sse)
+			}
+			if len(events) > 0 {
+				flusher.Flush()
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -233,14 +253,17 @@ func (w *Wire) Notify(ctx context.Context, topic, message string) error {
 
 // writeSSEEvent writes a single SSE event to w. Multi-line data is split
 // into separate "data:" fields per the SSE spec.
-func writeSSEEvent(w io.Writer, ev wireEvent) {
-	fmt.Fprintf(w, "event: %s\n", ev.topic)
-	if ev.message == "" {
+func writeSSEEvent(w io.Writer, ev SSEEvent) {
+	fmt.Fprintf(w, "event: %s\n", ev.Event)
+	if ev.Data == "" {
 		fmt.Fprint(w, "data:\n")
 	} else {
-		for line := range strings.SplitSeq(ev.message, "\n") {
+		for line := range strings.SplitSeq(ev.Data, "\n") {
 			fmt.Fprintf(w, "data: %s\n", line)
 		}
+	}
+	if ev.ID != "" {
+		fmt.Fprintf(w, "id: %s\n", ev.ID)
 	}
 	fmt.Fprint(w, "\n")
 }
@@ -274,25 +297,12 @@ func (w *Wire) deliverToListeners(ctx context.Context, topic, message string) {
 func (w *Wire) deliverLocal(topic string, ev wireEvent) {
 	w.mu.RLock()
 	subs := w.topics.match(topic, nil)
-	renders := w.renderers.match(topic, nil)
 	w.mu.RUnlock()
 
 	for _, sub := range subs {
-		// Apply first matching render transform if available.
-		outEv := ev
-		if len(renders) > 0 && sub.request != nil {
-			rendered, err := renders[0](sub.request, ev.topic, ev.message)
-			if err != nil {
-				w.logger.Warn("wire: render error", "topic", ev.topic, "error", err)
-				continue // skip this subscriber on render error
-			}
-			outEv = wireEvent{topic: ev.topic, message: rendered}
-		}
-
 		select {
-		case sub.ch <- outEv:
+		case sub.ch <- ev:
 		default:
-			// Channel full — check for slow consumer.
 			sub.mu.Lock()
 			if time.Since(sub.lastDelivery) > wireSlowConsumerTimeout {
 				sub.cancel()
@@ -414,33 +424,40 @@ func (w *Wire) presenceLeave(sub *wireSubscriber) {
 	}
 }
 
-// Render registers a typed render handler that unmarshals JSON messages
-// into type T and passes them to fn. The result is written to a string
-// via io.WriterTo. Works with Templ components, html/template, or any
-// func(T) io.WriterTo.
-func Render[T any](w *Wire, pattern string, fn func(T) io.WriterTo) {
-	w.Render(pattern, func(r *http.Request, topic, message string) (string, error) {
-		var data T
-		if err := json.Unmarshal([]byte(message), &data); err != nil {
-			return "", err
+// renderSSE matches sseRenderers for the event's topic and calls each match.
+// No renderer match → returns nil (event is dropped).
+func (w *Wire) renderSSE(r *http.Request, ev wireEvent) []SSEEvent {
+	w.mu.RLock()
+	renderers := w.sseRenderers.match(ev.topic, nil)
+	w.mu.RUnlock()
+
+	if len(renderers) == 0 {
+		return nil
+	}
+
+	events := make([]SSEEvent, 0, len(renderers))
+	for _, fn := range renderers {
+		sse, err := fn(r, ev.topic, ev.message)
+		if err != nil {
+			w.logger.Warn("wire: sse render error", "topic", ev.topic, "error", err)
+			continue
 		}
-		var buf strings.Builder
-		_, err := fn(data).WriteTo(&buf)
-		return buf.String(), err
-	})
+		if sse.Event == "" {
+			sse.Event = ev.topic
+		}
+		events = append(events, sse)
+	}
+	return events
 }
 
-// RenderFunc registers a typed render handler that receives the HTTP request
-// for access to user context (auth, language, etc). The result is written
-// to a string via io.WriterTo.
-func RenderFunc[T any](w *Wire, pattern string, fn func(*http.Request, T) io.WriterTo) {
-	w.Render(pattern, func(r *http.Request, topic, message string) (string, error) {
+// RenderSSE registers a typed SSE render handler that unmarshals JSON messages
+// into type T and passes them to fn for full SSEEvent control.
+func RenderSSE[T any](w *Wire, pattern string, fn func(r *http.Request, topic string, data T) (SSEEvent, error)) {
+	w.RenderSSE(pattern, func(r *http.Request, topic, message string) (SSEEvent, error) {
 		var data T
 		if err := json.Unmarshal([]byte(message), &data); err != nil {
-			return "", err
+			return SSEEvent{}, err
 		}
-		var buf strings.Builder
-		_, err := fn(r, data).WriteTo(&buf)
-		return buf.String(), err
+		return fn(r, topic, data)
 	})
 }

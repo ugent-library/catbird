@@ -380,7 +380,7 @@ These are the functions most app code and external clients care about.
 **Wire (SSE toolkit)**
 
 ### `cb_notify`
-- **What it does**: Send a notification via pg NOTIFY on the schema-qualified cb_wire channel. Topic is used as the SSE event name.
+- **What it does**: Send a notification via pg NOTIFY on the schema-qualified cb_wire channel.
 - **Inputs**: `cb_notify(topic text, data text DEFAULT NULL, node_id uuid DEFAULT NULL)`
 - **Returns**: `RETURNS void`
 

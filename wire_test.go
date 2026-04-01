@@ -142,6 +142,7 @@ func TestWireServeSSEUnauthorized(t *testing.T) {
 func TestWireNotifySSE(t *testing.T) {
 	cb := getTestClient(t)
 	wire := NewWire(testPool, testSecret)
+	wire.RenderSSE("#", ssePassthrough)
 	startTestWire(t, wire)
 
 	topic := "test." + uuid.NewString()[:8]
@@ -183,6 +184,7 @@ func TestWireNotifySSE(t *testing.T) {
 func TestWireNotifyWithData(t *testing.T) {
 	cb := getTestClient(t)
 	wire := NewWire(testPool, testSecret)
+	wire.RenderSSE("#", ssePassthrough)
 	startTestWire(t, wire)
 
 	topic := "test." + uuid.NewString()[:8]
@@ -221,6 +223,7 @@ func TestWireNotifyWithData(t *testing.T) {
 func TestWireLocalNotify(t *testing.T) {
 	getTestClient(t)
 	wire := NewWire(testPool, testSecret)
+	wire.RenderSSE("#", ssePassthrough)
 	startTestWire(t, wire)
 
 	topic := "test." + uuid.NewString()[:8]
@@ -436,6 +439,7 @@ func TestWireDeliverLocalWildcard(t *testing.T) {
 func TestWireNotifySSEWildcard(t *testing.T) {
 	cb := getTestClient(t)
 	wire := NewWire(testPool, testSecret)
+	wire.RenderSSE("#", ssePassthrough)
 	startTestWire(t, wire)
 
 	base := "user." + uuid.NewString()[:8]
@@ -473,6 +477,11 @@ func TestWireNotifySSEWildcard(t *testing.T) {
 }
 
 // --- SSE test helpers ---
+
+// ssePassthrough is a renderer that passes topic and message through as-is.
+var ssePassthrough SSERenderHandler = func(r *http.Request, topic, message string) (SSEEvent, error) {
+	return SSEEvent{Event: topic, Data: message}, nil
+}
 
 type sseEvent struct {
 	event string

@@ -783,9 +783,9 @@ wire.Listen("order.*", func(ctx context.Context, topic, message string) {
     log.Println(topic, message)
 })
 
-// Render: transform events before SSE dispatch to clients
-wire.Render("task.*.completed", func(r *http.Request, topic, message string) (string, error) {
-    return "<div>Task done</div>", nil
+// RenderSSE: transform events for SSE clients (acts as allowlist)
+wire.RenderSSE("task.*.completed", func(r *http.Request, topic, message string) (catbird.SSEEvent, error) {
+    return catbird.SSEEvent{Event: "task-done", Data: "<div>Task done</div>"}, nil
 })
 
 go wire.Start(ctx)
@@ -800,14 +800,14 @@ http.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 })
 ```
 
-### Listen vs Render
+### Listen vs RenderSSE
 
 | Method | Runs on | Purpose |
 |--------|---------|---------|
 | `wire.Listen` | Every node | Server-side side effects (logging, webhooks) |
-| `wire.Render` | Node with SSE client | Transform before SSE push (e.g., JSON → HTML) |
+| `wire.RenderSSE` | Node with SSE client | Transform for SSE push (e.g., JSON → HTML) |
 
-Without a Render, SSE clients get the raw message. Render handlers receive the SSE client's `*http.Request` for access to user context (auth, language, etc).
+Only topics with a registered SSE renderer are delivered to SSE clients — the renderer acts as an allowlist. Multiple renderers matching the same topic each produce an SSE event (fan-out). Render handlers receive the SSE client's `*http.Request` for access to user context (auth, language, etc).
 
 ### Notify
 
@@ -822,19 +822,18 @@ client.Notify(ctx, "order.created", `{"id": 123}`)
 wire.Notify(ctx, "order.created", `{"id": 123}`)
 ```
 
-### Typed Render Helpers
+### SSEEvent
 
-Generic helpers for common patterns — unmarshal JSON and render via `io.WriterTo`:
+`SSEEvent` controls the full SSE output: event name, data, and optional ID. It implements `io.Writer`, so templates can write directly to it:
 
 ```go
-// Stateless: fn(T) io.WriterTo
-catbird.Render[TaskEvent](wire, "task.*", views.TaskCompleted)
-
-// Request-aware: fn(*http.Request, T) io.WriterTo
-catbird.RenderFunc[TaskEvent](wire, "task.*", views.TaskCompleted)
+// Typed helper — unmarshals JSON, gives full SSEEvent control
+catbird.RenderSSE[TaskEvent](wire, "task.*", func(r *http.Request, topic string, data TaskEvent) (catbird.SSEEvent, error) {
+    ev := catbird.SSEEvent{Event: "task-update", ID: topic}
+    err := views.TaskCompleted(r, data).Render(r.Context(), &ev)
+    return ev, err
+})
 ```
-
-Works with Templ, `html/template`, or any `func(T) io.WriterTo`.
 
 ### Tokens & SSE
 
