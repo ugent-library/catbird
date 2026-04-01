@@ -84,7 +84,7 @@ When adding migrations:
 4. Use `LANGUAGE plpgsql AS $$` in CREATE, terminate with `$$;` (not `$$ LANGUAGE plpgsql;`)
 5. SQL indentation: 4 spaces, no tabs
 6. The `down` section must clean up everything the `up` section created
-7. Update `docs/sql-api-reference.md` for any SQL function changes
+7. Update `docs/sql-api.md` for any SQL function changes
 
 ## Flow Patterns
 
@@ -104,7 +104,7 @@ When adding migrations:
 
 ## Status Constants
 
-Use Go constants (`StatusQueued`, `StatusStarted`, `StatusCompleted`, `StatusFailed`, `StatusSkipped`, `StatusCanceled`, etc.) — not raw string literals.
+Use Go constants (`StatusQueued`, `StatusStarted`, `StatusCompleted`, `StatusFailed`, `StatusSkipped`, `StatusCanceled`, `StatusExpired`, etc.) — not raw string literals.
 
 ## Error Sentinels
 

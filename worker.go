@@ -1956,7 +1956,6 @@ type taskOnFailClaim struct {
 	StartedAt      time.Time       `json:"started_at"`
 	FailedAt       time.Time       `json:"failed_at"`
 	ConcurrencyKey string          `json:"concurrency_key,omitempty"`
-	IdempotencyKey string          `json:"idempotency_key,omitempty"`
 }
 
 type taskOnFailWorker struct {
@@ -2009,7 +2008,6 @@ func (w *taskOnFailWorker) handle(ctx context.Context, claim taskOnFailClaim) {
 		StartedAt:      claim.StartedAt,
 		FailedAt:       claim.FailedAt,
 		ConcurrencyKey: claim.ConcurrencyKey,
-		IdempotencyKey: claim.IdempotencyKey,
 	}
 
 	err := runWithTimeoutErr(ctx, h.timeout, func(fnCtx context.Context) error {
@@ -2033,7 +2031,6 @@ func scanCollectibleTaskOnFailClaim(row pgx.CollectableRow) (taskOnFailClaim, er
 func scanTaskOnFailClaim(row pgx.Row) (taskOnFailClaim, error) {
 	rec := taskOnFailClaim{}
 	var concurrencyKey *string
-	var idempotencyKey *string
 	var startedAt *time.Time
 	var failedAt *time.Time
 
@@ -2046,7 +2043,6 @@ func scanTaskOnFailClaim(row pgx.Row) (taskOnFailClaim, error) {
 		&startedAt,
 		&failedAt,
 		&concurrencyKey,
-		&idempotencyKey,
 	); err != nil {
 		return rec, err
 	}
@@ -2060,9 +2056,6 @@ func scanTaskOnFailClaim(row pgx.Row) (taskOnFailClaim, error) {
 	if concurrencyKey != nil {
 		rec.ConcurrencyKey = *concurrencyKey
 	}
-	if idempotencyKey != nil {
-		rec.IdempotencyKey = *idempotencyKey
-	}
 
 	return rec, nil
 }
@@ -2075,7 +2068,6 @@ type flowOnFailClaim struct {
 	StartedAt             time.Time       `json:"started_at"`
 	FailedAt              time.Time       `json:"failed_at"`
 	ConcurrencyKey        string          `json:"concurrency_key,omitempty"`
-	IdempotencyKey        string          `json:"idempotency_key,omitempty"`
 	FailedStepName        string          `json:"failed_step_name,omitempty"`
 	FailedStepInput       json.RawMessage `json:"failed_step_input,omitempty"`
 	FailedStepSignalInput json.RawMessage `json:"failed_step_signal_input,omitempty"`
@@ -2133,7 +2125,6 @@ func (w *flowOnFailWorker) handle(ctx context.Context, claim flowOnFailClaim) {
 		StartedAt:             claim.StartedAt,
 		FailedAt:              claim.FailedAt,
 		ConcurrencyKey:        claim.ConcurrencyKey,
-		IdempotencyKey:        claim.IdempotencyKey,
 		FailedStepInput:       claim.FailedStepInput,
 		FailedStepSignalInput: claim.FailedStepSignalInput,
 		conn:                  w.conn,
@@ -2163,7 +2154,6 @@ func scanFlowOnFailClaim(row pgx.Row) (flowOnFailClaim, error) {
 	var startedAt *time.Time
 	var failedAt *time.Time
 	var concurrencyKey *string
-	var idempotencyKey *string
 	var failedStepName *string
 	var failedStepInput *json.RawMessage
 	var failedStepSignalInput *json.RawMessage
@@ -2177,7 +2167,6 @@ func scanFlowOnFailClaim(row pgx.Row) (flowOnFailClaim, error) {
 		&startedAt,
 		&failedAt,
 		&concurrencyKey,
-		&idempotencyKey,
 		&failedStepName,
 		&failedStepInput,
 		&failedStepSignalInput,
@@ -2194,9 +2183,6 @@ func scanFlowOnFailClaim(row pgx.Row) (flowOnFailClaim, error) {
 	}
 	if concurrencyKey != nil {
 		rec.ConcurrencyKey = *concurrencyKey
-	}
-	if idempotencyKey != nil {
-		rec.IdempotencyKey = *idempotencyKey
 	}
 	if failedStepName != nil {
 		rec.FailedStepName = *failedStepName

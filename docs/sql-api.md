@@ -13,14 +13,14 @@ SELECT cb_create_queue(
 -- Send a message
 SELECT cb_send(
 	queue => 'my_queue',
-	payload => '{"user_id": 123, "action": "process"}'::jsonb
+	body => '{"user_id": 123, "action": "process"}'::jsonb
 );
 
 -- Publish to topic-bound queues
 SELECT cb_publish(
 	topic => 'events.user.created',
-	payload => '{"user_id": 456}'::jsonb,
-	idempotency_key => 'user-456-created'
+	body => '{"user_id": 456}'::jsonb,
+	concurrency_key => 'user-456-created'
 );
 
 -- Read messages (with 30 second visibility timeout)
@@ -44,6 +44,31 @@ SELECT cb_bind(
 SELECT cb_unbind(
 	queue => 'user_events',
 	pattern => 'events.user.*'
+);
+
+-- Bind a task to a topic pattern (event trigger)
+SELECT cb_bind_task(
+	name => 'send_email',
+	pattern => 'events.email.*'
+);
+
+-- Bind a flow to a topic pattern (event trigger)
+SELECT cb_bind_flow(
+	name => 'order_processing',
+	pattern => 'events.order.#'
+);
+
+-- Publishing now also triggers task/flow runs
+SELECT cb_publish(
+	topic => 'events.email.welcome',
+	body => '{"user_id": 123}'::jsonb,
+	concurrency_key => 'user-123-welcome'
+);
+
+-- Unbind a task trigger
+SELECT cb_unbind_task(
+	name => 'send_email',
+	pattern => 'events.email.*'
 );
 ```
 
@@ -100,7 +125,6 @@ You can query task and flow run information directly:
 SELECT
 	id,
 	concurrency_key,
-	idempotency_key,
 	status,
 	input,
 	output,
@@ -116,7 +140,6 @@ LIMIT 20;
 SELECT
 	id,
 	concurrency_key,
-	idempotency_key,
 	status,
 	input,
 	output,
@@ -170,33 +193,53 @@ These are the functions most app code and external clients care about.
 - **Inputs**: `cb_unbind(queue text, pattern text)`
 - **Returns**: `RETURNS boolean`
 
+### `cb_bind_task`
+- **What it does**: Subscribe a task to a topic pattern. When a message is published to a matching topic, a task run is created with the message body as input.
+- **Inputs**: `cb_bind_task(name text, pattern text)`
+- **Returns**: `RETURNS void`
+
+### `cb_unbind_task`
+- **What it does**: Unsubscribe a task from a topic pattern.
+- **Inputs**: `cb_unbind_task(name text, pattern text)`
+- **Returns**: `RETURNS boolean`
+
+### `cb_bind_flow`
+- **What it does**: Subscribe a flow to a topic pattern. When a message is published to a matching topic, a flow run is created with the message body as input.
+- **Inputs**: `cb_bind_flow(name text, pattern text)`
+- **Returns**: `RETURNS void`
+
+### `cb_unbind_flow`
+- **What it does**: Unsubscribe a flow from a topic pattern.
+- **Inputs**: `cb_unbind_flow(name text, pattern text)`
+- **Returns**: `RETURNS boolean`
+
 ### `cb_send` (single message)
 - **What it does**: Send one message to a specific queue.
-- **Inputs**: `cb_send(queue text, payload jsonb, topic text DEFAULT NULL, idempotency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0)`
+- **Inputs**: `cb_send(queue text, body jsonb, topic text DEFAULT NULL, concurrency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0, expires_at timestamptz DEFAULT NULL)`
 - **Returns**: `RETURNS bigint`
 
 ### `cb_send` (batch)
 - **What it does**: Send multiple messages to a specific queue in one call.
-- **Inputs**: `cb_send(queue text, payloads jsonb[], topic text DEFAULT NULL, idempotency_keys text[] DEFAULT NULL, headers jsonb[] DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0)`
+- **Inputs**: `cb_send(queue text, bodies jsonb[], topic text DEFAULT NULL, concurrency_keys text[] DEFAULT NULL, headers jsonb[] DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0, expires_at timestamptz DEFAULT NULL)`
 - **Returns**: `RETURNS bigint[]`
 
 ### `cb_publish` (single message)
-- **What it does**: Publish one message to all queues matching a topic.
-- **Inputs**: `cb_publish(topic text, payload jsonb, idempotency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL)`
+- **What it does**: Publish one message to all queues, tasks, and flows matching a topic.
+- **Inputs**: `cb_publish(topic text, body jsonb, concurrency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0, expires_at timestamptz DEFAULT NULL)`
 - **Returns**: `RETURNS int`
 
 ### `cb_publish` (batch)
-- **What it does**: Publish multiple messages to all queues matching a topic.
-- **Inputs**: `cb_publish(topic text, payloads jsonb[], idempotency_keys text[] DEFAULT NULL, headers jsonb[] DEFAULT NULL, visible_at timestamptz DEFAULT NULL)`
+- **What it does**: Publish multiple messages to all queues, tasks, and flows matching a topic.
+- **Inputs**: `cb_publish(topic text, bodies jsonb[], concurrency_keys text[] DEFAULT NULL, headers jsonb[] DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0, expires_at timestamptz DEFAULT NULL)`
 - **Returns**: `RETURNS int`
 
 ### `cb_read`
-- **What it does**: Read messages from a queue.
+- **What it does**: Read messages from a queue. Expired messages (past `expires_at`) are automatically skipped.
 - **Inputs**: `cb_read(queue text, quantity int, hide_for int)`
 - **Returns**: `RETURNS SETOF cb_message`
 
 ### `cb_read_poll`
-- **What it does**: Read messages from a queue with polling.
+- **What it does**: Read messages from a queue with polling. Expired messages (past `expires_at`) are automatically skipped.
 - **Inputs**: `cb_read_poll(queue text, quantity int, hide_for int, poll_for int, poll_interval int)`
 - **Returns**: `RETURNS SETOF cb_message`
 
@@ -234,7 +277,7 @@ These are the functions most app code and external clients care about.
 
 ### `cb_run_task`
 - **What it does**: Create a task run (enqueue a task execution).
-- **Inputs**: `cb_run_task(name text, input jsonb, concurrency_key text DEFAULT NULL, idempotency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0)`
+- **Inputs**: `cb_run_task(name text, input jsonb, concurrency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0, expires_at timestamptz DEFAULT NULL)`
 - **Returns**: `RETURNS bigint`
 
 ### `cb_wait_task_output`
@@ -273,7 +316,7 @@ These are the functions most app code and external clients care about.
 
 ### `cb_run_flow`
 - **What it does**: Create a flow run (enqueue a flow execution).
-- **Inputs**: `cb_run_flow(name text, input jsonb, concurrency_key text DEFAULT NULL, idempotency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0)`
+- **Inputs**: `cb_run_flow(name text, input jsonb, concurrency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0, expires_at timestamptz DEFAULT NULL)`
 - **Returns**: `RETURNS bigint`
 
 ### `cb_wait_flow_output`
@@ -308,11 +351,11 @@ These are the functions most app code and external clients care about.
 **Maintenance**
 
 ### `cb_gc`
-- **What it does**: Garbage collection for stale workers, expired queues, and old task/flow runs.
+- **What it does**: Garbage collection: deletes expired queues and messages, transitions expired task/flow runs to `'expired'` status, cleans stale workers and wire nodes, purges old terminal runs.
 - **Inputs**: `cb_gc()`
 - **Returns**: `RETURNS jsonb`
 - **Returned JSON shape**:
-	- `{ "expired_queues_deleted": int, "stale_workers_deleted": int, "task_runs_purged": int, "flow_runs_purged": int }`
+	- `{ "expired_queues_deleted": int, "expired_messages_deleted": int, "expired_task_runs": int, "expired_flow_runs": int, "stale_workers_deleted": int, "stale_wire_nodes_deleted": int, "task_runs_purged": int, "flow_runs_purged": int }`
 
 ### `cb_clear_task_runs`
 - **What it does**: Delete all task runs regardless of status. In-flight work will be lost.
@@ -348,7 +391,7 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 **Task worker runtime**
 
 ### `cb_claim_tasks`
-- **What it does**: Claim task runs from the queue.
+- **What it does**: Claim task runs from the queue. Expired runs (past `expires_at`) are automatically skipped.
 - **Inputs**: `cb_claim_tasks(name text, quantity int, hide_for int)`
 - **Returns**: `RETURNS SETOF cb_task_claim`
 
@@ -370,7 +413,7 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 ### `cb_claim_task_on_fail`
 - **What it does**: Claim failed task runs for on-fail handling.
 - **Inputs**: `cb_poll_task_on_fail(name text, quantity int)`
-- **Returns**: `RETURNS TABLE(id bigint, input jsonb, error_message text, attempts int, on_fail_attempts int, started_at timestamptz, failed_at timestamptz, concurrency_key text, idempotency_key text)`
+- **Returns**: `RETURNS TABLE(id bigint, input jsonb, error_message text, attempts int, on_fail_attempts int, started_at timestamptz, failed_at timestamptz, concurrency_key text)`
 
 ### `cb_complete_task_on_fail`
 - **What it does**: Mark on-fail handling as completed for a task run.
@@ -390,7 +433,7 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 - **Returns**: `RETURNS void`
 
 ### `cb_claim_steps`
-- **What it does**: Claim step runs from a flow.
+- **What it does**: Claim step runs from a flow. Steps belonging to expired flow runs (past `expires_at`) are automatically skipped.
 - **Inputs**: `cb_claim_steps(flow_name text, step_name text, quantity int, hide_for int)`
 - **Returns**: `RETURNS SETOF cb_step_claim`
 
@@ -467,7 +510,7 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 ### `cb_claim_flow_on_fail`
 - **What it does**: Claim failed flow runs for on-fail handling.
 - **Inputs**: `cb_poll_flow_on_fail(name text, quantity int)`
-- **Returns**: `RETURNS TABLE(id bigint, input jsonb, error_message text, on_fail_attempts int, started_at timestamptz, failed_at timestamptz, concurrency_key text, idempotency_key text, failed_step_name text, failed_step_input jsonb, failed_step_signal_input jsonb, failed_step_attempts int)`
+- **Returns**: `RETURNS TABLE(id bigint, input jsonb, error_message text, on_fail_attempts int, started_at timestamptz, failed_at timestamptz, concurrency_key text, failed_step_name text, failed_step_input jsonb, failed_step_signal_input jsonb, failed_step_attempts int)`
 
 ### `cb_complete_flow_on_fail`
 - **What it does**: Mark on-fail handling as completed for a flow run.
@@ -480,11 +523,6 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 - **Returns**: `RETURNS void`
 
 **Flow cancellation internals**
-
-### `cb_maybe_finalize_flow_cancellation`
-- **What it does**: Finalize flow cancellation when no active step/map-task work remains.
-- **Inputs**: `cb_maybe_finalize_flow_cancellation(name text, run_id bigint)`
-- **Returns**: `RETURNS boolean`
 
 ### `cb_finalize_flow_cancellation`
 - **What it does**: Force final cancellation state for a flow run and stop remaining pending work.
@@ -526,7 +564,7 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 **Worker bookkeeping & garbage collection**
 
 ### `cb_worker_started`
-- **What it does**: Register a worker with the system.
+- **What it does**: Register a worker with the system. Emits `catbird.worker.started` via `cb_notify`.
 - **Inputs**: `cb_worker_started(id uuid, task_handlers jsonb, step_handlers jsonb)`
 - **Returns**: `RETURNS void`
 
@@ -537,54 +575,26 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 - **Returned JSON shape**:
 	- `{ "gc_info": { "expired_queues_deleted": int, "stale_workers_deleted": int, "stale_wire_nodes_deleted": int, "task_runs_purged": int, "flow_runs_purged": int } }`
 
+**Event emission (trigger functions)**
+
+### `cb_run_event`
+- **What it does**: Trigger function that emits `cb_notify` events on task/flow run status changes. Attached to `cb_t_*` and `cb_f_*` tables via `AFTER INSERT OR UPDATE OF status` triggers.
+- **Topics emitted**: `catbird.{task|flow}.{started|completed|failed|skipped|canceled|expired}`
+- **Payload**: `{"task"|"flow": name, "run_id": id, ...}` with `input` (started), `output` (completed), or `error` (failed) when applicable.
+
+### `cb_lifecycle_event`
+- **What it does**: Trigger function that emits `cb_notify` events on queue/task/flow creation and deletion. Attached to `cb_queues`, `cb_tasks`, and `cb_flows` via `AFTER INSERT OR DELETE` triggers.
+- **Topics emitted**: `catbird.{queue|task|flow}.{created|deleted}`
+- **Payload**: `{"queue"|"task"|"flow": name}`
+
+### `cb_worker_event`
+- **What it does**: Trigger function that emits `cb_notify` on worker deletion (stale cleanup or shutdown). Attached to `cb_workers` via `AFTER DELETE` trigger.
+- **Topics emitted**: `catbird.worker.stopped`
+- **Payload**: `{"worker_id": uuid}`
+
 **Utility helpers (advanced)**
-
-### `cb_parse_condition`
-- **What it does**: Canonical condition parser for all clients (go, python, js, ruby, java, etc.).
-- **Inputs**: `cb_parse_condition(expr text)`
-- **Returns**: `RETURNS jsonb`
-
-### `cb_parse_condition_value`
-- **What it does**: Parse a condition value string into appropriate JSON type.
-- **Inputs**: `cb_parse_condition_value(val_str text, op text)`
-- **Returns**: `RETURNS jsonb`
-
-### `cb_evaluate_condition`
-- **What it does**: Evaluate a parsed condition against step output.
-- **Inputs**: `cb_evaluate_condition(condition jsonb, output jsonb)`
-- **Returns**: `RETURNS boolean`
-
-### `cb_get_jsonb_field`
-- **What it does**: Extract a value from jsonb using a field path.
-- **Inputs**: `cb_get_jsonb_field(obj jsonb, field_path text)`
-- **Returns**: `RETURNS jsonb`
-
-### `cb_evaluate_condition_expr`
-- **What it does**: Wrapper that takes text condition.
-- **Inputs**: `cb_evaluate_condition_expr(condition_expr text, output jsonb)`
-- **Returns**: `RETURNS boolean`
-
-### `cb_cron_expand_spec`
-- **What it does**: Expand cron aliases/presets into canonical cron field format.
-- **Inputs**: `cb_cron_expand_spec(cron_spec text)`
-- **Returns**: `RETURNS text`
-
-### `cb_cron_parse_field`
-- **What it does**: Parse one cron field expression into the allowed integer values for that field.
-- **Inputs**: `cb_cron_parse_field(field text, min_value int, max_value int, allow_seven_as_sunday boolean DEFAULT false)`
-- **Returns**: `RETURNS int[]`
-
-### `cb_cron_matches`
-- **What it does**: Determine whether a timestamp matches a cron specification.
-- **Inputs**: `cb_cron_matches(cron_spec text, ts timestamptz)`
-- **Returns**: `RETURNS boolean`
 
 ### `cb_next_cron_tick`
 - **What it does**: Compute the next timestamp after `from_time` that matches a cron specification.
 - **Inputs**: `cb_next_cron_tick(cron_spec text, from_time timestamptz)`
 - **Returns**: `RETURNS timestamptz`
-
-### `cb_table_name`
-- **What it does**: Generate a PostgreSQL table name for queue/task/flow storage.
-- **Inputs**: `cb_table_name(name text, prefix text)`
-- **Returns**: `RETURNS text`

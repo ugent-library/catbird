@@ -40,7 +40,6 @@ func TestRunTaskQuery(t *testing.T) {
 		input{Value: "hello"},
 		RunTaskOpts{
 			ConcurrencyKey: "con-1",
-			IdempotencyKey: "idem-1",
 			VisibleAt:      time.Unix(1700000200, 0).UTC(),
 		},
 	)
@@ -48,7 +47,7 @@ func TestRunTaskQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedQuery := `SELECT * FROM cb_run_task(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, headers => $5, visible_at => $6, priority => $7);`
+	expectedQuery := `SELECT * FROM cb_run_task(name => $1, input => $2, concurrency_key => $3, headers => $4, visible_at => $5, priority => $6, expires_at => $7);`
 	if query != expectedQuery {
 		t.Fatalf("unexpected query: %s", query)
 	}
@@ -69,16 +68,12 @@ func TestRunTaskQuery(t *testing.T) {
 		t.Fatalf("unexpected concurrency key arg: %#v", args[2])
 	}
 
-	if gotIdempotencyKey, ok := args[3].(*string); !ok || gotIdempotencyKey == nil || *gotIdempotencyKey != "idem-1" {
-		t.Fatalf("unexpected idempotency key arg: %#v", args[3])
+	if gotHeaders, ok := args[3].(json.RawMessage); !ok || gotHeaders != nil {
+		t.Fatalf("expected nil headers arg: %#v", args[3])
 	}
 
-	if gotHeaders, ok := args[4].(json.RawMessage); !ok || gotHeaders != nil {
-		t.Fatalf("expected nil headers arg: %#v", args[4])
-	}
-
-	if gotVisibleAt, ok := args[5].(*time.Time); !ok || gotVisibleAt == nil || !gotVisibleAt.Equal(time.Unix(1700000200, 0).UTC()) {
-		t.Fatalf("unexpected visible_at arg: %#v", args[5])
+	if gotVisibleAt, ok := args[4].(*time.Time); !ok || gotVisibleAt == nil || !gotVisibleAt.Equal(time.Unix(1700000200, 0).UTC()) {
+		t.Fatalf("unexpected visible_at arg: %#v", args[4])
 	}
 
 	_, nilArgs, err := RunTaskQuery("test_task", input{Value: "hello"})
@@ -91,14 +86,11 @@ func TestRunTaskQuery(t *testing.T) {
 	if gotConcurrencyKey, ok := nilArgs[2].(*string); !ok || gotConcurrencyKey != nil {
 		t.Fatalf("expected nil *string concurrency key arg for nil opts, got %#v", nilArgs[2])
 	}
-	if gotIdempotencyKey, ok := nilArgs[3].(*string); !ok || gotIdempotencyKey != nil {
-		t.Fatalf("expected nil *string idempotency key arg for nil opts, got %#v", nilArgs[3])
+	if gotHeaders, ok := nilArgs[3].(json.RawMessage); !ok || gotHeaders != nil {
+		t.Fatalf("expected nil headers arg for nil opts, got %#v", nilArgs[3])
 	}
-	if gotHeaders, ok := nilArgs[4].(json.RawMessage); !ok || gotHeaders != nil {
-		t.Fatalf("expected nil headers arg for nil opts, got %#v", nilArgs[4])
-	}
-	if gotVisibleAt, ok := nilArgs[5].(*time.Time); !ok || gotVisibleAt != nil {
-		t.Fatalf("expected nil *time.Time visible_at arg for nil opts, got %#v", nilArgs[5])
+	if gotVisibleAt, ok := nilArgs[4].(*time.Time); !ok || gotVisibleAt != nil {
+		t.Fatalf("expected nil *time.Time visible_at arg for nil opts, got %#v", nilArgs[4])
 	}
 }
 
@@ -499,72 +491,6 @@ func TestTaskConcurrencyKey(t *testing.T) {
 	}
 }
 
-func TestTaskIdempotencyKey(t *testing.T) {
-	client := getTestClient(t)
-	taskName := fmt.Sprintf("idempotent_task_%d", time.Now().UnixNano())
-
-	task := NewTask(taskName).Do(func(ctx context.Context, in int) (int, error) {
-		time.Sleep(100 * time.Millisecond)
-		return in * 3, nil
-	})
-
-	worker := NewWorker(testPool).AddTask(task)
-	startTestWorker(t, worker)
-	time.Sleep(100 * time.Millisecond)
-
-	h1, err := client.RunTask(t.Context(), taskName, 7, RunTaskOpts{IdempotencyKey: "payment-456"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h1.ID == 0 {
-		t.Fatal("expected first run to be created")
-	}
-
-	h2, err := client.RunTask(t.Context(), taskName, 8, RunTaskOpts{IdempotencyKey: "payment-456"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h2.ID != h1.ID {
-		t.Fatalf("expected duplicate run to return existing ID %d, got %d", h1.ID, h2.ID)
-	}
-
-	var result1 int
-	ctx1, cancel1 := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel1()
-	if err := h1.WaitForOutput(ctx1, &result1); err != nil {
-		t.Fatalf("first run failed: %v", err)
-	}
-	if result1 != 21 {
-		t.Fatalf("expected 21, got %d", result1)
-	}
-
-	h3, err := client.RunTask(t.Context(), taskName, 9, RunTaskOpts{IdempotencyKey: "payment-456"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h3.ID != h1.ID {
-		t.Fatalf("expected duplicate run to return existing ID %d after completion, got %d", h1.ID, h3.ID)
-	}
-
-	h4, err := client.RunTask(t.Context(), taskName, 10, RunTaskOpts{IdempotencyKey: "payment-789"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h4.ID == h1.ID {
-		t.Fatal("expected new run with different IdempotencyKey to have different ID")
-	}
-
-	var result4 int
-	ctx4, cancel4 := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel4()
-	if err := h4.WaitForOutput(ctx4, &result4); err != nil {
-		t.Fatalf("fourth run failed: %v", err)
-	}
-	if result4 != 30 {
-		t.Fatalf("expected 30, got %d", result4)
-	}
-}
-
 func TestTaskDeduplicationRetryOnFailure(t *testing.T) {
 	client := getTestClient(t)
 
@@ -600,24 +526,6 @@ func TestTaskDeduplicationRetryOnFailure(t *testing.T) {
 	}
 	if h2.ID == h1.ID {
 		t.Fatal("expected retry to create new run after failure (different ID for ConcurrencyKey)")
-	}
-
-	h3, err := client.RunTask(t.Context(), taskName, RetryInput{Fail: true}, RunTaskOpts{IdempotencyKey: "idempotent-retry-1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h3.ID == 0 {
-		t.Fatal("expected first run to be created")
-	}
-
-	waitForTaskRunStatus(t, client, taskName, h3.ID, StatusFailed, 5*time.Second)
-
-	h4, err := client.RunTask(t.Context(), taskName, RetryInput{Fail: false}, RunTaskOpts{IdempotencyKey: "idempotent-retry-1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h4.ID == h3.ID {
-		t.Fatal("expected retry to create new run after failure (different ID for IdempotencyKey)")
 	}
 }
 
@@ -670,109 +578,6 @@ func TestFlowConcurrencyKey(t *testing.T) {
 	}
 	if h3.ID == h1.ID {
 		t.Fatal("expected new flow run to be created after completion (different ID)")
-	}
-}
-
-func TestFlowIdempotencyKey(t *testing.T) {
-	client := getTestClient(t)
-
-	flow := NewFlow("idempotent_flow")
-	flow.AddStep(NewStep("step1").Do(func(ctx context.Context, in int) (int, error) {
-		time.Sleep(100 * time.Millisecond)
-		return in * 5, nil
-	}))
-
-	worker := NewWorker(testPool).AddFlow(flow)
-	startTestWorker(t, worker)
-	time.Sleep(100 * time.Millisecond)
-
-	uniqueKey1 := fmt.Sprintf("order-999-%d", time.Now().UnixNano())
-	uniqueKey2 := fmt.Sprintf("order-888-%d", time.Now().UnixNano())
-
-	h1, err := client.RunFlow(t.Context(), "idempotent_flow", 10, RunFlowOpts{IdempotencyKey: uniqueKey1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h1.ID == 0 {
-		t.Fatal("expected first flow run to be created")
-	}
-
-	h2, err := client.RunFlow(t.Context(), "idempotent_flow", 20, RunFlowOpts{IdempotencyKey: uniqueKey1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h2.ID != h1.ID {
-		t.Fatalf("expected duplicate flow run to return existing ID %d, got %d", h1.ID, h2.ID)
-	}
-
-	var out1 int
-	ctx1, cancel1 := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel1()
-	if err := h1.WaitForOutput(ctx1, &out1); err != nil {
-		t.Fatalf("first run failed: %v", err)
-	}
-	if out1 != 50 {
-		t.Fatalf("expected 50, got %d", out1)
-	}
-
-	h3, err := client.RunFlow(t.Context(), "idempotent_flow", 30, RunFlowOpts{IdempotencyKey: uniqueKey1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h3.ID != h1.ID {
-		t.Fatalf("expected duplicate flow run to return existing ID %d after completion, got %d", h1.ID, h3.ID)
-	}
-
-	h4, err := client.RunFlow(t.Context(), "idempotent_flow", 40, RunFlowOpts{IdempotencyKey: uniqueKey2})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h4.ID == h1.ID {
-		t.Fatal("expected new flow run with different IdempotencyKey to have different ID")
-	}
-}
-
-func TestTaskBothKeysRejected(t *testing.T) {
-	client := getTestClient(t)
-	var err error
-	taskName := fmt.Sprintf("both_keys_task_%d", time.Now().UnixNano())
-
-	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
-		return in, nil
-	})
-
-	worker := NewWorker(testPool).AddTask(task)
-	startTestWorker(t, worker)
-	time.Sleep(100 * time.Millisecond)
-
-	_, err = client.RunTask(t.Context(), taskName, "input", RunTaskOpts{
-		ConcurrencyKey: "key1",
-		IdempotencyKey: "key2",
-	})
-	if err == nil {
-		t.Fatal("expected error when both ConcurrencyKey and IdempotencyKey are provided")
-	}
-}
-
-func TestFlowBothKeysRejected(t *testing.T) {
-	client := getTestClient(t)
-	var err error
-
-	flow := NewFlow("both_keys_flow")
-	flow.AddStep(NewStep("step1").Do(func(ctx context.Context, in string) (string, error) {
-		return in, nil
-	}))
-
-	worker := NewWorker(testPool).AddFlow(flow)
-	startTestWorker(t, worker)
-	time.Sleep(100 * time.Millisecond)
-
-	_, err = client.RunFlow(t.Context(), "both_keys_flow", "input", RunFlowOpts{
-		ConcurrencyKey: "key1",
-		IdempotencyKey: "key2",
-	})
-	if err == nil {
-		t.Fatal("expected error when both ConcurrencyKey and IdempotencyKey are provided")
 	}
 }
 

@@ -8,9 +8,9 @@ import (
 	"time"
 )
 
-// TestSchedulerIdempotencyKeyGeneration verifies that scheduled runs generate
-// stable, deterministic idempotency keys based on scheduled time.
-func TestSchedulerIdempotencyKeyGeneration(t *testing.T) {
+// TestSchedulerConcurrencyKeyGeneration verifies that scheduled runs generate
+// stable, deterministic concurrency keys based on scheduled time.
+func TestSchedulerConcurrencyKeyGeneration(t *testing.T) {
 	client := getTestClient(t)
 
 	task := NewTask("scheduled_task").
@@ -35,7 +35,7 @@ func TestSchedulerIdempotencyKeyGeneration(t *testing.T) {
 	key2 := fmt.Sprintf("schedule:%d", scheduledTime.Unix())
 
 	if key1 != key2 {
-		t.Fatalf("idempotency keys should be identical for same time: %s vs %s", key1, key2)
+		t.Fatalf("concurrency keys should be identical for same time: %s vs %s", key1, key2)
 	}
 
 	// Keys should have the expected format
@@ -48,7 +48,7 @@ func TestSchedulerIdempotencyKeyGeneration(t *testing.T) {
 }
 
 // TestSchedulerCrossWorkerDedup verifies that multiple workers generate
-// identical idempotency keys for the same scheduled execution, ensuring
+// identical concurrency keys for the same scheduled execution, ensuring
 // only one run is enqueued even when multiple workers run the same schedule.
 func TestSchedulerCrossWorkerDedup(t *testing.T) {
 	client := getTestClient(t)
@@ -73,11 +73,11 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 	// Simulate multiple workers by manually triggering scheduled runs with same time
 	// In real scenario, multiple workers would independently trigger cron at same time
 	scheduledTime := time.Now().UTC()
-	idempotencyKey := fmt.Sprintf("schedule:%d", scheduledTime.Unix())
+	concurrencyKey := fmt.Sprintf("schedule:%d", scheduledTime.Unix())
 
 	// First "worker" enqueues
 	h1, err := client.RunTask(t.Context(), "dedup_test_task", "test", RunTaskOpts{
-		IdempotencyKey: idempotencyKey,
+		ConcurrencyKey: concurrencyKey,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -85,7 +85,7 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 
 	// Second "worker" tries to enqueue same run (should be deduplicated)
 	h2, err := client.RunTask(t.Context(), "dedup_test_task", "test", RunTaskOpts{
-		IdempotencyKey: idempotencyKey,
+		ConcurrencyKey: concurrencyKey,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -93,7 +93,7 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 
 	// Should get same ID (dedup worked)
 	if h1.ID != h2.ID {
-		t.Fatalf("expected same run ID for identical idempotency key: %d vs %d", h1.ID, h2.ID)
+		t.Fatalf("expected same run ID for identical concurrency key: %d vs %d", h1.ID, h2.ID)
 	}
 
 	// Wait for task to complete
@@ -109,58 +109,6 @@ func TestSchedulerCrossWorkerDedup(t *testing.T) {
 	defer countMutex.Unlock()
 	if executionCount != 1 {
 		t.Fatalf("expected task to execute exactly once, but executed %d times", executionCount)
-	}
-}
-
-// TestSchedulerIdempotencyPersists verifies that after a scheduled run completes,
-// the idempotency key persists and prevents new runs with the same key.
-func TestSchedulerIdempotencyPersists(t *testing.T) {
-	client := getTestClient(t)
-
-	task := NewTask("persisted_dedup_task").Do(func(ctx context.Context, in int) (int, error) {
-		return in * 2, nil
-	})
-
-	worker := NewWorker(testPool).AddTask(task)
-	startTestWorker(t, worker)
-	time.Sleep(100 * time.Millisecond)
-
-	idempotencyKey := "schedule:1707759600"
-	h1, err := client.RunTask(t.Context(), "persisted_dedup_task", 21, RunTaskOpts{
-		IdempotencyKey: idempotencyKey,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Wait for completion
-	var result1 int
-	ctx1, cancel1 := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel1()
-	if err := h1.WaitForOutput(ctx1, &result1); err != nil {
-		t.Fatal(err)
-	}
-	if result1 != 42 {
-		t.Fatalf("expected 42, got %d", result1)
-	}
-
-	// Verify task run status is completed
-	run1, err := client.GetTaskRun(context.Background(), "persisted_dedup_task", h1.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if run1.Status != StatusCompleted {
-		t.Fatalf("expected status %s, got %s", StatusCompleted, run1.Status)
-	}
-
-	// Try to enqueue with same idempotency key (should be rejected)
-	// In idempotency mode, completed runs block new runs with same key
-	run, err := client.GetTaskRun(context.Background(), "persisted_dedup_task", h1.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if run.IdempotencyKey != idempotencyKey {
-		t.Fatalf("expected idempotency key %s, got %s", idempotencyKey, run.IdempotencyKey)
 	}
 }
 
@@ -198,8 +146,8 @@ func TestSchedulerUTCNormalization(t *testing.T) {
 	}
 }
 
-// TestSchedulerFlowIdempotency verifies scheduled flows also use idempotency dedup.
-func TestSchedulerFlowIdempotency(t *testing.T) {
+// TestSchedulerFlowConcurrencyKey verifies scheduled flows also use concurrency key dedup.
+func TestSchedulerFlowConcurrencyKey(t *testing.T) {
 	client := getTestClient(t)
 
 	flow := NewFlow("scheduled_flow")
@@ -217,18 +165,18 @@ func TestSchedulerFlowIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Enqueue two flows with same idempotency key
-	idempotencyKey := "schedule:1707759600"
+	// Enqueue two flows with same concurrency key
+	concurrencyKey := "schedule:1707759600"
 
 	h1, err := client.RunFlow(t.Context(), "scheduled_flow", "test1", RunFlowOpts{
-		IdempotencyKey: idempotencyKey,
+		ConcurrencyKey: concurrencyKey,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	h2, err := client.RunFlow(t.Context(), "scheduled_flow", "test2", RunFlowOpts{
-		IdempotencyKey: idempotencyKey,
+		ConcurrencyKey: concurrencyKey,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -236,7 +184,7 @@ func TestSchedulerFlowIdempotency(t *testing.T) {
 
 	// Should get same ID (dedup worked)
 	if h1.ID != h2.ID {
-		t.Fatalf("expected same flow run ID for identical idempotency key: %d vs %d", h1.ID, h2.ID)
+		t.Fatalf("expected same flow run ID for identical concurrency key: %d vs %d", h1.ID, h2.ID)
 	}
 
 	// Wait for completion

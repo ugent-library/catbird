@@ -11,14 +11,15 @@ import (
 // Message represents a message in a queue
 type Message struct {
 	ID             int64           `json:"id"`
-	IdempotencyKey string          `json:"idempotency_key,omitempty"`
+	ConcurrencyKey string          `json:"concurrency_key,omitempty"`
 	Topic          string          `json:"topic"`
-	Payload        json.RawMessage `json:"payload"`
+	Body           json.RawMessage `json:"body"`
 	Headers        json.RawMessage `json:"headers,omitempty"`
 	Priority       int             `json:"priority"`
 	Deliveries     int             `json:"deliveries"`
 	CreatedAt      time.Time       `json:"created_at"`
 	VisibleAt      time.Time       `json:"visible_at"`
+	ExpiresAt      time.Time       `json:"expires_at,omitzero"`
 }
 
 type QueueInfo struct {
@@ -74,16 +75,17 @@ func DeleteQueue(ctx context.Context, conn Conn, queueName string) (bool, error)
 
 type SendOpts struct {
 	Topic          string
-	IdempotencyKey string
+	ConcurrencyKey string
 	Headers        map[string]any
 	VisibleAt      time.Time
+	ExpiresAt      time.Time
 	Priority       int
 }
 
 // Send enqueues a message to the specified queue.
 // Pass no opts to use defaults.
-func Send(ctx context.Context, conn Conn, queueName string, payload any, opts ...SendOpts) error {
-	q, args, err := SendQuery(queueName, payload, opts...)
+func Send(ctx context.Context, conn Conn, queueName string, body any, opts ...SendOpts) error {
+	q, args, err := SendQuery(queueName, body, opts...)
 	if err != nil {
 		return err
 	}
@@ -94,13 +96,13 @@ func Send(ctx context.Context, conn Conn, queueName string, payload any, opts ..
 
 // SendQuery builds the SQL query and args for a Send operation.
 // Pass no opts to use defaults.
-func SendQuery(queueName string, payload any, opts ...SendOpts) (string, []any, error) {
+func SendQuery(queueName string, body any, opts ...SendOpts) (string, []any, error) {
 	var resolved SendOpts
 	if len(opts) > 0 {
 		resolved = opts[0]
 	}
 
-	b, err := json.Marshal(payload)
+	b, err := json.Marshal(body)
 	if err != nil {
 		return "", nil, err
 	}
@@ -109,24 +111,25 @@ func SendQuery(queueName string, payload any, opts ...SendOpts) (string, []any, 
 		return "", nil, err
 	}
 
-	q := `SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, headers => $5::jsonb, visible_at => $6, priority => $7);`
-	args := []any{queueName, b, ptrOrNil(resolved.Topic), ptrOrNil(resolved.IdempotencyKey), headers, ptrOrNil(resolved.VisibleAt), resolved.Priority}
+	q := `SELECT cb_send(queue => $1, body => $2, topic => $3, concurrency_key => $4, headers => $5::jsonb, visible_at => $6, priority => $7, expires_at => $8);`
+	args := []any{queueName, b, ptrOrNil(resolved.Topic), ptrOrNil(resolved.ConcurrencyKey), headers, ptrOrNil(resolved.VisibleAt), resolved.Priority, ptrOrNil(resolved.ExpiresAt)}
 
 	return q, args, nil
 }
 
 type SendManyOpts struct {
 	Topic           string
-	IdempotencyKeys []string
+	ConcurrencyKeys []string
 	Headers         []map[string]any
 	VisibleAt       time.Time
+	ExpiresAt       time.Time
 	Priority        int
 }
 
 // SendMany enqueues multiple messages to the specified queue.
 // Pass no opts to use defaults.
-func SendMany(ctx context.Context, conn Conn, queueName string, payloads []any, opts ...SendManyOpts) error {
-	q, args, err := SendManyQuery(queueName, payloads, opts...)
+func SendMany(ctx context.Context, conn Conn, queueName string, bodies []any, opts ...SendManyOpts) error {
+	q, args, err := SendManyQuery(queueName, bodies, opts...)
 	if err != nil {
 		return err
 	}
@@ -137,17 +140,17 @@ func SendMany(ctx context.Context, conn Conn, queueName string, payloads []any, 
 
 // SendManyQuery builds the SQL query and args for a SendMany operation.
 // Pass no opts to use defaults.
-func SendManyQuery(queueName string, payloads []any, opts ...SendManyOpts) (string, []any, error) {
+func SendManyQuery(queueName string, bodies []any, opts ...SendManyOpts) (string, []any, error) {
 	var resolved SendManyOpts
 	if len(opts) > 0 {
 		resolved = opts[0]
 	}
 
-	if payloads == nil {
-		payloads = []any{}
+	if bodies == nil {
+		bodies = []any{}
 	}
 
-	encodedPayloads, err := marshalPayloads(payloads)
+	encodedBodies, err := marshalBodies(bodies)
 	if err != nil {
 		return "", nil, err
 	}
@@ -156,8 +159,8 @@ func SendManyQuery(queueName string, payloads []any, opts ...SendManyOpts) (stri
 		return "", nil, err
 	}
 
-	q := `SELECT cb_send(queue => $1, payloads => $2, topic => $3, idempotency_keys => $4, headers => $5::jsonb[], visible_at => $6, priority => $7);`
-	args := []any{queueName, encodedPayloads, ptrOrNil(resolved.Topic), resolved.IdempotencyKeys, headers, ptrOrNil(resolved.VisibleAt), resolved.Priority}
+	q := `SELECT cb_send(queue => $1, bodies => $2, topic => $3, concurrency_keys => $4, headers => $5::jsonb[], visible_at => $6, priority => $7, expires_at => $8);`
+	args := []any{queueName, encodedBodies, ptrOrNil(resolved.Topic), resolved.ConcurrencyKeys, headers, ptrOrNil(resolved.VisibleAt), resolved.Priority, ptrOrNil(resolved.ExpiresAt)}
 
 	return q, args, nil
 }
@@ -184,21 +187,25 @@ func Unbind(ctx context.Context, conn Conn, queueName string, pattern string) (b
 }
 
 type PublishOpts struct {
-	IdempotencyKey string
+	ConcurrencyKey string
 	Headers        map[string]any
 	VisibleAt      *time.Time
+	ExpiresAt      time.Time
+	Priority       int
 }
 
 type PublishManyOpts struct {
-	IdempotencyKeys []string
+	ConcurrencyKeys []string
 	Headers         []map[string]any
 	VisibleAt       time.Time
+	ExpiresAt       time.Time
+	Priority        int
 }
 
 // Publish sends a message to topic-subscribed queues with options.
 // Pass no opts to use defaults.
-func Publish(ctx context.Context, conn Conn, topic string, payload any, opts ...PublishOpts) (int, error) {
-	q, args, err := PublishQuery(topic, payload, opts...)
+func Publish(ctx context.Context, conn Conn, topic string, body any, opts ...PublishOpts) (int, error) {
+	q, args, err := PublishQuery(topic, body, opts...)
 	if err != nil {
 		return 0, err
 	}
@@ -214,13 +221,13 @@ func Publish(ctx context.Context, conn Conn, topic string, payload any, opts ...
 
 // PublishQuery builds the SQL query and args for a Publish operation.
 // Pass no opts to use defaults.
-func PublishQuery(topic string, payload any, opts ...PublishOpts) (string, []any, error) {
+func PublishQuery(topic string, body any, opts ...PublishOpts) (string, []any, error) {
 	var resolved PublishOpts
 	if len(opts) > 0 {
 		resolved = opts[0]
 	}
 
-	b, err := json.Marshal(payload)
+	b, err := json.Marshal(body)
 	if err != nil {
 		return "", nil, err
 	}
@@ -229,16 +236,16 @@ func PublishQuery(topic string, payload any, opts ...PublishOpts) (string, []any
 		return "", nil, err
 	}
 
-	q := `SELECT cb_publish(topic => $1, payload => $2, idempotency_key => $3, headers => $4::jsonb, visible_at => $5);`
-	args := []any{topic, b, ptrOrNil(resolved.IdempotencyKey), headers, ptrOrNil(resolved.VisibleAt)}
+	q := `SELECT cb_publish(topic => $1, body => $2, concurrency_key => $3, headers => $4::jsonb, visible_at => $5, priority => $6, expires_at => $7);`
+	args := []any{topic, b, ptrOrNil(resolved.ConcurrencyKey), headers, ptrOrNil(resolved.VisibleAt), resolved.Priority, ptrOrNil(resolved.ExpiresAt)}
 
 	return q, args, nil
 }
 
 // PublishMany sends multiple messages to topic-subscribed queues with options.
 // Pass no opts to use defaults.
-func PublishMany(ctx context.Context, conn Conn, topic string, payloads []any, opts ...PublishManyOpts) (int, error) {
-	q, args, err := PublishManyQuery(topic, payloads, opts...)
+func PublishMany(ctx context.Context, conn Conn, topic string, bodies []any, opts ...PublishManyOpts) (int, error) {
+	q, args, err := PublishManyQuery(topic, bodies, opts...)
 	if err != nil {
 		return 0, err
 	}
@@ -254,17 +261,17 @@ func PublishMany(ctx context.Context, conn Conn, topic string, payloads []any, o
 
 // PublishManyQuery builds the SQL query and args for a PublishMany operation.
 // Pass no opts to use defaults.
-func PublishManyQuery(topic string, payloads []any, opts ...PublishManyOpts) (string, []any, error) {
+func PublishManyQuery(topic string, bodies []any, opts ...PublishManyOpts) (string, []any, error) {
 	var resolved PublishManyOpts
 	if len(opts) > 0 {
 		resolved = opts[0]
 	}
 
-	if payloads == nil {
-		payloads = []any{}
+	if bodies == nil {
+		bodies = []any{}
 	}
 
-	encodedPayloads, err := marshalPayloads(payloads)
+	encodedBodies, err := marshalBodies(bodies)
 	if err != nil {
 		return "", nil, err
 	}
@@ -273,8 +280,8 @@ func PublishManyQuery(topic string, payloads []any, opts ...PublishManyOpts) (st
 		return "", nil, err
 	}
 
-	q := `SELECT cb_publish(topic => $1, payloads => $2, idempotency_keys => $3, headers => $4::jsonb[], visible_at => $5);`
-	args := []any{topic, encodedPayloads, resolved.IdempotencyKeys, headers, ptrOrNil(resolved.VisibleAt)}
+	q := `SELECT cb_publish(topic => $1, bodies => $2, concurrency_keys => $3, headers => $4::jsonb[], visible_at => $5, priority => $6, expires_at => $7);`
+	args := []any{topic, encodedBodies, resolved.ConcurrencyKeys, headers, ptrOrNil(resolved.VisibleAt), resolved.Priority, ptrOrNil(resolved.ExpiresAt)}
 
 	return q, args, nil
 }
@@ -320,6 +327,44 @@ func ReadPoll(ctx context.Context, conn Conn, queueName string, quantity int, hi
 	}
 
 	return pgx.CollectRows(rows, scanCollectibleMessage)
+}
+
+// ReaderHandler processes a queue message. Return nil to ack (delete).
+// Return an error to nack (message becomes visible again after hideFor).
+type ReaderHandler = func(ctx context.Context, msg Message) error
+
+// Reader continuously reads messages from a queue and processes them with
+// the given handler. Blocks until ctx is cancelled. Mirrors the ReadPoll
+// signature: quantity and hideFor are required, polling behavior is optional.
+func Reader(ctx context.Context, conn Conn, queueName string, quantity int, hideFor time.Duration, handler ReaderHandler, opts ...ReadPollOpts) error {
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		msgs, err := ReadPoll(ctx, conn, queueName, quantity, hideFor, opts...)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// Brief pause before retry on transient errors.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+
+		for _, msg := range msgs {
+			if err := handler(ctx, msg); err != nil {
+				// Nack: message stays hidden, will become visible after hideFor.
+				continue
+			}
+			// Ack: delete the message.
+			_, _ = Delete(ctx, conn, queueName, msg.ID)
+		}
+	}
 }
 
 // Hide hides a single message from being read for the specified duration.
@@ -371,20 +416,22 @@ func scanCollectibleMessage(row pgx.CollectableRow) (Message, error) {
 func scanMessage(row pgx.Row) (Message, error) {
 	rec := Message{}
 
-	var idempotencyKey *string
+	var concurrencyKey *string
 	var topic *string
 	var headers *json.RawMessage
+	var expiresAt *time.Time
 
 	if err := row.Scan(
 		&rec.ID,
-		&idempotencyKey,
+		&concurrencyKey,
 		&topic,
-		&rec.Payload,
+		&rec.Body,
 		&headers,
 		&rec.Priority,
 		&rec.Deliveries,
 		&rec.CreatedAt,
 		&rec.VisibleAt,
+		&expiresAt,
 	); err != nil {
 		return rec, err
 	}
@@ -392,11 +439,14 @@ func scanMessage(row pgx.Row) (Message, error) {
 	if topic != nil {
 		rec.Topic = *topic
 	}
-	if idempotencyKey != nil {
-		rec.IdempotencyKey = *idempotencyKey
+	if concurrencyKey != nil {
+		rec.ConcurrencyKey = *concurrencyKey
 	}
 	if headers != nil {
 		rec.Headers = *headers
+	}
+	if expiresAt != nil {
+		rec.ExpiresAt = *expiresAt
 	}
 
 	return rec, nil

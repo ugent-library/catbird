@@ -21,7 +21,7 @@ func TestSendQuery(t *testing.T) {
 		payload{Value: "hello"},
 		SendOpts{
 			Topic:          "topic.a",
-			IdempotencyKey: "idem-1",
+			ConcurrencyKey: "idem-1",
 			VisibleAt:      visibleAt,
 		},
 	)
@@ -29,29 +29,29 @@ func TestSendQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedQuery := `SELECT cb_send(queue => $1, payload => $2, topic => $3, idempotency_key => $4, headers => $5::jsonb, visible_at => $6, priority => $7);`
+	expectedQuery := `SELECT cb_send(queue => $1, body => $2, topic => $3, concurrency_key => $4, headers => $5::jsonb, visible_at => $6, priority => $7, expires_at => $8);`
 	if query != expectedQuery {
 		t.Fatalf("unexpected query: %s", query)
 	}
 
-	if len(args) != 7 {
-		t.Fatalf("expected 7 args, got %d", len(args))
+	if len(args) != 8 {
+		t.Fatalf("expected 8 args, got %d", len(args))
 	}
 
 	if gotQueue, ok := args[0].(string); !ok || gotQueue != "test_queue" {
 		t.Fatalf("unexpected queue arg: %#v", args[0])
 	}
 
-	if gotPayload, ok := args[1].([]byte); !ok || string(gotPayload) != `{"value":"hello"}` {
-		t.Fatalf("unexpected payload arg: %#v", args[1])
+	if gotBody, ok := args[1].([]byte); !ok || string(gotBody) != `{"value":"hello"}` {
+		t.Fatalf("unexpected body arg: %#v", args[1])
 	}
 
 	if gotTopic, ok := args[2].(*string); !ok || gotTopic == nil || *gotTopic != "topic.a" {
 		t.Fatalf("unexpected topic arg: %#v", args[2])
 	}
 
-	if gotIdempotencyKey, ok := args[3].(*string); !ok || gotIdempotencyKey == nil || *gotIdempotencyKey != "idem-1" {
-		t.Fatalf("unexpected idempotency key arg: %#v", args[3])
+	if gotConcurrencyKey, ok := args[3].(*string); !ok || gotConcurrencyKey == nil || *gotConcurrencyKey != "idem-1" {
+		t.Fatalf("unexpected concurrency key arg: %#v", args[3])
 	}
 
 	if gotHeaders, ok := args[4].(json.RawMessage); !ok || gotHeaders != nil {
@@ -66,14 +66,14 @@ func TestSendQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nilArgs) != 7 {
-		t.Fatalf("expected 7 args for nil opts, got %d", len(nilArgs))
+	if len(nilArgs) != 8 {
+		t.Fatalf("expected 8 args for nil opts, got %d", len(nilArgs))
 	}
 	if gotTopic, ok := nilArgs[2].(*string); !ok || gotTopic != nil {
 		t.Fatalf("expected nil *string topic arg for nil opts, got %#v", nilArgs[2])
 	}
-	if gotIdempotencyKey, ok := nilArgs[3].(*string); !ok || gotIdempotencyKey != nil {
-		t.Fatalf("expected nil *string idempotency key arg for nil opts, got %#v", nilArgs[3])
+	if gotConcurrencyKey, ok := nilArgs[3].(*string); !ok || gotConcurrencyKey != nil {
+		t.Fatalf("expected nil *string concurrency key arg for nil opts, got %#v", nilArgs[3])
 	}
 	if gotHeaders, ok := nilArgs[4].(json.RawMessage); !ok || gotHeaders != nil {
 		t.Fatalf("expected nil headers arg for nil opts, got %#v", nilArgs[4])
@@ -94,7 +94,7 @@ func TestSendManyQuery(t *testing.T) {
 		[]any{payload{Value: "hello"}, payload{Value: "world"}},
 		SendManyOpts{
 			Topic:           "topic.a",
-			IdempotencyKeys: []string{"idem-a", "idem-b"},
+			ConcurrencyKeys: []string{"idem-a", "idem-b"},
 			VisibleAt:       visibleAt,
 		},
 	)
@@ -102,29 +102,29 @@ func TestSendManyQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedQuery := `SELECT cb_send(queue => $1, payloads => $2, topic => $3, idempotency_keys => $4, headers => $5::jsonb[], visible_at => $6, priority => $7);`
+	expectedQuery := `SELECT cb_send(queue => $1, bodies => $2, topic => $3, concurrency_keys => $4, headers => $5::jsonb[], visible_at => $6, priority => $7, expires_at => $8);`
 	if query != expectedQuery {
 		t.Fatalf("unexpected query: %s", query)
 	}
 
-	if len(args) != 7 {
-		t.Fatalf("expected 7 args, got %d", len(args))
+	if len(args) != 8 {
+		t.Fatalf("expected 8 args, got %d", len(args))
 	}
 
 	if gotQueue, ok := args[0].(string); !ok || gotQueue != "test_queue" {
 		t.Fatalf("unexpected queue arg: %#v", args[0])
 	}
 
-	if gotPayloads, ok := args[1].(pgtype.FlatArray[json.RawMessage]); !ok || len(gotPayloads) != 2 || string(gotPayloads[0]) != `{"value":"hello"}` || string(gotPayloads[1]) != `{"value":"world"}` {
-		t.Fatalf("unexpected payloads arg: %#v", args[1])
+	if gotBodies, ok := args[1].(pgtype.FlatArray[json.RawMessage]); !ok || len(gotBodies) != 2 || string(gotBodies[0]) != `{"value":"hello"}` || string(gotBodies[1]) != `{"value":"world"}` {
+		t.Fatalf("unexpected bodies arg: %#v", args[1])
 	}
 
 	if gotTopic, ok := args[2].(*string); !ok || gotTopic == nil || *gotTopic != "topic.a" {
 		t.Fatalf("unexpected topic arg: %#v", args[2])
 	}
 
-	if gotIdempotencyKeys, ok := args[4-1].([]string); !ok || len(gotIdempotencyKeys) != 2 || gotIdempotencyKeys[0] != "idem-a" || gotIdempotencyKeys[1] != "idem-b" {
-		t.Fatalf("unexpected idempotency_keys arg: %#v", args[3])
+	if gotConcurrencyKeys, ok := args[4-1].([]string); !ok || len(gotConcurrencyKeys) != 2 || gotConcurrencyKeys[0] != "idem-a" || gotConcurrencyKeys[1] != "idem-b" {
+		t.Fatalf("unexpected concurrency_keys arg: %#v", args[3])
 	}
 
 	if gotHeaders, ok := args[4].(pgtype.FlatArray[json.RawMessage]); !ok || gotHeaders != nil {
@@ -139,17 +139,17 @@ func TestSendManyQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nilArgs) != 7 {
-		t.Fatalf("expected 7 args for nil opts, got %d", len(nilArgs))
+	if len(nilArgs) != 8 {
+		t.Fatalf("expected 8 args for nil opts, got %d", len(nilArgs))
 	}
-	if gotPayloads, ok := nilArgs[1].(pgtype.FlatArray[json.RawMessage]); !ok || len(gotPayloads) != 0 {
-		t.Fatalf("expected [] payloads for nil input, got %#v", nilArgs[1])
+	if gotBodies, ok := nilArgs[1].(pgtype.FlatArray[json.RawMessage]); !ok || len(gotBodies) != 0 {
+		t.Fatalf("expected [] bodies for nil input, got %#v", nilArgs[1])
 	}
 	if gotTopic, ok := nilArgs[2].(*string); !ok || gotTopic != nil {
 		t.Fatalf("expected nil *string topic arg for nil opts, got %#v", nilArgs[2])
 	}
-	if gotIdempotencyKeys, ok := nilArgs[3].([]string); !ok || gotIdempotencyKeys != nil {
-		t.Fatalf("expected nil []string idempotency_keys arg for nil opts, got %#v", nilArgs[3])
+	if gotConcurrencyKeys, ok := nilArgs[3].([]string); !ok || gotConcurrencyKeys != nil {
+		t.Fatalf("expected nil []string concurrency_keys arg for nil opts, got %#v", nilArgs[3])
 	}
 	if gotHeaders, ok := nilArgs[4].(pgtype.FlatArray[json.RawMessage]); !ok || gotHeaders != nil {
 		t.Fatalf("expected nil headers arg for nil opts, got %#v", nilArgs[4])
@@ -169,7 +169,7 @@ func TestPublishQuery(t *testing.T) {
 		"topic.test",
 		payload{Value: "world"},
 		PublishOpts{
-			IdempotencyKey: "idem-2",
+			ConcurrencyKey: "idem-2",
 			VisibleAt:      &visibleAt,
 		},
 	)
@@ -177,25 +177,25 @@ func TestPublishQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedQuery := `SELECT cb_publish(topic => $1, payload => $2, idempotency_key => $3, headers => $4::jsonb, visible_at => $5);`
+	expectedQuery := `SELECT cb_publish(topic => $1, body => $2, concurrency_key => $3, headers => $4::jsonb, visible_at => $5, priority => $6, expires_at => $7);`
 	if query != expectedQuery {
 		t.Fatalf("unexpected query: %s", query)
 	}
 
-	if len(args) != 5 {
-		t.Fatalf("expected 5 args, got %d", len(args))
+	if len(args) != 7 {
+		t.Fatalf("expected 7 args, got %d", len(args))
 	}
 
 	if gotTopic, ok := args[0].(string); !ok || gotTopic != "topic.test" {
 		t.Fatalf("unexpected topic arg: %#v", args[0])
 	}
 
-	if gotPayload, ok := args[1].([]byte); !ok || string(gotPayload) != `{"value":"world"}` {
-		t.Fatalf("unexpected payload arg: %#v", args[1])
+	if gotBody, ok := args[1].([]byte); !ok || string(gotBody) != `{"value":"world"}` {
+		t.Fatalf("unexpected body arg: %#v", args[1])
 	}
 
-	if gotIdempotencyKey, ok := args[2].(*string); !ok || gotIdempotencyKey == nil || *gotIdempotencyKey != "idem-2" {
-		t.Fatalf("unexpected idempotency key arg: %#v", args[2])
+	if gotConcurrencyKey, ok := args[2].(*string); !ok || gotConcurrencyKey == nil || *gotConcurrencyKey != "idem-2" {
+		t.Fatalf("unexpected concurrency key arg: %#v", args[2])
 	}
 
 	if gotHeaders, ok := args[3].(json.RawMessage); !ok || gotHeaders != nil {
@@ -206,15 +206,19 @@ func TestPublishQuery(t *testing.T) {
 		t.Fatalf("unexpected visible_at arg: %#v", args[4])
 	}
 
+	if gotPriority, ok := args[5].(int); !ok || gotPriority != 0 {
+		t.Fatalf("unexpected priority arg: %#v", args[5])
+	}
+
 	_, nilArgs, err := PublishQuery("topic.test", payload{Value: "world"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nilArgs) != 5 {
-		t.Fatalf("expected 5 args for nil opts, got %d", len(nilArgs))
+	if len(nilArgs) != 7 {
+		t.Fatalf("expected 7 args for nil opts, got %d", len(nilArgs))
 	}
-	if gotIdempotencyKey, ok := nilArgs[2].(*string); !ok || gotIdempotencyKey != nil {
-		t.Fatalf("expected nil *string idempotency key arg for nil opts, got %#v", nilArgs[2])
+	if gotConcurrencyKey, ok := nilArgs[2].(*string); !ok || gotConcurrencyKey != nil {
+		t.Fatalf("expected nil *string concurrency key arg for nil opts, got %#v", nilArgs[2])
 	}
 	if gotHeaders, ok := nilArgs[3].(json.RawMessage); !ok || gotHeaders != nil {
 		t.Fatalf("expected nil headers arg for nil opts, got %#v", nilArgs[3])
@@ -233,31 +237,31 @@ func TestPublishManyQuery(t *testing.T) {
 	query, args, err := PublishManyQuery(
 		"topic.test",
 		[]any{payload{Value: "alpha"}, payload{Value: "beta"}},
-		PublishManyOpts{IdempotencyKeys: []string{"idem-1", "idem-2"}, VisibleAt: visibleAt},
+		PublishManyOpts{ConcurrencyKeys: []string{"idem-1", "idem-2"}, VisibleAt: visibleAt},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	expectedQuery := `SELECT cb_publish(topic => $1, payloads => $2, idempotency_keys => $3, headers => $4::jsonb[], visible_at => $5);`
+	expectedQuery := `SELECT cb_publish(topic => $1, bodies => $2, concurrency_keys => $3, headers => $4::jsonb[], visible_at => $5, priority => $6, expires_at => $7);`
 	if query != expectedQuery {
 		t.Fatalf("unexpected query: %s", query)
 	}
 
-	if len(args) != 5 {
-		t.Fatalf("expected 5 args, got %d", len(args))
+	if len(args) != 7 {
+		t.Fatalf("expected 7 args, got %d", len(args))
 	}
 
 	if gotTopic, ok := args[0].(string); !ok || gotTopic != "topic.test" {
 		t.Fatalf("unexpected topic arg: %#v", args[0])
 	}
 
-	if gotPayloads, ok := args[1].(pgtype.FlatArray[json.RawMessage]); !ok || len(gotPayloads) != 2 || string(gotPayloads[0]) != `{"value":"alpha"}` || string(gotPayloads[1]) != `{"value":"beta"}` {
-		t.Fatalf("unexpected payloads arg: %#v", args[1])
+	if gotBodies, ok := args[1].(pgtype.FlatArray[json.RawMessage]); !ok || len(gotBodies) != 2 || string(gotBodies[0]) != `{"value":"alpha"}` || string(gotBodies[1]) != `{"value":"beta"}` {
+		t.Fatalf("unexpected bodies arg: %#v", args[1])
 	}
 
-	if gotIdempotencyKeys, ok := args[2].([]string); !ok || len(gotIdempotencyKeys) != 2 || gotIdempotencyKeys[0] != "idem-1" || gotIdempotencyKeys[1] != "idem-2" {
-		t.Fatalf("unexpected idempotency_keys arg: %#v", args[2])
+	if gotConcurrencyKeys, ok := args[2].([]string); !ok || len(gotConcurrencyKeys) != 2 || gotConcurrencyKeys[0] != "idem-1" || gotConcurrencyKeys[1] != "idem-2" {
+		t.Fatalf("unexpected concurrency_keys arg: %#v", args[2])
 	}
 
 	if gotHeaders, ok := args[3].(pgtype.FlatArray[json.RawMessage]); !ok || gotHeaders != nil {
@@ -268,18 +272,22 @@ func TestPublishManyQuery(t *testing.T) {
 		t.Fatalf("unexpected visible_at arg: %#v", args[4])
 	}
 
+	if gotPriority, ok := args[5].(int); !ok || gotPriority != 0 {
+		t.Fatalf("unexpected priority arg: %#v", args[5])
+	}
+
 	_, nilArgs, err := PublishManyQuery("topic.test", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nilArgs) != 5 {
-		t.Fatalf("expected 5 args for nil opts, got %d", len(nilArgs))
+	if len(nilArgs) != 7 {
+		t.Fatalf("expected 7 args for nil opts, got %d", len(nilArgs))
 	}
-	if gotPayloads, ok := nilArgs[1].(pgtype.FlatArray[json.RawMessage]); !ok || len(gotPayloads) != 0 {
-		t.Fatalf("expected [] payloads for nil input, got %#v", nilArgs[1])
+	if gotBodies, ok := nilArgs[1].(pgtype.FlatArray[json.RawMessage]); !ok || len(gotBodies) != 0 {
+		t.Fatalf("expected [] bodies for nil input, got %#v", nilArgs[1])
 	}
-	if gotIdempotencyKeys, ok := nilArgs[2].([]string); !ok || gotIdempotencyKeys != nil {
-		t.Fatalf("expected nil []string idempotency_keys arg for nil opts, got %#v", nilArgs[2])
+	if gotConcurrencyKeys, ok := nilArgs[2].([]string); !ok || gotConcurrencyKeys != nil {
+		t.Fatalf("expected nil []string concurrency_keys arg for nil opts, got %#v", nilArgs[2])
 	}
 	if gotHeaders, ok := nilArgs[3].(pgtype.FlatArray[json.RawMessage]); !ok || gotHeaders != nil {
 		t.Fatalf("expected nil headers arg for nil opts, got %#v", nilArgs[3])
@@ -338,7 +346,7 @@ func TestQueueSendAndRead(t *testing.T) {
 	}
 
 	var received TestPayload
-	err = json.Unmarshal(messages[0].Payload, &received)
+	err = json.Unmarshal(messages[0].Body, &received)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +439,7 @@ func TestQueueSendManyAndRead(t *testing.T) {
 	}
 
 	var first TestPayload
-	err = json.Unmarshal(messages[0].Payload, &first)
+	err = json.Unmarshal(messages[0].Body, &first)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +448,7 @@ func TestQueueSendManyAndRead(t *testing.T) {
 	}
 
 	var second TestPayload
-	err = json.Unmarshal(messages[1].Payload, &second)
+	err = json.Unmarshal(messages[1].Body, &second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,7 +457,7 @@ func TestQueueSendManyAndRead(t *testing.T) {
 	}
 }
 
-func TestQueueSendManyIdempotencyLengthMismatch(t *testing.T) {
+func TestQueueSendManyConcurrencyLengthMismatch(t *testing.T) {
 	client := getTestClient(t)
 
 	queueName := "send_many_mismatch_queue"
@@ -462,10 +470,10 @@ func TestQueueSendManyIdempotencyLengthMismatch(t *testing.T) {
 		t.Context(),
 		queueName,
 		[]any{"a", "b"},
-		SendManyOpts{IdempotencyKeys: []string{"only-one"}},
+		SendManyOpts{ConcurrencyKeys: []string{"only-one"}},
 	)
 	if err == nil {
-		t.Fatal("expected SendMany to fail when idempotency key count does not match payload count")
+		t.Fatal("expected SendMany to fail when concurrency key count does not match body count")
 	}
 }
 
@@ -548,7 +556,7 @@ func TestQueuePublishMany(t *testing.T) {
 	}
 
 	var first Event
-	err = json.Unmarshal(messages[0].Payload, &first)
+	err = json.Unmarshal(messages[0].Body, &first)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -557,7 +565,7 @@ func TestQueuePublishMany(t *testing.T) {
 	}
 
 	var second Event
-	err = json.Unmarshal(messages[1].Payload, &second)
+	err = json.Unmarshal(messages[1].Body, &second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -566,7 +574,7 @@ func TestQueuePublishMany(t *testing.T) {
 	}
 }
 
-func TestQueuePublishManyIdempotencyLengthMismatch(t *testing.T) {
+func TestQueuePublishManyConcurrencyLengthMismatch(t *testing.T) {
 	client := getTestClient(t)
 
 	queueName := "publish_many_mismatch_queue"
@@ -583,10 +591,10 @@ func TestQueuePublishManyIdempotencyLengthMismatch(t *testing.T) {
 		t.Context(),
 		"event_topic_mismatch",
 		[]any{"a", "b"},
-		PublishManyOpts{IdempotencyKeys: []string{"only-one"}},
+		PublishManyOpts{ConcurrencyKeys: []string{"only-one"}},
 	)
 	if err == nil {
-		t.Fatal("expected PublishMany to fail when idempotency key count does not match payload count")
+		t.Fatal("expected PublishMany to fail when concurrency key count does not match body count")
 	}
 }
 
@@ -603,7 +611,7 @@ func TestQueueHeadersMustBeJSONObject(t *testing.T) {
 
 	_, err := client.Conn.Exec(
 		t.Context(),
-		`SELECT cb_send(queue => $1, payload => '{}'::jsonb, headers => '[]'::jsonb);`,
+		`SELECT cb_send(queue => $1, body => '{}'::jsonb, headers => '[]'::jsonb);`,
 		queueName,
 	)
 	if err == nil {
@@ -615,7 +623,7 @@ func TestQueueHeadersMustBeJSONObject(t *testing.T) {
 
 	_, err = client.Conn.Exec(
 		t.Context(),
-		`SELECT cb_publish(topic => $1, payload => '{}'::jsonb, headers => '"bad"'::jsonb);`,
+		`SELECT cb_publish(topic => $1, body => '{}'::jsonb, headers => '"bad"'::jsonb);`,
 		"headers.validation.topic",
 	)
 	if err == nil {

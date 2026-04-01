@@ -39,7 +39,7 @@ type scheduleOpts struct {
 // ScheduleOpt configures scheduled task/flow behavior.
 type ScheduleOpt func(*scheduleOpts)
 
-// WithInput sets static input payload for scheduled task/flow runs.
+// WithInput sets static input body for scheduled task/flow runs.
 func WithInput(input any) ScheduleOpt {
 	return func(opts *scheduleOpts) {
 		opts.input = input
@@ -205,17 +205,17 @@ func wrapNotDefinedErr(err error, resourceType, name string) error {
 	return err
 }
 
-func marshalPayloads(payloads []any) (pgtype.FlatArray[json.RawMessage], error) {
-	encodedPayloads := make(pgtype.FlatArray[json.RawMessage], 0, len(payloads))
-	for _, payload := range payloads {
-		b, err := json.Marshal(payload)
+func marshalBodies(bodies []any) (pgtype.FlatArray[json.RawMessage], error) {
+	encodedBodies := make(pgtype.FlatArray[json.RawMessage], 0, len(bodies))
+	for _, body := range bodies {
+		b, err := json.Marshal(body)
 		if err != nil {
 			return nil, err
 		}
-		encodedPayloads = append(encodedPayloads, json.RawMessage(b))
+		encodedBodies = append(encodedBodies, json.RawMessage(b))
 	}
 
-	return encodedPayloads, nil
+	return encodedBodies, nil
 }
 
 // marshalOptionalHeaders marshals an optional headers object to JSON.

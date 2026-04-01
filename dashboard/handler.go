@@ -238,10 +238,10 @@ func (a *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 
 	queue := r.FormValue("queue")
 	topic := r.FormValue("topic")
-	payload := r.FormValue("payload")
+	body := r.FormValue("body")
 
-	if payload == "" {
-		payload = "{}"
+	if body == "" {
+		body = "{}"
 	}
 
 	opts := catbird.SendOpts{}
@@ -249,7 +249,7 @@ func (a *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		opts.Topic = topic
 	}
 
-	err := a.client.Send(r.Context(), queue, json.RawMessage(payload), opts)
+	err := a.client.Send(r.Context(), queue, json.RawMessage(body), opts)
 	if err != nil {
 		a.queues.ExecuteTemplate(w, "send_message_error", struct {
 			Error string

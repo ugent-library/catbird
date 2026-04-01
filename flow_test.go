@@ -45,7 +45,6 @@ func TestRunFlowQuery(t *testing.T) {
 		input{Value: "hello"},
 		RunFlowOpts{
 			ConcurrencyKey: "con-1",
-			IdempotencyKey: "idem-1",
 			VisibleAt:      time.Unix(1700000300, 0).UTC(),
 		},
 	)
@@ -53,7 +52,7 @@ func TestRunFlowQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedQuery := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, headers => $5, visible_at => $6, priority => $7);`
+	expectedQuery := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, headers => $4, visible_at => $5, priority => $6, expires_at => $7);`
 	if query != expectedQuery {
 		t.Fatalf("unexpected query: %s", query)
 	}
@@ -74,16 +73,12 @@ func TestRunFlowQuery(t *testing.T) {
 		t.Fatalf("unexpected concurrency key arg: %#v", args[2])
 	}
 
-	if gotIdempotencyKey, ok := args[3].(*string); !ok || gotIdempotencyKey == nil || *gotIdempotencyKey != "idem-1" {
-		t.Fatalf("unexpected idempotency key arg: %#v", args[3])
+	if gotHeaders, ok := args[3].(json.RawMessage); !ok || gotHeaders != nil {
+		t.Fatalf("expected nil headers arg: %#v", args[3])
 	}
 
-	if gotHeaders, ok := args[4].(json.RawMessage); !ok || gotHeaders != nil {
-		t.Fatalf("expected nil headers arg: %#v", args[4])
-	}
-
-	if gotVisibleAt, ok := args[5].(*time.Time); !ok || gotVisibleAt == nil || !gotVisibleAt.Equal(time.Unix(1700000300, 0).UTC()) {
-		t.Fatalf("unexpected visible_at arg: %#v", args[5])
+	if gotVisibleAt, ok := args[4].(*time.Time); !ok || gotVisibleAt == nil || !gotVisibleAt.Equal(time.Unix(1700000300, 0).UTC()) {
+		t.Fatalf("unexpected visible_at arg: %#v", args[4])
 	}
 
 	_, nilArgs, err := RunFlowQuery("test_flow", input{Value: "hello"})
@@ -96,14 +91,11 @@ func TestRunFlowQuery(t *testing.T) {
 	if gotConcurrencyKey, ok := nilArgs[2].(*string); !ok || gotConcurrencyKey != nil {
 		t.Fatalf("expected nil *string concurrency key arg for nil opts, got %#v", nilArgs[2])
 	}
-	if gotIdempotencyKey, ok := nilArgs[3].(*string); !ok || gotIdempotencyKey != nil {
-		t.Fatalf("expected nil *string idempotency key arg for nil opts, got %#v", nilArgs[3])
+	if gotHeaders, ok := nilArgs[3].(json.RawMessage); !ok || gotHeaders != nil {
+		t.Fatalf("expected nil headers arg for nil opts, got %#v", nilArgs[3])
 	}
-	if gotHeaders, ok := nilArgs[4].(json.RawMessage); !ok || gotHeaders != nil {
-		t.Fatalf("expected nil headers arg for nil opts, got %#v", nilArgs[4])
-	}
-	if gotVisibleAt, ok := nilArgs[5].(*time.Time); !ok || gotVisibleAt != nil {
-		t.Fatalf("expected nil *time.Time visible_at arg for nil opts, got %#v", nilArgs[5])
+	if gotVisibleAt, ok := nilArgs[4].(*time.Time); !ok || gotVisibleAt != nil {
+		t.Fatalf("expected nil *time.Time visible_at arg for nil opts, got %#v", nilArgs[4])
 	}
 }
 
@@ -190,8 +182,7 @@ func TestFlowRunDelayedVisibleAt(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	h, err := client.RunFlow(t.Context(), flowName, "input", RunFlowOpts{
-		VisibleAt:      time.Now().Add(3 * time.Second),
-		IdempotencyKey: "idem-1",
+		VisibleAt: time.Now().Add(3 * time.Second),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1823,7 +1814,7 @@ func testFlowName(t *testing.T, base string) string {
 	return fmt.Sprintf("%s_%s", base, suffix)
 }
 
-// TestConditionEvaluation tests the cb_evaluate_condition() PostgreSQL function directly
+// TestConditionEvaluation tests the _cb_evaluate_condition() PostgreSQL function directly
 func TestConditionEvaluation(t *testing.T) {
 	client := getTestClient(t)
 
@@ -2004,7 +1995,7 @@ func TestConditionEvaluation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var result bool
 
-			query := `SELECT cb_evaluate_condition_expr($1, $2::jsonb)`
+			query := `SELECT __cb_evaluate_condition_expr($1, $2::jsonb)`
 			err := client.Conn.QueryRow(t.Context(), query, tt.condition, tt.payload).Scan(&result)
 
 			if tt.wantErr {
@@ -2019,7 +2010,7 @@ func TestConditionEvaluation(t *testing.T) {
 			}
 
 			if result != tt.want {
-				t.Errorf("cb_evaluate_condition_expr(%q, %s) = %v, want %v",
+				t.Errorf("__cb_evaluate_condition_expr(%q, %s) = %v, want %v",
 					tt.condition, tt.payload, result, tt.want)
 			}
 		})

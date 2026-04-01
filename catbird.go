@@ -23,6 +23,7 @@ const (
 	StatusFailed                 = "failed"
 	StatusSkipped                = "skipped"
 	StatusCanceled               = "canceled"
+	StatusExpired                = "expired"
 )
 
 var (
@@ -61,11 +62,14 @@ type Conn interface {
 
 // GCInfo is the garbage collection report returned by cb_gc().
 type GCInfo struct {
-	ExpiredQueuesDeleted  int `json:"expired_queues_deleted"`
-	StaleWorkersDeleted   int `json:"stale_workers_deleted"`
-	StaleWireNodesDeleted int `json:"stale_wire_nodes_deleted"`
-	TaskRunsPurged        int `json:"task_runs_purged"`
-	FlowRunsPurged        int `json:"flow_runs_purged"`
+	ExpiredQueuesDeleted   int `json:"expired_queues_deleted"`
+	ExpiredMessagesDeleted int `json:"expired_messages_deleted"`
+	ExpiredTaskRuns        int `json:"expired_task_runs"`
+	ExpiredFlowRuns        int `json:"expired_flow_runs"`
+	StaleWorkersDeleted    int `json:"stale_workers_deleted"`
+	StaleWireNodesDeleted  int `json:"stale_wire_nodes_deleted"`
+	TaskRunsPurged         int `json:"task_runs_purged"`
+	FlowRunsPurged         int `json:"flow_runs_purged"`
 }
 
 // GC runs garbage collection to clean up expired queues and stale workers.

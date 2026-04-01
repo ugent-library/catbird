@@ -39,13 +39,13 @@ func (c *Client) DeleteQueue(ctx context.Context, queueName string) (bool, error
 }
 
 // Send enqueues a message to the specified queue.
-func (c *Client) Send(ctx context.Context, queueName string, payload any, opts ...SendOpts) error {
-	return Send(ctx, c.Conn, queueName, payload, opts...)
+func (c *Client) Send(ctx context.Context, queueName string, body any, opts ...SendOpts) error {
+	return Send(ctx, c.Conn, queueName, body, opts...)
 }
 
 // SendMany enqueues multiple messages to the specified queue.
-func (c *Client) SendMany(ctx context.Context, queueName string, payloads []any, opts ...SendManyOpts) error {
-	return SendMany(ctx, c.Conn, queueName, payloads, opts...)
+func (c *Client) SendMany(ctx context.Context, queueName string, bodies []any, opts ...SendManyOpts) error {
+	return SendMany(ctx, c.Conn, queueName, bodies, opts...)
 }
 
 // Bind subscribes a queue to a topic pattern.
@@ -61,13 +61,13 @@ func (c *Client) Unbind(ctx context.Context, queueName string, pattern string) (
 }
 
 // Publish sends a message to all queues subscribed to the specified topic.
-func (c *Client) Publish(ctx context.Context, topic string, payload any, opts ...PublishOpts) (int, error) {
-	return Publish(ctx, c.Conn, topic, payload, opts...)
+func (c *Client) Publish(ctx context.Context, topic string, body any, opts ...PublishOpts) (int, error) {
+	return Publish(ctx, c.Conn, topic, body, opts...)
 }
 
 // PublishMany sends multiple messages to all queues subscribed to the specified topic.
-func (c *Client) PublishMany(ctx context.Context, topic string, payloads []any, opts ...PublishManyOpts) (int, error) {
-	return PublishMany(ctx, c.Conn, topic, payloads, opts...)
+func (c *Client) PublishMany(ctx context.Context, topic string, bodies []any, opts ...PublishManyOpts) (int, error) {
+	return PublishMany(ctx, c.Conn, topic, bodies, opts...)
 }
 
 // Read reads up to quantity messages from the queue, hiding them from other
@@ -212,9 +212,39 @@ func (c *Client) ClearFlowRuns(ctx context.Context, flowName string) (int, error
 	return ClearFlowRuns(ctx, c.Conn, flowName)
 }
 
+// BindTask subscribes a task to a topic pattern.
+// When a message is published to a matching topic, a task run is created
+// with the message body as input.
+func (c *Client) BindTask(ctx context.Context, taskName string, pattern string) error {
+	return BindTask(ctx, c.Conn, taskName, pattern)
+}
+
+// UnbindTask removes a task trigger binding.
+func (c *Client) UnbindTask(ctx context.Context, taskName string, pattern string) (bool, error) {
+	return UnbindTask(ctx, c.Conn, taskName, pattern)
+}
+
+// BindFlow subscribes a flow to a topic pattern.
+// When a message is published to a matching topic, a flow run is created
+// with the message body as input.
+func (c *Client) BindFlow(ctx context.Context, flowName string, pattern string) error {
+	return BindFlow(ctx, c.Conn, flowName, pattern)
+}
+
+// UnbindFlow removes a flow trigger binding.
+func (c *Client) UnbindFlow(ctx context.Context, flowName string, pattern string) (bool, error) {
+	return UnbindFlow(ctx, c.Conn, flowName, pattern)
+}
+
 // Notify sends an ephemeral notification via pg NOTIFY.
 func (c *Client) Notify(ctx context.Context, topic, message string, opts ...NotifyOpts) error {
 	return Notify(ctx, c.Conn, topic, message, opts...)
+}
+
+// Reader continuously reads messages from a queue and processes them.
+// Blocks until ctx is cancelled.
+func (c *Client) Reader(ctx context.Context, queueName string, quantity int, hideFor time.Duration, handler ReaderHandler, opts ...ReadPollOpts) error {
+	return Reader(ctx, c.Conn, queueName, quantity, hideFor, handler, opts...)
 }
 
 // GC runs garbage collection and returns a summary report.

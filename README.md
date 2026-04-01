@@ -19,6 +19,7 @@ A PostgreSQL-powered message queue and task execution engine. Catbird brings rel
 - **Persistence and auditability**: queues, runs, and results live in PostgreSQL.
 - **Resiliency baked in**: retries, backoff, optional circuit breakers.
 - **Operational UX**: web dashboard and tui for runs, queues, and workers.
+- **Optional real-time layer**: opt-in pub/sub with SSE support for pushing events to browsers.
 
 <p align="center">
   <img src="assets/screenshots/dashboard-flows.png" alt="Flow Visualization" width="800" />
@@ -32,12 +33,19 @@ ctx := context.Background()
 // Queues
 err := client.CreateQueue(ctx, "my-queue")
 err = client.Send(ctx, "my-queue", map[string]any{"user_id": 123}, catbird.SendOpts{
-    IdempotencyKey: "user-123",
+    ConcurrencyKey: "user-123",
 })
 messages, err := client.Read(ctx, "my-queue", 10, 30*time.Second)
 for _, msg := range messages {
     err = client.Delete(ctx, "my-queue", msg.ID)
 }
+
+// Continuous reader: loops ReadPoll, ack on nil, nack on error
+go client.Reader(ctx, "my-queue", 10, 30*time.Second,
+    func(ctx context.Context, msg catbird.Message) error {
+        return nil // ack (deletes message)
+    },
+)
 
 // Delayed send
 client.Send(ctx, "my_queue", map[string]any{"job": "cleanup"}, catbird.SendOpts{VisibleAt: time.Now().Add(30 * time.Minute)})
@@ -88,47 +96,25 @@ err = client.CreateFlow(ctx, flowB)
 taskHandle, err := catbird.RunTask(ctx, tx, "send-email", "hello")
 ```
 
-## Deduplication Strategies
+## Deduplication
 
-Catbird supports two deduplication strategies for tasks and flows.
-
-### ConcurrencyKey (Temporary)
-
-Prevents overlapping runs; allows re-runs after completion or failure.
-
-### IdempotencyKey (Permanent)
-
-Ensures exactly-once execution; blocks reuse after completion.
+Catbird uses a `ConcurrencyKey` to prevent overlapping runs of tasks and flows, and overlapping messages in queues.
 
 ```go
 // ConcurrencyKey: prevent overlap
 _, err := client.RunTask(ctx, "process-user", userID, catbird.RunTaskOpts{
     ConcurrencyKey: fmt.Sprintf("user-%d", userID),
 })
-
-// IdempotencyKey: exactly once
-_, err = client.RunTask(ctx, "charge-payment", payment, catbird.RunTaskOpts{
-    IdempotencyKey: fmt.Sprintf("payment-%s", payment.ID),
-})
 ```
 
-#### Comparison Table
+### Behavior
 
-| Feature | ConcurrencyKey | IdempotencyKey |
-|---------|----------------|----------------|
-| **Purpose** | Prevent overlapping runs | Ensure exactly-once execution |
-| **Deduplicates** | `queued`, `started` | `queued`, `started`, `completed` |
-| **After completion** | Allows re-run | Rejects duplicate |
-| **After failure** | Allows retry | Allows retry |
-| **Use for** | Rate limiting, resource locking, scheduled tasks | Payments, orders, webhooks, audit logs |
-
-### Important Notes
-
-- **Mutually exclusive**: You cannot provide both `ConcurrencyKey` and `IdempotencyKey` for the same run (returns error)
+- **Deduplicates** `queued` and `started` runs: a new run with the same key is rejected while one is active
+- **After completion or failure**: the same key can be used again
 - **Return value on duplicate**: `RunTask()`/`RunFlow()` return a handle to the existing run ID
-- **Failure retries**: Both strategies allow retries on failed runs
-- **No key = no deduplication**: If you don't provide either key, duplicates are allowed
-- **Queue messages**: Use `IdempotencyKey` in `SendOpts` for exactly-once message delivery
+- **Failure retries**: allows retries on failed runs
+- **No key = no deduplication**: if you don't provide a key, duplicates are allowed
+- **Queue messages**: Use `ConcurrencyKey` in `SendOpts` for message deduplication
 
 ## Topic-Based Routing
 
@@ -152,6 +138,30 @@ Wildcard rules:
 - `#` matches zero or more tokens at the end (e.g., `events.user.#` matches `events.user` and `events.user.created.v1`)
 - `#` must appear as `.#` at the end of the pattern, or as `#` by itself
 - Tokens are separated by `.` and can contain `a-z`, `A-Z`, `0-9`, `_`, `-`
+
+### Event-Triggered Runs
+
+Bind tasks or flows to topic patterns so that publishing a message automatically creates a run.
+
+```go
+// Bind a task to a topic pattern
+err = client.BindTask(ctx, "send_email", "events.email.*")
+
+// Bind a flow to a topic pattern
+err = client.BindFlow(ctx, "order_processing", "events.order.#")
+
+// Publishing now also triggers task/flow runs
+_, err = client.Publish(ctx, "events.email.welcome", map[string]any{
+    "user_id": 123,
+    "email":   "user@example.com",
+}, catbird.PublishOpts{
+    ConcurrencyKey: "user-123",
+})
+
+// Unbind when done
+_, err = client.UnbindTask(ctx, "send_email", "events.email.*")
+_, err = client.UnbindFlow(ctx, "order_processing", "events.order.#")
+```
 
 ## Task Execution
 
@@ -713,7 +723,7 @@ If retries are exhausted in either phase, the parent step fails and task/flow `O
 
 ### Be aware of side effects
 
-Catbird deduplication (`ConcurrencyKey`/`IdempotencyKey`) controls duplicate run creation, while handler retries can still re-attempt the same run after transient failures. For non-repeatable side effects (payments, email, webhooks), use idempotent write patterns or upstream idempotency keys so retry attempts remain safe.
+Catbird deduplication (`ConcurrencyKey`) controls duplicate run creation, while handler retries can still re-attempt the same run after transient failures. For non-repeatable side effects (payments, email, webhooks), use idempotent write patterns or upstream idempotency keys so retry attempts remain safe.
 
 ## Cancellation
 
@@ -759,6 +769,110 @@ flow.AddStep(catbird.NewStep("guard").Do(func(ctx context.Context, input Order) 
 }))
 ```
 
+## Wire: Real-Time Notifications
+
+Wire is an optional real-time pub/sub layer — use it when you need to push events to browsers or react to notifications server-side. If you're only using queues, tasks, and flows, you can ignore Wire entirely.
+
+Wire provides topic-matched event dispatch with SSE support and presence tracking. Notifications are ephemeral (at-most-once, no storage).
+
+```go
+wire := catbird.NewWire(pool, secret)
+
+// Listen: server-side callbacks on topic patterns
+wire.Listen("order.*", func(ctx context.Context, topic, message string) {
+    log.Println(topic, message)
+})
+
+// Render: transform events before SSE dispatch to clients
+wire.Render("task.*.completed", func(r *http.Request, topic, message string) (string, error) {
+    return "<div>Task done</div>", nil
+})
+
+go wire.Start(ctx)
+
+// Notify: local dispatch + pg_notify for cross-node delivery
+wire.Notify(ctx, "order.created", `{"id": 123}`)
+
+// SSE: app controls token retrieval
+http.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+    token := r.URL.Query().Get("token")
+    wire.ServeSSE(w, r, token)
+})
+```
+
+### Listen vs Render
+
+| Method | Runs on | Purpose |
+|--------|---------|---------|
+| `wire.Listen` | Every node | Server-side side effects (logging, webhooks) |
+| `wire.Render` | Node with SSE client | Transform before SSE push (e.g., JSON → HTML) |
+
+Without a Render, SSE clients get the raw message. Render handlers receive the SSE client's `*http.Request` for access to user context (auth, language, etc).
+
+### Notify
+
+```go
+// Package-level: explicit Conn, works inside transactions (fires on commit)
+catbird.Notify(ctx, tx, "order.progress", `{"step": 1}`)
+
+// Client method: uses client's Conn
+client.Notify(ctx, "order.created", `{"id": 123}`)
+
+// Wire method: local dispatch + pg_notify for cross-node
+wire.Notify(ctx, "order.created", `{"id": 123}`)
+```
+
+### Typed Render Helpers
+
+Generic helpers for common patterns — unmarshal JSON and render via `io.WriterTo`:
+
+```go
+// Stateless: fn(T) io.WriterTo
+catbird.Render[TaskEvent](wire, "task.*", views.TaskCompleted)
+
+// Request-aware: fn(*http.Request, T) io.WriterTo
+catbird.RenderFunc[TaskEvent](wire, "task.*", views.TaskCompleted)
+```
+
+Works with Templ, `html/template`, or any `func(T) io.WriterTo`.
+
+### Tokens & SSE
+
+SSE connections are authorized via encrypted tokens that specify which topics the client can subscribe to:
+
+```go
+token := wire.Token([]string{"order.*", "task.invoice.#"}, catbird.TokenOpts{
+    Identity: "user-123",
+    ValidFor: time.Hour,
+})
+```
+
+### Presence
+
+Track which identities are connected to a topic (across all nodes):
+
+```go
+identities, err := wire.Presence(ctx, "dashboard")
+```
+
+### Handler Access to Conn
+
+Handlers can access the database connection from context for transactional work:
+
+```go
+task := catbird.NewTask("process-order").Do(func(ctx context.Context, input Order) (Result, error) {
+    conn, _ := catbird.GetConn(ctx)
+    tx, _ := conn.Begin(ctx)
+    defer tx.Rollback(ctx)
+
+    catbird.Send(ctx, tx, "audit", map[string]any{"order_id": input.ID})
+    catbird.Notify(ctx, tx, "order.progress", `{"step": 1}`)  // fires on commit
+
+    tx.Commit(ctx)
+    return Result{}, nil
+})
+```
+
 ## Naming Rules
 
 - **Queue, task, flow, and step names**: Lowercase letters, digits, and underscores only (`a-z`, `0-9`, `_`). Max 58 characters. Step names must be unique within a flow. Reserved step names: `input`, `signal`.
@@ -768,8 +882,8 @@ flow.AddStep(catbird.NewStep("guard").Do(func(ctx context.Context, input Order) 
 
 Use query builders when you want SQL + args directly (for `pgx.Batch` or custom execution):
 
-- `SendQuery(queue, payload, opts)`
-- `PublishQuery(topic, payload, opts)`
+- `SendQuery(queue, body, opts)`
+- `PublishQuery(topic, body, opts)`
 - `RunTaskQuery(name, input, opts)`
 - `RunFlowQuery(name, input, opts)`
 
@@ -787,7 +901,7 @@ batch.Queue(q1, args1...)
 
 Catbird is built on PostgreSQL functions, so you can use the API directly from any language or tool with PostgreSQL support (psql, Python, Node.js, Ruby, etc.).
 
-For the full SQL function reference and practical SQL examples (queues, tasks, workflows, and run monitoring), see the [SQL API reference](docs/sql-api-reference.md).
+For the full SQL function reference and practical SQL examples (queues, tasks, workflows, and run monitoring), see the [SQL API reference](docs/sql-api.md).
 
 ## Dashboard
 
@@ -893,7 +1007,7 @@ _ = flowPurged
 ### External archiving
 
 For SQL-based archiving patterns and example queries, see the
-`External archiving` section in the [SQL API reference](docs/sql-api-reference.md).
+`External archiving` section in the [SQL API reference](docs/sql-api.md).
 
 ## Migrations
 
@@ -930,7 +1044,8 @@ Keep an explicit pinned version (for example `13`) in this migration file. Do no
 ## Documentation
 
 - **[Go API Documentation](https://pkg.go.dev/github.com/ugent-library/catbird)**
-- **[SQL API Reference](docs/sql-api-reference.md)**: SQL function reference and practical SQL usage examples
+- **[SQL API Reference](docs/sql-api.md)**: SQL function reference and practical SQL usage examples
+- **[Events Reference](docs/events.md)**
 - **[Testing Guide](docs/testing.md)**
 - **[Copilot Instructions](.github/copilot-instructions.md)**
 

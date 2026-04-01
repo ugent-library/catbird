@@ -57,7 +57,6 @@ type FlowFailure struct {
 	StartedAt             time.Time       `json:"started_at,omitzero"`
 	FailedAt              time.Time       `json:"failed_at,omitzero"`
 	ConcurrencyKey        string          `json:"concurrency_key,omitempty"`
-	IdempotencyKey        string          `json:"idempotency_key,omitempty"`
 	FailedStepInput       json.RawMessage `json:"failed_step_input,omitempty"`
 	FailedStepSignalInput json.RawMessage `json:"failed_step_signal_input,omitempty"`
 
@@ -1310,9 +1309,9 @@ func ListFlows(ctx context.Context, conn Conn) ([]*FlowInfo, error) {
 
 type RunFlowOpts struct {
 	ConcurrencyKey string // Prevents overlapping runs; allows reruns after completion
-	IdempotencyKey string // Prevents all duplicate runs; permanent across all statuses
 	Headers        map[string]any
 	VisibleAt      time.Time
+	ExpiresAt      time.Time
 	Priority       int
 }
 
@@ -1321,7 +1320,6 @@ type FlowRunInfo struct {
 	ID                int64           `json:"id"`
 	Priority          int             `json:"priority"`
 	ConcurrencyKey    string          `json:"concurrency_key,omitempty"`
-	IdempotencyKey    string          `json:"idempotency_key,omitempty"`
 	Status            string          `json:"status"`
 	Input             json.RawMessage `json:"input,omitempty"`
 	Headers           json.RawMessage `json:"headers,omitempty"`
@@ -1338,7 +1336,7 @@ type FlowRunInfo struct {
 // IsDone reports whether the flow run reached a terminal state.
 func (r *FlowRunInfo) IsDone() bool {
 	switch r.Status {
-	case StatusCompleted, StatusFailed, StatusCanceled:
+	case StatusCompleted, StatusFailed, StatusCanceled, StatusExpired:
 		return true
 	default:
 		return false
@@ -1518,8 +1516,8 @@ func RunFlowQuery(flowName string, input any, opts ...RunFlowOpts) (string, []an
 		return "", nil, err
 	}
 
-	q := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, headers => $5, visible_at => $6, priority => $7);`
-	args := []any{flowName, b, ptrOrNil(resolved.ConcurrencyKey), ptrOrNil(resolved.IdempotencyKey), headers, ptrOrNil(resolved.VisibleAt), resolved.Priority}
+	q := `SELECT * FROM cb_run_flow(name => $1, input => $2, concurrency_key => $3, headers => $4, visible_at => $5, priority => $6, expires_at => $7);`
+	args := []any{flowName, b, ptrOrNil(resolved.ConcurrencyKey), headers, ptrOrNil(resolved.VisibleAt), resolved.Priority, ptrOrNil(resolved.ExpiresAt)}
 
 	return q, args, nil
 }
@@ -1527,7 +1525,7 @@ func RunFlowQuery(flowName string, input any, opts ...RunFlowOpts) (string, []an
 // GetFlowRun retrieves a specific flow run result by ID.
 func GetFlowRun(ctx context.Context, conn Conn, flowName string, flowRunID int64) (*FlowRunInfo, error) {
 	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
-	query := fmt.Sprintf(`SELECT id, priority, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, priority, concurrency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
 	run, err := scanFlowRun(conn.QueryRow(ctx, query, flowRunID))
 	if err != nil {
 		return nil, wrapNotDefinedErr(err, "flow", flowName)
@@ -1538,12 +1536,34 @@ func GetFlowRun(ctx context.Context, conn Conn, flowName string, flowRunID int64
 // ListFlowRuns returns recent flow runs for the specified flow.
 func ListFlowRuns(ctx context.Context, conn Conn, flowName string) ([]*FlowRunInfo, error) {
 	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
-	query := fmt.Sprintf(`SELECT id, priority, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, priority, concurrency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, wrapNotDefinedErr(err, "flow", flowName)
 	}
 	return pgx.CollectRows(rows, scanCollectibleFlowRun)
+}
+
+// BindFlow subscribes a flow to a topic pattern.
+// When a message is published to a matching topic, a flow run is created
+// with the message body as input.
+// Pattern supports exact topics and wildcards: * (single token), # (multi-token tail).
+func BindFlow(ctx context.Context, conn Conn, flowName string, pattern string) error {
+	q := `SELECT cb_bind_flow(name => $1, pattern => $2);`
+	_, err := conn.Exec(ctx, q, flowName, pattern)
+	return wrapNotDefinedErr(err, "flow", flowName)
+}
+
+// UnbindFlow removes a flow trigger binding.
+// Returns true if a binding was removed, false if it was already absent.
+func UnbindFlow(ctx context.Context, conn Conn, flowName string, pattern string) (bool, error) {
+	q := `SELECT cb_unbind_flow(name => $1, pattern => $2);`
+	deleted := false
+	err := conn.QueryRow(ctx, q, flowName, pattern).Scan(&deleted)
+	if err != nil {
+		return false, err
+	}
+	return deleted, nil
 }
 
 func scanCollectibleFlowRun(row pgx.CollectableRow) (*FlowRunInfo, error) {
@@ -1554,7 +1574,6 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 	rec := FlowRunInfo{}
 
 	var concurrencyKey *string
-	var idempotencyKey *string
 	var input *json.RawMessage
 	var headers *json.RawMessage
 	var output *json.RawMessage
@@ -1569,7 +1588,6 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 		&rec.ID,
 		&rec.Priority,
 		&concurrencyKey,
-		&idempotencyKey,
 		&rec.Status,
 		&input,
 		&headers,
@@ -1590,9 +1608,6 @@ func scanFlowRun(row pgx.Row) (*FlowRunInfo, error) {
 
 	if concurrencyKey != nil {
 		rec.ConcurrencyKey = *concurrencyKey
-	}
-	if idempotencyKey != nil {
-		rec.IdempotencyKey = *idempotencyKey
 	}
 	if input != nil {
 		rec.Input = *input

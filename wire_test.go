@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -476,6 +477,237 @@ func TestWireNotifySSEWildcard(t *testing.T) {
 type sseEvent struct {
 	event string
 	data  string
+}
+
+// --- Listen tests (migrated from listener_test.go) ---
+
+func TestWireListenExactTopic(t *testing.T) {
+	cb := getTestClient(t)
+
+	topic := "test.listen." + uuid.NewString()[:8]
+
+	var mu sync.Mutex
+	var received []string
+
+	wire := NewWire(testPool, testSecret)
+	wire.Listen(topic, func(ctx context.Context, topic, message string) {
+		mu.Lock()
+		received = append(received, topic)
+		mu.Unlock()
+	})
+	startTestWire(t, wire)
+
+	if err := cb.Notify(t.Context(), topic, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 1 || received[0] != topic {
+		t.Errorf("received = %v, want [%s]", received, topic)
+	}
+}
+
+func TestWireListenWildcardStar(t *testing.T) {
+	cb := getTestClient(t)
+
+	prefix := "test.lwc." + uuid.NewString()[:8]
+
+	var mu sync.Mutex
+	var received []string
+
+	wire := NewWire(testPool, testSecret)
+	wire.Listen(prefix+".*", func(ctx context.Context, topic, message string) {
+		mu.Lock()
+		received = append(received, topic)
+		mu.Unlock()
+	})
+	startTestWire(t, wire)
+
+	// Should match
+	if err := cb.Notify(t.Context(), prefix+".created", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := cb.Notify(t.Context(), prefix+".updated", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Should not match (two tokens after prefix)
+	if err := cb.Notify(t.Context(), prefix+".sub.created", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 2 {
+		t.Errorf("received = %v, want 2 events", received)
+	}
+}
+
+func TestWireListenWildcardHash(t *testing.T) {
+	cb := getTestClient(t)
+
+	prefix := "test.lhash." + uuid.NewString()[:8]
+
+	var mu sync.Mutex
+	var received []string
+
+	wire := NewWire(testPool, testSecret)
+	wire.Listen(prefix+".#", func(ctx context.Context, topic, message string) {
+		mu.Lock()
+		received = append(received, topic)
+		mu.Unlock()
+	})
+	startTestWire(t, wire)
+
+	// All should match
+	if err := cb.Notify(t.Context(), prefix, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := cb.Notify(t.Context(), prefix+".one", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := cb.Notify(t.Context(), prefix+".one.two", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 3 {
+		t.Errorf("received %d events, want 3: %v", len(received), received)
+	}
+}
+
+func TestWireListenWithData(t *testing.T) {
+	cb := getTestClient(t)
+
+	topic := "test.ldata." + uuid.NewString()[:8]
+
+	var mu sync.Mutex
+	var gotData string
+
+	wire := NewWire(testPool, testSecret)
+	wire.Listen(topic, func(ctx context.Context, topic, message string) {
+		mu.Lock()
+		gotData = message
+		mu.Unlock()
+	})
+	startTestWire(t, wire)
+
+	if err := cb.Notify(t.Context(), topic, `<div>hello</div>`); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotData != "<div>hello</div>" {
+		t.Errorf("data = %q, want %q", gotData, "<div>hello</div>")
+	}
+}
+
+func TestWireListenMultipleHandlers(t *testing.T) {
+	cb := getTestClient(t)
+
+	topic := "test.lmulti." + uuid.NewString()[:8]
+
+	var mu sync.Mutex
+	var count int
+
+	wire := NewWire(testPool, testSecret)
+	wire.Listen(topic, func(ctx context.Context, topic, message string) {
+		mu.Lock()
+		count++
+		mu.Unlock()
+	})
+	wire.Listen(topic, func(ctx context.Context, topic, message string) {
+		mu.Lock()
+		count++
+		mu.Unlock()
+	})
+	startTestWire(t, wire)
+
+	if err := cb.Notify(t.Context(), topic, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if count != 2 {
+		t.Errorf("count = %d, want 2", count)
+	}
+}
+
+func TestWireListenNoMatch(t *testing.T) {
+	cb := getTestClient(t)
+
+	prefix := "test.lnomatch." + uuid.NewString()[:8]
+
+	var mu sync.Mutex
+	var received bool
+
+	wire := NewWire(testPool, testSecret)
+	wire.Listen(prefix+".specific", func(ctx context.Context, topic, message string) {
+		mu.Lock()
+		received = true
+		mu.Unlock()
+	})
+	startTestWire(t, wire)
+
+	if err := cb.Notify(t.Context(), prefix+".other", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if received {
+		t.Error("handler was called for non-matching topic")
+	}
+}
+
+func TestWireListenSkipSelf(t *testing.T) {
+	cb := getTestClient(t)
+
+	topic := "test.lskipself." + uuid.NewString()[:8]
+
+	var mu sync.Mutex
+	var count int
+
+	wire := NewWire(testPool, testSecret)
+	wire.Listen(topic, func(ctx context.Context, topic, message string) {
+		mu.Lock()
+		count++
+		mu.Unlock()
+	})
+	startTestWire(t, wire)
+
+	// Notify with SentBy: wire.ID() — should be skipped
+	if err := cb.Notify(t.Context(), topic, "", NotifyOpts{SentBy: wire.ID()}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Notify without SentBy — should be delivered
+	if err := cb.Notify(t.Context(), topic, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if count != 1 {
+		t.Errorf("count = %d, want 1 (skip-self should have prevented one delivery)", count)
+	}
 }
 
 func readSSEEvents(t *testing.T, resp *http.Response, count int, timeout time.Duration) []sseEvent {

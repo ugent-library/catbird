@@ -275,11 +275,11 @@ func TestBindFanout(t *testing.T) {
 		}
 
 		var received map[string]string
-		if err := json.Unmarshal(msgs[0].Payload, &received); err != nil {
+		if err := json.Unmarshal(msgs[0].Body, &received); err != nil {
 			t.Fatal(err)
 		}
 		if received["msg"] != "hello all" {
-			t.Fatalf("queue %s: unexpected payload %v", q, received)
+			t.Fatalf("queue %s: unexpected body %v", q, received)
 		}
 	}
 }

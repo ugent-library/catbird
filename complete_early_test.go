@@ -25,7 +25,7 @@ func TestCompleteEarlyCreatesTypedControlError(t *testing.T) {
 
 	outputMap, ok := completion.output.(map[string]any)
 	if !ok || outputMap["ok"] != true {
-		t.Fatalf("unexpected output payload: %#v", completion.output)
+		t.Fatalf("unexpected output body: %#v", completion.output)
 	}
 }
 

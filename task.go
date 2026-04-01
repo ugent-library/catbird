@@ -36,7 +36,6 @@ type TaskFailure struct {
 	StartedAt      time.Time `json:"started_at,omitzero"`
 	FailedAt       time.Time `json:"failed_at,omitzero"`
 	ConcurrencyKey string    `json:"concurrency_key,omitempty"`
-	IdempotencyKey string    `json:"idempotency_key,omitempty"`
 }
 
 // NewTask creates a new task definition with the given name.
@@ -215,7 +214,6 @@ type TaskRunInfo struct {
 	ID                int64           `json:"id"`
 	Priority          int             `json:"priority"`
 	ConcurrencyKey    string          `json:"concurrency_key,omitempty"`
-	IdempotencyKey    string          `json:"idempotency_key,omitempty"`
 	Status            string          `json:"status"`
 	Input             json.RawMessage `json:"input,omitempty"`
 	Headers           json.RawMessage `json:"headers,omitempty"`
@@ -233,7 +231,7 @@ type TaskRunInfo struct {
 // IsDone reports whether the task run reached a terminal state.
 func (r *TaskRunInfo) IsDone() bool {
 	switch r.Status {
-	case StatusCompleted, StatusFailed, StatusSkipped, StatusCanceled:
+	case StatusCompleted, StatusFailed, StatusSkipped, StatusCanceled, StatusExpired:
 		return true
 	default:
 		return false
@@ -323,6 +321,19 @@ func (h *TaskHandle) WaitForOutput(ctx context.Context, out any, opts ...WaitOpt
 	}
 }
 
+// GetConn returns the database connection from inside a task or flow handler.
+// This gives handlers access to the full Conn interface, including transactions.
+// Returns ErrNoRunContext if called outside a handler.
+func GetConn(ctx context.Context) (Conn, error) {
+	if scope, _ := ctx.Value(taskRunScopeContextKey{}).(*taskRunScope); scope != nil && scope.conn != nil {
+		return scope.conn, nil
+	}
+	if scope, _ := ctx.Value(flowRunScopeContextKey{}).(*flowRunScope); scope != nil && scope.conn != nil {
+		return scope.conn, nil
+	}
+	return nil, ErrNoRunContext
+}
+
 // GetTaskRunID returns the task run ID from inside a task handler.
 // Returns ErrNoRunContext if called outside a task handler.
 func GetTaskRunID(ctx context.Context) (int64, error) {
@@ -401,9 +412,9 @@ func ListTasks(ctx context.Context, conn Conn) ([]*TaskInfo, error) {
 
 type RunTaskOpts struct {
 	ConcurrencyKey string // Prevents overlapping runs; allows reruns after completion
-	IdempotencyKey string // Prevents all duplicate runs; permanent across all statuses
 	Headers        map[string]any
 	VisibleAt      time.Time
+	ExpiresAt      time.Time
 	Priority       int
 }
 
@@ -441,8 +452,8 @@ func RunTaskQuery(taskName string, input any, opts ...RunTaskOpts) (string, []an
 		return "", nil, err
 	}
 
-	q := `SELECT * FROM cb_run_task(name => $1, input => $2, concurrency_key => $3, idempotency_key => $4, headers => $5, visible_at => $6, priority => $7);`
-	args := []any{taskName, b, ptrOrNil(resolved.ConcurrencyKey), ptrOrNil(resolved.IdempotencyKey), headers, ptrOrNil(resolved.VisibleAt), resolved.Priority}
+	q := `SELECT * FROM cb_run_task(name => $1, input => $2, concurrency_key => $3, headers => $4, visible_at => $5, priority => $6, expires_at => $7);`
+	args := []any{taskName, b, ptrOrNil(resolved.ConcurrencyKey), headers, ptrOrNil(resolved.VisibleAt), resolved.Priority, ptrOrNil(resolved.ExpiresAt)}
 
 	return q, args, nil
 }
@@ -450,7 +461,7 @@ func RunTaskQuery(taskName string, input any, opts ...RunTaskOpts) (string, []an
 // GetTaskRun retrieves a specific task run result by ID.
 func GetTaskRun(ctx context.Context, conn Conn, taskName string, taskRunID int64) (*TaskRunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(taskName))
-	query := fmt.Sprintf(`SELECT id, priority, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at, skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, priority, concurrency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at, skipped_at FROM %s WHERE id = $1;`, pgx.Identifier{tableName}.Sanitize())
 	run, err := scanTaskRun(conn.QueryRow(ctx, query, taskRunID))
 	if err != nil {
 		return nil, wrapNotDefinedErr(err, "task", taskName)
@@ -461,12 +472,34 @@ func GetTaskRun(ctx context.Context, conn Conn, taskName string, taskRunID int64
 // ListTaskRuns returns recent task runs for the specified task.
 func ListTaskRuns(ctx context.Context, conn Conn, taskName string) ([]*TaskRunInfo, error) {
 	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(taskName))
-	query := fmt.Sprintf(`SELECT id, priority, concurrency_key, idempotency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at, skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
+	query := fmt.Sprintf(`SELECT id, priority, concurrency_key, status, input, headers, output, error_message, cancel_reason, cancel_requested_at, canceled_at, started_at, completed_at, failed_at, skipped_at FROM %s ORDER BY started_at DESC LIMIT 20;`, pgx.Identifier{tableName}.Sanitize())
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, wrapNotDefinedErr(err, "task", taskName)
 	}
 	return pgx.CollectRows(rows, scanCollectibleTaskRun)
+}
+
+// BindTask subscribes a task to a topic pattern.
+// When a message is published to a matching topic, a task run is created
+// with the message body as input.
+// Pattern supports exact topics and wildcards: * (single token), # (multi-token tail).
+func BindTask(ctx context.Context, conn Conn, taskName string, pattern string) error {
+	q := `SELECT cb_bind_task(name => $1, pattern => $2);`
+	_, err := conn.Exec(ctx, q, taskName, pattern)
+	return wrapNotDefinedErr(err, "task", taskName)
+}
+
+// UnbindTask removes a task trigger binding.
+// Returns true if a binding was removed, false if it was already absent.
+func UnbindTask(ctx context.Context, conn Conn, taskName string, pattern string) (bool, error) {
+	q := `SELECT cb_unbind_task(name => $1, pattern => $2);`
+	deleted := false
+	err := conn.QueryRow(ctx, q, taskName, pattern).Scan(&deleted)
+	if err != nil {
+		return false, err
+	}
+	return deleted, nil
 }
 
 func scanCollectibleTaskRun(row pgx.CollectableRow) (*TaskRunInfo, error) {
@@ -477,7 +510,6 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 	rec := TaskRunInfo{}
 
 	var concurrencyKey *string
-	var idempotencyKey *string
 	var input *json.RawMessage
 	var headers *json.RawMessage
 	var output *json.RawMessage
@@ -493,7 +525,6 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 		&rec.ID,
 		&rec.Priority,
 		&concurrencyKey,
-		&idempotencyKey,
 		&rec.Status,
 		&input,
 		&headers,
@@ -515,9 +546,6 @@ func scanTaskRun(row pgx.Row) (*TaskRunInfo, error) {
 
 	if concurrencyKey != nil {
 		rec.ConcurrencyKey = *concurrencyKey
-	}
-	if idempotencyKey != nil {
-		rec.IdempotencyKey = *idempotencyKey
 	}
 	if input != nil {
 		rec.Input = *input

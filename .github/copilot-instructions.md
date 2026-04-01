@@ -27,23 +27,24 @@ Catbird is a PostgreSQL-based message queue with task and workflow execution eng
 
 **Two Independent Systems**:
 1. **Generic Message Queues**: `Send()`, `Publish()`, `Read()` operations similar to pgmq/SQS. Messages stored in queue tables; independent from tasks/flows. **Topic routing** via explicit bindings with wildcard support (`?` for single token, `*` for multi-token tail). Bindings stored in `cb_bindings` table with pattern type (exact/wildcard), prefix extraction for indexed filtering, and precompiled regexes.
-2. **Task & Flow Execution**: Task/flow definitions describe shape; `RunTask()` or `RunFlow()` create entries in task_run/step_run tables (which act as queues themselves). Workers claim from these tables via NOTIFY-driven scheduling and execute handlers. State tracked via constants (queued, started, completed, failed, skipped, canceled).
+2. **Task & Flow Execution**: Task/flow definitions describe shape; `RunTask()` or `RunFlow()` create entries in task_run/step_run tables (which act as queues themselves). Workers claim from these tables via NOTIFY-driven scheduling and execute handlers. State tracked via constants (queued, started, completed, failed, skipped, canceled, expired).
 
 ## Database Schema
 
-All schema is version-controlled in `migrations/` (goose-managed):
-- **Queues Schema** (v1): `cb_queues` table (name PK, expires_at) + `cb_bindings` table (queue_name FK, pattern, pattern_type, prefix, regex); custom types `cb_message` (7 fields including id, topic, payload). Bindings use exact match fast path (indexed) or wildcard (prefix filter + regex). Also includes `cb_table_name()` function.
-- **Queues Functions** (v2): Message operations (`cb_create_queue`, `cb_delete_queue`, `cb_send`, `cb_read`, `cb_read_poll`, `cb_publish`), binding management (`cb_bind`, `cb_unbind`), message control (`cb_hide`, `cb_delete`)
-- **Condition Functions** (v3): Condition system (`cb_parse_condition`, `cb_parse_condition_value`, `cb_evaluate_condition`, `cb_get_jsonb_field`, `cb_evaluate_condition_expr`) for task/step conditional execution
-- **Tasks Schema** (v4): `cb_task_claim` type, `cb_tasks` table
-- **Flows Schema** (v5): `cb_step_claim` type, `cb_flows`, `cb_steps`, `cb_step_dependencies` tables; `cb_flow_info` view
-- **Tasks Functions** (v6): Task operations (`cb_create_task`, `cb_run_task`, `cb_claim_tasks`, `cb_hide_tasks`, `cb_complete_task`, `cb_fail_task`, `cb_delete_task`)
-- **Flows Functions** (v7): Flow operations (`cb_create_flow`, `cb_run_flow`, `cb_start_steps`, `cb_claim_steps`, `cb_hide_steps`, `cb_complete_step`, `cb_fail_step`, `cb_signal_flow`, `cb_delete_flow`)
-- **GC** (v8): Garbage collection (`cb_gc`) for stale workers and expired queues
-- **Workers Schema** (v9): `cb_workers` table + `cb_task_handlers` and `cb_step_handlers` tables (worker-to-task and worker-to-step mappings; depends on workers/tasks/flows)
-- **Workers Functions** (v10): Worker management (`cb_worker_started`, `cb_worker_heartbeat`) and `cb_worker_info` view
+All schema is version-controlled in `migrations/` (goose-managed), consolidated into a single migration file `00001_catbird.sql` containing:
+- **Types**: `cb_message`, `cb_task_claim`, `cb_step_claim`
+- **Tables**: `cb_queues`, `cb_bindings`, `cb_tasks`, `cb_flows`, `cb_steps`, `cb_step_dependencies`, `cb_workers`, `cb_task_handlers`, `cb_step_handlers`, `cb_task_schedules`, `cb_flow_schedules`, `cb_wire_nodes`, `cb_wire_presence`
+- **Views**: `cb_flow_info`, `cb_worker_info`
+- **Queue functions**: `cb_create_queue`, `cb_delete_queue`, `cb_send`, `cb_read`, `cb_read_poll`, `cb_publish`, `cb_bind`, `cb_unbind`, `cb_hide`, `cb_delete`
+- **Task functions**: `cb_create_task`, `cb_run_task`, `cb_claim_tasks`, `cb_hide_tasks`, `cb_complete_task`, `cb_fail_task`, `cb_delete_task`, `cb_cancel_task`
+- **Flow functions**: `cb_create_flow`, `cb_run_flow`, `cb_start_steps`, `cb_claim_steps`, `cb_hide_steps`, `cb_complete_step`, `cb_fail_step`, `cb_signal_flow`, `cb_delete_flow`, `cb_cancel_flow`
+- **Condition functions**: `cb_parse_condition`, `cb_evaluate_condition`, `cb_evaluate_condition_expr`
+- **Worker functions**: `cb_worker_started`, `cb_worker_heartbeat`
+- **GC**: `cb_gc` (expires queues, messages, task/flow runs; cleans stale workers/wire nodes; purges old runs)
+- **Cron/schedule functions**: `cb_cron_expand_spec`, `cb_cron_matches`, `cb_next_cron_tick`, `cb_create_task_schedule`, `cb_create_flow_schedule`, `cb_execute_due_task_schedules`, `cb_execute_due_flow_schedules`
+- **Binding functions**: `cb_bind_task`, `cb_unbind_task`, `cb_bind_flow`, `cb_unbind_flow`
 
-Key: Migrations use goose with a namespaced version table (`cb_goose_db_version`) + embedded FS. Current schema version = 13.
+Key: Migrations use goose with a namespaced version table (`cb_goose_db_version`) + embedded FS. Current schema version = 1.
 
 **Table Name Construction**:
 All runtime tables (messages, task runs, flow runs, step runs) are created dynamically using the `cb_table_name(name, prefix)` function:
@@ -172,14 +173,11 @@ NewFlow("workflow").
 - **Options pattern**: Handler execution uses functional `HandlerOpt` values (e.g., `WithConcurrency`, `WithBatchSize`, `WithMaxRetries`, `WithFullJitterBackoff`, `WithCircuitBreaker`). Worker configuration uses builder methods on `Worker` (`WithLogger`, `WithShutdownTimeout`). Scheduling uses functional `ScheduleOpt` values (e.g., `WithScheduleInput`).
 - **Conn interface**: Abstracts pgx; accepts `*pgxpool.Pool`, `*pgx.Conn` or `pgx.Tx`. Note: Workers require `*pgxpool.Pool` directly (not the Conn interface)
 - **Logging**: Uses stdlib `log/slog`; workers accept custom logger via `worker.WithLogger(...)`
-- **Scheduled tasks/flows**: Decoupled from task/flow definitions. Create via `client.CreateTaskSchedule(ctx, taskName, cronSpec, opts...)` and `client.CreateFlowSchedule(ctx, flowName, cronSpec, opts...)`. Pass optional `WithScheduleInput(value)` for static JSON input (defaults to `{}`). Example: `client.CreateTaskSchedule(ctx, "mytask", "@hourly", WithScheduleInput(MyInput{...}))`. Worker polls for due schedules automatically and enqueues them with idempotency deduplication.
+- **Scheduled tasks/flows**: Decoupled from task/flow definitions. Create via `client.CreateTaskSchedule(ctx, taskName, cronSpec, opts...)` and `client.CreateFlowSchedule(ctx, flowName, cronSpec, opts...)`. Pass optional `WithScheduleInput(value)` for static JSON input (defaults to `{}`). Example: `client.CreateTaskSchedule(ctx, "mytask", "@hourly", WithScheduleInput(MyInput{...}))`. Worker polls for due schedules automatically and enqueues them with concurrency key deduplication.
 - **Automatic garbage collection**: Worker heartbeats (every 10 seconds) opportunistically clean up stale workers and expired queues; no configuration needed. Manual cleanup available via `client.GC(ctx)` for deployments without workers.
-- **Deduplication strategies**: Two strategies available:
-  - **ConcurrencyKey**: Prevents concurrent/overlapping runs (deduplicates `queued`/`started` status). After completion or failure, same key can be used again.
-  - **IdempotencyKey**: Ensures exactly-once execution (deduplicates `queued`/`started`/`completed` status). After successful completion, same key permanently rejected.
+- **Deduplication**: Uses `ConcurrencyKey` to prevent concurrent/overlapping runs (deduplicates `queued`/`started` status). After completion or failure, same key can be used again.
   - **Return behavior**: When a duplicate is detected, `RunTask()`/`RunFlow()` return the **existing row's ID**, not 0 or an error. This allows callers to wait on the existing execution.
-  - **Failure retries**: Both strategies allow retries when a task/flow fails (`status: failed`).
-  - **Mutually exclusive**: Cannot specify both keys simultaneously (returns error).
+  - **Failure retries**: Allows retries when a task/flow fails (`status: failed`).
 - **Topic bindings**: Explicit via `Bind(queue, pattern)`; wildcards `?` (single token) and `*` (multi-token tail as `.*`). Foreign key CASCADE deletes bindings when queue is deleted. Pattern validation at bind time; regex precompiled in PostgreSQL.
 - **Task/Flow execution**: `client.RunTask()` or `client.RunFlow()` return handles with `WaitForOutput()` to block until completion. When deduplication detects an existing run, the handle contains the existing run's ID.
 - **Workflow signals**: Steps can require signals (external input) before executing. Use `.WithSignal()` builder method. Signal delivered via `client.SignalFlow(ctx, flowName, flowRunID, stepName, input)`. Steps with both dependencies and signals wait for **both** conditions before starting. Enables approval workflows, webhooks, and human-in-the-loop patterns.
@@ -256,7 +254,7 @@ docker compose logs -f postgres
   3. Runs `MigrateUpTo(SchemaVersion)` to apply all migrations
   4. Creates connection pool and test client
 - **Key consequence**: Dynamic tables (e.g., `cb_f_myflow`, `cb_s_myflow`) and data persist across all tests in the suite
-- **Data isolation impact**: If a test uses a hardcoded deduplication key (e.g., `IdempotencyKey: "order-123"`), subsequent test runs will retrieve the OLD flow run (with potentially outdated data formats)
+- **Data isolation impact**: If a test uses a hardcoded deduplication key (e.g., `ConcurrencyKey: "order-123"`), subsequent test runs will retrieve the OLD flow run (with potentially outdated data formats)
 - **Solutions**:
   - Use unique identifiers per test run: `fmt.Sprintf("key-%d", time.Now().UnixNano())`
   - Or reset specific tables/flows in test setup if needed
@@ -345,8 +343,8 @@ docker compose logs -f postgres
 6. **Concurrency**: Default 1 per handler; set via `WithConcurrency(...)`
 7. **Conditional execution**: Use `.WithCondition("expression")` on tasks/steps. Tasks use `input.field` syntax (e.g., `"input.is_premium"`), flow steps use `step_name.field` syntax (e.g., `"validate.score gte 50"`)
 8. **Optional dependencies**: Use `Optional[T]` + `OptionalDependency()` pair when depending on conditional steps. Validation at flow construction time enforces type safety.
-9. **Status constants in Go**: Use shared status constants from `statuses.go` (e.g., `StatusQueued`, `StatusStarted`, `StatusWaitingForDependencies`) instead of raw status string literals in Go code and tests.
-10. **Atomic deduplication with UNION ALL**: For `RunTask()` and `RunFlow()` deduplication (concurrency_key / idempotency_key), use the atomic ON CONFLICT DO UPDATE pattern with UNION ALL fallback. **DO NOT remove the UNION ALL or simplify to plain `RETURNING id`**. The pattern is:
+9. **Status constants in Go**: Use shared status constants from `catbird.go` (e.g., `StatusQueued`, `StatusStarted`, `StatusWaitingForDependencies`, `StatusExpired`) instead of raw status string literals in Go code and tests.
+10. **Atomic deduplication with UNION ALL**: For `RunTask()` and `RunFlow()` deduplication (concurrency_key), use the atomic ON CONFLICT DO UPDATE pattern with UNION ALL fallback. **DO NOT remove the UNION ALL or simplify to plain `RETURNING id`**. The pattern is:
 ```sql
 WITH ins AS (
     INSERT INTO table_name (key_col, data_col)
@@ -367,5 +365,5 @@ LIMIT 1
 - Together they guarantee exactly one row ID is returned atomically—no race window between INSERT and SELECT
 - Simplifying to bare `DO UPDATE ... WHERE FALSE RETURNING id` causes NULL returns on conflict (RETURNING doesn't fire in DO UPDATE branch)
 - Plain `DO UPDATE SET col = col RETURNING id` can produce ambiguous column references when identifiers are not explicitly qualified
-**Used in**: `cb_run_task()`, `cb_run_flow()`, `cb_send()` for both concurrency_key and idempotency_key variants
+**Used in**: `cb_run_task()`, `cb_run_flow()`, `cb_send()` for concurrency_key deduplication
 **Reference**: https://stackoverflow.com/a/35953488

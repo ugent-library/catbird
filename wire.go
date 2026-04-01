@@ -22,7 +22,18 @@ const (
 	wireHeartbeatInterval   = 5 * time.Second
 )
 
-// Wire is an SSE toolkit for notifying browser clients and tracking presence.
+// ListenHandler is called when a notification matches a registered pattern.
+// Handlers run synchronously in the dispatch goroutine — don't block.
+type ListenHandler = func(ctx context.Context, topic, message string)
+
+// RenderHandler transforms a Wire event before SSE dispatch to clients.
+// It receives the SSE client's HTTP request for access to user context
+// (auth, language, etc). Return the transformed message string.
+type RenderHandler = func(r *http.Request, topic, message string) (string, error)
+
+// Wire is a real-time pub/sub layer with SSE support and presence tracking.
+// It absorbs Listener's topic-matched dispatch, adds local delivery to
+// Notify, and serves SSE connections with optional Render transforms.
 // Create with NewWire, configure with builder methods, then call Start.
 type Wire struct {
 	id     string
@@ -31,8 +42,10 @@ type Wire struct {
 	logger *slog.Logger
 	schema string
 
-	mu     sync.RWMutex
-	topics *topicTrie[*wireSubscriber]
+	mu        sync.RWMutex
+	topics    *topicTrie[*wireSubscriber]
+	listeners *topicTrie[ListenHandler]
+	renderers *topicTrie[RenderHandler]
 }
 
 type wireSubscriber struct {
@@ -41,6 +54,7 @@ type wireSubscriber struct {
 	identity string
 	topics   []string
 	cancel   context.CancelFunc
+	request  *http.Request // SSE client's HTTP request for Render context
 
 	mu           sync.Mutex
 	lastDelivery time.Time
@@ -64,17 +78,40 @@ func NewWire(pool *pgxpool.Pool, secret []byte) *Wire {
 		panic("catbird: Wire secret must be exactly 32 bytes")
 	}
 	return &Wire{
-		id:     uuid.NewString(),
-		pool:   pool,
-		secret: secret,
-		logger: slog.Default(),
-		topics: newTopicTrie[*wireSubscriber](),
+		id:        uuid.NewString(),
+		pool:      pool,
+		secret:    secret,
+		logger:    slog.Default(),
+		topics:    newTopicTrie[*wireSubscriber](),
+		listeners: newTopicTrie[ListenHandler](),
+		renderers: newTopicTrie[RenderHandler](),
 	}
 }
 
 // WithLogger sets the Wire logger.
 func (w *Wire) WithLogger(logger *slog.Logger) *Wire {
 	w.logger = logger
+	return w
+}
+
+// Listen registers a handler for the given topic pattern.
+// Handlers fire on every node that receives the event (local or cross-node).
+// They're for server-side side effects — logging, webhooks, triggering work.
+// Patterns use the same syntax as Bind: "." separates tokens,
+// "*" matches one token, "#" matches zero or more trailing tokens.
+// Must be called before Start.
+func (w *Wire) Listen(pattern string, fn ListenHandler) *Wire {
+	w.listeners.add(pattern, fn)
+	return w
+}
+
+// Render registers a transform for the given topic pattern.
+// Render handlers run only on nodes with matching SSE clients, transforming
+// the raw event into what the client receives (e.g., JSON → HTML fragment).
+// Without a Render, clients get the raw message.
+// Must be called before Start.
+func (w *Wire) Render(pattern string, fn RenderHandler) *Wire {
+	w.renderers.add(pattern, fn)
 	return w
 }
 
@@ -135,6 +172,7 @@ func (w *Wire) ServeSSE(rw http.ResponseWriter, r *http.Request, token string) {
 		identity:     payload.Identity,
 		topics:       payload.Topics,
 		cancel:       cancel,
+		request:      r,
 		lastDelivery: time.Now(),
 	}
 
@@ -182,10 +220,11 @@ func (w *Wire) ID() string {
 	return w.id
 }
 
-// Notify delivers a notification to SSE subscribers and Listeners on the given topic.
-// Delivers locally first, then fires pg NOTIFY for cross-node delivery.
-// The Wire's own LISTEN loop skips the echo (From is set automatically).
+// Notify delivers a notification to Listen handlers and SSE subscribers locally,
+// then fires pg NOTIFY for cross-node delivery.
+// The Wire's own LISTEN loop skips the echo (SentBy is set automatically).
 func (w *Wire) Notify(ctx context.Context, topic, message string) error {
+	w.deliverToListeners(ctx, topic, message)
 	w.deliverLocal(topic, wireEvent{topic: topic, message: message})
 	return Notify(ctx, w.pool, topic, message, NotifyOpts{SentBy: w.id})
 }
@@ -222,14 +261,36 @@ func (w *Wire) removeSubscriber(sub *wireSubscriber) {
 	}
 }
 
+func (w *Wire) deliverToListeners(ctx context.Context, topic, message string) {
+	w.mu.RLock()
+	handlers := w.listeners.match(topic, nil)
+	w.mu.RUnlock()
+
+	for _, fn := range handlers {
+		fn(ctx, topic, message)
+	}
+}
+
 func (w *Wire) deliverLocal(topic string, ev wireEvent) {
 	w.mu.RLock()
 	subs := w.topics.match(topic, nil)
+	renders := w.renderers.match(topic, nil)
 	w.mu.RUnlock()
 
 	for _, sub := range subs {
+		// Apply first matching render transform if available.
+		outEv := ev
+		if len(renders) > 0 && sub.request != nil {
+			rendered, err := renders[0](sub.request, ev.topic, ev.message)
+			if err != nil {
+				w.logger.Warn("wire: render error", "topic", ev.topic, "error", err)
+				continue // skip this subscriber on render error
+			}
+			outEv = wireEvent{topic: ev.topic, message: rendered}
+		}
+
 		select {
-		case sub.ch <- ev:
+		case sub.ch <- outEv:
 		default:
 			// Channel full — check for slow consumer.
 			sub.mu.Lock()
@@ -308,6 +369,7 @@ func (w *Wire) listenOnce(ctx context.Context) error {
 			continue
 		}
 
+		w.deliverToListeners(ctx, msg.Topic, msg.Message)
 		w.deliverLocal(msg.Topic, wireEvent{topic: msg.Topic, message: msg.Message})
 	}
 }
@@ -350,4 +412,35 @@ func (w *Wire) presenceLeave(sub *wireSubscriber) {
 			`SELECT cb_notify(topic => $1, "from" => $2::uuid)`,
 			topic, w.id)
 	}
+}
+
+// Render registers a typed render handler that unmarshals JSON messages
+// into type T and passes them to fn. The result is written to a string
+// via io.WriterTo. Works with Templ components, html/template, or any
+// func(T) io.WriterTo.
+func Render[T any](w *Wire, pattern string, fn func(T) io.WriterTo) {
+	w.Render(pattern, func(r *http.Request, topic, message string) (string, error) {
+		var data T
+		if err := json.Unmarshal([]byte(message), &data); err != nil {
+			return "", err
+		}
+		var buf strings.Builder
+		_, err := fn(data).WriteTo(&buf)
+		return buf.String(), err
+	})
+}
+
+// RenderFunc registers a typed render handler that receives the HTTP request
+// for access to user context (auth, language, etc). The result is written
+// to a string via io.WriterTo.
+func RenderFunc[T any](w *Wire, pattern string, fn func(*http.Request, T) io.WriterTo) {
+	w.Render(pattern, func(r *http.Request, topic, message string) (string, error) {
+		var data T
+		if err := json.Unmarshal([]byte(message), &data); err != nil {
+			return "", err
+		}
+		var buf strings.Builder
+		_, err := fn(r, data).WriteTo(&buf)
+		return buf.String(), err
+	})
 }
