@@ -807,7 +807,7 @@ http.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 | `wire.Listen` | Every node | Server-side side effects (logging, webhooks) |
 | `wire.RenderSSE` | Node with SSE client | Transform for SSE push (e.g., JSON → HTML) |
 
-Only topics with a registered SSE renderer are delivered to SSE clients — the renderer acts as an allowlist. Multiple renderers matching the same topic each produce an SSE event (fan-out). Render handlers receive the SSE client's `*http.Request` for access to user context (auth, language, etc).
+Topics without a renderer pass through as-is. Multiple renderers matching the same topic each produce an SSE event. Render handlers receive the SSE client's `*http.Request` for access to user context (auth, language, etc).
 
 ### Notify
 

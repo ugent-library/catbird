@@ -121,9 +121,8 @@ func (w *Wire) Listen(pattern string, fn ListenHandler) *Wire {
 }
 
 // RenderSSE registers an SSE render handler for the given topic pattern.
-// Only topics with a registered renderer are delivered to SSE clients —
-// the renderer acts as an allowlist. Multiple renderers matching the same
-// topic each produce an SSE event (fan-out).
+// Multiple renderers matching the same topic each produce an SSE event.
+// Topics without a renderer pass through as-is.
 // Must be called before Start.
 func (w *Wire) RenderSSE(pattern string, fn SSERenderHandler) *Wire {
 	w.sseRenderers.add(pattern, fn)
@@ -425,14 +424,14 @@ func (w *Wire) presenceLeave(sub *wireSubscriber) {
 }
 
 // renderSSE matches sseRenderers for the event's topic and calls each match.
-// No renderer match → returns nil (event is dropped).
+// No renderer match → pass through raw event as-is.
 func (w *Wire) renderSSE(r *http.Request, ev wireEvent) []SSEEvent {
 	w.mu.RLock()
 	renderers := w.sseRenderers.match(ev.topic, nil)
 	w.mu.RUnlock()
 
 	if len(renderers) == 0 {
-		return nil
+		return []SSEEvent{{Event: ev.topic, Data: ev.message}}
 	}
 
 	events := make([]SSEEvent, 0, len(renderers))
