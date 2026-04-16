@@ -7,7 +7,7 @@ require (
 	charm.land/lipgloss/v2 v2.0.1
 	charm.land/log/v2 v2.0.0
 	github.com/dustin/go-humanize v1.0.1
-	github.com/jackc/pgx/v5 v5.8.0
+	github.com/jackc/pgx/v5 v5.9.0
 	github.com/pressly/goose/v3 v3.27.0
 	github.com/samber/slog-http v1.12.0
 )
