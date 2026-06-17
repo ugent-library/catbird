@@ -632,6 +632,14 @@ func CreateTaskSchedule(ctx context.Context, conn Conn, taskName, cronSpec strin
 	return nil
 }
 
+// DeleteTaskSchedule removes the cron schedule for a task.
+// It reports whether a schedule existed; deleting a missing schedule is a no-op.
+func DeleteTaskSchedule(ctx context.Context, conn Conn, taskName string) (bool, error) {
+	existed := false
+	err := conn.QueryRow(ctx, `SELECT cb_delete_task_schedule($1);`, taskName).Scan(&existed)
+	return existed, err
+}
+
 // ListTaskSchedules returns all task schedules ordered by next_run_at.
 func ListTaskSchedules(ctx context.Context, conn Conn) ([]*TaskScheduleInfo, error) {
 	q := `SELECT task_name, cron_spec, next_run_at, last_run_at, last_enqueued_at, enabled, catch_up, created_at, updated_at

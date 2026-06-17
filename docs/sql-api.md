@@ -337,16 +337,26 @@ These are the functions most app code and external clients care about.
 **Scheduling setup**
 
 ### `cb_create_task_schedule`
-- **What it does**: Create or replace a cron schedule for a task with static JSON input and catch-up policy.
+- **What it does**: Create or replace a cron schedule for a task with static JSON input and catch-up policy. If a schedule already exists for the task it is upserted: `cron_spec`, `input`, and `catch_up` are updated. `next_run_at` is only recomputed when `cron_spec` actually changes, so repeat calls with the same spec preserve any catch-up backlog.
 - **Inputs**: `cb_create_task_schedule(task_name text, cron_spec text, input jsonb DEFAULT '{}'::jsonb, catch_up text DEFAULT 'one')`
 - **Returns**: `RETURNS void`
 - **Catch-up policies**: `'skip'` (skip all missed ticks), `'one'` (enqueue one catch-up, default), `'all'` (replay every missed tick)
 
 ### `cb_create_flow_schedule`
-- **What it does**: Create or replace a cron schedule for a flow with static JSON input and catch-up policy.
+- **What it does**: Create or replace a cron schedule for a flow with static JSON input and catch-up policy. If a schedule already exists for the flow it is upserted: `cron_spec`, `input`, and `catch_up` are updated. `next_run_at` is only recomputed when `cron_spec` actually changes, so repeat calls with the same spec preserve any catch-up backlog.
 - **Inputs**: `cb_create_flow_schedule(flow_name text, cron_spec text, input jsonb DEFAULT '{}'::jsonb, catch_up text DEFAULT 'one')`
 - **Returns**: `RETURNS void`
 - **Catch-up policies**: `'skip'` (skip all missed ticks), `'one'` (enqueue one catch-up, default), `'all'` (replay every missed tick)
+
+### `cb_delete_task_schedule`
+- **What it does**: Remove the cron schedule for a task. Returns `true` if a schedule existed, `false` otherwise (deleting a missing schedule is a no-op).
+- **Inputs**: `cb_delete_task_schedule(task_name text)`
+- **Returns**: `RETURNS boolean`
+
+### `cb_delete_flow_schedule`
+- **What it does**: Remove the cron schedule for a flow. Returns `true` if a schedule existed, `false` otherwise (deleting a missing schedule is a no-op).
+- **Inputs**: `cb_delete_flow_schedule(flow_name text)`
+- **Returns**: `RETURNS boolean`
 
 **Maintenance**
 

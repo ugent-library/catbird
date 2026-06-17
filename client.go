@@ -271,6 +271,18 @@ func (c *Client) CreateFlowSchedule(ctx context.Context, flowName, cronSpec stri
 	return CreateFlowSchedule(ctx, c.Conn, flowName, cronSpec, opts...)
 }
 
+// DeleteTaskSchedule removes the cron schedule for a task.
+// It reports whether a schedule existed; deleting a missing schedule is a no-op.
+func (c *Client) DeleteTaskSchedule(ctx context.Context, taskName string) (bool, error) {
+	return DeleteTaskSchedule(ctx, c.Conn, taskName)
+}
+
+// DeleteFlowSchedule removes the cron schedule for a flow.
+// It reports whether a schedule existed; deleting a missing schedule is a no-op.
+func (c *Client) DeleteFlowSchedule(ctx context.Context, flowName string) (bool, error) {
+	return DeleteFlowSchedule(ctx, c.Conn, flowName)
+}
+
 // ListTaskSchedules returns all task schedules ordered by next_run_at.
 func (c *Client) ListTaskSchedules(ctx context.Context) ([]*TaskScheduleInfo, error) {
 	return ListTaskSchedules(ctx, c.Conn)
