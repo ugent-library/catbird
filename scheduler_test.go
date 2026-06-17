@@ -311,6 +311,194 @@ func TestSchedulerEnqueueRollback(t *testing.T) {
 	}
 }
 
+// TestSchedulerScheduleUpsert verifies that re-creating an existing schedule
+// applies a changed cron spec (instead of silently ignoring it), while a
+// re-create with the same spec preserves next_run_at. See issue #34.
+func TestSchedulerScheduleUpsert(t *testing.T) {
+	client := getTestClient(t)
+	suffix := fmt.Sprintf("_%d", time.Now().UnixNano())
+	taskName := "test_upsert_task" + suffix
+	flowName := "test_upsert_flow" + suffix
+
+	findTaskSchedule := func(name string) *TaskScheduleInfo {
+		schedules, err := client.ListTaskSchedules(t.Context())
+		if err != nil {
+			t.Fatalf("ListTaskSchedules failed: %v", err)
+		}
+		for _, s := range schedules {
+			if s.TaskName == name {
+				return s
+			}
+		}
+		t.Fatalf("no task schedule found for %q", name)
+		return nil
+	}
+
+	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
+		return "done", nil
+	})
+	if err := CreateTask(t.Context(), client.Conn, task); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create with an hourly spec (the "stale fallback" from the bug report).
+	if err := client.CreateTaskSchedule(t.Context(), taskName, "0 */1 * * *"); err != nil {
+		t.Fatalf("CreateTaskSchedule failed: %v", err)
+	}
+	initial := findTaskSchedule(taskName)
+	if initial.CronSpec != "0 */1 * * *" {
+		t.Fatalf("expected initial cron_spec %q, got %q", "0 */1 * * *", initial.CronSpec)
+	}
+
+	// Re-create with the corrected spec — must be applied, not ignored.
+	if err := client.CreateTaskSchedule(t.Context(), taskName, "*/1 * * * *", WithCatchUpAll()); err != nil {
+		t.Fatalf("CreateTaskSchedule (update) failed: %v", err)
+	}
+	updated := findTaskSchedule(taskName)
+	if updated.CronSpec != "*/1 * * * *" {
+		t.Fatalf("expected updated cron_spec %q, got %q (spec change silently ignored)", "*/1 * * * *", updated.CronSpec)
+	}
+	if updated.CatchUp != "all" {
+		t.Fatalf("expected catch_up to update to %q, got %q", "all", updated.CatchUp)
+	}
+	if !updated.NextRunAt.Before(initial.NextRunAt) {
+		t.Fatalf("expected next_run_at to be recomputed earlier after spec change: initial=%s updated=%s", initial.NextRunAt, updated.NextRunAt)
+	}
+
+	// Re-create with the same spec — next_run_at must be preserved.
+	if err := client.CreateTaskSchedule(t.Context(), taskName, "*/1 * * * *", WithCatchUpAll()); err != nil {
+		t.Fatalf("CreateTaskSchedule (same spec) failed: %v", err)
+	}
+	unchanged := findTaskSchedule(taskName)
+	if !unchanged.NextRunAt.Equal(updated.NextRunAt) {
+		t.Fatalf("expected next_run_at preserved on same-spec re-create: before=%s after=%s", updated.NextRunAt, unchanged.NextRunAt)
+	}
+
+	// Flows behave the same way.
+	flow := NewFlow(flowName)
+	flow.AddStep(NewStep("s1").Do(func(ctx context.Context, in int) (int, error) {
+		return in, nil
+	}))
+	if err := CreateFlow(t.Context(), client.Conn, flow); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.CreateFlowSchedule(t.Context(), flowName, "0 */1 * * *"); err != nil {
+		t.Fatalf("CreateFlowSchedule failed: %v", err)
+	}
+	if err := client.CreateFlowSchedule(t.Context(), flowName, "*/1 * * * *"); err != nil {
+		t.Fatalf("CreateFlowSchedule (update) failed: %v", err)
+	}
+
+	flowSchedules, err := client.ListFlowSchedules(t.Context())
+	if err != nil {
+		t.Fatalf("ListFlowSchedules failed: %v", err)
+	}
+	var fs *FlowScheduleInfo
+	for _, s := range flowSchedules {
+		if s.FlowName == flowName {
+			fs = s
+		}
+	}
+	if fs == nil {
+		t.Fatalf("no flow schedule found for %q", flowName)
+	}
+	if fs.CronSpec != "*/1 * * * *" {
+		t.Fatalf("expected updated flow cron_spec %q, got %q (spec change silently ignored)", "*/1 * * * *", fs.CronSpec)
+	}
+}
+
+// TestSchedulerScheduleDelete verifies schedules can be removed, that delete
+// reports whether a schedule existed, and that deleting a missing schedule is
+// a no-op. See issue #34.
+func TestSchedulerScheduleDelete(t *testing.T) {
+	client := getTestClient(t)
+	suffix := fmt.Sprintf("_%d", time.Now().UnixNano())
+	taskName := "test_delete_task" + suffix
+	flowName := "test_delete_flow" + suffix
+
+	hasTaskSchedule := func(name string) bool {
+		schedules, err := client.ListTaskSchedules(t.Context())
+		if err != nil {
+			t.Fatalf("ListTaskSchedules failed: %v", err)
+		}
+		for _, s := range schedules {
+			if s.TaskName == name {
+				return true
+			}
+		}
+		return false
+	}
+	hasFlowSchedule := func(name string) bool {
+		schedules, err := client.ListFlowSchedules(t.Context())
+		if err != nil {
+			t.Fatalf("ListFlowSchedules failed: %v", err)
+		}
+		for _, s := range schedules {
+			if s.FlowName == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Deleting a non-existent schedule is a no-op that reports false.
+	existed, err := client.DeleteTaskSchedule(t.Context(), taskName)
+	if err != nil {
+		t.Fatalf("DeleteTaskSchedule (missing) failed: %v", err)
+	}
+	if existed {
+		t.Fatalf("expected DeleteTaskSchedule to report false for missing schedule")
+	}
+
+	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
+		return "done", nil
+	})
+	if err := CreateTask(t.Context(), client.Conn, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CreateTaskSchedule(t.Context(), taskName, "@hourly"); err != nil {
+		t.Fatalf("CreateTaskSchedule failed: %v", err)
+	}
+	if !hasTaskSchedule(taskName) {
+		t.Fatalf("expected task schedule to exist after create")
+	}
+
+	existed, err = client.DeleteTaskSchedule(t.Context(), taskName)
+	if err != nil {
+		t.Fatalf("DeleteTaskSchedule failed: %v", err)
+	}
+	if !existed {
+		t.Fatalf("expected DeleteTaskSchedule to report true for existing schedule")
+	}
+	if hasTaskSchedule(taskName) {
+		t.Fatalf("expected task schedule to be gone after delete")
+	}
+
+	// Flows behave the same way.
+	flow := NewFlow(flowName)
+	flow.AddStep(NewStep("s1").Do(func(ctx context.Context, in int) (int, error) {
+		return in, nil
+	}))
+	if err := CreateFlow(t.Context(), client.Conn, flow); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CreateFlowSchedule(t.Context(), flowName, "@daily"); err != nil {
+		t.Fatalf("CreateFlowSchedule failed: %v", err)
+	}
+
+	existed, err = client.DeleteFlowSchedule(t.Context(), flowName)
+	if err != nil {
+		t.Fatalf("DeleteFlowSchedule failed: %v", err)
+	}
+	if !existed {
+		t.Fatalf("expected DeleteFlowSchedule to report true for existing schedule")
+	}
+	if hasFlowSchedule(flowName) {
+		t.Fatalf("expected flow schedule to be gone after delete")
+	}
+}
+
 // TestSchedulerConcurrentWorkers verifies that multiple workers fairly distribute
 // due schedules without creating duplicates or starving any worker.
 // This tests the core distributed scheduling guarantee: exactly one execution

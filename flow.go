@@ -1899,6 +1899,14 @@ func CreateFlowSchedule(ctx context.Context, conn Conn, flowName, cronSpec strin
 	return nil
 }
 
+// DeleteFlowSchedule removes the cron schedule for a flow.
+// It reports whether a schedule existed; deleting a missing schedule is a no-op.
+func DeleteFlowSchedule(ctx context.Context, conn Conn, flowName string) (bool, error) {
+	existed := false
+	err := conn.QueryRow(ctx, `SELECT cb_delete_flow_schedule($1);`, flowName).Scan(&existed)
+	return existed, err
+}
+
 // ListFlowSchedules returns all flow schedules ordered by next_run_at.
 func ListFlowSchedules(ctx context.Context, conn Conn) ([]*FlowScheduleInfo, error) {
 	q := `SELECT flow_name, cron_spec, next_run_at, last_run_at, last_enqueued_at, enabled, catch_up, created_at, updated_at
