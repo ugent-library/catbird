@@ -120,7 +120,6 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /", a.handleIndex)
 	mux.HandleFunc("GET /queues", a.handleQueues)
 	mux.HandleFunc("GET /queues/table", a.handleQueuesTable)
-	mux.HandleFunc("GET /queue/create-form", a.handleCreateQueueForm)
 	mux.HandleFunc("POST /queue/create", a.handleCreateQueue)
 	mux.HandleFunc("GET /queue/send-form", a.handleSendMessageForm)
 	mux.HandleFunc("POST /queue/send", a.handleSendMessage)
@@ -260,12 +259,6 @@ func (a *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.queues.ExecuteTemplate(w, "send_message_success", nil)
-}
-
-func (a *App) handleCreateQueueForm(w http.ResponseWriter, r *http.Request) {
-	if err := a.queues.ExecuteTemplate(w, "create_queue_form", nil); err != nil {
-		a.handleError(w, r, err)
-	}
 }
 
 func (a *App) handleCreateQueue(w http.ResponseWriter, r *http.Request) {

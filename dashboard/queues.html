@@ -22,8 +22,33 @@
 </div>
 
 <!-- Create Queue Modal -->
-<div id="create-queue-modal" class="modal" tabindex="-1" hx-get="{{ route `queue` `create-form` }}" hx-trigger="show.bs.modal" hx-target="#create-queue-modal" hx-swap="innerHTML">
-  <div id="create-queue-modal-content"></div>
+<div id="create-queue-modal" class="modal" tabindex="-1">
+  <div id="create-queue-modal-content">
+    <form id="create-queue-form" hx-post="{{ route `queue` `create` }}" hx-target="#create-queue-modal" hx-swap="innerHTML">
+      <div class="modal-dialog">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title">Create Queue</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            <div class="mb-3">
+              <label for="queue-name" class="form-label">Queue Name</label>
+              <input type="text" class="form-control" id="queue-name" name="name" placeholder="my-queue" required>
+            </div>
+            <div class="mb-3">
+              <label for="queue-description" class="form-label">Description (optional)</label>
+              <input type="text" class="form-control" id="queue-description" name="description" placeholder="Queue purpose">
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+            <button type="submit" class="btn btn-primary">Create</button>
+          </div>
+        </div>
+      </div>
+    </form>
+  </div>
 </div>
 
 <!-- Send Message Modal -->
@@ -128,33 +153,6 @@
       <div class="modal-footer">
         <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
         <button type="submit" class="btn btn-primary">Send</button>
-      </div>
-    </div>
-  </div>
-</form>
-{{ end }}
-
-{{ define "create_queue_form" }}
-<form id="create-queue-form" hx-post="{{ route `queue` `create` }}" hx-target="#create-queue-modal" hx-swap="innerHTML">
-  <div class="modal-dialog">
-    <div class="modal-content">
-      <div class="modal-header">
-        <h5 class="modal-title">Create Queue</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-      </div>
-      <div class="modal-body">
-        <div class="mb-3">
-          <label for="queue-name" class="form-label">Queue Name</label>
-          <input type="text" class="form-control" id="queue-name" name="name" placeholder="my-queue" required>
-        </div>
-        <div class="mb-3">
-          <label for="queue-description" class="form-label">Description (optional)</label>
-          <input type="text" class="form-control" id="queue-description" name="description" placeholder="Queue purpose">
-        </div>
-      </div>
-      <div class="modal-footer">
-        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-        <button type="submit" class="btn btn-primary">Create</button>
       </div>
     </div>
   </div>
