@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"embed"
 	"io/fs"
+	"path/filepath"
 
 	"github.com/pressly/goose/v3"
 )
@@ -54,4 +55,32 @@ func MigrateDownTo(ctx context.Context, db *sql.DB, version int) error {
 		return err
 	}
 	return nil
+}
+
+// MigrationInfo reports a single migration's applied state.
+type MigrationInfo struct {
+	Version int
+	Name    string
+	Applied bool
+}
+
+// MigrationStatus returns the state of every known migration, ordered by version.
+func MigrationStatus(ctx context.Context, db *sql.DB) ([]MigrationInfo, error) {
+	p, err := newMigrationProvider(db)
+	if err != nil {
+		return nil, err
+	}
+	st, err := p.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]MigrationInfo, len(st))
+	for i, s := range st {
+		out[i] = MigrationInfo{
+			Version: int(s.Source.Version),
+			Name:    filepath.Base(s.Source.Path),
+			Applied: s.State == goose.StateApplied,
+		}
+	}
+	return out, nil
 }

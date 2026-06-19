@@ -1010,6 +1010,21 @@ For SQL-based archiving patterns and example queries, see the
 
 ## Migrations
 
+### Standalone CLI
+
+When Catbird owns its own database (or you want to manage its schema outside your application's migration flow), the `cb` CLI applies the schema directly:
+
+```bash
+go install github.com/ugent-library/catbird/cmd/cb@latest
+export CB_CONN="postgres://user:pass@localhost:5432/mydb?sslmode=disable"
+
+cb migrate up              # apply all pending migrations
+cb migrate status          # list applied and pending migrations
+cb migrate down --to 1     # roll back down to a target version
+```
+
+### Embedding in your own migrations
+
 If your application already uses Goose migrations, you can register Catbird's schema migration as a normal app migration:
 
 Create a migration file such as `00003_add_catbird.go`:
