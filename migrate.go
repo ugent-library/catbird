@@ -10,7 +10,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const SchemaVersion = 2
+const SchemaVersion = 3
 const gooseVersionTable = "cb_goose_db_version"
 
 //go:embed migrations/*.sql
