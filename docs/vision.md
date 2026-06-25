@@ -7,15 +7,8 @@
 This is the **long-term vision**: the *why* (the compass) and the *how* (the map).
 It is a direction, not a commitment — catbird is 0.x, and breaking changes are on
 the table. It exists to keep scope honest: when a feature or a refactor doesn't serve
-the one-sentence vision above, it's out.
-
-The short-term work — a durable notification inbox plus htmx-polling delivery — is
-the **first incremental step** toward this vision and is tracked in issues, not
-here: [catbird#29](https://github.com/ugent-library/catbird/issues/29) and
-[ugent-library/raven#13](https://github.com/ugent-library/raven/issues/13) (durable
-notifications), [catbird#37](https://github.com/ugent-library/catbird/issues/37)
-(SSE hardening). See [The incremental path](#9-the-incremental-path) for how that
-slice relates to the whole.
+the one-sentence vision above, it's out. If pursued, it would be reached
+incrementally, never as a big-bang rewrite.
 
 Where the design conversation explored and walked back, only the conclusion is
 recorded — see the [appendix](#appendix--rejected-and-why-dont-relitigate) for what
@@ -416,8 +409,7 @@ The browser-facing module: **ephemeral + durable**, as two independent primitive
 
 - **wire stays ephemeral** — SSE, live pub/sub, presence, push-only-on-commit.
   Durable push is deliberately *not* baked into wire; doing so would turn an SSE layer
-  into "messaging + scheduling + inbox + SSE." (Hardening the SSE transport itself is
-  tracked in [catbird#37](https://github.com/ugent-library/catbird/issues/37).)
+  into "messaging + scheduling + inbox + SSE."
 - **the durable inbox** is its own per-identity, cursor-addressed store, read by
   polling. Durable push to a user is therefore composed, not built-in: persist to the
   inbox, then (optionally) notify wire to re-pull. The two share no machinery and each
@@ -426,10 +418,6 @@ The browser-facing module: **ephemeral + durable**, as two independent primitive
 The inbox is, in shape, an **identity-partitioned durable stream** — the same
 primitive the substrate offers. Standalone, catbird ships its own minimal store; if
 the substrate is also present, the inbox can ride on it. Resonance, not coupling.
-
-The durable inbox is also the **first slice we build** (see below): its store-as-
-cursor-authority model is the smallest thing that already embodies the substrate's
-central bet.
 
 ---
 
@@ -446,33 +434,7 @@ central bet.
 
 ---
 
-## 9. The incremental path
-
-This vision is **not** executed as a big-bang rewrite. If it is pursued, it is a
-strangler starting from the smallest slice that already embodies the central bet.
-
-That slice is the **durable notification inbox** (tracked in
-[catbird#29](https://github.com/ugent-library/catbird/issues/29) /
-[raven#13](https://github.com/ugent-library/raven/issues/13)). It is the simplest
-thing that already uses this vision's core pattern — *the store as cursor authority;
-cursor + seen + staleness; no visibility timeout.* Three things make it an unusually
-good first step:
-
-- **Forward-compatible API.** `NotifyDurable` / `UnseenNotifications` /
-  `MarkSeenThrough` and the staleness model survive untouched if the full direction is
-  pursued — only the backing `cb_notifications` table is later re-homed onto the log.
-- **Disposable data.** Notifications are perishable pointers, so re-homing the store
-  needs no migration: flip the implementation, let the old table drain via TTL. The
-  cutover is nearly free.
-- **A real consumer.** raven exercises it for real, which is what actually tells you
-  whether the cursor/staleness mental model clicks for a team in production.
-
-So the short-term work is both a useful feature on its own **and** a low-risk probe of
-this vision's central bet. Shipping it commits to nothing here; it just buys evidence.
-
----
-
-## 10. Open decisions
+## 9. Open decisions
 
 1. **Where the spine lives** — a capability of the substrate, or its own thin `bind`
    module above it. The conversation drew it as a separate layer; that is probably
