@@ -167,6 +167,49 @@ ORDER BY finished_at, id
 LIMIT $batch_size;
 ```
 
+### Durable notifications
+
+```sql
+-- Append a durable notification to an identity's inbox; returns the new id (cursor)
+SELECT cb_notify_durable(
+	identity => 'user-123',
+	topic => 'import.done',
+	message => 'Your import finished'
+);
+
+-- Collapse progress updates: a newer message with the same collapse_key marks
+-- prior unseen ones seen, so only the latest stays live (FCM collapse_key semantics)
+SELECT cb_notify_durable(
+	identity => 'user-123',
+	topic => 'import.progress',
+	message => '100%',
+	collapse_key => 'import-42',
+	expires_at => now() + interval '1 hour'
+);
+
+-- Read an identity's unseen, still-relevant notifications after a cursor
+SELECT id, topic, message, created_at
+FROM cb_notifications
+WHERE identity = 'user-123'
+	AND id > 0                       -- the client's last-seen cursor
+	AND seen_at IS NULL
+	AND (expires_at IS NULL OR expires_at > now())
+ORDER BY id
+LIMIT 50;
+
+-- Ack the cursor: mark everything up to an id seen; returns rows marked
+SELECT cb_mark_seen(
+	identity => 'user-123',
+	up_to_id => 42
+);
+```
+
+Retention (physically dropping rows past their `expires_at`) folds into the core
+`cb_gc` sweep, which runs on worker heartbeat. A deployment that runs Wire but no
+worker therefore performs no GC — it must call `cb_gc()` / `Client.GC()` on its own
+schedule, or notifications accumulate. The unseen read already hides stale rows, so
+this is a storage concern, not a correctness one.
+
 ## Public SQL API
 
 These are the functions most app code and external clients care about.
@@ -361,11 +404,11 @@ These are the functions most app code and external clients care about.
 **Maintenance**
 
 ### `cb_gc`
-- **What it does**: Garbage collection: deletes expired queues and messages, transitions expired task/flow runs to `'expired'` status, cleans stale workers and wire nodes, purges old terminal runs.
+- **What it does**: Garbage collection: deletes expired queues and messages, transitions expired task/flow runs to `'expired'` status, cleans stale workers and wire nodes, deletes durable notifications past their relevance window, purges old terminal runs.
 - **Inputs**: `cb_gc()`
 - **Returns**: `RETURNS jsonb`
 - **Returned JSON shape**:
-	- `{ "expired_queues_deleted": int, "expired_messages_deleted": int, "expired_task_runs": int, "expired_flow_runs": int, "stale_workers_deleted": int, "stale_wire_nodes_deleted": int, "task_runs_purged": int, "flow_runs_purged": int }`
+	- `{ "expired_queues_deleted": int, "expired_messages_deleted": int, "expired_task_runs": int, "expired_flow_runs": int, "stale_workers_deleted": int, "stale_wire_nodes_deleted": int, "expired_notifications_deleted": int, "task_runs_purged": int, "flow_runs_purged": int }`
 
 ### `cb_clear_task_runs`
 - **What it does**: Delete all task runs regardless of status. In-flight work will be lost.
@@ -393,6 +436,20 @@ These are the functions most app code and external clients care about.
 - **What it does**: Send a notification via pg NOTIFY on the schema-qualified cb_wire channel.
 - **Inputs**: `cb_notify(topic text, data text DEFAULT NULL, node_id uuid DEFAULT NULL)`
 - **Returns**: `RETURNS void`
+
+**Durable notifications (per-identity inbox)**
+
+### `cb_notify_durable`
+- **What it does**: Append a durable notification to an identity's inbox and return the new row id (the monotonic cursor). When `collapse_key` is set, prior unseen rows with the same `(identity, collapse_key)` are first marked seen (write-time keep-newest collapse, the FCM `collapse_key` semantics — the deliberate opposite of the queue's keep-oldest `concurrency_key`), so the new row is the only live one for that subject. `expires_at` is the relevance window and the GC drop trigger.
+- **Inputs**: `cb_notify_durable(identity text, topic text, message text DEFAULT NULL, collapse_key text DEFAULT NULL, expires_at timestamptz DEFAULT NULL)`
+- **Returns**: `RETURNS bigint`
+
+### `cb_mark_seen`
+- **What it does**: Cursor ack: mark an identity's unseen notifications with `id <= up_to_id` as seen. Returns the number of rows marked.
+- **Inputs**: `cb_mark_seen(identity text, up_to_id bigint)`
+- **Returns**: `RETURNS bigint`
+
+The unseen read is a plain parameterized `SELECT` against `cb_notifications` (unseen **and** still-relevant: `seen_at IS NULL AND (expires_at IS NULL OR expires_at > now())`), not a function — see the usage example above.
 
 ## Internal / runtime SQL API
 

@@ -20,6 +20,7 @@ A PostgreSQL-powered message queue and task execution engine. Catbird brings rel
 - **Resiliency baked in**: retries, backoff, optional circuit breakers.
 - **Operational UX**: web dashboard and tui for runs, queues, and workers.
 - **Optional real-time layer**: opt-in pub/sub with SSE support for pushing events to browsers.
+- **Durable notifications**: a per-identity inbox with a cursor and seen-tracking, so clients reliably catch up on missed notifications at their own pace.
 
 <p align="center">
   <img src="assets/screenshots/dashboard-flows.png" alt="Flow Visualization" width="800" />
@@ -872,6 +873,65 @@ task := catbird.NewTask("process-order").Do(func(ctx context.Context, input Orde
 })
 ```
 
+## Durable Notifications
+
+A per-identity durable inbox. Where Wire is ephemeral push — miss the moment
+(navigating, offline, asleep) and the notification is gone — the inbox is a store the
+client catches up against on its own schedule. It is a separate primitive with **no
+dependency on Wire**: delete Wire and the inbox still does its whole job.
+
+The inbox is a mailbox keyed by `identity`. Each notification has a monotonic `id`
+(the cursor) and a `seen` marker, so "replay everything since I last looked" is just
+*read the unseen rows after my cursor, then ack the cursor*.
+
+```go
+// Append to an identity's inbox; returns the new id (the cursor value)
+id, err := catbird.NotifyDurable(ctx, conn, "user-123", "import.done", "Your import finished")
+
+// Read unseen, still-relevant notifications after the client's last cursor
+ns, err := catbird.UnseenNotifications(ctx, conn, "user-123", afterID, 50)
+for _, n := range ns {
+    fmt.Println(n.ID, n.Topic, n.Message)
+}
+
+// Ack the cursor: mark everything up to an id seen (returns rows marked)
+marked, err := catbird.MarkSeen(ctx, conn, "user-123", ns[len(ns)-1].ID)
+```
+
+**Relevance window (`ExpiresAt`).** A notification is a *perishable pointer to a durable
+fact* — the underlying result lives permanently elsewhere (e.g. a task row); the
+notification is only the prompt to look. Set `ExpiresAt` to bound how long it is worth
+delivering: once it passes, the row drops out of `UnseenNotifications` and `cb_gc`
+deletes it. Leave it zero and the notification **waits until seen** (cleared by
+`MarkSeen`, not by a timer) — the right choice for "action required" items.
+
+```go
+// Perishable toast: gone after an hour whether seen or not
+catbird.NotifyDurable(ctx, conn, "user-123", "batch.done", "Batch finished",
+    catbird.NotifyDurableOpts{ExpiresAt: time.Now().Add(time.Hour)})
+
+// Collapse: a newer notification with the same CollapseKey marks prior unseen ones
+// seen, so only the latest stays live (FCM collapse-key semantics — keep newest,
+// the deliberate opposite of the queue's keep-oldest ConcurrencyKey)
+catbird.NotifyDurable(ctx, conn, "user-123", "import.progress", "100%",
+    catbird.NotifyDurableOpts{CollapseKey: "import-42"})
+```
+
+Reads return **unseen *and* still-relevant** rows — never "everything since the cursor"
+— so an identity offline for a day is not flooded with stale toasts. Retention folds
+into the core `cb_gc` sweep (see [Data Retention](#data-retention)).
+
+**Pairing with Wire (optional).** Durability (is it stored?) and transport (push vs
+poll) are independent. If you also run Wire, push a *content-free ping* and let the
+client re-pull from its cursor — the store stays the single source of truth and the
+cursor dedups, so a client that is both connected and polling never shows a
+notification twice:
+
+```go
+catbird.NotifyDurable(ctx, conn, userID, topic, msg, opts) // the real message, stored
+wire.Notify(ctx, "user."+userID, "")                       // empty ping → client re-pulls
+```
+
 ## Naming Rules
 
 - **Queue, task, flow, and step names**: Lowercase letters, digits, and underscores only (`a-z`, `0-9`, `_`). Max 58 characters. Step names must be unique within a flow. Reserved step names: `input`, `signal`.
@@ -967,7 +1027,12 @@ _ = gcInfo.ExpiredQueuesDeleted
 _ = gcInfo.StaleWorkersDeleted
 _ = gcInfo.TaskRunsPurged
 _ = gcInfo.FlowRunsPurged
+_ = gcInfo.ExpiredNotificationsDeleted
 ```
+
+Durable notifications past their `ExpiresAt` are deleted by the same `cb_gc()` sweep.
+Because GC runs from the worker heartbeat, a deployment that runs Wire but no worker
+must call `client.GC(ctx)` on its own schedule, or expired notifications accumulate.
 
 ```go
 task := catbird.NewTask("send-email").

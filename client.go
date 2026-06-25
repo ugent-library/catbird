@@ -241,6 +241,23 @@ func (c *Client) Notify(ctx context.Context, topic, message string, opts ...Noti
 	return Notify(ctx, c.Conn, topic, message, opts...)
 }
 
+// NotifyDurable appends a durable notification to identity's inbox and returns its id.
+func (c *Client) NotifyDurable(ctx context.Context, identity, topic, message string, opts ...NotifyDurableOpts) (int64, error) {
+	return NotifyDurable(ctx, c.Conn, identity, topic, message, opts...)
+}
+
+// UnseenNotifications returns an identity's unseen and still-relevant notifications
+// with id greater than afterID, ordered by id, limited to limit rows.
+func (c *Client) UnseenNotifications(ctx context.Context, identity string, afterID int64, limit int) ([]Notification, error) {
+	return UnseenNotifications(ctx, c.Conn, identity, afterID, limit)
+}
+
+// MarkSeen acks the cursor: marks all of identity's unseen notifications with id
+// less than or equal to upToID as seen, and returns the number of rows marked.
+func (c *Client) MarkSeen(ctx context.Context, identity string, upToID int64) (int64, error) {
+	return MarkSeen(ctx, c.Conn, identity, upToID)
+}
+
 // Reader continuously reads messages from a queue and processes them.
 // Blocks until ctx is cancelled.
 func (c *Client) Reader(ctx context.Context, queueName string, quantity int, hideFor time.Duration, handler ReaderHandler, opts ...ReadPollOpts) error {
