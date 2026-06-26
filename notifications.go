@@ -89,14 +89,35 @@ func UnseenNotifications(ctx context.Context, conn Conn, identity string, afterI
 	return pgx.CollectRows(rows, scanCollectibleNotification)
 }
 
-// MarkSeen acks the cursor: it marks all of identity's unseen notifications with
-// id less than or equal to upToID as seen, and returns the number of rows marked.
-// Seen-tracking always flows through this cursor, regardless of transport.
-func MarkSeen(ctx context.Context, conn Conn, identity string, upToID int64) (int64, error) {
-	q := `SELECT cb_mark_seen(identity => $1, up_to_id => $2);`
+// MarkSeenUntil acks the cursor as a bounded watermark: it marks all of identity's
+// unseen notifications with id less than or equal to id as seen, and returns the
+// number of rows marked. The id bound is load-bearing — it must not mark rows that
+// arrived between a reader's fetch and its ack.
+//
+// This is whole-inbox scope only: a by-id range is unsafe across interleaved subsets
+// (a subset's ids interleave with others' in one inbox), so subset-scoped acks use
+// MarkSeen instead. Seen-tracking always flows through these acks, regardless of
+// transport.
+func MarkSeenUntil(ctx context.Context, conn Conn, identity string, id int64) (int64, error) {
+	q := `SELECT cb_mark_seen_until(identity => $1, id => $2);`
 
 	var marked int64
-	err := conn.QueryRow(ctx, q, identity, upToID).Scan(&marked)
+	err := conn.QueryRow(ctx, q, identity, id).Scan(&marked)
+	if err != nil {
+		return 0, err
+	}
+	return marked, nil
+}
+
+// MarkSeen acks precisely: it marks the identity's unseen notifications whose id is
+// in ids as seen, and returns the number of rows marked. Use this for subset-scoped
+// acks — a transport matches a subset's unseen rows and acks exactly those ids, since
+// the watermark MarkSeenUntil would clobber interleaved sibling subsets.
+func MarkSeen(ctx context.Context, conn Conn, identity string, ids []int64) (int64, error) {
+	q := `SELECT cb_mark_seen(identity => $1, ids => $2);`
+
+	var marked int64
+	err := conn.QueryRow(ctx, q, identity, ids).Scan(&marked)
 	if err != nil {
 		return 0, err
 	}

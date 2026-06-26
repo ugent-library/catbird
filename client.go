@@ -252,10 +252,17 @@ func (c *Client) UnseenNotifications(ctx context.Context, identity string, after
 	return UnseenNotifications(ctx, c.Conn, identity, afterID, limit)
 }
 
-// MarkSeen acks the cursor: marks all of identity's unseen notifications with id
-// less than or equal to upToID as seen, and returns the number of rows marked.
-func (c *Client) MarkSeen(ctx context.Context, identity string, upToID int64) (int64, error) {
-	return MarkSeen(ctx, c.Conn, identity, upToID)
+// MarkSeenUntil acks the cursor as a bounded watermark: marks all of identity's
+// unseen notifications with id less than or equal to id as seen, and returns the
+// number of rows marked. Whole-inbox scope only — see the package-level MarkSeenUntil.
+func (c *Client) MarkSeenUntil(ctx context.Context, identity string, id int64) (int64, error) {
+	return MarkSeenUntil(ctx, c.Conn, identity, id)
+}
+
+// MarkSeen acks precisely: marks the identity's unseen notifications whose id is in
+// ids as seen, and returns the number of rows marked. Use for subset-scoped acks.
+func (c *Client) MarkSeen(ctx context.Context, identity string, ids []int64) (int64, error) {
+	return MarkSeen(ctx, c.Conn, identity, ids)
 }
 
 // Reader continuously reads messages from a queue and processes them.

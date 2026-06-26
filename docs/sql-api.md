@@ -197,10 +197,16 @@ WHERE identity = 'user-123'
 ORDER BY id
 LIMIT 50;
 
--- Ack the cursor: mark everything up to an id seen; returns rows marked
+-- Ack as a bounded watermark: mark everything up to an id seen; returns rows marked
+SELECT cb_mark_seen_until(
+	identity => 'user-123',
+	id => 42
+);
+
+-- Ack precisely: mark only the named ids seen (subset-scoped); returns rows marked
 SELECT cb_mark_seen(
 	identity => 'user-123',
-	up_to_id => 42
+	ids => ARRAY[40, 42, 45]::bigint[]
 );
 ```
 
@@ -444,9 +450,14 @@ These are the functions most app code and external clients care about.
 - **Inputs**: `cb_notify_durable(identity text, topic text, message text DEFAULT NULL, collapse_key text DEFAULT NULL, expires_at timestamptz DEFAULT NULL)`
 - **Returns**: `RETURNS bigint`
 
+### `cb_mark_seen_until`
+- **What it does**: Bounded watermark ack: mark an identity's unseen notifications with `id <= id` as seen. Returns the number of rows marked. The `id` bound is load-bearing — it must not mark rows that arrived between a reader's fetch and its ack. Whole-inbox scope only; a by-`id` range is unsafe across interleaved subsets (use `cb_mark_seen` for subset-scoped acks).
+- **Inputs**: `cb_mark_seen_until(identity text, id bigint)`
+- **Returns**: `RETURNS bigint`
+
 ### `cb_mark_seen`
-- **What it does**: Cursor ack: mark an identity's unseen notifications with `id <= up_to_id` as seen. Returns the number of rows marked.
-- **Inputs**: `cb_mark_seen(identity text, up_to_id bigint)`
+- **What it does**: Precise ack: mark the identity's unseen notifications whose `id` is in `ids` as seen. Returns the number of rows marked. Used for subset-scoped acks — a transport matches a subset's unseen rows and acks exactly those ids, since subsets' ids interleave in one inbox and a range would clobber siblings.
+- **Inputs**: `cb_mark_seen(identity text, ids bigint[])`
 - **Returns**: `RETURNS bigint`
 
 The unseen read is a plain parameterized `SELECT` against `cb_notifications` (unseen **and** still-relevant: `seen_at IS NULL AND (expires_at IS NULL OR expires_at > now())`), not a function — see the usage example above.

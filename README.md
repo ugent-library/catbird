@@ -784,9 +784,9 @@ wire.Listen("order.*", func(ctx context.Context, topic, message string) {
     log.Println(topic, message)
 })
 
-// RenderSSE: transform events for SSE clients (acts as allowlist)
-wire.RenderSSE("task.*.completed", func(r *http.Request, topic, message string) (catbird.SSEEvent, error) {
-    return catbird.SSEEvent{Event: "task-done", Data: "<div>Task done</div>"}, nil
+// Render: project events into a transport-neutral Fragment (acts as allowlist)
+wire.Render("task.*.completed", func(r *http.Request, topic, message string) (catbird.Fragment, error) {
+    return catbird.Fragment{Event: "task-done", Data: "<div>Task done</div>"}, nil
 })
 
 go wire.Start(ctx)
@@ -801,14 +801,16 @@ http.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 })
 ```
 
-### Listen vs RenderSSE
+A `Render` definition is transport-neutral: `ServeSSE` wraps each `Fragment` as an SSE frame, and `ServePoll` concatenates fragments into an HTTP body backed by the [durable inbox](#durable-notifications) — define the projection once, pick the transport per surface. (`RenderSSE` is a deprecated alias for `Render`.)
+
+### Listen vs Render
 
 | Method | Runs on | Purpose |
 |--------|---------|---------|
 | `wire.Listen` | Every node | Server-side side effects (logging, webhooks) |
-| `wire.RenderSSE` | Node with SSE client | Transform for SSE push (e.g., JSON → HTML) |
+| `wire.Render` | Node serving SSE/poll | Project events into a `Fragment` (e.g., JSON → HTML) |
 
-Topics without a renderer pass through as-is. Multiple renderers matching the same topic each produce an SSE event. Render handlers receive the SSE client's `*http.Request` for access to user context (auth, language, etc).
+Topics without a renderer are handled per-transport: `ServeSSE` passes them through raw, `ServePoll` skips them. Multiple renderers matching the same topic each produce a fragment. Render handlers receive the client's `*http.Request` for access to user context (auth, language, etc).
 
 ### Notify
 
@@ -823,16 +825,16 @@ client.Notify(ctx, "order.created", `{"id": 123}`)
 wire.Notify(ctx, "order.created", `{"id": 123}`)
 ```
 
-### SSEEvent
+### Fragment
 
-`SSEEvent` controls the full SSE output: event name, data, and optional ID. It implements `io.Writer`, so templates can write directly to it:
+`Fragment` is the transport-neutral render output: a `Data` payload (e.g. an HTML fragment) plus SSE-only `Event`/`ID` hints. It implements `io.Writer`, so templates can write directly to it. `ServeSSE` frames it; `ServePoll` emits its `Data`. (`SSEEvent` is a deprecated alias for `Fragment`.)
 
 ```go
-// Typed helper — unmarshals JSON, gives full SSEEvent control
-catbird.RenderSSE[TaskEvent](wire, "task.*", func(r *http.Request, topic string, data TaskEvent) (catbird.SSEEvent, error) {
-    ev := catbird.SSEEvent{Event: "task-update", ID: topic}
-    err := views.TaskCompleted(r, data).Render(r.Context(), &ev)
-    return ev, err
+// Typed helper — unmarshals JSON, gives full Fragment control
+catbird.Render[TaskEvent](wire, "task.*", func(r *http.Request, topic string, data TaskEvent) (catbird.Fragment, error) {
+    f := catbird.Fragment{Event: "task-update", ID: topic}
+    err := views.TaskCompleted(r, data).Render(r.Context(), &f)
+    return f, err
 })
 ```
 
@@ -895,15 +897,16 @@ for _, n := range ns {
 }
 
 // Ack the cursor: mark everything up to an id seen (returns rows marked)
-marked, err := catbird.MarkSeen(ctx, conn, "user-123", ns[len(ns)-1].ID)
+marked, err := catbird.MarkSeenUntil(ctx, conn, "user-123", ns[len(ns)-1].ID)
 ```
 
 **Relevance window (`ExpiresAt`).** A notification is a *perishable pointer to a durable
 fact* — the underlying result lives permanently elsewhere (e.g. a task row); the
 notification is only the prompt to look. Set `ExpiresAt` to bound how long it is worth
 delivering: once it passes, the row drops out of `UnseenNotifications` and `cb_gc`
-deletes it. Leave it zero and the notification **waits until seen** (cleared by
-`MarkSeen`, not by a timer) — the right choice for "action required" items.
+deletes it. Leave it zero and the notification **waits until seen** (cleared by an
+explicit `MarkSeenUntil`/`MarkSeen` ack, not by a timer) — the right choice for
+"action required" items.
 
 ```go
 // Perishable toast: gone after an hour whether seen or not
@@ -930,6 +933,22 @@ notification twice:
 ```go
 catbird.NotifyDurable(ctx, conn, userID, topic, msg, opts) // the real message, stored
 wire.Notify(ctx, "user."+userID, "")                       // empty ping → client re-pulls
+```
+
+`wire.ServePoll` is the read side: it renders an identity's unseen notifications
+(scoped to the token's topics) through the **same `Render` definitions** as `ServeSSE`
+and returns them as one HTTP body, with the next cursor in the `X-Wire-Cursor` header.
+It is a pure read — the client acks explicitly, so opening the same surface in several
+tabs is convergent, not destructive:
+
+```go
+http.HandleFunc("/inbox", func(w http.ResponseWriter, r *http.Request) {
+    wire.ServePoll(w, r, r.URL.Query().Get("token")) // ?after=<cursor> for catch-up
+})
+
+// Ack on an explicit gesture, never on read:
+catbird.MarkSeenUntil(ctx, conn, userID, cursor)        // "mark all read" (bounded watermark)
+catbird.MarkSeen(ctx, conn, userID, []int64{id1, id2})  // dismiss specific items (precise)
 ```
 
 ## Naming Rules
