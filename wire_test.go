@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -469,6 +470,101 @@ func TestWireNotifySSEWildcard(t *testing.T) {
 	}
 	if events[0].data != "finished" {
 		t.Errorf("data = %q, want %q", events[0].data, "finished")
+	}
+}
+
+func TestWireServePollUnauthorized(t *testing.T) {
+	getTestClient(t)
+	wire := NewWire(testPool, testSecret)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/poll", nil)
+	wire.ServePoll(rr, req, "bad-token")
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", rr.Code)
+	}
+}
+
+func TestWireServePollRequiresIdentity(t *testing.T) {
+	getTestClient(t)
+	wire := NewWire(testPool, testSecret)
+
+	// A token without an identity can't address the identity-keyed inbox.
+	token := wire.Token([]string{"notif.#"})
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/poll", nil)
+	wire.ServePoll(rr, req, token)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rr.Code)
+	}
+}
+
+// TestWireServePoll exercises the poll transport end to end: the same Render
+// definition projects stored inbox rows, the token's topic scope filters the
+// identity-keyed inbox to a subset, the cursor advances past skipped rows, and the
+// poll is a pure read (no ack).
+func TestWireServePoll(t *testing.T) {
+	cb := getTestClient(t)
+	ctx := t.Context()
+	wire := NewWire(testPool, testSecret)
+
+	identity := "poll-user-" + uuid.NewString()[:8]
+	base := "notif." + uuid.NewString()[:8]
+	drawerTopic := base + ".message"
+	otherTopic := "change." + uuid.NewString()[:8] // out of the token's scope
+
+	// One renderer, shared by both transports: wrap the message in an <li>.
+	wire.Render(base+".#", func(r *http.Request, topic, message string) (Fragment, error) {
+		return Fragment{Data: "<li>" + message + "</li>"}, nil
+	})
+
+	// Seed the inbox: two in-scope rows interleaved with one out-of-scope row.
+	if _, err := cb.NotifyDurable(ctx, identity, drawerTopic, "one"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cb.NotifyDurable(ctx, identity, otherTopic, "ignored"); err != nil {
+		t.Fatal(err)
+	}
+	lastID, err := cb.NotifyDurable(ctx, identity, drawerTopic, "two")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Identity token scoped to the drawer subset only.
+	token := wire.Token([]string{base + ".#"}, TokenOpts{Identity: identity})
+
+	rr := httptest.NewRecorder()
+	wire.ServePoll(rr, httptest.NewRequest("GET", "/poll?after=0", nil), token)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	// Only in-scope rows rendered, in cursor order; the out-of-scope row is skipped.
+	if got := rr.Body.String(); got != "<li>one</li><li>two</li>" {
+		t.Fatalf("body = %q", got)
+	}
+	// Cursor advances past every fetched row, including the skipped one.
+	if got := rr.Header().Get("X-Wire-Cursor"); got != strconv.FormatInt(lastID, 10) {
+		t.Fatalf("cursor = %q, want %d", got, lastID)
+	}
+
+	// Pure read: nothing was acked, so all three rows are still unseen.
+	unseen, err := UnseenNotifications(ctx, testPool, identity, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unseen) != 3 {
+		t.Fatalf("expected 3 rows still unseen (poll must not ack), got %d", len(unseen))
+	}
+
+	// Polling again from the returned cursor is caught up: empty body.
+	rr2 := httptest.NewRecorder()
+	wire.ServePoll(rr2, httptest.NewRequest("GET", "/poll?after="+strconv.FormatInt(lastID, 10), nil), token)
+	if rr2.Body.Len() != 0 {
+		t.Fatalf("expected empty body on caught-up poll, got %q", rr2.Body.String())
 	}
 }
 

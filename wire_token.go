@@ -24,6 +24,17 @@ type tokenPayload struct {
 	Expiry   int64    `json:"e,omitempty"`
 }
 
+// coversTopic reports whether any of the token's granted topic patterns matches the
+// concrete topic. Used by ServePoll to scope an identity's inbox to the token's reach.
+func (p *tokenPayload) coversTopic(topic string) bool {
+	for _, pattern := range p.Topics {
+		if matchTopic(pattern, topic) {
+			return true
+		}
+	}
+	return false
+}
+
 // Token mints a signed, URL-safe SSE connection token for the given topics.
 // The token is encrypted with AES-256-GCM and encoded as base64url (no padding).
 // Panics if the secret is invalid or the system's random source fails.

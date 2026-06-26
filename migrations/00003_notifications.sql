@@ -70,10 +70,37 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- cb_mark_seen: cursor ack. Marks unseen rows with id <= up_to_id as seen for this
--- identity. Returns the number of rows marked. Seen-tracking always flows through this
--- cursor regardless of transport.
-CREATE OR REPLACE FUNCTION cb_mark_seen(identity text, up_to_id bigint)
+-- cb_mark_seen_until: bounded watermark ack. Marks an identity's unseen rows with
+-- id <= id as seen, and returns the number of rows marked. The id bound is
+-- load-bearing: it must not mark rows that arrived between a reader's fetch and its
+-- ack. Whole-inbox scope only — a by-id range is unsafe across interleaved subsets,
+-- so subset-scoped acks use cb_mark_seen(ids) instead. Seen-tracking always flows
+-- through these acks regardless of transport.
+CREATE OR REPLACE FUNCTION cb_mark_seen_until(identity text, id bigint)
+RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+    _marked bigint;
+BEGIN
+    UPDATE cb_notifications
+    SET seen_at = now()
+    WHERE cb_notifications.identity = cb_mark_seen_until.identity
+      AND cb_notifications.id <= cb_mark_seen_until.id
+      AND cb_notifications.seen_at IS NULL;
+
+    GET DIAGNOSTICS _marked = ROW_COUNT;
+
+    RETURN _marked;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- cb_mark_seen: precise ack. Marks the identity's unseen rows whose id is in ids as
+-- seen, and returns the number of rows marked. Used for subset-scoped acks: a transport
+-- matches a subset's unseen rows and acks exactly those ids, since subsets' ids
+-- interleave in one inbox and a range (cb_mark_seen_until) would clobber siblings.
+CREATE OR REPLACE FUNCTION cb_mark_seen(identity text, ids bigint[])
 RETURNS bigint
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -82,7 +109,7 @@ BEGIN
     UPDATE cb_notifications
     SET seen_at = now()
     WHERE cb_notifications.identity = cb_mark_seen.identity
-      AND cb_notifications.id <= cb_mark_seen.up_to_id
+      AND cb_notifications.id = ANY(cb_mark_seen.ids)
       AND cb_notifications.seen_at IS NULL;
 
     GET DIAGNOSTICS _marked = ROW_COUNT;
@@ -225,7 +252,8 @@ $$;
 
 -- +goose down
 
-DROP FUNCTION IF EXISTS cb_mark_seen(text, bigint);
+DROP FUNCTION IF EXISTS cb_mark_seen(text, bigint[]);
+DROP FUNCTION IF EXISTS cb_mark_seen_until(text, bigint);
 DROP FUNCTION IF EXISTS cb_notify_durable(text, text, text, text, timestamptz);
 
 -- Restore cb_gc without the durable-notifications retention sweep.

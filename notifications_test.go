@@ -105,14 +105,14 @@ func TestUnseenNotificationsPaging(t *testing.T) {
 	}
 }
 
-// TestMarkSeen verifies the cursor ack: marking through a mid-inbox id leaves
-// only later rows unseen and reports the number of rows marked.
-func TestMarkSeen(t *testing.T) {
+// TestMarkSeenUntil verifies the bounded watermark ack: marking through a mid-inbox
+// id leaves only later rows unseen and reports the number of rows marked.
+func TestMarkSeenUntil(t *testing.T) {
 	client := getTestClient(t)
 	ctx := t.Context()
 	conn := client.Conn
 
-	identity := "TestMarkSeen"
+	identity := "TestMarkSeenUntil"
 	var ids []int64
 	for i := 0; i < 4; i++ {
 		id, err := NotifyDurable(ctx, conn, identity, "evt", fmt.Sprintf("msg-%d", i))
@@ -123,7 +123,7 @@ func TestMarkSeen(t *testing.T) {
 	}
 
 	// Mark seen through the second notification.
-	marked, err := MarkSeen(ctx, conn, identity, ids[1])
+	marked, err := MarkSeenUntil(ctx, conn, identity, ids[1])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,12 +140,57 @@ func TestMarkSeen(t *testing.T) {
 	}
 
 	// Re-acking the same cursor is a no-op (rows already seen).
-	marked, err = MarkSeen(ctx, conn, identity, ids[1])
+	marked, err = MarkSeenUntil(ctx, conn, identity, ids[1])
 	if err != nil {
 		t.Fatal(err)
 	}
 	if marked != 0 {
 		t.Fatalf("expected 0 rows marked on re-ack, got %d", marked)
+	}
+}
+
+// TestMarkSeen verifies the precise ack: only the explicitly named ids are marked,
+// leaving interleaved siblings untouched (the subset-scoped ack semantics a watermark
+// can't express).
+func TestMarkSeen(t *testing.T) {
+	client := getTestClient(t)
+	ctx := t.Context()
+	conn := client.Conn
+
+	identity := "TestMarkSeen"
+	var ids []int64
+	for i := 0; i < 5; i++ {
+		id, err := NotifyDurable(ctx, conn, identity, "evt", fmt.Sprintf("msg-%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+
+	// Ack a non-contiguous subset, skipping interleaved siblings.
+	marked, err := MarkSeen(ctx, conn, identity, []int64{ids[0], ids[2], ids[4]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marked != 3 {
+		t.Fatalf("expected 3 rows marked, got %d", marked)
+	}
+
+	got, err := UnseenNotifications(ctx, conn, identity, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].ID != ids[1] || got[1].ID != ids[3] {
+		t.Fatalf("expected only ids[1] and ids[3] unseen, got %+v", got)
+	}
+
+	// Re-acking already-seen ids is a no-op; only the still-unseen id counts.
+	marked, err = MarkSeen(ctx, conn, identity, []int64{ids[0], ids[1]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marked != 1 {
+		t.Fatalf("expected 1 row marked on partial re-ack, got %d", marked)
 	}
 }
 
