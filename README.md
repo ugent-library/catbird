@@ -32,17 +32,17 @@ client := catbird.New(conn)
 ctx := context.Background()
 
 // Queues
-err := client.CreateQueue(ctx, "my-queue")
-err = client.Send(ctx, "my-queue", map[string]any{"user_id": 123}, catbird.SendOpts{
+err := client.CreateQueue(ctx, "my_queue")
+err = client.Send(ctx, "my_queue", map[string]any{"user_id": 123}, catbird.SendOpts{
     ConcurrencyKey: "user-123",
 })
-messages, err := client.Read(ctx, "my-queue", 10, 30*time.Second)
+messages, err := client.Read(ctx, "my_queue", 10, 30*time.Second)
 for _, msg := range messages {
-    err = client.Delete(ctx, "my-queue", msg.ID)
+    err = client.Delete(ctx, "my_queue", msg.ID)
 }
 
 // Continuous reader: loops ReadPoll, ack on nil, nack on error
-go client.Reader(ctx, "my-queue", 10, 30*time.Second,
+go client.Reader(ctx, "my_queue", 10, 30*time.Second,
     func(ctx context.Context, msg catbird.Message) error {
         return nil // ack (deletes message)
     },
@@ -52,12 +52,12 @@ go client.Reader(ctx, "my-queue", 10, 30*time.Second,
 client.Send(ctx, "my_queue", map[string]any{"job": "cleanup"}, catbird.SendOpts{VisibleAt: time.Now().Add(30 * time.Minute)})
 
 // Tasks and flows
-task := catbird.NewTask("send-email").
+task := catbird.NewTask("send_email").
     WithDescription("Send a transactional email to a user").Do(func(ctx context.Context, input string) (string, error) {
         return "sent", nil
     })
 
-flow := catbird.NewFlow("double-add")
+flow := catbird.NewFlow("double_add")
 flow.AddStep(catbird.NewStep("double").Do(func(ctx context.Context, input int) (int, error) {
     return input * 2, nil
 }))
@@ -69,32 +69,35 @@ flow.AddStep(catbird.NewStep("add").
 worker := catbird.NewWorker(pool).
     AddTask(task).
     AddFlow(flow)
+
+// Ensure definitions exist before enqueueing runs; worker.Start below is asynchronous.
+err = client.CreateTask(ctx, task)
+err = client.CreateFlow(ctx, flow)
 go worker.Start(ctx)
 
-taskHandle, err := client.RunTask(ctx, "send-email", "hello")
+taskHandle, err := client.RunTask(ctx, "send_email", "hello")
 var taskOut string
 err = taskHandle.WaitForOutput(ctx, &taskOut)
 
-flowHandle, err := client.RunFlow(ctx, "double-add", 10)
+flowHandle, err := client.RunFlow(ctx, "double_add", 10)
 var flowOut int
 err = flowHandle.WaitForOutput(ctx, &flowOut)
 
 // Delayed execution
-client.RunTask(ctx, "process-user", userID, catbird.RunTaskOpts{VisibleAt: time.Now().Add(5 * time.Minute)})
+client.RunTask(ctx, "process_user", userID, catbird.RunTaskOpts{VisibleAt: time.Now().Add(5 * time.Minute)})
 client.RunFlow(ctx, "order_processing", map[string]any{"order_id": 123}, catbird.RunFlowOpts{VisibleAt: time.Now().Add(30 * time.Second)})
 
 // Priority (higher = claimed first, default 0)
-client.RunTask(ctx, "send-email", email, catbird.RunTaskOpts{Priority: 10})
+client.RunTask(ctx, "send_email", email, catbird.RunTaskOpts{Priority: 10})
 
-// Ensure definitions exist before usage; this is not necessary if you
-// just want to run a worker, definitions will be created for you.
-err := client.CreateTask(ctx, taskA)
+// Definitions can also be created directly, for example from setup code.
+err = client.CreateTask(ctx, taskA)
 err = client.CreateTask(ctx, taskB)
 err = client.CreateFlow(ctx, flowA)
 err = client.CreateFlow(ctx, flowB)
 
 // Direct package-level usage (no Client), for example in a transaction:
-taskHandle, err := catbird.RunTask(ctx, tx, "send-email", "hello")
+taskHandle, err = catbird.RunTask(ctx, tx, "send_email", "hello")
 ```
 
 ## Deduplication
@@ -103,7 +106,7 @@ Catbird uses a `ConcurrencyKey` to prevent overlapping runs of tasks and flows, 
 
 ```go
 // ConcurrencyKey: prevent overlap
-_, err := client.RunTask(ctx, "process-user", userID, catbird.RunTaskOpts{
+_, err := client.RunTask(ctx, "process_user", userID, catbird.RunTaskOpts{
     ConcurrencyKey: fmt.Sprintf("user-%d", userID),
 })
 ```
@@ -120,18 +123,18 @@ _, err := client.RunTask(ctx, "process-user", userID, catbird.RunTaskOpts{
 ## Topic-Based Routing
 
 ```go
-err := client.CreateQueue(ctx, "user-events")
-err = client.CreateQueue(ctx, "audit-log")
+err := client.CreateQueue(ctx, "user_events")
+err = client.CreateQueue(ctx, "audit_log")
 
-err = client.Bind(ctx, "user-events", "events.user.created")
-err = client.Bind(ctx, "user-events", "events.*.updated")
-err = client.Bind(ctx, "audit-log", "events.#")
+err = client.Bind(ctx, "user_events", "events.user.created")
+err = client.Bind(ctx, "user_events", "events.*.updated")
+err = client.Bind(ctx, "audit_log", "events.#")
 
 _, err = client.Publish(ctx, "events.user.created", map[string]any{
     "user_id": 123,
     "email":   "user@example.com",
 })
-_, err = client.Unbind(ctx, "user-events", "events.*.updated")
+_, err = client.Unbind(ctx, "user_events", "events.*.updated")
 ```
 
 Wildcard rules:
@@ -168,7 +171,7 @@ _, err = client.UnbindFlow(ctx, "order_processing", "events.order.#")
 
 ```go
 // Define task (scheduling is separate)
-task := catbird.NewTask("send-email").Do(func(ctx context.Context, input EmailRequest) (EmailResponse, error) {
+task := catbird.NewTask("send_email").Do(func(ctx context.Context, input EmailRequest) (EmailResponse, error) {
         return EmailResponse{SentAt: time.Now()}, nil
     },
         catbird.WithConcurrency(5),
@@ -178,7 +181,7 @@ task := catbird.NewTask("send-email").Do(func(ctx context.Context, input EmailRe
     )
 
 // Define a task with a condition (skipped when condition is false)
-conditionalTask := catbird.NewTask("premium-processing").
+conditionalTask := catbird.NewTask("premium_processing").
     WithCondition("input.is_premium"). // Skipped if is_premium = false
     Do(func(ctx context.Context, input ProcessRequest) (string, error) {
         return "processed", nil
@@ -190,10 +193,14 @@ worker := catbird.NewWorker(pool).
     WithShutdownTimeout(10 * time.Second).
     AddTask(task).
     AddTask(conditionalTask)
+
+// Create definitions before enqueueing runs; worker.Start below is asynchronous.
+err := client.CreateTask(ctx, task)
+err = client.CreateTask(ctx, conditionalTask)
 go worker.Start(ctx)
 
 // Run the task
-handle, err := client.RunTask(ctx, "send-email", EmailRequest{
+handle, err := client.RunTask(ctx, "send_email", EmailRequest{
     To:      "user@example.com",
     Subject: "Hello",
 })
@@ -216,7 +223,7 @@ original input plus rich failure context.
 - If `OnFail` retries are exhausted, on-fail handling remains failed and no further retries are scheduled.
 
 ```go
-task := catbird.NewTask("charge-payment").Do(func(ctx context.Context, input ChargeRequest) (ChargeResult, error) {
+task := catbird.NewTask("charge_payment").Do(func(ctx context.Context, input ChargeRequest) (ChargeResult, error) {
         return ChargeResult{}, fmt.Errorf("gateway timeout")
     }).
     OnFail(func(ctx context.Context, input ChargeRequest, failure catbird.TaskFailure) error {
@@ -243,7 +250,7 @@ A **flow** is a **directed acyclic graph (DAG)** of steps that execute when thei
 ### Examples: Workflows
 
 ```go
-flow := catbird.NewFlow("order-processing")
+flow := catbird.NewFlow("order_processing")
 flow.AddStep(catbird.NewStep("validate").Do(func(ctx context.Context, order Order) (ValidationResult, error) {
     if order.Amount <= 0 {
         return ValidationResult{Valid: false, Reason: "Invalid amount"}, nil
@@ -260,7 +267,7 @@ flow.AddStep(catbird.NewStep("charge").
         Amount:        order.Amount,
     }, nil
 }))
-flow.AddStep(catbird.NewStep("check-inventory").
+flow.AddStep(catbird.NewStep("check_inventory").
     DependsOn("validate").Do(func(ctx context.Context, order Order, validated ValidationResult) (InventoryCheck, error) {
     return InventoryCheck{
         InStock: true,
@@ -268,7 +275,7 @@ flow.AddStep(catbird.NewStep("check-inventory").
     }, nil
 }))
 flow.AddStep(catbird.NewStep("ship").
-    DependsOn("charge", "check-inventory").Do(func(ctx context.Context, order Order, chargeResult ChargeResult, inventory InventoryCheck) (ShipmentResult, error) {
+    DependsOn("charge", "check_inventory").Do(func(ctx context.Context, order Order, chargeResult ChargeResult, inventory InventoryCheck) (ShipmentResult, error) {
     if !inventory.InStock {
         return ShipmentResult{}, fmt.Errorf("out of stock")
     }
@@ -281,6 +288,7 @@ flow.AddStep(catbird.NewStep("ship").
 // Create worker
 worker := catbird.NewWorker(pool).
     AddFlow(flow)
+err := client.CreateFlow(ctx, flow)
 go worker.Start(ctx)
 ```
 
@@ -289,7 +297,7 @@ go worker.Start(ctx)
 Flows can have multiple terminal steps.
 
 ```go
-flow := catbird.NewFlow("approval-or-escalation")
+flow := catbird.NewFlow("approval_or_escalation")
 flow.OutputPriority("approve", "escalate")
 
 flow.AddStep(catbird.NewStep("validate").Do(func(ctx context.Context, req Request) (Validation, error) {
@@ -310,7 +318,7 @@ flow.AddStep(catbird.NewStep("escalate").
 If you omit `OutputPriority(...)`, Catbird uses terminal steps in definition order as the default priority.
 
 ```go
-flow := catbird.NewFlow("default-terminal-priority")
+flow := catbird.NewFlow("default_terminal_priority")
 flow.AddStep(catbird.NewStep("a").Do(func(ctx context.Context, in int) (int, error) { return in, nil }))
 flow.AddStep(catbird.NewStep("left").DependsOn("a").Do(func(ctx context.Context, in int, a int) (int, error) { return a + 1, nil }))
 flow.AddStep(catbird.NewStep("right").DependsOn("a").Do(func(ctx context.Context, in int, a int) (int, error) { return a + 2, nil }))
@@ -325,7 +333,7 @@ They execute with their own `HandlerOpt` retry and backoff settings, and receive
 original input plus rich failure context.
 
 ```go
-flow := catbird.NewFlow("order-processing")
+flow := catbird.NewFlow("order_processing")
 flow.AddStep(catbird.NewStep("charge").Do(func(ctx context.Context, order Order) (string, error) {
     return "", fmt.Errorf("charge failed")
 }))
@@ -381,7 +389,7 @@ A step with both dependencies and a signal waits for **both** conditions: all de
 Use `CompleteEarly(ctx, output, reason)` inside a flow step handler when you already have the final business output and want to stop remaining branches.
 
 ```go
-flow := catbird.NewFlow("fraud-check")
+flow := catbird.NewFlow("fraud_check")
 flow.AddStep(catbird.NewStep("quick_guard").Do(func(ctx context.Context, in Order) (string, error) {
     if in.IsKnownSafe {
         return "", catbird.CompleteEarly(ctx, Decision{Approved: true}, "known-safe fast path")
@@ -413,14 +421,15 @@ Map steps fan out array processing into per-item SQL-coordinated work and aggreg
 #### Map flow input
 
 ```go
-flow := catbird.NewFlow("double-input")
+flow := catbird.NewFlow("double_input")
 flow.AddStep(catbird.NewStep("double").
     MapFlowInput().
     Do(func(ctx context.Context, n int) (int, error) {
     return n * 2, nil
 }))
 
-handle, _ := client.RunFlow(ctx, "double-input", []int{1, 2, 3})
+_ = client.CreateFlow(ctx, flow)
+handle, _ := client.RunFlow(ctx, "double_input", []int{1, 2, 3})
 var out []int
 _ = handle.WaitForOutput(ctx, &out)
 // out == []int{2, 4, 6}
@@ -429,7 +438,7 @@ _ = handle.WaitForOutput(ctx, &out)
 #### Map dependency output
 
 ```go
-flow := catbird.NewFlow("double-numbers")
+flow := catbird.NewFlow("double_numbers")
 flow.AddStep(catbird.NewStep("numbers").Do(func(ctx context.Context, _ string) ([]int, error) {
     return []int{1, 2, 3}, nil
 }))
@@ -440,7 +449,7 @@ flow.AddStep(catbird.NewStep("double").
 }))
 
 // Reduce mapped outputs with an explicit reducer step
-flow = catbird.NewFlow("double-numbers-reduced")
+flow = catbird.NewFlow("double_numbers_reduced")
 flow.AddStep(catbird.NewStep("numbers").Do(func(ctx context.Context, _ string) ([]int, error) {
     return []int{1, 2, 3}, nil
 }))
@@ -462,8 +471,8 @@ Use `IgnoreOutput("step")` when a step must wait for a dependency but doesn't ne
 
 ```go
 flow.AddStep(catbird.NewStep("finish").
-    DependsOn("expensive-map").
-    IgnoreOutput("expensive-map").
+    DependsOn("expensive_map").
+    IgnoreOutput("expensive_map").
     Do(func(ctx context.Context, in Input) (string, error) {
     return "done", nil
 }))
@@ -481,7 +490,7 @@ Generator steps act like normal flow steps with an extra trailing `yield` callba
 - Generator steps do not support `MapFlowInput()` or `MapStepOutput()`
 
 ```go
-flow := catbird.NewFlow("generate-double-sum")
+flow := catbird.NewFlow("generate_double_sum")
 flow.AddStep(catbird.NewStep("seed").Do(func(ctx context.Context, in int) (int, error) {
     return in, nil
 }))
@@ -507,7 +516,8 @@ flow.AddStep(catbird.NewStep("sum").
     return total, nil
 }))
 
-handle, _ := client.RunFlow(ctx, "generate-double-sum", 5)
+_ = client.CreateFlow(ctx, flow)
+handle, _ := client.RunFlow(ctx, "generate_double_sum", 5)
 var out int
 _ = handle.WaitForOutput(ctx, &out)
 // out == 20
@@ -516,7 +526,7 @@ _ = handle.WaitForOutput(ctx, &out)
 Use an explicit reducer step when you want bounded generator output instead of storing all item outputs as `[]Out`:
 
 ```go
-flow := catbird.NewFlow("generate-double-sum-reduced")
+flow := catbird.NewFlow("generate_double_sum_reduced")
 flow.AddStep(catbird.NewStep("generate").
     Generate(func(ctx context.Context, input int, yield func(int) error) error {
     for i := 0; i < input; i++ {
@@ -535,7 +545,8 @@ flow.AddStep(catbird.NewStep("sum").
     return acc + out, nil
 }))
 
-handle, _ := client.RunFlow(ctx, "generate-double-sum-reduced", 5)
+_ = client.CreateFlow(ctx, flow)
+handle, _ := client.RunFlow(ctx, "generate_double_sum_reduced", 5)
 var out int
 _ = handle.WaitForOutput(ctx, &out)
 // out == 20
@@ -611,15 +622,15 @@ Tasks and flows can be scheduled with cron expressions using `CreateTaskSchedule
 
 ```go
 // Schedule a task
-client.CreateTaskSchedule(ctx, "send-email", "@hourly")
+client.CreateTaskSchedule(ctx, "send_email", "@hourly")
 
 // Schedule with static input
-client.CreateTaskSchedule(ctx, "send-report", "*/15 * * * *",
+client.CreateTaskSchedule(ctx, "send_report", "*/15 * * * *",
     catbird.WithInput(EmailRequest{To: "ops@example.com", Subject: "Report"}),
 )
 
 // Schedule a flow
-client.CreateFlowSchedule(ctx, "order-processing", "0 2 * * *")
+client.CreateFlowSchedule(ctx, "order_processing", "0 2 * * *")
 
 // Skip all missed ticks on recovery (no catch-up runs)
 client.CreateTaskSchedule(ctx, "stats", "@hourly", catbird.WithSkipCatchUp())
@@ -688,6 +699,7 @@ premiumTask := catbird.NewTask("premium_processing").
     })
 
 // Run task - may be skipped based on input
+_ = client.CreateTask(ctx, premiumTask)
 client.RunTask(ctx, "premium_processing", ProcessRequest{UserID: 123, IsPremium: false})
 // This task run will be skipped (is_premium = false)
 ```
@@ -738,17 +750,17 @@ Catbird deduplication (`ConcurrencyKey`) controls duplicate run creation, while 
 External cancellation:
 
 ```go
-taskHandle, _ := client.RunTask(ctx, "send-email", "hello")
-_, _ = client.CancelTaskRun(ctx, "send-email", taskHandle.ID, catbird.CancelOpts{Reason: "operator requested stop"})
+taskHandle, _ := client.RunTask(ctx, "send_email", "hello")
+_, _ = client.CancelTaskRun(ctx, "send_email", taskHandle.ID, catbird.CancelOpts{Reason: "operator requested stop"})
 
-flowHandle, _ := client.RunFlow(ctx, "order-processing", map[string]any{"order_id": 123})
-_, _ = client.CancelFlowRun(ctx, "order-processing", flowHandle.ID, catbird.CancelOpts{Reason: "customer canceled order"})
+flowHandle, _ := client.RunFlow(ctx, "order_processing", map[string]any{"order_id": 123})
+_, _ = client.CancelFlowRun(ctx, "order_processing", flowHandle.ID, catbird.CancelOpts{Reason: "customer canceled order"})
 ```
 
 Internal cancellation from handlers:
 
 ```go
-task := catbird.NewTask("validate-order").Do(func(ctx context.Context, input Order) (string, error) {
+task := catbird.NewTask("validate_order").Do(func(ctx context.Context, input Order) (string, error) {
         if input.Amount <= 0 {
             if err := catbird.Cancel(ctx, catbird.CancelOpts{Reason: "invalid amount"}); err != nil {
                 return "", err
@@ -758,7 +770,7 @@ task := catbird.NewTask("validate-order").Do(func(ctx context.Context, input Ord
         return "ok", nil
     })
 
-flow := catbird.NewFlow("order-processing")
+flow := catbird.NewFlow("order_processing")
 flow.AddStep(catbird.NewStep("guard").Do(func(ctx context.Context, input Order) (string, error) {
     if input.Amount <= 0 {
         if err := catbird.Cancel(ctx, catbird.CancelOpts{Reason: "invalid amount"}); err != nil {
@@ -862,7 +874,7 @@ identities, err := wire.Presence(ctx, "dashboard")
 Handlers can access the database connection from context for transactional work:
 
 ```go
-task := catbird.NewTask("process-order").Do(func(ctx context.Context, input Order) (Result, error) {
+task := catbird.NewTask("process_order").Do(func(ctx context.Context, input Order) (Result, error) {
     conn, _ := catbird.GetConn(ctx)
     tx, _ := conn.Begin(ctx)
     defer tx.Rollback(ctx)
@@ -968,7 +980,7 @@ Use query builders when you want SQL + args directly (for `pgx.Batch` or custom 
 ```go
 // Queue into a batch
 var batch pgx.Batch
-q1, args1, err := catbird.SendQuery("my-queue", map[string]any{"user_id": 123})
+q1, args1, err := catbird.SendQuery("my_queue", map[string]any{"user_id": 123})
 if err != nil {
     return err
 }
@@ -1054,13 +1066,13 @@ Because GC runs from the worker heartbeat, a deployment that runs Wire but no wo
 must call `client.GC(ctx)` on its own schedule, or expired notifications accumulate.
 
 ```go
-task := catbird.NewTask("send-email").
+task := catbird.NewTask("send_email").
     RetentionPeriod(7 * 24 * time.Hour). // NULL by default = no cleanup
     Do(func(ctx context.Context, in EmailInput) (string, error) {
         return "sent", nil
     })
 
-flow := catbird.NewFlow("order-processing")
+flow := catbird.NewFlow("order_processing")
 flow.RetentionPeriod(90 * 24 * time.Hour)
 flow.AddStep(catbird.NewStep("step1").Do(func(ctx context.Context, in OrderInput) (string, error) {
     return "done", nil
@@ -1077,10 +1089,10 @@ For targeted or ad-hoc cleanup independent of the retention period:
 
 ```go
 // Delete task runs older than 30 days
-taskPurged, err := client.PurgeTaskRuns(ctx, "send-email", 30*24*time.Hour)
+taskPurged, err := client.PurgeTaskRuns(ctx, "send_email", 30*24*time.Hour)
 
 // Delete flow runs older than 90 days
-flowPurged, err := client.PurgeFlowRuns(ctx, "order-processing", 90*24*time.Hour)
+flowPurged, err := client.PurgeFlowRuns(ctx, "order_processing", 90*24*time.Hour)
 
 _ = taskPurged
 _ = flowPurged
