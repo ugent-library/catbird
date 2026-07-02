@@ -188,11 +188,71 @@ func (f FlowFailure) OutputAs(ctx context.Context, step string, out any) error {
 	return json.Unmarshal(b, out)
 }
 
+// StepDependencyInput is a single input a step received from one of its
+// dependencies. Value is the raw output the dependency produced; decode it with
+// As.
+type StepDependencyInput struct {
+	Name  string          // the dependency step's name
+	Value json.RawMessage // the output that dependency produced
+}
+
+// As decodes the dependency input into out.
+func (d StepDependencyInput) As(out any) error {
+	return json.Unmarshal(d.Value, out)
+}
+
+// FailedStepInputAs decodes the input that caused the failed step, into out.
+//
+// The meaning depends on the step type:
+//   - Normal steps: the flow input (the step handler's first parameter). This
+//     is NOT the inputs the step received from its dependencies — use
+//     FailedStepDependencyInputs for those.
+//   - Map steps: the individual array item the failed map task was processing,
+//     not the whole flow input.
+//
+// It returns ErrNoFailedStepInput when no input was captured.
 func (f FlowFailure) FailedStepInputAs(out any) error {
 	if len(f.FailedStepInput) == 0 {
 		return ErrNoFailedStepInput
 	}
 	return json.Unmarshal(f.FailedStepInput, out)
+}
+
+// FailedStepDependencyInputs returns the inputs the failed step received from
+// its dependencies, in dependency (handler-argument) order. IgnoreOutput
+// dependencies are excluded, mirroring what the step handler actually received.
+//
+// It returns an empty slice for steps with no dependencies (for example a
+// flow's first step). Use this when you need the inputs a step received from
+// upstream steps — for example the doubled value a step failed on — rather than
+// the flow input returned by FailedStepInputAs.
+func (f FlowFailure) FailedStepDependencyInputs(ctx context.Context) ([]StepDependencyInput, error) {
+	if f.conn == nil {
+		return nil, ErrUnknownStepOutput
+	}
+
+	rows, err := f.conn.Query(
+		ctx,
+		`SELECT dependency_step_name, output FROM cb_get_flow_step_dependency_outputs($1, $2, $3)`,
+		f.FlowName, f.FlowRunID, f.FailedStepName,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var deps []StepDependencyInput
+	for rows.Next() {
+		var dep StepDependencyInput
+		if err := rows.Scan(&dep.Name, &dep.Value); err != nil {
+			return nil, err
+		}
+		deps = append(deps, dep)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return deps, nil
 }
 
 func (f FlowFailure) FailedStepSignalAs(out any) error {
