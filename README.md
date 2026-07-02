@@ -344,7 +344,7 @@ flow.OnFail(func(ctx context.Context, order Order, failure catbird.FlowFailure) 
     }
 
     var chargeResult ChargeResult
-    if err := failure.OutputAs("charge", &chargeResult); err == nil {
+    if err := failure.OutputAs(ctx, "charge", &chargeResult); err == nil {
         // access completed step output when available
     }
 
