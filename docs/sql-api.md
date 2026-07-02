@@ -635,12 +635,12 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 - **Returns**: `RETURNS void`
 
 ### `cb_execute_due_task_schedules`
-- **What it does**: Execute due task schedules for selected task names in batches.
+- **What it does**: Execute due task schedules for selected task names in batches. Returns the number of runs enqueued. Under the `skip` policy a tick is suppressed only when it is genuinely stale (a later tick is already due, i.e. `cb_next_cron_tick(cron_spec, next_run_at) <= now()`); an on-time tick still enqueues under every policy. Suppressed ticks leave `last_run_at` / `last_enqueued_at` untouched.
 - **Inputs**: `cb_execute_due_task_schedules(task_names text[], batch_size int DEFAULT 32)`
 - **Returns**: `RETURNS int`
 
 ### `cb_execute_due_flow_schedules`
-- **What it does**: Execute due flow schedules for selected flow names in batches.
+- **What it does**: Execute due flow schedules for selected flow names in batches. Returns the number of runs enqueued. Under the `skip` policy a tick is suppressed only when it is genuinely stale (a later tick is already due, i.e. `cb_next_cron_tick(cron_spec, next_run_at) <= now()`); an on-time tick still enqueues under every policy. Suppressed ticks leave `last_run_at` / `last_enqueued_at` untouched.
 - **Inputs**: `cb_execute_due_flow_schedules(flow_names text[], batch_size int DEFAULT 32)`
 - **Returns**: `RETURNS int`
 
