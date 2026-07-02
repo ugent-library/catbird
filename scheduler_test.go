@@ -746,6 +746,74 @@ func TestSchedulerSkipPolicy(t *testing.T) {
 	if !nextRunAt.After(time.Now()) {
 		t.Fatalf("expected next_run_at in the future, got %s", nextRunAt.Format(time.RFC3339))
 	}
+
+	// A suppressed tick must not stamp a phantom run: last_run_at /
+	// last_enqueued_at stay NULL because nothing was enqueued.
+	var lastRunAt, lastEnqueuedAt *time.Time
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT last_run_at, last_enqueued_at FROM cb_task_schedules WHERE task_name = $1`, taskName,
+	).Scan(&lastRunAt, &lastEnqueuedAt); err != nil {
+		t.Fatal(err)
+	}
+	if lastRunAt != nil {
+		t.Fatalf("expected last_run_at to stay NULL when skip suppressed a tick, got %s", lastRunAt)
+	}
+	if lastEnqueuedAt != nil {
+		t.Fatalf("expected last_enqueued_at to stay NULL when skip suppressed a tick, got %s", lastEnqueuedAt)
+	}
+}
+
+// TestSchedulerSkipPolicyOnTime verifies that with WithSkipCatchUp(), a tick
+// that just became due (no backlog) still enqueues a run. Regression test for
+// the bug where skip suppressed every tick, so the schedule never fired.
+func TestSchedulerSkipPolicyOnTime(t *testing.T) {
+	client := getTestClient(t)
+	suffix := fmt.Sprintf("_%d", time.Now().UnixNano())
+	taskName := "skip_ontime" + suffix
+
+	task := NewTask(taskName).Do(func(ctx context.Context, in string) (string, error) {
+		return "ok", nil
+	})
+
+	if err := CreateTask(t.Context(), client.Conn, task); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.CreateTaskSchedule(t.Context(), taskName, "* * * * *", WithSkipCatchUp()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate an on-time tick: due now, but the following tick is still in the
+	// future (start of the current minute), so it is not a missed/stale tick.
+	if _, err := client.Conn.Exec(t.Context(),
+		`UPDATE cb_task_schedules SET next_run_at = date_trunc('minute', now()) WHERE task_name = $1`,
+		taskName,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	var executed int
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT cb_execute_due_task_schedules(ARRAY[$1]::text[], 32)`, taskName,
+	).Scan(&executed); err != nil {
+		t.Fatal(err)
+	}
+
+	// On-time skip tick: exactly 1 run enqueued.
+	if executed != 1 {
+		t.Fatalf("expected 1 run for on-time skip tick, got %d", executed)
+	}
+
+	// next_run_at advanced to the future.
+	var nextRunAt time.Time
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT next_run_at FROM cb_task_schedules WHERE task_name = $1`, taskName,
+	).Scan(&nextRunAt); err != nil {
+		t.Fatal(err)
+	}
+	if !nextRunAt.After(time.Now()) {
+		t.Fatalf("expected next_run_at in the future, got %s", nextRunAt.Format(time.RFC3339))
+	}
 }
 
 // TestSchedulerAllPolicy verifies that with WithCatchUpAll(), 5 minutes of downtime
@@ -940,6 +1008,56 @@ func TestFlowSchedulerSkipPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if !nextRunAt.After(time.Now()) {
+		t.Fatalf("expected next_run_at in the future, got %s", nextRunAt.Format(time.RFC3339))
+	}
+}
+
+// TestFlowSchedulerSkipPolicyOnTime verifies that with WithSkipCatchUp(), an
+// on-time flow tick (no backlog) still enqueues a run.
+func TestFlowSchedulerSkipPolicyOnTime(t *testing.T) {
+	client := getTestClient(t)
+	suffix := fmt.Sprintf("_%d", time.Now().UnixNano())
+	flowName := "skip_flow_ontime" + suffix
+
+	flow := NewFlow(flowName)
+	flow.AddStep(NewStep("s1").Do(func(ctx context.Context, in string) (string, error) {
+		return "ok", nil
+	}))
+
+	if err := CreateFlow(t.Context(), client.Conn, flow); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.CreateFlowSchedule(t.Context(), flowName, "* * * * *", WithSkipCatchUp()); err != nil {
+		t.Fatal(err)
+	}
+
+	// On-time tick: due now, following tick still in the future.
+	if _, err := client.Conn.Exec(t.Context(),
+		`UPDATE cb_flow_schedules SET next_run_at = date_trunc('minute', now()) WHERE flow_name = $1`,
+		flowName,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	var executed int
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT cb_execute_due_flow_schedules(ARRAY[$1]::text[], 32)`, flowName,
+	).Scan(&executed); err != nil {
+		t.Fatal(err)
+	}
+
+	if executed != 1 {
+		t.Fatalf("expected 1 run for on-time skip tick, got %d", executed)
+	}
+
+	var nextRunAt time.Time
+	if err := client.Conn.QueryRow(t.Context(),
+		`SELECT next_run_at FROM cb_flow_schedules WHERE flow_name = $1`, flowName,
+	).Scan(&nextRunAt); err != nil {
+		t.Fatal(err)
+	}
 	if !nextRunAt.After(time.Now()) {
 		t.Fatalf("expected next_run_at in the future, got %s", nextRunAt.Format(time.RFC3339))
 	}
