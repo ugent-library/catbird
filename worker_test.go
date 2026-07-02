@@ -620,6 +620,144 @@ func TestFlowOnFailMapStepInputIntegration(t *testing.T) {
 	}
 }
 
+func TestFlowOnFailStepDependenciesIntegration(t *testing.T) {
+	client := getTestClient(t)
+
+	onFailCalled := make(chan FlowFailure, 1)
+
+	flow := NewFlow("flow_on_fail_deps")
+	flow.AddStep(NewStep("double").Do(func(_ context.Context, input int) (int, error) {
+		return input * 2, nil
+	},
+		WithConcurrency(1),
+		WithBatchSize(10),
+	))
+	flow.AddStep(NewStep("add").
+		DependsOn("double").
+		Do(func(_ context.Context, _input int, _doubled int) (int, error) {
+			return 0, fmt.Errorf("add always fails")
+		},
+			WithConcurrency(1),
+			WithBatchSize(10),
+			WithMaxRetries(0),
+		))
+	flow.OnFail(func(_ context.Context, _input int, failure FlowFailure) error {
+		onFailCalled <- failure
+		return nil
+	},
+		WithConcurrency(1),
+		WithBatchSize(10),
+		WithMaxRetries(0),
+	)
+
+	worker := NewWorker(testPool).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), "flow_on_fail_deps", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var out int
+	if err := h.WaitForOutput(ctx, &out); err == nil {
+		t.Fatal("expected flow to fail")
+	}
+
+	select {
+	case f := <-onFailCalled:
+		if f.FailedStepName != "add" {
+			t.Fatalf("unexpected failed step name: %s", f.FailedStepName)
+		}
+
+		// FailedStepInputAs returns the flow input (10), not the dependency output.
+		var flowInput int
+		if err := f.FailedStepInputAs(&flowInput); err != nil {
+			t.Fatalf("expected failed step input to decode: %v", err)
+		}
+		if flowInput != 10 {
+			t.Fatalf("expected flow input 10, got %d", flowInput)
+		}
+
+		// FailedStepDependencyInputs returns the doubled value (20) the failed step consumed.
+		deps, err := f.FailedStepDependencyInputs(ctx)
+		if err != nil {
+			t.Fatalf("failed to get step dependency inputs: %v", err)
+		}
+		if len(deps) != 1 {
+			t.Fatalf("expected 1 dependency, got %d: %+v", len(deps), deps)
+		}
+		if deps[0].Name != "double" {
+			t.Fatalf("unexpected dependency name: %s", deps[0].Name)
+		}
+		var doubled int
+		if err := deps[0].As(&doubled); err != nil {
+			t.Fatalf("expected dependency output to decode: %v", err)
+		}
+		if doubled != 20 {
+			t.Fatalf("expected doubled value 20, got %d", doubled)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for flow on-fail handler")
+	}
+}
+
+func TestFlowOnFailStepDependenciesEmptyForRootStep(t *testing.T) {
+	client := getTestClient(t)
+
+	onFailCalled := make(chan FlowFailure, 1)
+
+	flow := NewFlow("flow_on_fail_deps_root")
+	flow.AddStep(NewStep("root").Do(func(_ context.Context, _input int) (int, error) {
+		return 0, fmt.Errorf("root always fails")
+	},
+		WithConcurrency(1),
+		WithBatchSize(10),
+		WithMaxRetries(0),
+	))
+	flow.OnFail(func(_ context.Context, _input int, failure FlowFailure) error {
+		onFailCalled <- failure
+		return nil
+	},
+		WithConcurrency(1),
+		WithBatchSize(10),
+		WithMaxRetries(0),
+	)
+
+	worker := NewWorker(testPool).AddFlow(flow)
+	startTestWorker(t, worker)
+	time.Sleep(100 * time.Millisecond)
+
+	h, err := client.RunFlow(t.Context(), "flow_on_fail_deps_root", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var out int
+	if err := h.WaitForOutput(ctx, &out); err == nil {
+		t.Fatal("expected flow to fail")
+	}
+
+	select {
+	case f := <-onFailCalled:
+		deps, err := f.FailedStepDependencyInputs(ctx)
+		if err != nil {
+			t.Fatalf("failed to get step dependency inputs: %v", err)
+		}
+		if len(deps) != 0 {
+			t.Fatalf("expected no dependency inputs for root step, got %+v", deps)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for flow on-fail handler")
+	}
+}
+
 func TestWorkerValidatesTaskHandlerOpts(t *testing.T) {
 	_ = getTestClient(t)
 

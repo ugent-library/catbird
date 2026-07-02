@@ -575,6 +575,11 @@ These are mostly used by Catbird workers and scheduler internals. Most users sho
 - **Inputs**: `cb_get_flow_step_output(flow_name text, run_id bigint, step_name text)`
 - **Returns**: `RETURNS jsonb`
 
+### `cb_get_flow_step_dependency_outputs`
+- **What it does**: Fetch the outputs a step's dependencies produced, in dependency (handler-argument) order, excluding `IgnoreOutput` dependencies. Backs `FlowFailure.FailedStepDependencyInputs`.
+- **Inputs**: `cb_get_flow_step_dependency_outputs(flow_name text, run_id bigint, step_name text)`
+- **Returns**: `RETURNS TABLE(dependency_step_name text, output jsonb)`
+
 ### `cb_get_flow_step_status`
 - **What it does**: Read status details for a single step run.
 - **Inputs**: `cb_get_flow_step_status(flow_name text, run_id bigint, step_name text)`
