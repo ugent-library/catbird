@@ -4,7 +4,8 @@ One package, two storage stories (D12). The vision's "wire and the inbox share n
 machinery" was already false in the current code — they share Fragment rendering,
 token auth, and the poll transport (PR #41). The honest claim, and the design rule:
 **independent storage and delivery, shared presentation.** Package `wire`, depends
-on the kernel only; `stream` optional (spine glue).
+on the kernel; importing `stream` is optional and buys exactly one thing —
+registering the `inbox` relay kind with the spine (02 §3).
 
 ## 1. Shape
 

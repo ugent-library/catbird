@@ -57,12 +57,13 @@ evidence.
 | D8 | **Fan-out-on-read**: publish writes one row into a topic-keyed root stream; bindings are read-side; destinations are materialized by relays | 02 |
 | D9 | The engine is a projection over per-flow event streams, **sharded by `hash(run_id)`** — parallel across runs, serial within a run | 03 §4 |
 | D10 | Plan mutations are **buffered client-side and applied atomically with step completion** — one SQL call carries completion + spawns + edges | 03 §5 |
-| D11 | Cross-language steps are supported at the **SQL API level only**: claim / complete / fail / signal functions + JSON payloads + per-step dedicated ready streams. No cross-language DSL, no schema registry | 03 §7 |
+| D11 | Cross-language steps are supported at the **SQL API level only**: claim / complete / fail / signal / heartbeat functions + JSON payloads + per-step dedicated ready streams. No cross-language DSL, no schema registry | 03 §7 |
 | D12 | wire and the inbox live in **one package** with shared rendering; durable push ships built-in as a composed helper, each half usable alone | 04 |
 | D13 | The inbox stores rows in its **own identity-keyed table**, not on the log (retention semantics are incompatible); it rides the spine, not the substrate | 04 §3 |
 | D14 | "Swappable implementation" is dropped as a promise. The stable contract is the **SQL API** (`docs/sql-api.md`); internals evolve via migrations | — |
 | D15 | Keep the **catbird umbrella**: one module, subpackages `stream`, `flow`, `wire`; kernel in the root package as the end state (in `internal/kernel/` until M6). CLI/TUI/dashboard move to a nested module | below, 05 |
 | D16 | Postgres floor: **14+** | 01 §11 |
+| D17 | **Poll-first staging**: M0–M4 wake on plain interval ticks (the correctness path); the LISTEN notifier + NOTIFY wake accelerator land at M5 with wire. SQL emits `pg_notify` from day one — only the *listening* is staged | 01 §2, 05 |
 
 ## Naming and repo structure
 
@@ -73,7 +74,7 @@ dependencies live in a nested module.
 
 ```
 github.com/ugent-library/catbird          (module — the library)
-├── catbird.go, conn.go, notifier.go, …   kernel: Conn, topic matching, NOTIFY relay,
+├── catbird.go, conn.go, …                 kernel: Conn, topic matching, NOTIFY relay,
 │                                          ticker facility, migration runner
 ├── stream/                                substrate (01) — depends on kernel only
 ├── flow/                                  engine (03) — depends on stream
@@ -83,7 +84,9 @@ github.com/ugent-library/catbird          (module — the library)
 
 - The root package is the kernel **and** the spine facade: `catbird.Publish`,
   `catbird.Bind` are the five-minute API; they delegate to `stream`.
-- Dependency rule: `flow → stream → kernel`, `wire → kernel`. The engine's hard
+- Dependency rule: `flow → stream → kernel`, `wire → kernel` — plus an *optional*
+  wire → stream import whose only purpose is registering the `inbox` relay kind
+  (02 §3); without it, wire simply has no relay. The engine's hard
   dependency on the substrate is accepted and stated (vision open decision 3); the
   alternative — a second embedded log — means maintaining the correctness-critical
   sequencing machinery twice.
@@ -147,3 +150,7 @@ Fold these into vision.md by hand; the plan documents assume them.
     incompatible (idle users pin cursor-floor retention forever); D13 (§7).
 11. **Add the missing feature dispositions**: signals, cron, retries, OnFail, flow
     output — each has an explicit home now (03, 01 §6–7).
+12. **`SignalFlow` changes semantics** in the event model: signals are buffered
+    per run until a matching step awaits them, and the synchronous
+    `ErrSignalNotDelivered` is retired — the call errors only if the run is
+    missing or terminal (03 §3).

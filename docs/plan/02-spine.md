@@ -76,13 +76,51 @@ Notes:
   `start_position` (tail | begin | ordinal) — the late-binding/replay story.
 - The current `Bind(queue, pattern)` API survives with the same name and idempotent
   semantics; it now writes a binding row instead of routing at publish time.
+- Relay *kinds* are registered, not imported: the relay runner exposes
+  `RegisterRelayKind(name, writer)`; `stream` ships the `stream` kind, and `flow`
+  and `wire` register theirs at init when the app imports them. This keeps the
+  README's dependency rule intact — no package reaches into another's tables.
+- `start_position` is honored by the binding that *creates* the destination's
+  relay group; later bindings to the same destination inherit the existing cursor.
+  One cursor per destination — two bindings cannot make it replay twice.
+- The `inbox` kind's identity extraction is config, not convention: an
+  `identity_from` column on the binding row (a topic segment index or a payload
+  JSON path).
+
+The relay itself is ~a screenful of Go — an ordered consumer wearing a trie:
+
+```go
+// one per destination, leader-elected like the sequencer; runs in any worker
+func runRelay(ctx context.Context, pool *pgxpool.Pool, dest Destination) error {
+	matcher := trie.New(loadPatterns(dest)) // ported topic_trie.go; reload on
+	                                        // binding-change notify
+	return stream.Consume(ctx, pool, "bus", "relay."+dest.Name,
+		func(ctx context.Context, tx pgx.Tx, msgs []stream.Message) error {
+			for _, m := range msgs {
+				if !matcher.Match(m.Topic) { // wildcard match: Go-side (01 §4)
+					continue
+				}
+				if err := dest.Writer.Write(ctx, tx, m); err != nil {
+					return err // registered kind (RegisterRelayKind)
+				}
+			}
+			return nil
+			// commit: destination writes + cursor advance in one tx —
+			// exactly-once materialization, the guarantee in the README table
+		})
+}
+```
 
 ## 4. The ephemeral path (wire)
 
 wire never touches storage: `Publish` fires `pg_notify` inside the transaction, so
-Postgres delivers it **on commit** — the push-only-on-commit property is free.
-The kernel's notifier (today's `notifier.go`, reused) holds the one LISTEN
-connection per process and fans out to wire's in-process subscribers (04). Payloads
+Postgres delivers it **on commit** — the push-only-on-commit property is free. The
+nudge follows the *actual append*: a delayed or coalesced publish does not notify
+at accept time (the pending sweeper fires it at delivery), and a dedup-skipped
+publish does not notify at all. The kernel's notifier (grown from today's
+`worker_notifier.go` — see 05's file-name note) holds the one LISTEN connection
+per process and fans out to wire's in-process subscribers (04); it arrives at M5
+with wire (D17) — before that the emissions simply have no listeners. Payloads
 above the 8000-byte NOTIFY limit send topic-only; wire re-pulls state — same
 discipline as today.
 
