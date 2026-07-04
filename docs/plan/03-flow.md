@@ -13,12 +13,12 @@ dependency, D15). A task is a one-step flow — one model, not two.
 - One ready stream per flow: `flow.<name>.ready` (work mode, 01 §5), plus one per
   dedicated step (§7).
 - Projection tables — **rows are the view, the log is the truth**:
-  `cb_flow_run (run_id, flow, status, input, output, dedup_key — UNIQUE(flow,
+  `cb_flow_runs (run_id, flow, status, input, output, dedup_key — UNIQUE(flow,
   dedup_key), the RunFlow dedup point (§3), created/finished)` ·
-  `cb_flow_step (run_id, step_id, name, status, input, output, attempt,
-  idempotency_key UNIQUE)` · `cb_flow_dep (run_id, step_id, needs_step_id,
-  satisfied)` · `cb_flow (name, shards, …)` (per-flow config) ·
-  `cb_flow_step_claim (run_id, step_id, attempt, outcome — PK on the triple)`,
+  `cb_flow_steps (run_id, step_id, name, status, input, output, attempt,
+  idempotency_key UNIQUE)` · `cb_flow_deps (run_id, step_id, needs_step_id,
+  satisfied)` · `cb_flows (name, shards, …)` (per-flow config) ·
+  `cb_flow_step_claims (run_id, step_id, attempt, outcome — PK on the triple)`,
   the per-attempt resolution claim (§7), GC'd when the run turns terminal.
   Lookups (`WaitForOutput`, status, dashboard) hit rows only.
 
@@ -60,7 +60,7 @@ idempotency story; handlers only need their *external* effects idempotent.
   the run; running handlers see context cancellation via the worker's NOTIFY
   wakeup, best-effort, as today.
 - **Dedup**: `RunFlow` mints the run id synchronously — it upserts the
-  `cb_flow_run` row (`ON CONFLICT (flow, dedup_key) … WHERE FALSE` + `UNION ALL`,
+  `cb_flow_runs` row (`ON CONFLICT (flow, dedup_key) … WHERE FALSE` + `UNION ALL`,
   today's pattern verbatim) and appends `run_requested` in the same transaction;
   an existing run returns its id and appends nothing. The *stream* dedup table is
   the wrong tool here: mapping its row back to a run id would mean reading an
@@ -79,13 +79,15 @@ idempotency story; handlers only need their *external* effects idempotent.
 CREATE FUNCTION cb_flow_run(flow text, input jsonb, dedup_key text DEFAULT NULL)
 RETURNS TABLE (run_id bigint, existing boolean)
 LANGUAGE plpgsql AS $$
+#variable_conflict use_column   -- params flow/dedup_key vs columns in the
+                                -- ON CONFLICT target (see 01 §8's sketch)
 DECLARE _id bigint; _won bigint;
 BEGIN
-    _id := nextval(pg_get_serial_sequence('cb_flow_run', 'run_id'));
+    _id := nextval(pg_get_serial_sequence('cb_flow_runs', 'run_id'));
 
     -- today's dedup pattern, verbatim (WHERE FALSE + UNION ALL — do not simplify)
     WITH won AS (
-        INSERT INTO cb_flow_run AS r (run_id, flow, status, input, dedup_key)
+        INSERT INTO cb_flow_runs AS r (run_id, flow, status, input, dedup_key)
         VALUES (_id, flow, 'requested', input, dedup_key)
         ON CONFLICT (flow, dedup_key) WHERE dedup_key IS NOT NULL
         DO UPDATE SET status = r.status WHERE FALSE
@@ -94,7 +96,7 @@ BEGIN
     SELECT x.run_id INTO _won FROM (
         SELECT w.run_id FROM won w
         UNION ALL
-        SELECT r.run_id FROM cb_flow_run r
+        SELECT r.run_id FROM cb_flow_runs r
         WHERE r.flow = cb_flow_run.flow AND r.dedup_key = cb_flow_run.dedup_key
         LIMIT 1
     ) x;
@@ -105,13 +107,13 @@ BEGIN
     END IF;
 
     -- same event shape as cb_flow_complete's appends, same shard header
-    INSERT INTO cb_stream_message (stream, topic, payload, headers)
+    INSERT INTO cb_stream_messages (stream, topic, payload, headers)
     VALUES ('flow.' || flow, 'run_requested',
             jsonb_build_object('run_id', _id, 'input', input),
             jsonb_build_object('run_id', _id,
-                'shard', abs(hashint8(_id)) % (SELECT f.shards FROM cb_flow f
+                'shard', abs(hashint8(_id)) % (SELECT f.shards FROM cb_flows f
                                                WHERE f.name = cb_flow_run.flow)));
-    PERFORM pg_notify(current_schema || '.cb_seq', 'flow.' || flow);
+    PERFORM pg_notify(current_schema || '.cb_s_flow.' || flow, '');
     RETURN QUERY VALUES (_id, false);
 END;
 $$;
@@ -120,7 +122,7 @@ $$;
 ## 4. The projection — sharded, exactly-once (D9)
 
 Not single-threaded (your note — correctly feared). The projection is N ordered
-groups (`flow.<name>#proj.0 … proj.N-1`); events route to shard
+groups on `flow.<name>` (`proj_0 … proj_N-1`); events route to shard
 `hash(run_id) % N` **at append time** via a shard header the group filter matches.
 Events for one run are always in one shard: serial per run (required for
 correctness), parallel across runs. `N` is per-flow config, default 4; rebalancing
@@ -139,7 +141,7 @@ handlers never run inside it — a slow handler can never hold a projection lock
 
 Throughput sanity: a shard applying a few hundred row-updates per batch commits in
 single-digit ms; four shards absorb the "burst to thousands of events" envelope
-with sub-second lag. The floor is *two* sequenced legs per dependency edge —
+with sub-second lag. The floor is *two* assigned legs per dependency edge —
 completion events to the projection, then ready messages to a worker — so
 step-to-step latency is about twice the publish→consume figure of 01 §2: ~60–160ms
 with the NOTIFY accelerator, two to four tick intervals poll-only. Irrelevant at
@@ -154,26 +156,26 @@ CREATE FUNCTION cb_flow_apply(flow text, shard int, batch int DEFAULT 500)
 RETURNS int LANGUAGE plpgsql AS $$
 DECLARE
     _stream text := 'flow.' || flow;
-    _grp    text := 'proj.' || shard;
+    _grp    text := 'proj_' || shard;
     _pos bigint; _high bigint; _e record; _n int := 0;
     _ready bigint[] := '{}';           -- step_ids flipped ready this batch
 BEGIN
-    SELECT g.position INTO _pos FROM cb_stream_group g
-    WHERE g.stream = _stream AND g.name = _grp FOR UPDATE;  -- one writer per shard
-    SELECT s.last_ordinal INTO _high FROM cb_stream s WHERE s.name = _stream;
+    SELECT c.position INTO _pos FROM cb_stream_cursors c
+    WHERE c.stream = _stream AND c.name = _grp FOR UPDATE;  -- one writer per shard
+    SELECT s.last_position INTO _high FROM cb_streams s WHERE s.name = _stream;
 
     FOR _e IN
-        SELECT m.ordinal, m.topic, m.payload FROM cb_stream_message m
-        WHERE m.stream = _stream AND m.ordinal > _pos AND m.ordinal <= _high
+        SELECT m.position, m.topic, m.payload FROM cb_stream_messages m
+        WHERE m.stream = _stream AND m.position > _pos AND m.position <= _high
           AND (m.headers->>'shard')::int = shard           -- 01 §4 header filter
-        ORDER BY m.ordinal LIMIT batch
+        ORDER BY m.position LIMIT batch
     LOOP
         CASE _e.topic
         WHEN 'run_requested' THEN
             -- project the run to 'queued' and spawn the entry step 'start'
             -- with the run input; entry step has no deps → ready immediately
         WHEN 'step_spawned' THEN
-            INSERT INTO cb_flow_step (run_id, name, status, input, idempotency_key)
+            INSERT INTO cb_flow_steps (run_id, name, status, input, idempotency_key)
             VALUES (..., 'pending', ...)
             ON CONFLICT (idempotency_key) DO NOTHING;      -- duplicate spawn = no-op
             IF FOUND THEN
@@ -184,8 +186,8 @@ BEGIN
                 -- zero unsatisfied deps → append step_id to _ready
             END IF;
         WHEN 'step_completed' THEN
-            UPDATE cb_flow_step SET status = 'completed', output = ... WHERE ...;
-            UPDATE cb_flow_dep SET satisfied = true WHERE needs_step_id = ...;
+            UPDATE cb_flow_steps SET status = 'completed', output = ... WHERE ...;
+            UPDATE cb_flow_deps SET satisfied = true WHERE needs_step_id = ...;
             -- dependents whose last dep this was → _ready
         WHEN 'step_failed' THEN
             -- policy row (§6): attempts left → re-ready via the pending
@@ -194,26 +196,26 @@ BEGIN
             -- buffer into run state; a live awaiting step matches → its
             -- signal-dep satisfies, possibly → _ready (§3)
         WHEN 'run_output_set' THEN
-            UPDATE cb_flow_run SET output = _e.payload->'value' WHERE ...;
+            UPDATE cb_flow_runs SET output = _e.payload->'value' WHERE ...;
         WHEN 'run_canceled' THEN
             -- skip all non-started steps, mark the run, clear _ready of them
         END CASE;
-        _n := _n + 1; _pos := _e.ordinal;
+        _n := _n + 1; _pos := _e.position;
     END LOOP;
 
     -- dispatch: one ready message per flipped step, routed to the step's ready
     -- stream (flow.<name>.ready, or .<queue> for dedicated steps, §7)
-    INSERT INTO cb_stream_message (stream, topic, payload)
+    INSERT INTO cb_stream_messages (stream, topic, payload)
     SELECT ready_stream_of(s), 'step_ready',
            jsonb_build_object('run_id', s.run_id, 'step_id', s.step_id,
                               'attempt', s.attempt, 'name', s.name)
-    FROM cb_flow_step s WHERE s.step_id = ANY (_ready);
-    -- + mark them 'ready'; + pg_notify('.cb_seq', ready streams)
+    FROM cb_flow_steps s WHERE s.step_id = ANY (_ready);
+    -- + mark them 'ready'; + pg_notify on each touched ready stream's channel
 
     -- run completion (§3): for touched runs with no live or signal-awaiting
     -- steps left → terminal; resolve run output; wake WaitForOutput watchers
 
-    UPDATE cb_stream_group SET position = _pos
+    UPDATE cb_stream_cursors SET position = _pos
     WHERE stream = _stream AND name = _grp;
     RETURN _n;
     -- commit: row deltas + dispatch + cursor advance, atomically — the
@@ -371,8 +373,8 @@ DECLARE
 BEGIN
     -- run → flow → event stream + projection shard (01 §4: header equality filter)
     SELECT r.flow, f.shards INTO _flow, _shards
-    FROM cb_flow_run r
-    JOIN cb_flow f ON f.name = r.flow
+    FROM cb_flow_runs r
+    JOIN cb_flows f ON f.name = r.flow
     WHERE r.run_id = cb_flow_complete.run_id;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'catbird: run % not found', run_id;
@@ -387,7 +389,7 @@ BEGIN
     -- produces no duplicate events, buffered spawns included, which is why
     -- handlers need not spawn deterministically. cb_flow_fail claims the same
     -- key with outcome = 'failed'.
-    INSERT INTO cb_flow_step_claim (run_id, step_id, attempt, outcome)
+    INSERT INTO cb_flow_step_claims (run_id, step_id, attempt, outcome)
     VALUES (run_id, step_id, attempt, 'completed')
     ON CONFLICT (run_id, step_id, attempt) DO NOTHING;
     IF NOT FOUND THEN
@@ -395,10 +397,10 @@ BEGIN
     END IF;
 
     -- One event batch, atomic with the claim. Spawns first, completion last:
-    -- insert order = id order = ordinal tie-break (01 §2), so the projection
+    -- insert order = id order = position tie-break (01 §2), so the projection
     -- sees the children before the completion that may satisfy their edges and
     -- resolves everything in a single apply pass.
-    INSERT INTO cb_stream_message (stream, topic, payload, headers)
+    INSERT INTO cb_stream_messages (stream, topic, payload, headers)
     SELECT _stream, 'step_spawned',
            jsonb_build_object(
                'name',            s->>'name',
@@ -411,14 +413,14 @@ BEGIN
            _hdrs
     FROM jsonb_array_elements(spawns) WITH ORDINALITY AS b(s, i);
 
-    INSERT INTO cb_stream_message (stream, topic, payload, headers)
+    INSERT INTO cb_stream_messages (stream, topic, payload, headers)
     VALUES (_stream, 'step_completed',
             jsonb_build_object('step_id', step_id, 'attempt', attempt,
                                'output', output),
             _hdrs);
 
     IF run_output IS NOT NULL THEN
-        INSERT INTO cb_stream_message (stream, topic, payload, headers)
+        INSERT INTO cb_stream_messages (stream, topic, payload, headers)
         VALUES (_stream, 'run_output_set',
                 jsonb_build_object('value', run_output, 'step_id', step_id),
                 _hdrs);
@@ -426,8 +428,8 @@ BEGIN
 
     -- The engine owns this stream, so it appends directly rather than through
     -- cb_stream_publish (no dedup, no pending on this path) — but it still owes
-    -- the sequencer its wake-up.
-    PERFORM pg_notify(current_schema || '.cb_seq', _stream);
+    -- the assigner its wake-up.
+    PERFORM pg_notify(current_schema || '.cb_s_' || _stream, '');
 
     RETURN true;
 END;
@@ -451,17 +453,17 @@ deliberately dumb, because retry policy is the projection's job, not the worker'
 CREATE FUNCTION cb_flow_fail(run_id bigint, step_id bigint, attempt int, error text)
 RETURNS boolean LANGUAGE plpgsql AS $$
 BEGIN
-    INSERT INTO cb_flow_step_claim (run_id, step_id, attempt, outcome)
+    INSERT INTO cb_flow_step_claims (run_id, step_id, attempt, outcome)
     VALUES (run_id, step_id, attempt, 'failed')
     ON CONFLICT (run_id, step_id, attempt) DO NOTHING;
     IF NOT FOUND THEN RETURN false; END IF;
 
-    INSERT INTO cb_stream_message (stream, topic, payload, headers)
+    INSERT INTO cb_stream_messages (stream, topic, payload, headers)
     VALUES (..., 'step_failed',
             jsonb_build_object('step_id', step_id, 'attempt', attempt,
                                'error', error),
             ...same run→stream→shard resolution as complete...);
-    PERFORM pg_notify(current_schema || '.cb_seq', ...);
+    PERFORM pg_notify(current_schema || '.cb_s_' || ..., '');
     RETURN true;
 END;
 $$;
@@ -469,9 +471,9 @@ $$;
 
 `cb_flow_claim` adds no new ideas: `cb_stream_claim` on the ready stream (01 §5),
 then a PK fetch of each claimed `step_ready` message's `(run_id, step_id, attempt,
-name)` plus the step's `input` from `cb_flow_step` — no joins, two indexed reads.
+name)` plus the step's `input` from `cb_flow_steps` — no joins, two indexed reads.
 `cb_flow_signal` is `cb_flow_run`'s little sibling: validate the run row exists
-and is not terminal, append one `signal` event, notify the sequencer.
+and is not terminal, append one `signal` event, notify the assigner.
 
 The boundary that keeps it from becoming a rabbit hole — explicitly out of scope:
 cross-language flow *definition*, typed payload schemas/registries, SDK parity.
@@ -504,7 +506,7 @@ accept that when it fires, the audit trail has a hole (recorded by the
    from `worker.go` (much of it survives).
 5. DSL surface (§5); `RunFlow`/`WaitForOutput`/`SignalFlow`/`CancelFlow` with
    today's signatures where possible.
-6. OnFail, dedup, cron-via-pending (`RunEvery`).
+6. OnFail, dedup, `RunEvery` via the schedule table.
 7. `docs/sql-api.md`: rewrite as the normative cross-language contract.
 8. Tests: port the semantic core of `flow_test.go` (deps, signals, OnFail, cancel,
    dedup, map-as-pattern, output semantics); new: projection crash mid-batch (no

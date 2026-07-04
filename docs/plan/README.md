@@ -14,7 +14,7 @@ should be able to defend after implementing it.
 
 | Doc | Covers |
 |---|---|
-| [01-stream.md](01-stream.md) | The substrate: sequenced append-only log, ordered + work consumption, dedup, pending (delay / retry / coalesce / cron), DLQ, retention |
+| [01-stream.md](01-stream.md) | The substrate: assigned append-only log, ordered + work consumption, dedup, pending (delay / retry), schedules (cron), DLQ, retention |
 | [02-spine.md](02-spine.md) | Publish, topics, bindings, relays — the transactional fanout |
 | [03-flow.md](03-flow.md) | The engine: event log, sharded projection, dispatch, Plan DSL, cross-language step contract |
 | [04-web.md](04-web.md) | wire: SSE + durable inbox, seen/read semantics, durable push |
@@ -47,9 +47,9 @@ evidence.
 
 | # | Decision | Where |
 |---|---|---|
-| D1 | The log is **sequenced**: a ticker assigns contiguous, commit-ordered ordinals. No visibility timeouts, no xid arithmetic, no fixed MVCC watermark | 01 §2 |
+| D1 | The log is **assigned**: a ticker assigns contiguous, commit-ordered positions. No visibility timeouts, no xid arithmetic, no fixed MVCC watermark | 01 §2 |
 | D2 | Two read modes on one log: **ordered groups** (cursor, exactly-once capable) and **work groups** (range leases, at-least-once). No SKIP-LOCKED scan on the hot path | 01 §4–5 |
-| D3 | One **pending** mechanism for delayed delivery, retries, coalescing (keep-newest), and cron. The scheduler module dissolves into it | 01 §6 |
+| D3 | One **sweeper** for everything time-based, two tables: `cb_stream_pending` for one-shot waiting messages (delayed publishes + retries — same lifecycle), `cb_stream_schedules` for cron (config with identity, updated by ensure, survives delivery). The scheduler module dissolves into these | 01 §6 |
 | D4 | Retry/backoff policy lives **in the database**, per consumer group / per step; SQL applies it. Go builders only write config rows | 01 §7, 03 §6 |
 | D5 | Dedup = keep-oldest at append (unique key table); keep-newest = coalesce in pending. Appended log rows are immutable | 01 §8 |
 | D6 | DLQ is an ordinary stream (`<stream>.dlq`) with failure metadata in headers; replay = republish | 01 §9 |
@@ -64,6 +64,9 @@ evidence.
 | D15 | Keep the **catbird umbrella**: one module, subpackages `stream`, `flow`, `wire`; kernel in the root package as the end state (in `internal/kernel/` until M6). CLI/TUI/dashboard move to a nested module | below, 05 |
 | D16 | Postgres floor: **14+** | 01 §11 |
 | D17 | **Poll-first staging**: M0–M4 wake on plain interval ticks (the correctness path); the LISTEN notifier + NOTIFY wake accelerator land at M5 with wire. SQL emits `pg_notify` from day one — only the *listening* is staged | 01 §2, 05 |
+| D18 | Consumer state is **two tables** — `cb_stream_cursors` and `cb_stream_work_groups` — not one with a mode column: one meaning per column, cross-mode misuse structurally impossible, the janitor can't read the wrong retention floor. Name uniqueness across both enforced by ensure under the setup advisory lock | 01 §3 |
+| D19 | Publish identity is **one `key`, keep-oldest only**: unknown key → store; known key → skip, returning the existing ref + an `existing` flag, until the dedup window expires. **No replacement, no cancel, no expiry column**: payloads carry identifiers, handlers read current state at delivery and skip what's no longer wanted or too old — at-least-once forces that check anyway. Scheduling: `delay` (relative, DB clock) or `deliver_at` (absolute), mutually exclusive — both set is an error; past-due targets append immediately. Appends notify a channel named after the stream — listeners choose; no notify config | 01 §4, §6, §8 |
+| D20 | **Enums for closed sets** (`ref_kind`, lease `state`, `failure_policy`, `catch_up_policy`, claim `outcome` — validated at the function-parameter boundary, where the cross-language contract lives), **text + CHECK for sets expected to grow** (`backoff_kind`, flow statuses). Enum warts accepted knowingly: `ADD VALUE` needs a NO TRANSACTION migration; values can never be dropped | 01 §3 |
 
 ## Naming and repo structure
 
@@ -89,7 +92,7 @@ github.com/ugent-library/catbird          (module — the library)
   (02 §3); without it, wire simply has no relay. The engine's hard
   dependency on the substrate is accepted and stated (vision open decision 3); the
   alternative — a second embedded log — means maintaining the correctness-critical
-  sequencing machinery twice.
+  assignment machinery twice.
 - Table naming: static tables per module (`cb_stream_*`, `cb_flow_*`, `cb_wire_*`),
   one goose version table per module (`cb_stream_migrations`, …) so modules install
   and upgrade independently. No collision with the current `cb_q_*`/`cb_t_*` dynamic
@@ -110,14 +113,14 @@ never a migration.
 | Thing | Predefined? | How |
 |---|---|---|
 | Stream | ensured | config row + `LIST` partition; `stream.Ensure(name, opts)` |
-| Ordered consumer group | ensured (or late-bound) | cursor row with an explicit start position (`tail` \| `begin` \| ordinal) |
+| Ordered consumer group | ensured (or late-bound) | cursor row with an explicit start position (`tail` \| `begin` \| position) |
 | Work consumer group | ensured | group row + policy columns |
 | Binding | ensured | row in the bindings table; relays pick it up live |
 | Retry/backoff policy | ensured | columns on the group / step-policy row (D4) |
 | Flow | ensured | flow row + registered step handlers on workers |
 | Steps of a run | **dynamic** | spawned by handlers at runtime (D10) |
 | Signals | **dynamic** | appended events, no declaration |
-| Cron schedule | ensured | self-rescheduling pending row (D3) |
+| Cron schedule | ensured | row in `cb_stream_schedules`, updated by ensure via its PK (D3) |
 | Queues/streams per priority class | ensured | just streams — priority is composition, as in the vision |
 
 Nothing at runtime performs DDL except `stream.Ensure` (partition creation) — same
@@ -131,7 +134,7 @@ Fold these into vision.md by hand; the plan documents assume them.
    library-agnostic; htmx is an example, not a target (§ intro, §1, §2).
 2. **"Thousands of users" → "thousands of concurrent users"** (§ non-goals, §5 scale
    envelope).
-3. **The ~50ms MVCC watermark is unsound and is replaced** by the sequencer (D1).
+3. **The ~50ms MVCC watermark is unsound and is replaced** by the assigner (D1).
    Transactional publish means messages can be uncommitted for arbitrarily long; a
    time heuristic loses messages. See 01 §2 for the full argument (§5 perf levers).
 4. **"Sub-50ms NOTIFY latency" becomes "~30–80ms end-to-end"** for both consumer

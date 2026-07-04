@@ -23,7 +23,7 @@ JSON — server-rendered apps generally. htmx appears in examples only.
 
 Ports as-is: topics, SSE handler, tokens, presence. Changes: subscribe to the
 kernel notifier instead of owning a LISTEN connection (one connection per process,
-shared with the sequencer/ticker wakeups); push-on-commit is inherited from
+shared with the assigner/ticker wakeups); push-on-commit is inherited from
 `pg_notify` semantics (02 §4). No storage, no cursor, at-most-once — a disconnected
 browser misses ephemeral pushes, by design; that gap is the inbox's job.
 

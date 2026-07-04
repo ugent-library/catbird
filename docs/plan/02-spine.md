@@ -38,25 +38,34 @@ replay window. Default root retention: age-cap, 7 days.
 // the five-minute API, in the root package
 catbird.Publish(ctx, tx, "order.placed", order)          // one insert, atomic with tx
 catbird.Publish(ctx, tx, "order.placed", order,
-    catbird.WithKey("order-"+id),                         // dedup keep-oldest (01 §8)
-    catbird.WithDelay(10*time.Minute),                    // pending (01 §6)
-    catbird.WithCoalesce("reindex-"+id, 30*time.Second))  // keep-newest (01 §6)
+    catbird.WithKey("order-"+id),                        // dedup keep-oldest (01 §8)
+    catbird.WithDelay(10*time.Minute))                   // relative — DB clock (01 §6)
+
+catbird.Publish(ctx, tx, "record.embargo_lifted", rec,
+    catbird.WithDeliverAt(rec.EmbargoEnd))               // absolute; not with WithDelay
+
+catbird.Publish(ctx, tx, "digest.send", u.ID,
+    catbird.WithKey("digest-"+u.ID),
+    catbird.WithDelay(30*time.Second))    // held 30s; same-key publishes dedup (01 §8).
+                                          // undo = flag it in app state; the handler
+                                          // checks before sending (01 §6)
 ```
 
-`Publish` = `stream.Append("bus", topic, …)` plus one `pg_notify('cb_wire', topic)`
-for the ephemeral path (§4). Producers need the `stream` schema installed and
+`Publish` = `stream.Append("bus", topic, …)` — nothing more. The append's own
+per-stream notify *is* the ephemeral path: wire simply listens to the bus's
+channel (§4). Producers need the `stream` schema installed and
 nothing else running — publishing into a void is legal; the log holds the messages.
 
 ## 3. Bindings and relays
 
-A binding is a row: `cb_stream_binding (pattern, destination_kind, destination,
+A binding is a row: `cb_stream_bindings (pattern, destination_kind, destination,
 start_position)`. Patterns keep today's grammar (`?` single token, `*` tail) and
 today's matcher — port `topic_trie.go` as-is; matching happens **relay-side in Go**,
 not in SQL (the trie is built, tested code; SQL gets at most a cheap prefix
 prefilter).
 
 A **relay** is one ordered consumer group on the root stream per destination,
-running in any worker process (leader-elected the same way as the sequencer). Per
+running in any worker process (leader-elected the same way as the assigner). Per
 batch, in one transaction: match topics → write matches to the destination → advance
 the relay cursor. Same-database writes make this **exactly-once materialization**
 (README guarantees table) — destinations never see duplicates from the relay itself.
@@ -73,7 +82,7 @@ Notes:
   allowed — that's just an ordered group with a topic filter (01 §4). They are the
   one case where a laggard pins shared storage, which the age cap bounds (01 §10).
 - Binding changes take effect from the relay's next batch. New bindings choose
-  `start_position` (tail | begin | ordinal) — the late-binding/replay story.
+  `start_position` (tail | begin | position) — the late-binding/replay story.
 - The current `Bind(queue, pattern)` API survives with the same name and idempotent
   semantics; it now writes a binding row instead of routing at publish time.
 - Relay *kinds* are registered, not imported: the relay runner exposes
@@ -90,11 +99,11 @@ Notes:
 The relay itself is ~a screenful of Go — an ordered consumer wearing a trie:
 
 ```go
-// one per destination, leader-elected like the sequencer; runs in any worker
+// one per destination, leader-elected like the assigner; runs in any worker
 func runRelay(ctx context.Context, pool *pgxpool.Pool, dest Destination) error {
 	matcher := trie.New(loadPatterns(dest)) // ported topic_trie.go; reload on
 	                                        // binding-change notify
-	return stream.Consume(ctx, pool, "bus", "relay."+dest.Name,
+	return stream.Consume(ctx, pool, "bus", "relay_"+dest.Name,
 		func(ctx context.Context, tx pgx.Tx, msgs []stream.Message) error {
 			for _, m := range msgs {
 				if !matcher.Match(m.Topic) { // wildcard match: Go-side (01 §4)
@@ -113,11 +122,13 @@ func runRelay(ctx context.Context, pool *pgxpool.Pool, dest Destination) error {
 
 ## 4. The ephemeral path (wire)
 
-wire never touches storage: `Publish` fires `pg_notify` inside the transaction, so
-Postgres delivers it **on commit** — the push-only-on-commit property is free. The
-nudge follows the *actual append*: a delayed or coalesced publish does not notify
-at accept time (the pending sweeper fires it at delivery), and a dedup-skipped
-publish does not notify at all. The kernel's notifier (grown from today's
+wire never touches storage: every append fires `pg_notify` on a channel named
+after its stream, inside the transaction, so Postgres delivers it **on commit** —
+the push-only-on-commit property is free. There is no channel configuration:
+wire subscribes to the bus's channel, the same way the assigner driver
+subscribes to every stream's. The nudge follows the *actual append*: a delayed
+publish does not notify at accept time (the pending sweeper fires it at
+delivery), and a dedup-skipped publish does not notify at all. The kernel's notifier (grown from today's
 `worker_notifier.go` — see 05's file-name note) holds the one LISTEN connection
 per process and fans out to wire's in-process subscribers (04); it arrives at M5
 with wire (D17) — before that the emissions simply have no listeners. Payloads
@@ -128,7 +139,7 @@ discipline as today.
 
 1. Ensure the `bus` stream in the kernel migration; `catbird.Publish` facade over
    `stream.Append` + NOTIFY.
-2. `cb_stream_binding` DDL + `Bind`/`Unbind` (idempotent, same signatures as today).
+2. `cb_stream_bindings` DDL + `Bind`/`Unbind` (idempotent, same signatures as today).
 3. Relay runner: leader election, batch match (ported trie), per-kind writers,
    exactly-once cursor advance. `flow` and `inbox` kinds land with 03/04; `stream`
    kind lands first.
