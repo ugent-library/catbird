@@ -7,10 +7,10 @@ dependency, D15). A task is a one-step flow — one model, not two.
 
 ## 1. Streams and tables
 
-- One event stream **per flow name**: `flow.<name>` (a LIST partition each —
+- One event stream **per flow name**: `fe.<flow>` (a LIST partition each —
   isolation and per-flow retention for free). `run_id` is a field, *not* a stream:
   a stream per run would explode the partition count.
-- One ready stream per flow: `flow.<name>.ready` (work mode, 01 §5), plus one per
+- One ready stream per flow: `fq.<flow>` (work mode, 01 §5), plus `fq.<flow>.<queue>` per
   dedicated step (§7).
 - Projection tables — **rows are the view, the log is the truth**:
   `cb_flow_runs (run_id, flow, status, input, output, dedup_key — UNIQUE(flow,
@@ -108,12 +108,12 @@ BEGIN
 
     -- same event shape as cb_flow_complete's appends, same shard header
     INSERT INTO cb_stream_messages (stream, topic, payload, headers)
-    VALUES ('flow.' || flow, 'run_requested',
+    VALUES ('fe.' || flow, 'run_requested',
             jsonb_build_object('run_id', _id, 'input', input),
             jsonb_build_object('run_id', _id,
                 'shard', abs(hashint8(_id)) % (SELECT f.shards FROM cb_flows f
                                                WHERE f.name = cb_flow_run.flow)));
-    PERFORM pg_notify(current_schema || '.cb_s_flow.' || flow, '');
+    PERFORM pg_notify(current_schema || '.cbs_fe.' || flow, '');
     RETURN QUERY VALUES (_id, false);
 END;
 $$;
@@ -122,7 +122,7 @@ $$;
 ## 4. The projection — sharded, exactly-once (D9)
 
 Not single-threaded (your note — correctly feared). The projection is N ordered
-groups on `flow.<name>` (`proj_0 … proj_N-1`); events route to shard
+groups on `fe.<flow>` (`proj_0 … proj_N-1`); events route to shard
 `hash(run_id) % N` **at append time** via a shard header the group filter matches.
 Events for one run are always in one shard: serial per run (required for
 correctness), parallel across runs. `N` is per-flow config, default 4; rebalancing
@@ -155,7 +155,7 @@ matters:
 CREATE FUNCTION cb_flow_apply(flow text, shard int, batch int DEFAULT 500)
 RETURNS int LANGUAGE plpgsql AS $$
 DECLARE
-    _stream text := 'flow.' || flow;
+    _stream text := 'fe.' || flow;
     _grp    text := 'proj_' || shard;
     _pos bigint; _high bigint; _e record; _n int := 0;
     _ready bigint[] := '{}';           -- step_ids flipped ready this batch
@@ -190,8 +190,9 @@ BEGIN
             UPDATE cb_flow_deps SET satisfied = true WHERE needs_step_id = ...;
             -- dependents whose last dep this was → _ready
         WHEN 'step_failed' THEN
-            -- policy row (§6): attempts left → re-ready via the pending
-            -- machinery (01 §6); exhausted → run failed + OnFail spawn (§3)
+            -- policy row (§6): attempts left → delayed publish to the ready
+            -- stream's retry stream (D21); exhausted → run failed + OnFail
+            -- spawn (§3)
         WHEN 'signal' THEN
             -- buffer into run state; a live awaiting step matches → its
             -- signal-dep satisfies, possibly → _ready (§3)
@@ -204,7 +205,7 @@ BEGIN
     END LOOP;
 
     -- dispatch: one ready message per flipped step, routed to the step's ready
-    -- stream (flow.<name>.ready, or .<queue> for dedicated steps, §7)
+    -- stream (fq.<flow>, or fq.<flow>.<queue> for dedicated steps, §7)
     INSERT INTO cb_stream_messages (stream, topic, payload)
     SELECT ready_stream_of(s), 'step_ready',
            jsonb_build_object('run_id', s.run_id, 'step_id', s.step_id,
@@ -317,7 +318,8 @@ for {
 
 Step retry policy is columns on a `cb_flow_step_policy` row (flow, step_name → same
 schema as 01 §7), written by builder options. `step_failed` projects through the
-same `cb_stream_fail` machinery: pending re-dispatch with backoff, exhaustion →
+same `cb_stream_fail` machinery: a delayed publish to the ready stream's retry
+stream (`fr.<flow>.<grp>`, D22) with backoff, exhaustion →
 run failure → OnFail. One robustness mechanism across queues and flows; visible to
 every language because it executes in SQL.
 
@@ -379,7 +381,7 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'catbird: run % not found', run_id;
     END IF;
-    _stream := 'flow.' || _flow;
+    _stream := 'fe.' || _flow;
     _hdrs   := jsonb_build_object(
         'run_id', run_id,
         'shard',  abs(hashint8(run_id)) % _shards);
@@ -429,7 +431,7 @@ BEGIN
     -- The engine owns this stream, so it appends directly rather than through
     -- cb_stream_publish (no dedup, no pending on this path) — but it still owes
     -- the assigner its wake-up.
-    PERFORM pg_notify(current_schema || '.cb_s_' || _stream, '');
+    PERFORM pg_notify(current_schema || '.cbs_' || _stream, '');
 
     RETURN true;
 END;
@@ -463,7 +465,7 @@ BEGIN
             jsonb_build_object('step_id', step_id, 'attempt', attempt,
                                'error', error),
             ...same run→stream→shard resolution as complete...);
-    PERFORM pg_notify(current_schema || '.cb_s_' || ..., '');
+    PERFORM pg_notify(current_schema || '.cbs_' || ..., '');
     RETURN true;
 END;
 $$;

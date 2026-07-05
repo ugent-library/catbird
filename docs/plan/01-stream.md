@@ -96,7 +96,7 @@ BEGIN
     SELECT count(*) INTO _n FROM stamped;
 
     IF _n > 0 THEN
-        PERFORM pg_notify(current_schema || '.cb_s_' || stream, '');  -- consumer wake (M5)
+        PERFORM pg_notify(current_schema || '.cbs_' || stream, '');  -- consumer wake (M5)
     END IF;
     RETURN _n;
 END;
@@ -135,10 +135,11 @@ cb_streams          name PK · last_position · retention config (§10) · creat
                    after the stream; listeners pick their channels, 02 §4)
 cb_stream_messages  PARTITION BY LIST (stream), then RANGE (created_at) per stream
                    stream · id (bigint identity) · position (bigint, NULL until
-                   assigned) · topic · target_grp (nullable — set on retry
-                   re-appends; consumed only by that group, skipped by all
-                   others) · payload jsonb · headers jsonb · created_at
-                   (clock_timestamp())
+                   assigned) · topic · payload jsonb · headers jsonb ·
+                   created_at (clock_timestamp())
+                   No consumer-targeting column: retries live in per-group
+                   retry streams (D21), so the log holds only what was
+                   published.
                    indexes: (stream, position) btree per partition; nothing else hot
 cb_stream_cursors   stream · name PK(stream,name) · position (everything ≤ it is
                    processed — the ack AND the retention floor) · filter columns
@@ -159,10 +160,9 @@ cb_stream_leases    stream · grp · from_position · to_position · worker · s
 cb_stream_workers   worker id PK · last_heartbeat            (UNLOGGED — see §11)
 cb_stream_pending  id PK · stream · topic · payload · headers · deliver_at ·
                    key (nullable — lets delivery swap the dedup ref on
-                   delivery, D19) · the retry trio target_grp + attempt +
-                   original_position (set together or not at all) ·
-                   UNIQUE(stream, target_grp, original_position) WHERE
-                   original_position IS NOT NULL — cb_stream_fail idempotency
+                   delivery, D19). Purely delayed messages: a retry is just a
+                   delayed publish to a retry stream (D21) — attempt and
+                   original position travel in headers, no retry columns here
 cb_stream_schedules PK(stream, name) — the identity ensure updates · cron_spec ·
                    catch_up_policy · topic/payload/headers template · next_at
                    (config, not data: survives delivery and re-arms, §6)
@@ -202,11 +202,220 @@ Column discipline (settled while writing the first migration):
   no longer collides with the `cb_flow_run()` function.
 - **Name validation, two tiers** (migration 00006): user-chosen names —
   streams at ensure, cursors, groups, flows — are single segments,
-  `cb_valid_name` (`^[a-z][a-z0-9_]*$`, ≤ 32 bytes; the cap keeps partition
-  identifiers under Postgres's 63-byte limit). Dots belong to the *system's*
-  stream composition only (`flow.<name>`, `<stream>.dlq`) — checked by
-  `_cb_valid_stream_name` on `cb_streams.name`. Consumer names therefore never
-  contain dots: shards are `proj_0`, relays `relay_<dest>`.
+  `cb_valid_name` (`^[a-z][a-z0-9_]*# 01 — stream: the substrate
+
+An ordered, partitioned, append-only log with two read modes. Everything else in
+catbird is a consumer of this. Package `stream`; tables `cb_stream_*`.
+
+## 1. The model in five sentences
+
+Producers `INSERT` messages inside their own transaction — that is the whole write
+path. A **assigner** (a tiny, notify-driven ticker) assigns contiguous, commit-ordered
+**positions** to newly visible rows; nothing downstream ever reads an unassigned row.
+**Ordered groups** consume by cursor: read after position N, process, advance —
+optionally inside one transaction with their own effects (exactly-once processing).
+**Work groups** consume by **range lease**: claim `[from, to]` with a single counter
+bump, process each message, retry failures through the pending table, close the lease.
+Retention drops whole partitions whose positions every group has passed, subject to an
+age cap that wins over laggards.
+
+## 2. Why an assigner (D1) — the correctness core
+
+**The problem.** Insert order is not commit order. Transaction A inserts id 100 and
+stalls; B inserts id 101 and commits. A cursor that reads 101 and advances past it
+silently loses 100 when A finally commits. Any design where cursors compare against
+insert-assigned ids has this hole, and *transactional publish makes it mandatory* —
+a publish rides inside an arbitrary user transaction, so no fixed time watermark is
+safe.
+
+**Options considered, in order of rejection:**
+
+- *"Never read rows younger than ~50ms" (the vision's lever).* Unsound. A user
+  transaction holding a publish open for 2 seconds straddles any watermark; the
+  message is lost. Rejected outright.
+- *xid-horizon gating* (store `xid8`, only advance cursors below
+  `pg_snapshot_xmin(pg_current_snapshot())`). Correct for deciding row visibility,
+  but insufficient to derive a safe **id** watermark (an in-flight transaction may
+  hold an id *below* rows you can already see), and any long-running write
+  transaction anywhere in the database stalls all consumption. Rejected.
+- *PgQ snapshot-diff batches* (per-tick snapshots; a batch = rows visible in tick N
+  but not N−1). Fully correct — it is what PgQ actually does — but the snapshot
+  predicate infects every downstream read, delivery order is not total in any
+  column, and replay/time-travel loses its simple meaning. For a system one person
+  wants to hold in their head, the complexity lands in the worst place: every
+  consumer. Rejected.
+- *Assigner* — **chosen**. All correctness machinery is concentrated in one
+  ~30-line function that runs in one place; every consumer everywhere reads
+  `WHERE position > $cursor ORDER BY position` and is trivially, provably right.
+
+**Mechanism.** Messages insert with `position NULL`. The assigner runs on the
+kernel ticker, per stream with unassigned rows. Wakeups are staged (D17): a plain
+fixed-interval poll first (~50–250ms, configurable — this is the correctness path
+and all M1–M4 need), accelerated at M5 by a NOTIFY wake with a small debounce
+(~10–25ms) once the kernel notifier lands with wire. Correctness never depends on
+a notification arriving; the tick remains the safety net:
+
+```sql
+-- Only one process may number a stream at a time. The try-lock enforces
+-- that: if someone else is already at it, return 0 and let them finish.
+--
+-- The lock must be the _xact variant, which releases automatically when
+-- this transaction ends. The session variant would not: it stays attached
+-- to the database connection after we return. Our connections live in a
+-- pool and get reused by unrelated code, so the lock would leak — held
+-- forever by a connection nobody remembers — and every later call here
+-- would find the stream "busy" and assign nothing, permanently.
+CREATE FUNCTION _cb_stream_assign_positions(stream text, batch int DEFAULT 5000)
+RETURNS int   -- rows assigned; 0 = caught up, or another node holds the lock
+LANGUAGE plpgsql AS $$
+DECLARE
+    _n int;
+BEGIN
+    IF NOT pg_try_advisory_xact_lock(hashtext('cb_assign:' || stream)) THEN
+        RETURN 0;
+    END IF;
+
+    WITH todo AS (
+        SELECT m.id, row_number() OVER (ORDER BY m.id) AS rn
+        FROM cb_stream_messages m
+        WHERE m.stream = _cb_stream_assign_positions.stream AND m.position IS NULL
+        ORDER BY m.id
+        LIMIT batch
+    ), bump AS (
+        UPDATE cb_streams s
+        SET last_position = s.last_position + (SELECT count(*) FROM todo)
+        WHERE s.name = _cb_stream_assign_positions.stream
+        RETURNING s.last_position - (SELECT count(*) FROM todo) AS base
+    ), stamped AS (
+        UPDATE cb_stream_messages m
+        SET position = bump.base + todo.rn
+        FROM todo, bump
+        WHERE m.stream = _cb_stream_assign_positions.stream
+          AND m.id = todo.id
+          AND m.position IS NULL
+        -- the trailing "position IS NULL" is a seatbelt: if lock discipline is
+        -- ever broken, it turns silent re-stamping into a detectable gap
+        RETURNING 1
+    )
+    SELECT count(*) INTO _n FROM stamped;
+
+    IF _n > 0 THEN
+        PERFORM pg_notify(current_schema || '.cbs_' || stream, '');  -- consumer wake (M5)
+    END IF;
+    RETURN _n;
+END;
+$$;
+```
+
+Properties that fall out:
+
+- **Positions are contiguous per stream** (a counter, not a sequence — no gaps,
+  ever). "Am I caught up" and "is this range complete" become integer arithmetic.
+- Only *visible* rows get positions, so position order = commit-batch order, ties
+  broken by insert id. A row that never commits never exists downstream.
+- The assigner is idempotent and crash-safe: it assigns or it doesn't; on restart
+  it continues from `last_position`. If no node holds the advisory lock momentarily,
+  assignment pauses — delivery pauses, nothing is lost.
+- After assignment, the SQL fires `pg_notify` per touched stream. Emission is
+  there from day one (one line, costs nothing without listeners); processes start
+  *listening* at M5 (D17) — until then consumers wake on their own tick.
+
+**The honest costs.** (1) One extra `UPDATE` per message — double heap/WAL traffic
+versus insert-only. At hundreds/sec this is noise; it would matter at Kafka scale,
+which is a stated non-goal. (2) A delivery latency floor. Poll-only (M1–M4): roughly one to two
+tick intervals end-to-end — ~100–500ms depending on configuration. With the NOTIFY
+accelerator (M5): **~30–80ms end-to-end** for *all* consumers, work groups
+included. This replaces the vision's "sub-50ms" claim (README amendment 4). The audience —
+emails, indexers, notifications, flow steps — does not feel 50ms. (3) A latency
+spike if the node running the assigner dies mid-tick (the next tick, anywhere, picks up).
+
+## 3. Table shape
+
+All static — creating a stream creates a partition, never a table family.
+
+```
+cb_streams          name PK · last_position · retention config (§10) · created_at
+                   (no notify config: every append notifies a channel named
+                   after the stream; listeners pick their channels, 02 §4)
+cb_stream_messages  PARTITION BY LIST (stream), then RANGE (created_at) per stream
+                   stream · id (bigint identity) · position (bigint, NULL until
+                   assigned) · topic · payload jsonb · headers jsonb ·
+                   created_at (clock_timestamp())
+                   No consumer-targeting column: retries live in per-group
+                   retry streams (D21), so the log holds only what was
+                   published.
+                   indexes: (stream, position) btree per partition; nothing else hot
+cb_stream_cursors   stream · name PK(stream,name) · position (everything ≤ it is
+                   processed — the ack AND the retention floor) · filter columns
+                   (§4) · failure_policy ('block'|'dlq') · created_at
+cb_stream_work_groups
+                   stream · name PK(stream,name) · claim_next (highest position
+                   handed to a lease — NOT an ack) · watermark (highest position
+                   below which all leases are closed — the retention floor) ·
+                   filter columns (§4) · retry policy columns (§7) · created_at
+                   Two tables, not one with a mode column: every column means
+                   exactly one thing, cross-mode misuse is structurally
+                   impossible, and the janitor cannot read the wrong floor. One
+                   consumer *name* per stream across both tables — no cross-table
+                   PK exists, so ensure enforces it under the setup advisory lock.
+cb_stream_leases    stream · grp · from_position · to_position · worker · state
+                   ('live'|'released'|'closed' — closed rows linger only until
+                   the watermark passes, §5) · created_at   (tiny, mostly empty)
+cb_stream_workers   worker id PK · last_heartbeat            (UNLOGGED — see §11)
+cb_stream_pending  id PK · stream · topic · payload · headers · deliver_at ·
+                   key (nullable — lets delivery swap the dedup ref on
+                   delivery, D19). Purely delayed messages: a retry is just a
+                   delayed publish to a retry stream (D21) — attempt and
+                   original position travel in headers, no retry columns here
+cb_stream_schedules PK(stream, name) — the identity ensure updates · cron_spec ·
+                   catch_up_policy · topic/payload/headers template · next_at
+                   (config, not data: survives delivery and re-arms, §6)
+cb_stream_keys    stream · key PK(stream,key) · ref_kind ('message'|'pending') ·
+                   ref_id · created_at
+```
+
+Postgres quirk to plan for: a partitioned table's unique constraints must include
+all partition key columns, so the message PK is `(stream, created_at, id)`;
+addressing is by the `(stream, position)` index in practice. Rows move positions via
+`UPDATE`, never partitions (partition key is `created_at`, which never changes).
+
+Column discipline (settled while writing the first migration):
+
+- **Types** (D20): enums for closed sets, text + CHECK for sets expected to grow.
+  Enums validate at the function-parameter boundary — where the cross-language
+  contract lives — so a foreign caller's typo dies at bind time.
+- **Integrity, three tiers**: references *into the log* (cursors, watermarks,
+  lease ranges) are coordinates, not FKs — retention drops their targets by
+  design, and no unique target exists on a partitioned position anyway. The *hot
+  path* carries no FK (a check is a hidden per-insert join; publish's explicit
+  PK read gives a better error). The *cold config tables* do: `cursor`,
+  `work_group`, `pending` → `cb_streams(name) ON DELETE CASCADE`, lease →
+  work_group, plus the arithmetic CHECKs (`watermark <= claim_next`,
+  `from_position <= to_position`, `jsonb_typeof(headers) = 'object'`).
+- **Column strictness follows the consumer**: `topic` nullable (absence feeds
+  filters, where SQL's three-valued logic does the right thing) · `payload`
+  NOT NULL DEFAULT 'null' (absence feeds decoders — JSON null is the one
+  canonical "no data") · `headers` NOT NULL DEFAULT '{}' + object CHECK (SQL
+  itself reads keys and `||`-merges; a scalar would corrupt silently).
+- **Naming authority is the migrations**, not these sketches — notably the
+  column is `stream_name` in DDL (kills plpgsql parameter ambiguity) while
+  sketches abbreviate to `stream`. Semantics here, identifiers there.
+  Convention: table names are **plural** (`cb_stream_messages`,
+  `cb_stream_keys`) except collectives (`cb_stream_pending`); function names
+  stay singular verbs (`cb_stream_publish`). Bonus: the `cb_flow_runs` table
+  no longer collides with the `cb_flow_run()` function.
+- **Name validation, two tiers** (migration 00006): user-chosen names —
+  streams at ensure, cursors, groups, flows — are single segments,
+  , **≤ 20 bytes**). Dots belong to the
+  *system's* stream composition only, using the D22 vocabulary
+  using the D22 grammar `[code.]<name>[.group]` — codes `fe` `fq` `fr` `fd`
+  `sr` `sd` (family char + kind char); the base is always segment 2 when a
+  code exists, so parsing is one `split_part`, and validation enforces arity
+  per code — checked by `_cb_valid_stream_name` on `cb_streams.name`: up
+  to **3 segments, ≤ 44 bytes**. The arithmetic: worst composed name
+  `sr.<20>.<20>` = 44 ≤ 44; partition (dots encoded as `__`) `cbm__` (5) + 46 + `__YYYYMMDD` (10) =
+  61 ≤ 63; channel `public.cbs_` (11) + 44 = 55 ≤ 63. Consumer names never contain dots:
+  shards are `proj_0`, relays `relay_<dest>`.
 - **Function visibility** (PostGIS's convention): `cb_*` is public — listed in
   `docs/sql-api.md`, stable, breaking changes are versioned events. `_cb_*` is
   internal — no stability promise, may change in any migration. Public by
@@ -261,8 +470,7 @@ func Consume(ctx context.Context, pool *pgxpool.Pool, stream, grp string,
 			}
 			msgs, err := fetch(ctx, tx, stream, grp, pos, batchSize)
 			// fetch: position > pos — no upper bound; assignment is atomic
-			//        AND (target_grp IS NULL OR target_grp = grp)
-			//        [+ prefix/header filter]  ORDER BY position
+			//        [+ optional prefix/header filter]  ORDER BY position
 			if err != nil || len(msgs) == 0 {
 				return err
 			}
@@ -284,11 +492,12 @@ func Consume(ctx context.Context, pool *pgxpool.Pool, stream, grp string,
 ```
 
 **The filtering contract (owned here; 02 and 03 refer back):** SQL evaluates only
-cheap predicates — `target_grp IS NULL OR target_grp = $grp` (always), an optional
-equality match on one header key (how flow shards route, 03 §4), and an optional
-topic *prefix*. Wildcard topic patterns (`?`/`*`) are matched **in Go only**, by
-the ported trie, after the batch read — the matcher exists once, never twice.
-Either way the cursor advances over skipped rows.
+cheap predicates — an optional equality match on one header key (how flow shards
+route, 03 §4) and an optional topic *prefix*. Wildcard topic patterns (`?`/`*`)
+are matched **in Go only**, by the ported trie, after the batch read — the
+matcher exists once, never twice. Either way the cursor advances over skipped
+rows. (No consumer-targeting predicate exists: retries live in per-group retry
+streams, D21, so ownership is a place, not a filter.)
 
 Freshness is also a per-consumer policy, not a message property: a handler that
 doesn't want old messages skips anything whose `created_at` is older than its
@@ -374,7 +583,8 @@ $$;
 No scan, no anti-join, no lock queue — one hot row per group. Before bumping the
 counter, a worker first adopts any `released` lease (`FOR UPDATE SKIP LOCKED` on the
 tiny lease table — cold path, fine). Then per message in the range: run the handler;
-on failure, write a retry into `cb_stream_pending` (§6) or the DLQ (§9) per policy.
+on failure, `cb_stream_fail` publishes a retry to the group's retry stream or
+the DLQ per policy (§7, D21).
 A lease closes when every message *fetched for it* is handled (succeeded, retried,
 or dead-lettered) — defined over what was fetched, not the position range, so a
 partition dropped mid-lease (§10) cannot wedge it. On close, delete the lease and
@@ -401,7 +611,7 @@ Their life is: born, wait until `deliver_at`, delivered, gone.
 | Feature | Row shape |
 |---|---|
 | Delayed delivery | `deliver_at` in the future |
-| Retry with backoff | `attempt = n`, `original_position` + `target_grp` set, `deliver_at = now + backoff(n)`. The re-append carries `target_grp` and the attempt count forward: only the failing group sees the retry (other groups on the stream already handled the original — without targeting, every retry would double-deliver to every other group and break the exactly-once headline), and the next failure backs off from `n+1`, not from 1 |
+| Retry with backoff | An ordinary delayed publish (D21): `cb_stream_fail` targets the failing group's retry stream `sr.<base>.<group>` with `delay = backoff(n)` and the attempt count in headers. Only that group consumes its retry stream, so no other consumer ever sees the retry — ownership by place, not by stamp — and the next failure backs off from `n+1`, not from 1 |
 
 Cron does **not** share this table. A schedule is *config*, not data: it has an
 identity — `PK (stream, name)`, which is what ensure updates when a deploy
@@ -451,8 +661,8 @@ BEGIN
         -- Now that it's due, do what publish would have done at the time:
         -- insert the message, point its key at the new row (until now the
         -- key pointed at this pending row), and ring the stream's channel.
-        INSERT INTO cb_stream_messages (stream, topic, payload, headers, target_grp)
-        VALUES (_p.stream, _p.topic, _p.payload, _p.headers, _p.target_grp)
+        INSERT INTO cb_stream_messages (stream, topic, payload, headers)
+        VALUES (_p.stream, _p.topic, _p.payload, _p.headers)
         RETURNING id INTO _mid;
         UPDATE cb_stream_keys d SET ref_kind = 'message', ref_id = _mid
         WHERE d.ref_kind = 'pending' AND d.ref_id = _p.id AND d.stream = _p.stream;
@@ -497,55 +707,78 @@ max_attempts int · backoff_kind ('none'|'fixed'|'full_jitter') ·
 backoff_base interval · backoff_max interval · on_exhaust ('dlq'|'drop')
 ```
 
-`cb_stream_fail(stream, grp, position, error)` reads the attempt count from the
-failing message (carried on its re-append, §6), computes the next `deliver_at`
-from these columns, and writes pending or DLQ — with `ON CONFLICT DO NOTHING` on
-`(stream, target_grp, original_position)`, so a crashed-and-adopted lease failing the
-same message twice yields one retry, not a multiplying family of them.
+`cb_stream_fail(stream, grp, position, error)` has no mechanism of its own
+(D21): it reads the failing message, then *publishes* — to the group's retry
+stream with a backoff delay, or to the base stream's DLQ when attempts are
+exhausted. Idempotency under duplicate fails (a crashed-and-adopted lease
+reporting the same failure twice) is the dedup key; the retry stream is created
+lazily, like the DLQ.
 
 ```sql
 CREATE FUNCTION cb_stream_fail(stream text, grp text, position bigint, error text)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
     _g cb_stream_work_groups; _m cb_stream_messages;
-    _attempt int; _origin bigint;
+    _attempt int; _origin bigint; _base text; _rp text; _dp text;
 BEGIN
+    -- Names follow the D22 grammar [code.]base[.group], so the base is
+    -- segment 2 whenever a code exists. Failures always act on base names —
+    -- escalation is the attempt counter in headers, never deeper composition.
+    _base := CASE WHEN cb_stream_fail.stream LIKE '%.%'
+                  THEN split_part(cb_stream_fail.stream, '.', 2)
+                  ELSE cb_stream_fail.stream END;
+    -- family decides the target codes: flow streams retry to fr./fd.,
+    -- everything else to sr./sd.
+    IF split_part(cb_stream_fail.stream, '.', 1) IN ('fe', 'fq', 'fr') THEN
+        _rp := 'fr.'; _dp := 'fd.';
+    ELSE
+        _rp := 'sr.'; _dp := 'sd.';
+    END IF;
     SELECT * INTO _g FROM cb_stream_work_groups g
-    WHERE g.stream = cb_stream_fail.stream AND g.name = grp;
+    WHERE g.stream = cb_stream_fail.stream AND g.name = cb_stream_fail.grp;
+    -- still readable: the group's watermark hasn't passed an unresolved message
     SELECT * INTO _m FROM cb_stream_messages m
     WHERE m.stream = cb_stream_fail.stream AND m.position = cb_stream_fail.position;
 
     _attempt := coalesce((_m.headers->>'attempt')::int, 0) + 1;
     -- retries of retries keep pointing at the first position
-    _origin  := coalesce((_m.headers->>'original_position')::bigint, position);
+    _origin  := coalesce((_m.headers->>'original_position')::bigint,
+                         cb_stream_fail.position);
 
     IF _attempt >= _g.max_attempts THEN
         IF _g.on_exhaust = 'dlq' THEN
-            -- the DLQ is an ordinary stream (§9); the dedup key makes
-            -- exhaustion idempotent under duplicate fails — composition pays
+            -- exhaustion goes to the BASE stream's DLQ, not the retry stream's
             PERFORM cb_stream_publish(
-                stream || '.dlq', _m.topic, _m.payload,
+                _dp || _base, _m.topic, _m.payload,
                 _m.headers || jsonb_build_object(
-                    'origin_stream', stream, 'original_position', _origin,
-                    'grp', grp, 'attempts', _attempt, 'last_error', error,
+                    'origin_stream', cb_stream_fail.stream,
+                    'original_position', _origin,
+                    'grp', cb_stream_fail.grp, 'attempts', _attempt,
+                    'last_error', cb_stream_fail.error,
                     'failed_at', clock_timestamp()),
-                key := stream || ':' || grp || ':' || _origin);
+                key => cb_stream_fail.grp || ':' || _origin);
         END IF;
         RETURN;
     END IF;
 
-    INSERT INTO cb_stream_pending (stream, topic, payload, headers, deliver_at,
-                                   target_grp, attempt, original_position)
-    VALUES (stream, _m.topic, _m.payload,
-            _m.headers || jsonb_build_object('attempt', _attempt,
-                                             'original_position', _origin),
-            clock_timestamp() + cb_backoff(_g.backoff_kind, _g.backoff_base,
-                                           _g.backoff_max, _attempt),
-            grp, _attempt, _origin)
-    ON CONFLICT (stream, target_grp, original_position) DO NOTHING;   -- idempotent
+    -- the retry IS a delayed publish; the key makes duplicate fails collapse
+    PERFORM _cb_stream_ensure_internal(_rp || _base || '.' || cb_stream_fail.grp);
+    PERFORM cb_stream_publish(
+        _rp || _base || '.' || cb_stream_fail.grp,
+        _m.topic, _m.payload,
+        _m.headers || jsonb_build_object('attempt', _attempt,
+                                         'original_position', _origin),
+        key   => cb_stream_fail.grp || ':' || _origin || ':' || _attempt,
+        delay => cb_backoff(_g.backoff_kind, _g.backoff_base,
+                            _g.backoff_max, _attempt));
 END;
 $$;
 ```
+
+(`_cb_stream_ensure_internal` is the ensure that accepts system-composed dotted
+names — the public one rejects dots. The worker claims from `<base>` and
+`sr.<base>.<grp>`; how it splits its batch appetite between them is a Go-side
+policy knob.)
 
 (`cb_backoff` is a pure function of the policy columns and attempt — fixed or
 full-jitter, ported from `backoff.go`.) A Python worker that calls it gets
@@ -705,7 +938,7 @@ BEGIN
     -- not config. Whoever cares listens: the assigner driver on every stream,
     -- wire on the bus (02 §4). Notifies are hints; spurious wakeups are
     -- harmless (D17).
-    PERFORM pg_notify(current_schema || '.cb_s_' || stream, topic);
+    PERFORM pg_notify(current_schema || '.cbs_' || stream, topic);
     -- (a NULL topic is fine: delivered as an empty payload, same as '')
 END;
 $$;
@@ -722,7 +955,7 @@ the stream's wire nudge — delivery *is* the append, so the nudges move with it
 
 ## 9. Dead letters (D6)
 
-A DLQ is an ordinary stream named `<stream>.dlq`, created lazily on first use.
+A DLQ is an ordinary stream named `sd.<stream>` (`fd.<flow>` for flows), created lazily on first use.
 Exhausted messages are appended there with headers
 `{origin_stream, original_position, grp, attempts, last_error, failed_at}`. Replay is
 `stream.Redrive(dlq, n)` — republish to the origin stream (new position, attempt
@@ -820,10 +1053,11 @@ System events like `$sys.data_loss` are ordinary bus messages under the reserved
    - Dual-assigner exclusion: two assignment transactions opened concurrently by
      hand — the second must lose the xact-lock try and assign nothing. (Kill-9
      of the assigner does *not* reproduce this race; build it deliberately.)
-   - Duplicate fail: `cb_stream_fail` twice for one (group, position) → exactly one
-     pending row.
-   - Multi-group retry: group A's retry is invisible to group B, in ordered and
-     work modes both.
+   - Duplicate fail: `cb_stream_fail` twice for one (group, position, attempt) →
+     exactly one retry message (the dedup key collapses them).
+   - Retry isolation: group A's retry lands in `sr.<base>.a` only — group B and
+     every cursor never see it, structurally (no filter to test; assert the
+     main stream gained no rows).
    - Exactly-once: consumer transaction aborts after effects → redelivered → effects
      appear exactly once.
    - Lease crash: kill a worker mid-range; lease sweeper releases; another worker adopts;

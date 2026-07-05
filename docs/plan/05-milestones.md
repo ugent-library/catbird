@@ -106,7 +106,7 @@ lands (D17).**
 
 ## M2 — stream work mode: leases, pending, retries, dedup, DLQ
 
-01 §§5–9: range leases + heartbeats + the lease sweeper, delivery of the pending table (delay, retry)
+01 §§5–9: range leases + heartbeats + the lease sweeper, delivery of the pending table (delay; retries are delayed publishes to per-group retry streams, D21)
 and the schedule table (cron), DB-side retry policy (`cb_stream_fail`), the
 keep-oldest key rule, DLQ + `Redrive`.
 
