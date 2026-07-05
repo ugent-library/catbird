@@ -22,6 +22,13 @@ LANGUAGE sql IMMUTABLE AS $$
 $$;
 -- +goose statementend
 
+-- +goose statementbegin
+CREATE FUNCTION _cb_stream_notify(stream text, payload text)
+RETURNS void LANGUAGE sql AS $$
+    SELECT pg_notify(current_schema || '.cb_s_' || stream, payload);
+$$;
+-- +goose statementend
+
 CREATE TABLE cb_streams (
     name text PRIMARY KEY CHECK (_cb_valid_stream_name(name)),
     last_position bigint NOT NULL DEFAULT 0
@@ -74,6 +81,7 @@ CREATE SEQUENCE cb_stream_messages_id_seq;
 CREATE TABLE cb_stream_messages (
     id bigint NOT NULL DEFAULT nextval('cb_stream_messages_id_seq'),
     stream_name text NOT NULL REFERENCES cb_streams(name) ON DELETE CASCADE,
+    group_name text,
     position bigint,
     topic text,
     payload jsonb NOT NULL,
@@ -104,6 +112,30 @@ BEGIN
          FOR VALUES FROM (%L) TO (%L)',
         format('cb_stream_messages__%s__dev', cb_stream_ensure.stream),
         'cb_stream_messages__' || cb_stream_ensure.stream, '2000-01-01', '2100-01-01');
+END; $$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE FUNCTION cb_stream_ensure_cursor(stream text, cursor text, start_position bigint DEFAULT NULL)
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    IF NOT cb_valid_name(cb_stream_ensure_cursor.cursor) THEN
+        RAISE EXCEPTION 'catbird: invalid cursor name %; use [a-z][a-z0-9_]*, max 32 bytes',
+            cb_stream_ensure_cursor.cursor;
+    END IF;
+
+    PERFORM 1 FROM cb_streams s WHERE s.name = cb_stream_ensure_cursor.stream;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_ensure_cursor.stream;
+    END IF;
+
+    INSERT INTO cb_stream_cursors (stream_name, name, position)
+    VALUES (
+        cb_stream_ensure_cursor.stream,
+        cb_stream_ensure_cursor.cursor,
+        coalesce(cb_stream_ensure_cursor.start_position,
+            (SELECT s.last_position FROM cb_streams s WHERE s.name = cb_stream_ensure_cursor.stream), 0))
+    ON CONFLICT (stream_name, name) DO NOTHING;
 END; $$;
 -- +goose statementend
 
@@ -237,13 +269,13 @@ BEGIN
     );
 
     -- Notify the position assigner.
-    PERFORM pg_notify(current_schema || '.cb_s_' || cb_stream_publish.stream, cb_stream_publish.topic);
+    PERFORM _cb_stream_notify(cb_stream_publish.stream, cb_stream_publish.topic);
 END;
 $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION _cb_stream_assign_positions(stream text, batch int DEFAULT 5000)
+CREATE FUNCTION _cb_stream_assign_positions(stream text, batch_size int DEFAULT 5000)
 RETURNS int   -- rows assigned; 0 = caught up, or lost the election
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -259,7 +291,7 @@ BEGIN
         FROM cb_stream_messages m
         WHERE m.stream_name = _cb_stream_assign_positions.stream AND m.position IS NULL
         ORDER BY m.id
-        LIMIT _cb_stream_assign_positions.batch
+        LIMIT _cb_stream_assign_positions.batch_size
     ), bump AS (
         UPDATE cb_streams s
         SET last_position = s.last_position + (SELECT count(*) FROM unassigned)
@@ -271,14 +303,17 @@ BEGIN
         FROM unassigned, bump
         WHERE m.stream_name = _cb_stream_assign_positions.stream
           AND m.id = unassigned.id
-          AND m.position IS NULL -- Just to be sure.
+           -- Not really needed with the advisory lock, just extra safety.
+           -- Without the lock, gaps would appear in the position sequence,
+           -- but no existing message would be updated.
+          AND m.position IS NULL
         RETURNING 1
     )
     SELECT count(*) INTO _n FROM assigned;
 
     IF _n > 0 THEN
         -- Inform consumers that new messages are available.
-        PERFORM pg_notify(current_schema || '.cb_s_' || _cb_stream_assign_positions.stream, '');
+        PERFORM _cb_stream_notify(_cb_stream_assign_positions.stream, '');
     END IF;
     RETURN _n;
 END;
@@ -286,34 +321,67 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION cb_stream_read(stream text, cursor text, max_count int DEFAULT 100)
+CREATE FUNCTION _cb_stream_deliver_pending(batch_size int DEFAULT 500)
+RETURNS int LANGUAGE plpgsql AS $$
+DECLARE
+    _p cb_stream_pending;
+    _msg_id bigint;
+    _n int := 0;
+BEGIN
+    FOR _p IN
+        SELECT * FROM cb_stream_pending
+        WHERE deliver_at <= clock_timestamp()
+        ORDER BY deliver_at LIMIT _cb_stream_deliver_pending.batch_size
+        FOR UPDATE SKIP LOCKED
+    LOOP
+        DELETE FROM cb_stream_pending WHERE id = _p.id;
+
+        -- Publish the message
+        INSERT INTO cb_stream_messages (stream_name, topic, payload, headers, group_name)
+        VALUES (_p.stream_name, _p.topic, _p.payload, _p.headers, _p.group_name)
+        RETURNING id INTO _msg_id;
+        -- If the message has a key, update it.
+        UPDATE cb_stream_keys k
+        SET ref_kind = 'message', ref_id = _msg_id
+        WHERE k.ref_kind = 'pending' AND k.ref_id = _p.id AND k.stream_name = _p.stream_name;
+
+        PERFORM _cb_stream_notify(_p.stream_name, _p.topic);
+
+        _n := _n + 1;
+    END LOOP;
+    RETURN _n;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE FUNCTION cb_stream_read(stream text, cursor text, batch_size int DEFAULT 100)
 RETURNS SETOF cb_stream_messages
 LANGUAGE plpgsql AS $$
 DECLARE
     _pos bigint;
-    _last_pos bigint;
     _new_pos bigint;
 BEGIN
-    -- one reader per cursor: a competing reader blocks here, not double-reads
+    -- Get current cursor position.
     SELECT c.position INTO _pos FROM cb_stream_cursors c
     WHERE c.stream_name = cb_stream_read.stream AND c.name = cb_stream_read.cursor
     FOR UPDATE;
+
     IF NOT FOUND THEN
         RAISE EXCEPTION 'catbird: cursor %.% not defined', cb_stream_read.stream, cb_stream_read.cursor;
     END IF;
-    SELECT s.last_position INTO _last_pos FROM cb_streams s
-    WHERE s.name = cb_stream_read.stream;
 
-    -- where this batch ends (NULL = caught up)
     SELECT max(b.position) INTO _new_pos FROM (
         SELECT m.position FROM cb_stream_messages m
         WHERE m.stream_name = cb_stream_read.stream
-          AND m.position > _pos AND m.position <= _last_pos
-        ORDER BY m.position LIMIT max_count) b;
-    IF _new_pos IS NULL THEN RETURN; END IF;
+          AND m.position > _pos
+        ORDER BY m.position
+        LIMIT cb_stream_read.batch_size) b;
 
-    -- emit the batch, then keep going — the one place RETURN QUERY's
-    -- "append and continue" behavior is what we want
+    IF _new_pos IS NULL THEN
+        RETURN;
+    END IF;
+
     RETURN QUERY
     SELECT m.* FROM cb_stream_messages m
     WHERE m.stream_name = cb_stream_read.stream
@@ -327,14 +395,17 @@ END; $$;
 
 -- +goose down
 
+DROP FUNCTION cb_stream_read(text, text, int);
 DROP FUNCTION cb_stream_publish(text, text, jsonb, jsonb, text, interval, timestamptz);
 DROP FUNCTION cb_stream_ensure(text);
+DROP FUNCTION _cb_stream_deliver_pending(int);
 DROP FUNCTION _cb_stream_assign_positions(text, int);
-DROP FUNCTION _cb_valid_stream_name(text);
-DROP FUNCTION cb_valid_name(text);
+DROP FUNCTION _cb_stream_notify(text, text);
 DROP TABLE cb_stream_messages;
 DROP TABLE cb_stream_cursors;
 DROP TABLE cb_stream_keys;
 DROP TABLE cb_stream_pending;
 DROP TABLE cb_streams;
+DROP FUNCTION _cb_valid_stream_name(text);
+DROP FUNCTION cb_valid_name(text);
 DROP TYPE cb_ref_kind;

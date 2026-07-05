@@ -62,7 +62,7 @@ a notification arriving; the tick remains the safety net:
 -- forever by a connection nobody remembers — and every later call here
 -- would find the stream "busy" and assign nothing, permanently.
 CREATE FUNCTION _cb_stream_assign_positions(stream text, batch int DEFAULT 5000)
-RETURNS int   -- rows assigned; 0 = caught up, or lost the election
+RETURNS int   -- rows assigned; 0 = caught up, or another node holds the lock
 LANGUAGE plpgsql AS $$
 DECLARE
     _n int;
@@ -123,7 +123,7 @@ tick intervals end-to-end — ~100–500ms depending on configuration. With the 
 accelerator (M5): **~30–80ms end-to-end** for *all* consumers, work groups
 included. This replaces the vision's "sub-50ms" claim (README amendment 4). The audience —
 emails, indexers, notifications, flow steps — does not feel 50ms. (3) A latency
-spike while an assigner leader hand-off happens (sub-second).
+spike if the node running the assigner dies mid-tick (the next tick, anywhere, picks up).
 
 ## 3. Table shape
 
@@ -158,7 +158,7 @@ cb_stream_leases    stream · grp · from_position · to_position · worker · s
                    the watermark passes, §5) · created_at   (tiny, mostly empty)
 cb_stream_workers   worker id PK · last_heartbeat            (UNLOGGED — see §11)
 cb_stream_pending  id PK · stream · topic · payload · headers · deliver_at ·
-                   key (nullable — lets the sweeper swap the dedup ref on
+                   key (nullable — lets delivery swap the dedup ref on
                    delivery, D19) · the retry trio target_grp + attempt +
                    original_position (set together or not at all) ·
                    UNIQUE(stream, target_grp, original_position) WHERE
@@ -213,7 +213,7 @@ Column discipline (settled while writing the first migration):
   necessity: the foreign-worker contract (claim / complete / fail / signal /
   heartbeat), `cb_stream_publish`, `cb_stream_fail`, `cb_valid_name` (users
   pre-validate against it). Internal as they land: `_cb_valid_stream_name`,
-  the notify-append tail, backoff, cron-next, the sweepers and janitors — and
+  the notify-append tail, backoff, cron-next, delivery, the lease sweeper, janitors — and
   decide the assigner's marker when building it (only catbird's own ticker
   and consume paths call it, so it leans internal).
 
@@ -233,7 +233,9 @@ stream.ConsumeFunc(ctx, pool, "orders", "mailer", func(ctx context.Context, batc
 
 Internals of one iteration: `SELECT … FROM cb_stream_cursors … FOR UPDATE` (pins the
 group row — a second competing reader blocks rather than corrupts), read
-`position > position AND position <= (SELECT last_position …) ORDER BY position LIMIT n`,
+`position > cursor ORDER BY position LIMIT n` (no upper bound: the assigner
+stamps rows and bumps the counter atomically, so every visible position belongs
+to a complete batch),
 run the handler, `UPDATE … SET position = $high`, commit. Failure semantics per
 group config: `block` (default — retry the batch with backoff in place; ordered
 means ordered) or `dlq` (append the poison message to the DLQ stream, advance past
@@ -258,7 +260,7 @@ func Consume(ctx context.Context, pool *pgxpool.Pool, stream, grp string,
 				return err
 			}
 			msgs, err := fetch(ctx, tx, stream, grp, pos, batchSize)
-			// fetch: position > pos AND position <= cb_streams.last_position
+			// fetch: position > pos — no upper bound; assignment is atomic
 			//        AND (target_grp IS NULL OR target_grp = grp)
 			//        [+ prefix/header filter]  ORDER BY position
 			if err != nil || len(msgs) == 0 {
@@ -382,16 +384,16 @@ already resolved; that is why `cb_stream_fail` is idempotent (§7).
 
 Liveness: a background goroutine per worker process heartbeats `cb_stream_workers`
 (one row per worker per interval — decoupled from handler duration, exactly as the
-vision demands). A sweeper (kernel ticker) flips leases of stale workers to
+vision demands). A lease sweeper (kernel ticker) flips leases of stale workers to
 `released`. A crashed worker's whole range is redelivered — coarser duplicates than
 per-message claims, the price of the simpler mechanism; at-least-once either way.
 
 What survives from each lineage: **pgq** — positions, batches, ticker, retention by
 rotation; **pgmq** — nothing on the hot path; SKIP LOCKED survives only on the cold
-lease-adoption path and in the sweeper. Today's queue semantics (`Send`/`Read`
+lease-adoption path and in the lease sweeper. Today's queue semantics (`Send`/`Read`
 with hide) are *not* re-exposed; the work-group API replaces them.
 
-## 6. Waiting messages and schedules — one sweeper, two tables (D3)
+## 6. Waiting messages and schedules — one delivery job, two tables (D3)
 
 `cb_stream_pending` holds one-shot messages that have not entered the log yet.
 Their life is: born, wait until `deliver_at`, delivered, gone.
@@ -410,7 +412,7 @@ deleted. (A cron row in pending would have no key to find it by; today's
 including the on-time-tick fix from #45) · a topic/payload/headers template ·
 `next_at`.
 
-One sweeper serves both — its tick makes two small scans, one job. Delivering a
+One delivery job serves both — its tick makes two small scans, one job. Delivering a
 pending row is delete + append in one transaction (exactly-once handoff);
 delivering a schedule is append + re-arm `next_at`. The current `scheduler.go`
 module dissolves into the schedule table plus builder sugar (`stream.Cron(...)`,
@@ -426,9 +428,10 @@ microseconds. A stuck row (say, a poisoned retry) is removed by hand:
 `DELETE FROM cb_stream_pending WHERE id = …` — it's a plain table.
 
 ```sql
--- kernel-ticker job, leader-elected; wakes on min(deliver_at) and on the
--- '.cb_pending' notify that publish fires for new earlier rows
-CREATE FUNCTION cb_stream_sweep_pending(batch int DEFAULT 500)
+-- kernel-ticker job on every node — no leadership; SKIP LOCKED below divides
+-- the work. Wakes on min(deliver_at) and on the '.cb_pending' notify that
+-- publish fires for new earlier rows
+CREATE FUNCTION _cb_stream_deliver_pending(batch int DEFAULT 500)
 RETURNS int LANGUAGE plpgsql AS $$
 DECLARE
     _p cb_stream_pending; _mid bigint; _n int := 0;
@@ -437,12 +440,17 @@ BEGIN
         SELECT * FROM cb_stream_pending
         WHERE deliver_at <= clock_timestamp()
         ORDER BY deliver_at LIMIT batch
-        FOR UPDATE SKIP LOCKED          -- belt over the leader election
+        FOR UPDATE SKIP LOCKED
+        -- Any number of copies may run this at once — each locks its own set
+        -- of due rows and skips rows another copy is delivering. No
+        -- coordination needed beyond the locks.
     LOOP
         DELETE FROM cb_stream_pending WHERE id = _p.id;
 
-        -- delivery IS the append, so publish's tail duties move here:
-        -- message row, dedup-ref swap, assigner notify, wire nudge (§8)
+        -- A delayed publish stored the message here instead of in the log.
+        -- Now that it's due, do what publish would have done at the time:
+        -- insert the message, point its key at the new row (until now the
+        -- key pointed at this pending row), and ring the stream's channel.
         INSERT INTO cb_stream_messages (stream, topic, payload, headers, target_grp)
         VALUES (_p.stream, _p.topic, _p.payload, _p.headers, _p.target_grp)
         RETURNING id INTO _mid;
@@ -673,14 +681,14 @@ BEGIN
         ref_kind := 'pending';
         ref_id := coalesce(_id,
                         nextval(pg_get_serial_sequence('cb_stream_pending', 'id')));
-        -- `key` stored on the row so the sweeper can swap the dedup ref from
+        -- `key` stored on the row so delivery can swap the dedup ref from
         -- 'pending' to the delivered message — the window spans both stages
         INSERT INTO cb_stream_pending
             (id, stream, topic, payload, headers, deliver_at, key)
         VALUES (ref_id, stream, topic, payload, headers, _at, key);
         PERFORM pg_notify(current_schema || '.cb_pending', to_char(_at AT TIME
             ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
-            -- today's visible_at timestamp encoding, reused: the Go sweeper
+            -- today's visible_at timestamp encoding, reused: the Go delivery job
             -- parses it and re-arms its timer if this is now the earliest
         RETURN;   -- no assigner notify, no wire nudge: nothing was appended
     END IF;
@@ -708,10 +716,9 @@ Sketch-level notes: real code prefixes parameters per the existing
 exactly one row → OUT params; zero-or-more rows → RETURNS TABLE** (so
 `cb_stream_claim` keeps its table form — "nothing to claim" is zero rows). The
 batch variant is the same shape over `unnest()` with one assigner notify per
-touched stream. The pending
-sweeper owes three things at delivery time: swap the dedup ref from `pending` to
-the delivered message, notify the assigner, and fire the stream's wire nudge —
-delivery *is* the append, so the nudges move with it.
+touched stream. `_cb_stream_deliver_pending` owes three things per delivered message: swap the
+dedup ref from `pending` to the delivered message, notify the assigner, and fire
+the stream's wire nudge — delivery *is* the append, so the nudges move with it.
 
 ## 9. Dead letters (D6)
 
@@ -781,7 +788,7 @@ System events like `$sys.data_loss` are ordinary bus messages under the reserved
   it comes back empty → all leases sweep to `released` → mass redelivery of
   in-flight work. Legal under at-least-once; document it loudly.
 - Hot-path rules kept: no joins on reads (`position > x` range scans), no advisory
-  locks outside assigner election, no N+1. The group row is the only contended
+  locks outside the assigner's try-lock, no N+1. The group row is the only contended
   row; batch sizes amortize it.
 - Payloads stay `jsonb` (today's choice); revisit `bytea` only if a real workload
   demands opaque payloads.
@@ -795,13 +802,13 @@ System events like `$sys.data_loss` are ordinary bus messages under the reserved
 2. `cb_stream_publish(stream, topic, payload, headers, key?, delay?, deliver_at?)`
    — the keep-oldest key rule (§8); emits `pg_notify` (no listeners until M5).
    Sketched in §8. Plus the batch variant.
-3. Assigner function + kernel-ticker wiring (poll-only, D17) + advisory-lock
-   election.
+3. Assigner function + kernel-ticker wiring (poll-only, D17); every node calls
+   it, the try-lock decides.
 4. Ordered consume (both Go shapes); cursor/work-group ensure with the
    cross-table name check under the setup advisory lock; start positions.
-5. Work groups: lease claim / adopt / close, heartbeat goroutine, sweeper.
-6. `cb_stream_fail` + policy columns; the sweeper: pending scan (delay, retry)
-   + schedule scan (cron re-arm).
+5. Work groups: lease claim / adopt / close, heartbeat goroutine, lease sweeper.
+6. `cb_stream_fail` + policy columns; `_cb_stream_deliver_pending` + the
+   schedule scan (cron re-arm).
 7. Dedup table + prune janitor; DLQ append + `Redrive`.
 8. Partition pre-creation job (no DEFAULT partition); retention janitor with
    age-cap force-advance.
@@ -812,14 +819,14 @@ System events like `$sys.data_loss` are ordinary bus messages under the reserved
    - Contiguity: positions have no gaps after crash-kill of the assigner mid-batch.
    - Dual-assigner exclusion: two assignment transactions opened concurrently by
      hand — the second must lose the xact-lock try and assign nothing. (Kill-9
-     of the leader does *not* reproduce this race; build it deliberately.)
+     of the assigner does *not* reproduce this race; build it deliberately.)
    - Duplicate fail: `cb_stream_fail` twice for one (group, position) → exactly one
      pending row.
    - Multi-group retry: group A's retry is invisible to group B, in ordered and
      work modes both.
    - Exactly-once: consumer transaction aborts after effects → redelivered → effects
      appear exactly once.
-   - Lease crash: kill a worker mid-range; sweeper releases; another worker adopts;
+   - Lease crash: kill a worker mid-range; lease sweeper releases; another worker adopts;
      duplicates ≤ range size.
    - Retention: age cap force-advances an abandoned cursor and emits the loss event.
    - The key rule: any same-key publish while the key is known (waiting or

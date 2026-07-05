@@ -71,17 +71,21 @@ measured against the tick math.
 
 ## M0 — kernel (small)
 
-Create `internal/kernel/`: a **ticker facility** (register periodic jobs with
-leader election — assigner, sweepers, janitors, relays all become registrations),
-and a per-module goose runner (by version table + migration FS, advisory-locked).
+Create `internal/kernel/`: a **ticker facility** (register periodic jobs —
+assigner, delivery, the lease sweeper, janitors, relays all become
+registrations; **no leader election**: every node runs every job, and each
+job's own locks decide who works — try-lock for the assigner, SKIP LOCKED for
+delivery, the cursor row for relays), and a per-module goose runner (by version
+table + migration FS, advisory-locked).
 **Poll-only at this stage** (D17) — design the job interface with a second wake
 source in mind (a channel the M5 notifier can feed), but build no LISTEN machinery
 now; the notifier copy is deferred to M5. `Conn` stays where it is (root, public);
 `topic_trie.go` untouched.
 
-*Exit:* a toy ticker job fires on its interval; leader election yields exactly one
-runner across N processes; an extra wake source can be attached to a running job
-(the seam M5 plugs into).
+*Exit:* a toy ticker job fires on its interval; two processes ticking the same
+lock-guarded job do each unit of work exactly once (the locks decide, no
+election); an extra wake source can be attached to a running job (the seam M5
+plugs into).
 
 ## M1 — stream core: publish, assigner, ordered consume (the wall)
 
@@ -102,7 +106,7 @@ lands (D17).**
 
 ## M2 — stream work mode: leases, pending, retries, dedup, DLQ
 
-01 §§5–9: range leases + heartbeats + sweeper, the pending table (delay, retry)
+01 §§5–9: range leases + heartbeats + the lease sweeper, delivery of the pending table (delay, retry)
 and the schedule table (cron), DB-side retry policy (`cb_stream_fail`), the
 keep-oldest key rule, DLQ + `Redrive`.
 
@@ -147,7 +151,7 @@ plumbing rules — the original keeps serving the old worker; wire's embedded
 listener is consolidated onto it in the same milestone): one LISTEN connection per
 process, subscribers registered by channel. Two
 consumers of it land together. First, the **ticker wake accelerator** (D17):
-assigner, consumers, and sweepers attach the notifier to the wake seam built in
+assigner, consumers, and the periodic jobs attach the notifier to the wake seam built in
 M0, waking on the notifications the SQL has emitted since M1; the poll interval is
 demoted to safety net. Second, **wire** (04): SSE onto the notifier, inbox
 `read_at`/`MarkRead`, retention tiers, `NotifyDurable`, the `inbox` relay kind.

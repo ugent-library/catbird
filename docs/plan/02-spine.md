@@ -64,8 +64,8 @@ today's matcher — port `topic_trie.go` as-is; matching happens **relay-side in
 not in SQL (the trie is built, tested code; SQL gets at most a cheap prefix
 prefilter).
 
-A **relay** is one ordered consumer group on the root stream per destination,
-running in any worker process (leader-elected the same way as the assigner). Per
+A **relay** is one ordered consumer group on the root stream per destination.
+Any worker may run it; the cursor row's lock lets one work at a time. Per
 batch, in one transaction: match topics → write matches to the destination → advance
 the relay cursor. Same-database writes make this **exactly-once materialization**
 (README guarantees table) — destinations never see duplicates from the relay itself.
@@ -99,7 +99,7 @@ Notes:
 The relay itself is ~a screenful of Go — an ordered consumer wearing a trie:
 
 ```go
-// one per destination, leader-elected like the assigner; runs in any worker
+// one per destination; any node may run it — the cursor row's lock decides
 func runRelay(ctx context.Context, pool *pgxpool.Pool, dest Destination) error {
 	matcher := trie.New(loadPatterns(dest)) // ported topic_trie.go; reload on
 	                                        // binding-change notify
@@ -127,8 +127,8 @@ after its stream, inside the transaction, so Postgres delivers it **on commit** 
 the push-only-on-commit property is free. There is no channel configuration:
 wire subscribes to the bus's channel, the same way the assigner driver
 subscribes to every stream's. The nudge follows the *actual append*: a delayed
-publish does not notify at accept time (the pending sweeper fires it at
-delivery), and a dedup-skipped publish does not notify at all. The kernel's notifier (grown from today's
+publish does not notify at accept time (`_cb_stream_deliver_pending` fires it
+when the message is due), and a dedup-skipped publish does not notify at all. The kernel's notifier (grown from today's
 `worker_notifier.go` — see 05's file-name note) holds the one LISTEN connection
 per process and fans out to wire's in-process subscribers (04); it arrives at M5
 with wire (D17) — before that the emissions simply have no listeners. Payloads
@@ -140,7 +140,7 @@ discipline as today.
 1. Ensure the `bus` stream in the kernel migration; `catbird.Publish` facade over
    `stream.Append` + NOTIFY.
 2. `cb_stream_bindings` DDL + `Bind`/`Unbind` (idempotent, same signatures as today).
-3. Relay runner: leader election, batch match (ported trie), per-kind writers,
+3. Relay runner: batch match (ported trie), per-kind writers,
    exactly-once cursor advance. `flow` and `inbox` kinds land with 03/04; `stream`
    kind lands first.
 4. Tests: publish-then-rollback delivers nothing anywhere (the LiveView property);

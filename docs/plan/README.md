@@ -49,7 +49,7 @@ evidence.
 |---|---|---|
 | D1 | The log is **assigned**: a ticker assigns contiguous, commit-ordered positions. No visibility timeouts, no xid arithmetic, no fixed MVCC watermark | 01 §2 |
 | D2 | Two read modes on one log: **ordered groups** (cursor, exactly-once capable) and **work groups** (range leases, at-least-once). No SKIP-LOCKED scan on the hot path | 01 §4–5 |
-| D3 | One **sweeper** for everything time-based, two tables: `cb_stream_pending` for one-shot waiting messages (delayed publishes + retries — same lifecycle), `cb_stream_schedules` for cron (config with identity, updated by ensure, survives delivery). The scheduler module dissolves into these | 01 §6 |
+| D3 | One **delivery job** for everything time-based, two tables: `cb_stream_pending` for one-shot waiting messages (delayed publishes + retries — same lifecycle), `cb_stream_schedules` for cron (config with identity, updated by ensure, survives delivery). The scheduler module dissolves into these | 01 §6 |
 | D4 | Retry/backoff policy lives **in the database**, per consumer group / per step; SQL applies it. Go builders only write config rows | 01 §7, 03 §6 |
 | D5 | Dedup = keep-oldest at append (unique key table); keep-newest = coalesce in pending. Appended log rows are immutable | 01 §8 |
 | D6 | DLQ is an ordinary stream (`<stream>.dlq`) with failure metadata in headers; replay = republish | 01 §9 |
