@@ -29,7 +29,7 @@ These are the guarantees the whole design is arranged around. Every mechanism in
 |---|---|---|
 | Ordered consumer, effects in the same Postgres | **Exactly-once processing** | Handler runs inside a transaction that also advances the cursor; commit applies effects and ack atomically |
 | Ordered consumer, external effects | At-least-once, in order | Cursor advances only on success; idempotency is the handler's job |
-| Work consumer (worker pools) | At-least-once, unordered | Range leases + heartbeats; retries via per-group retry streams (D21); DLQ on exhaustion |
+| Queue consumer (worker pools) | At-least-once, unordered | Range leases + heartbeats; retries via per-queue retry streams (D21); DLQ on exhaustion |
 | Relay (spine → materialized destination) | Exactly-once materialization | Relays are ordered consumers writing to the same database |
 | wire (ephemeral browser push) | At-most-once | `pg_notify`, fires on commit, no storage |
 
@@ -48,9 +48,9 @@ evidence.
 | # | Decision | Where |
 |---|---|---|
 | D1 | The log is **assigned**: a ticker assigns contiguous, commit-ordered positions. No visibility timeouts, no xid arithmetic, no fixed MVCC watermark | 01 §2 |
-| D2 | Two read modes on one log: **ordered groups** (cursor, exactly-once capable) and **work groups** (range leases, at-least-once). No SKIP-LOCKED scan on the hot path | 01 §4–5 |
+| D2 | Two read modes on one log: **cursors** (cursor, exactly-once capable) and **queues** (range leases, at-least-once). No SKIP-LOCKED scan on the hot path | 01 §4–5 |
 | D3 | One **delivery job** for everything time-based, two tables: `cb_stream_pending` for one-shot waiting messages (delayed publishes — retries are just delayed publishes to retry streams, D21), `cb_stream_schedules` for cron (config with identity, updated by ensure, survives delivery). The scheduler module dissolves into these | 01 §6 |
-| D4 | Retry/backoff policy lives **in the database**, per consumer group / per step; SQL applies it. Go builders only write config rows | 01 §7, 03 §6 |
+| D4 | Retry/backoff policy lives **in the database**, per queue / per step; SQL applies it. Go builders only write config rows | 01 §7, 03 §6 |
 | D5 | Dedup = keep-oldest at append (unique key table); keep-newest = coalesce in pending. Appended log rows are immutable | 01 §8 |
 | D6 | DLQ is an ordinary stream (`sd.<stream>`, `fd.<flow>`) with failure metadata in headers; replay = republish | 01 §9 |
 | D7 | Retention is **policy-driven** per stream: consumer floors ∩ age cap; the age cap wins over lagging cursors (force-advance + loss event) | 01 §10 |
@@ -64,11 +64,11 @@ evidence.
 | D15 | Keep the **catbird umbrella**: one module, subpackages `stream`, `flow`, `wire`; kernel in the root package as the end state (in `internal/kernel/` until M6). CLI/TUI/dashboard move to a nested module | below, 05 |
 | D16 | Postgres floor: **14+** | 01 §11 |
 | D17 | **Poll-first staging**: M0–M4 wake on plain interval ticks (the correctness path); the LISTEN notifier + NOTIFY wake accelerator land at M5 with wire. SQL emits `pg_notify` from day one — only the *listening* is staged | 01 §2, 05 |
-| D18 | Consumer state is **two tables** — `cb_stream_cursors` and `cb_stream_work_groups` — not one with a mode column: one meaning per column, cross-mode misuse structurally impossible, the janitor can't read the wrong retention floor. Name uniqueness across both enforced by ensure under the setup advisory lock | 01 §3 |
+| D18 | Consumer state is **two tables** — `cb_stream_cursors` and `cb_stream_queues` — not one with a mode column: one meaning per column, cross-mode misuse structurally impossible, the janitor can't read the wrong retention floor. Name uniqueness across both enforced by ensure under the setup advisory lock | 01 §3 |
 | D19 | Publish identity is **one `key`, keep-oldest only**: unknown key → store; known key → skip, returning the existing ref + an `existing` flag, until the dedup window expires. **No replacement, no cancel, no expiry column**: payloads carry identifiers, handlers read current state at delivery and skip what's no longer wanted or too old — at-least-once forces that check anyway. Scheduling: `delay` (relative, DB clock) or `deliver_at` (absolute), mutually exclusive — both set is an error; past-due targets append immediately. Appends notify a channel named after the stream — listeners choose; no notify config | 01 §4, §6, §8 |
 | D20 | **Enums for closed sets** (`ref_kind`, lease `state`, `failure_policy`, `catch_up_policy`, claim `outcome` — validated at the function-parameter boundary, where the cross-language contract lives), **text + CHECK for sets expected to grow** (`backoff_kind`, flow statuses). Enum warts accepted knowingly: `ADD VALUE` needs a NO TRANSACTION migration; values can never be dropped | 01 §3 |
-| D21 | **Retries are delayed publishes to a per-group retry stream** `sr.<base>.<group>` — the retry-topic pattern, same shape as the DLQ. `cb_stream_fail` = read the original + `cb_stream_publish(retry stream, …, key => grp:position:attempt, delay => backoff)`. Deletes: `group_name` on messages, the retry trio + CHECK + partial unique on pending, every read filter — the main log holds only what was published, and a group's retries are its own by *place*, not by stamp. Duplicate-fail idempotency = the dedup key. Exhaustion publishes to the base stream's DLQ (`sd.<base>` / `fd.<flow>`). Workers claim main + retry streams; ordered consumers never see retries, by construction | 01 §6–7 |
-| D22 | **Generated-identifier grammar**: humans read table names, machines generate the rest. Stream names are `[code.]<name>[.group]` — max **3 segments**; one segment = user stream, more = the first segment is a two-char family+kind code: `fe` flow events, `fq` flow ready queue, `fr` flow retry, `fd` flow DLQ, `sr` stream retry, `sd` stream DLQ. Base = segment 2, one `split_part`; validation enforces arity per code; segment count keeps user names unreserved. Channels: `cbs_<stream>` (per-stream wake) and `cb_pending` (new-pending-message wake) — dots verbatim, channels are always quoted. Partition names encode dots as `__`: `cbm__<stream-encoded>__<YYYYMMDD\|dev>` (`sr.orders.mailer` → `cbm__sr__orders__mailer__…`) — injective because user names may not contain `__`. (`$` — legal in identifiers and byte-free — was rejected: it interpolates in perl/PHP/shell string contexts.) Budgets: user names ≤ 20 bytes, composed ≤ 44 (46 encoded) — worst partition 5+46+10 = 61 ≤ 63 | 01 §3 |
+| D21 | **Retries are delayed publishes to a per-queue retry stream** `sr.<base>.<queue>` — the retry-topic pattern, same shape as the DLQ. `cb_stream_fail` = read the original + `cb_stream_publish(retry stream, …, key => queue:position:attempt, delay => backoff)`. Deletes: `group_name` on messages, the retry trio + CHECK + partial unique on pending, every read filter — the main log holds only what was published, and a queue's retries are its own by *place*, not by stamp. Duplicate-fail idempotency = the dedup key. Exhaustion publishes to the base stream's DLQ (`sd.<base>` / `fd.<flow>`). Workers claim main + retry streams; ordered consumers never see retries, by construction | 01 §6–7 |
+| D22 | **Generated-identifier grammar**: humans read table names, machines generate the rest. Stream names are `[code.]<name>[.queue]` — max **3 segments**; one segment = user stream, more = the first segment is a two-char family+kind code: `fe` flow events, `fq` flow ready queue, `fr` flow retry, `fd` flow DLQ, `sr` stream retry, `sd` stream DLQ. Base = segment 2, one `split_part`; validation enforces arity per code; segment count keeps user names unreserved. Channels: `cbs_<stream>` (per-stream wake) and `cb_pending` (new-pending-message wake) — dots verbatim, channels are always quoted. Partition names encode dots as `__`: `cbm__<stream-encoded>__<YYYYMMDD\|dev>` (`sr.orders.mailer` → `cbm__sr__orders__mailer__…`) — injective because user names may not contain `__`. (`$` — legal in identifiers and byte-free — was rejected: it interpolates in perl/PHP/shell string contexts.) Budgets: user names ≤ 20 bytes, composed ≤ 44 (46 encoded) — worst partition 5+46+10 = 61 ≤ 63 | 01 §3 |
 
 ## Naming and repo structure
 
@@ -115,10 +115,10 @@ never a migration.
 | Thing | Predefined? | How |
 |---|---|---|
 | Stream | ensured | config row + `LIST` partition; `stream.Ensure(name, opts)` |
-| Ordered consumer group | ensured (or late-bound) | cursor row with an explicit start position (`tail` \| `begin` \| position) |
-| Work consumer group | ensured | group row + policy columns |
+| Cursor | ensured (or late-bound) | cursor row with an explicit start position (`tail` \| `begin` \| position) |
+| Queue | ensured | queue row + policy columns |
 | Binding | ensured | row in the bindings table; relays pick it up live |
-| Retry/backoff policy | ensured | columns on the group / step-policy row (D4) |
+| Retry/backoff policy | ensured | columns on the queue / step-policy row (D4) |
 | Flow | ensured | flow row + registered step handlers on workers |
 | Steps of a run | **dynamic** | spawned by handlers at runtime (D10) |
 | Signals | **dynamic** | appended events, no declaration |

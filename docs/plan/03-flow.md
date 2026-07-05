@@ -10,7 +10,7 @@ dependency, D15). A task is a one-step flow — one model, not two.
 - One event stream **per flow name**: `fe.<flow>` (a LIST partition each —
   isolation and per-flow retention for free). `run_id` is a field, *not* a stream:
   a stream per run would explode the partition count.
-- One ready stream per flow: `fq.<flow>` (work mode, 01 §5), plus `fq.<flow>.<queue>` per
+- One ready stream per flow: `fq.<flow>` (queue mode, 01 §5), plus `fq.<flow>.<queue>` per
   dedicated step (§7).
 - Projection tables — **rows are the view, the log is the truth**:
   `cb_flow_runs (run_id, flow, status, input, output, dedup_key — UNIQUE(flow,
@@ -121,9 +121,9 @@ $$;
 
 ## 4. The projection — sharded, exactly-once (D9)
 
-Not single-threaded (your note — correctly feared). The projection is N ordered
-groups on `fe.<flow>` (`proj_0 … proj_N-1`); events route to shard
-`hash(run_id) % N` **at append time** via a shard header the group filter matches.
+Not single-threaded (your note — correctly feared). The projection is N
+cursors on `fe.<flow>` (`proj_0 … proj_N-1`); events route to shard
+`hash(run_id) % N` **at append time** via a shard header the cursor filter matches.
 Events for one run are always in one shard: serial per run (required for
 correctness), parallel across runs. `N` is per-flow config, default 4; rebalancing
 N is a stop-drain-restart operation, not dynamic.
@@ -319,7 +319,7 @@ for {
 Step retry policy is columns on a `cb_flow_step_policy` row (flow, step_name → same
 schema as 01 §7), written by builder options. `step_failed` projects through the
 same `cb_stream_fail` machinery: a delayed publish to the ready stream's retry
-stream (`fr.<flow>.<grp>`, D22) with backoff, exhaustion →
+stream (`fr.<flow>.<queue>`, D22) with backoff, exhaustion →
 run failure → OnFail. One robustness mechanism across queues and flows; visible to
 every language because it executes in SQL.
 
@@ -501,7 +501,7 @@ accept that when it fires, the audit trail has a hole (recorded by the
 1. Event types + append helpers; shard header at append time.
 2. Projection tables DDL; the apply function (one event batch → row deltas +
    ready appends) — pure SQL, the heart of the engine.
-3. Sharded projection groups; per-flow ensure (`flow.New(...).Ensure(pool)` creates
+3. Sharded projection cursors; per-flow ensure (`flow.New(...).Ensure(pool)` creates
    streams, policies, shards idempotently).
 4. Worker: claim ready → decode via reflection utils (port from `task.go`) → run
    handler → complete/fail with buffered Plan. Port worker lifecycle/NOTIFY wiring

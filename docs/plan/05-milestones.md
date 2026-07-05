@@ -89,7 +89,7 @@ plugs into).
 
 ## M1 — stream core: publish, assigner, ordered consume (the wall)
 
-01 §§2–4, 10: DDL, `cb_stream_publish`, the assigner, ordered groups with both Go
+01 §§2–4, 10: DDL, `cb_stream_publish`, the assigner, cursors with both Go
 consume shapes, ensure/start-positions, retention janitor with age-cap
 force-advance.
 
@@ -104,9 +104,9 @@ materially worse than the tick math, stop and revisit D1 before building on it.
 The ~30–80ms end-state target is re-measured at M5 when the NOTIFY accelerator
 lands (D17).**
 
-## M2 — stream work mode: leases, pending, retries, dedup, DLQ
+## M2 — stream queue mode: leases, pending, retries, dedup, DLQ
 
-01 §§5–9: range leases + heartbeats + the lease sweeper, delivery of the pending table (delay; retries are delayed publishes to per-group retry streams, D21)
+01 §§5–9: range leases + heartbeats + the lease sweeper, delivery of the pending table (delay; retries are delayed publishes to per-queue retry streams, D21)
 and the schedule table (cron), DB-side retry policy (`cb_stream_fail`), the
 keep-oldest key rule, DLQ + `Redrive`.
 

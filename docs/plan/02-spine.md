@@ -64,7 +64,7 @@ today's matcher — port `topic_trie.go` as-is; matching happens **relay-side in
 not in SQL (the trie is built, tested code; SQL gets at most a cheap prefix
 prefilter).
 
-A **relay** is one ordered consumer group on the root stream per destination.
+A **relay** is one cursor on the root stream per destination.
 Any worker may run it; the cursor row's lock lets one work at a time. Per
 batch, in one transaction: match topics → write matches to the destination → advance
 the relay cursor. Same-database writes make this **exactly-once materialization**
@@ -79,7 +79,7 @@ the relay cursor. Same-database writes make this **exactly-once materialization*
 Notes:
 
 - Direct cursor consumers on the root stream (no relay, no destination store) are
-  allowed — that's just an ordered group with a topic filter (01 §4). They are the
+  allowed — that's just a cursor with a topic filter (01 §4). They are the
   one case where a laggard pins shared storage, which the age cap bounds (01 §10).
 - Binding changes take effect from the relay's next batch. New bindings choose
   `start_position` (tail | begin | position) — the late-binding/replay story.
@@ -90,7 +90,7 @@ Notes:
   and `wire` register theirs at init when the app imports them. This keeps the
   README's dependency rule intact — no package reaches into another's tables.
 - `start_position` is honored by the binding that *creates* the destination's
-  relay group; later bindings to the same destination inherit the existing cursor.
+  relay cursor; later bindings to the same destination inherit the existing cursor.
   One cursor per destination — two bindings cannot make it replay twice.
 - The `inbox` kind's identity extraction is config, not convention: an
   `identity_from` column on the binding row (a topic segment index or a payload
