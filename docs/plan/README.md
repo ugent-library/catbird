@@ -29,7 +29,7 @@ These are the guarantees the whole design is arranged around. Every mechanism in
 |---|---|---|
 | Ordered consumer, effects in the same Postgres | **Exactly-once processing** | Handler runs inside a transaction that also advances the cursor; commit applies effects and ack atomically |
 | Ordered consumer, external effects | At-least-once, in order | Cursor advances only on success; idempotency is the handler's job |
-| Queue consumer (worker pools) | At-least-once, unordered | Range leases + heartbeats; retries via per-queue retry streams (D21); DLQ on exhaustion |
+| Queue consumer (worker pools) | At-least-once, unordered | Range claims with TTL expiry (D23); retries via per-queue retry streams (D21); DLQ on exhaustion |
 | Relay (spine → materialized destination) | Exactly-once materialization | Relays are ordered consumers writing to the same database |
 | wire (ephemeral browser push) | At-most-once | `pg_notify`, fires on commit, no storage |
 
@@ -48,7 +48,7 @@ evidence.
 | # | Decision | Where |
 |---|---|---|
 | D1 | The log is **assigned**: a ticker assigns contiguous, commit-ordered positions. No visibility timeouts, no xid arithmetic, no fixed MVCC watermark | 01 §2 |
-| D2 | Two read modes on one log: **cursors** (cursor, exactly-once capable) and **queues** (range leases, at-least-once). No SKIP-LOCKED scan on the hot path | 01 §4–5 |
+| D2 | Two read modes on one log: **cursors** (cursor, exactly-once capable) and **queues** (range claims, at-least-once). No SKIP-LOCKED scan on the hot path | 01 §4–5 |
 | D3 | One **delivery job** for everything time-based, two tables: `cb_stream_pending` for one-shot waiting messages (delayed publishes — retries are just delayed publishes to retry streams, D21), `cb_stream_schedules` for cron (config with identity, updated by ensure, survives delivery). The scheduler module dissolves into these | 01 §6 |
 | D4 | Retry/backoff policy lives **in the database**, per queue / per step; SQL applies it. Go builders only write config rows | 01 §7, 03 §6 |
 | D5 | Dedup = keep-oldest at append (unique key table); keep-newest = coalesce in pending. Appended log rows are immutable | 01 §8 |
@@ -57,7 +57,7 @@ evidence.
 | D8 | **Fan-out-on-read**: publish writes one row into a topic-keyed root stream; bindings are read-side; destinations are materialized by relays | 02 |
 | D9 | The engine is a projection over per-flow event streams, **sharded by `hash(run_id)`** — parallel across runs, serial within a run | 03 §4 |
 | D10 | Plan mutations are **buffered client-side and applied atomically with step completion** — one SQL call carries completion + spawns + edges | 03 §5 |
-| D11 | Cross-language steps are supported at the **SQL API level only**: claim / complete / fail / signal / heartbeat functions + JSON payloads + per-step dedicated ready streams. No cross-language DSL, no schema registry | 03 §7 |
+| D11 | Cross-language steps are supported at the **SQL API level only**: claim / extend / complete / fail / signal functions + JSON payloads + per-step dedicated ready streams. No cross-language DSL, no schema registry | 03 §7 |
 | D12 | wire and the inbox live in **one package** with shared rendering; durable push ships built-in as a composed helper, each half usable alone | 04 |
 | D13 | The inbox stores rows in its **own identity-keyed table**, not on the log (retention semantics are incompatible); it rides the spine, not the substrate | 04 §3 |
 | D14 | "Swappable implementation" is dropped as a promise. The stable contract is the **SQL API** (`docs/sql-api.md`); internals evolve via migrations | — |
@@ -66,9 +66,11 @@ evidence.
 | D17 | **Poll-first staging**: M0–M4 wake on plain interval ticks (the correctness path); the LISTEN notifier + NOTIFY wake accelerator land at M5 with wire. SQL emits `pg_notify` from day one — only the *listening* is staged | 01 §2, 05 |
 | D18 | Consumer state is **two tables** — `cb_stream_cursors` and `cb_stream_queues` — not one with a mode column: one meaning per column, cross-mode misuse structurally impossible, the janitor can't read the wrong retention floor. Name uniqueness across both enforced by ensure under the setup advisory lock | 01 §3 |
 | D19 | Publish identity is **one `key`, keep-oldest only**: unknown key → store; known key → skip, returning the existing ref + an `existing` flag, until the dedup window expires. **No replacement, no cancel, no expiry column**: payloads carry identifiers, handlers read current state at delivery and skip what's no longer wanted or too old — at-least-once forces that check anyway. Scheduling: `delay` (relative, DB clock) or `deliver_at` (absolute), mutually exclusive — both set is an error; past-due targets append immediately. Appends notify a channel named after the stream — listeners choose; no notify config | 01 §4, §6, §8 |
-| D20 | **Enums for closed sets** (`ref_kind`, lease `state`, `failure_policy`, `catch_up_policy`, claim `outcome` — validated at the function-parameter boundary, where the cross-language contract lives), **text + CHECK for sets expected to grow** (`backoff_kind`, flow statuses). Enum warts accepted knowingly: `ADD VALUE` needs a NO TRANSACTION migration; values can never be dropped | 01 §3 |
+| D20 | **Enums for closed sets** (`ref_kind`, `failure_policy`, `catch_up_policy`, claim `outcome` — validated at the function-parameter boundary, where the cross-language contract lives), **text + CHECK for sets expected to grow** (`backoff_kind`, flow statuses). Two-value sets that stay two-value are plain booleans (claim `closed`, D23). Enum warts accepted knowingly: `ADD VALUE` needs a NO TRANSACTION migration; values can never be dropped | 01 §3 |
 | D21 | **Retries are delayed publishes to a per-queue retry stream** `sr.<base>.<queue>` — the retry-topic pattern, same shape as the DLQ. `cb_stream_fail` = read the original + `cb_stream_publish(retry stream, …, key => queue:position:attempt, delay => backoff)`. Deletes: `group_name` on messages, the retry trio + CHECK + partial unique on pending, every read filter — the main log holds only what was published, and a queue's retries are its own by *place*, not by stamp. Duplicate-fail idempotency = the dedup key. Exhaustion publishes to the base stream's DLQ (`sd.<base>` / `fd.<flow>`). Workers claim main + retry streams; ordered consumers never see retries, by construction | 01 §6–7 |
 | D22 | **Generated-identifier grammar**: humans read table names, machines generate the rest. Stream names are `[code.]<name>[.queue]` — max **3 segments**; one segment = user stream, more = the first segment is a two-char family+kind code: `fe` flow events, `fq` flow ready queue, `fr` flow retry, `fd` flow DLQ, `sr` stream retry, `sd` stream DLQ. Base = segment 2, one `split_part`; validation enforces arity per code; segment count keeps user names unreserved. Channels: `cbs_<stream>` (per-stream wake) and `cb_pending` (new-pending-message wake) — dots verbatim, channels are always quoted. Partition names encode dots as `__`: `cbm__<stream-encoded>__<YYYYMMDD\|dev>` (`sr.orders.mailer` → `cbm__sr__orders__mailer__…`) — injective because user names may not contain `__`. (`$` — legal in identifiers and byte-free — was rejected: it interpolates in perl/PHP/shell string contexts.) Budgets: user names ≤ 20 bytes, composed ≤ 44 (46 encoded) — worst partition 5+46+10 = 61 ≤ 63 | 01 §3 |
+| D23 | **Claim liveness by expiry, not heartbeats** (KIP-932's acquisition lock): every claim carries `expires_at`, set from the queue's `claim_ttl`; adoption takes any claim past its deadline; a handler slower than the TTL calls `cb_stream_extend_claim` between messages — never from a background timer, which would rebuild the heartbeat's blind spot (a wedged-but-alive process keeps heartbeating; a claim that stops being extended always expires). Deletes the workers table, the heartbeat function, and the claim sweeper — failure detection happens at the point of contention, like every other job here. Claim state collapses to a `closed` boolean — a claim is open or closed; "available" is never stored, it is `NOT closed AND expires_at <= now`. TTL resolution is three-level (SQS's scheme): queue `claim_ttl` default → per-call `ttl` override → stored on the claim row, which is what extend renews and adoption inherits. Per-claim terms at batch size 1 make the pgmq emulation exact: read/set_vt/delete = claim/extend/close | 01 §5 |
+| D24 | **The substrate says consumer, not worker.** The stream layer only knows something takes messages from a queue — a relay, an indexer, a mailer. "Worker" is the flow engine's word for its handler-running processes; they pass their id as the `consumer` argument when claiming. Substrate names what things are; the engine names what they do | 01 §5, 03 §7 |
 
 ## Naming and repo structure
 
@@ -89,11 +91,11 @@ github.com/ugent-library/catbird          (module — the library)
 
 - The root package is the kernel **and** the spine facade: `catbird.Publish`,
   `catbird.Bind` are the five-minute API; they delegate to `stream`.
-- Dependency rule: `flow → stream → kernel`, `wire → kernel` — plus an *optional*
-  wire → stream import whose only purpose is registering the `inbox` relay kind
-  (02 §3); without it, wire simply has no relay. The engine's hard
-  dependency on the substrate is accepted and stated (vision open decision 3); the
-  alternative — a second embedded log — means maintaining the correctness-critical
+- Dependency rule: `flow → stream → kernel`, `wire → kernel`. One optional extra:
+  wire may import stream, solely to register the `inbox` relay kind (02 §3);
+  without it, wire simply has no relay. The engine's hard dependency on the
+  substrate is accepted and stated (vision open decision 3). The alternative is a
+  second embedded log, which means maintaining the correctness-critical
   assignment machinery twice.
 - Table naming: static tables per module (`cb_stream_*`, `cb_flow_*`, `cb_wire_*`),
   one goose version table per module (`cb_stream_migrations`, …) so modules install
@@ -151,8 +153,9 @@ Fold these into vision.md by hand; the plan documents assume them.
    as an optional composed helper, D12 (§ appendix).
 9. **The spine is a usage pattern of the substrate** (fan-out-on-read, D8), which
    resolves open decisions 1 and 3 (§9).
-10. **The inbox does not ride the substrate's log** — retention semantics are
-    incompatible (idle users pin cursor-floor retention forever); D13 (§7).
+10. **The inbox does not ride the substrate's log** — retention needs are
+    incompatible: an idle user's cursor would pin the log's retention floor
+    forever; D13 (§7).
 11. **Add the missing feature dispositions**: signals, cron, retries, OnFail, flow
     output — each has an explicit home now (03, 01 §6–7).
 12. **`SignalFlow` changes semantics** in the event model: signals are buffered

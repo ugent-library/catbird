@@ -1,11 +1,12 @@
 # 04 — wire: async web delivery
 
-One package, two storage stories (D12). The vision's "wire and the inbox share no
-machinery" was already false in the current code — they share Fragment rendering,
-token auth, and the poll transport (PR #41). The honest claim, and the design rule:
-**independent storage and delivery, shared presentation.** Package `wire`, depends
-on the kernel; importing `stream` is optional and buys exactly one thing —
-registering the `inbox` relay kind with the spine (02 §3).
+One package, two storage stories (D12). The vision said wire and the inbox share
+no machinery. That was already false in the current code: they share Fragment
+rendering, token auth, and the poll transport (PR #41). The honest claim, and the
+design rule: **independent storage and delivery, shared presentation.** The
+package is `wire` and it depends on the kernel. Importing `stream` is optional
+and buys exactly one thing: registering the `inbox` relay kind with the spine
+(02 §3).
 
 ## 1. Shape
 
@@ -17,25 +18,27 @@ wire/
 ```
 
 Framework positioning (README amendment 1): the surface is SSE + HTML fragments +
-JSON — server-rendered apps generally. htmx appears in examples only.
+JSON, aimed at server-rendered apps generally. htmx appears in examples only.
 
 ## 2. Ephemeral (wire proper)
 
-Ports as-is: topics, SSE handler, tokens, presence. Changes: subscribe to the
-kernel notifier instead of owning a LISTEN connection (one connection per process,
-shared with the assigner/ticker wakeups); push-on-commit is inherited from
-`pg_notify` semantics (02 §4). No storage, no cursor, at-most-once — a disconnected
-browser misses ephemeral pushes, by design; that gap is the inbox's job.
+Ports as-is: topics, SSE handler, tokens, presence. Two changes. First, subscribe
+to the kernel notifier instead of owning a LISTEN connection. That means one
+connection per process, shared with the assigner/ticker wakeups. Second,
+push-on-commit is inherited from `pg_notify` semantics (02 §4). There is no
+storage, no cursor, and delivery is at-most-once. A disconnected browser misses
+ephemeral pushes. That is by design: filling that gap is the inbox's job.
 
 ## 3. Inbox — own table, not the log (D13)
 
 `cb_wire_inbox (identity, id, topic, payload, created_at, seen_at, read_at,
 expires_at?)`, plus the existing token/poll machinery. It deliberately does **not**
-store rows on the substrate's log: per-identity cursors with mostly-idle users are
-incompatible with cursor-floor retention (one dormant account would pin partitions
-forever). The vision's "the inbox can ride on the substrate" is amended (README #10)
-to: the inbox rides the **spine** — an `inbox` relay kind (02 §3) writes rows here —
-while storage and retention stay identity-local.
+store rows on the substrate's log. The log's retention floor is the lowest cursor,
+and the log can only drop rows below that floor. Inbox cursors would be
+per-identity, and most users sit idle. One dormant account would pin partitions
+forever. The vision said "the inbox can ride on the substrate". That is amended
+(README #10): the inbox rides the **spine**. An `inbox` relay kind (02 §3) writes
+rows here, while storage and retention stay identity-local.
 
 **seen / read distinction** (your note). Three timestamps, two verbs:
 
@@ -45,28 +48,31 @@ while storage and retention stay identity-local.
 | **seen** | rendered in the client's list — clears the badge | `MarkSeenUntil(identity, watermark)` — the watermark API from PR #41, unchanged |
 | **read** | user opened/acted on this item | `MarkRead(identity, id)` / `MarkReadUntil` — per-item, **new** |
 
-Unseen count drives badges; unread drives item styling. Retention (resolves the
-open seen-row follow-up from the durable-notifications work): delete when
-`read_at` older than R, or `seen_at` older than S, or age older than the hard cap A
-(defaults R 30d < S 90d < A 365d, per-app config); `expires_at` still wins when set.
-The wait-until-seen guarantee from #39 survives as: no deletion of unseen rows
-before A.
+Unseen count drives badges. Unread drives item styling. Retention resolves the
+open seen-row follow-up from the durable-notifications work. Delete a row when
+`read_at` is older than R, when `seen_at` is older than S, or when its age passes
+the hard cap A. Defaults: R 30d < S 90d < A 365d, per-app config. `expires_at`
+still wins when set. The wait-until-seen guarantee from #39 survives as: no
+deletion of unseen rows before A.
 
 ## 4. Durable push — built-in, optional (D12)
 
-Your note, adopted: the vision rejected *baking durable push into wire*; the right
+Your note, adopted. The vision rejected *baking durable push into wire*. The right
 resolution is composition **shipped in the box**:
 
 ```go
 wire.NotifyDurable(ctx, tx, identity, topic, payload)
-// = inbox insert (transactional, atomic with caller's writes)
-// + pg_notify nudge; connected clients re-pull the inbox; offline clients
-//   find it on next poll. Exactly-once in the store, at-most-once on the nudge.
+// = inbox insert + pg_notify nudge.
+// The insert is transactional: atomic with the caller's writes.
+// Connected clients re-pull the inbox on the nudge; offline clients find
+// the row on their next poll.
+// Exactly-once in the store, at-most-once on the nudge.
 ```
 
-Each half remains independently usable — `wire.Notify` (ephemeral only) and direct
-inbox reads both stay public. Nothing about the SSE layer learns about scheduling
-or messaging; the helper is ten lines, not a subsystem.
+Each half remains independently usable. `wire.Notify` stays public for
+ephemeral-only pushes, and direct inbox reads stay public too. The SSE layer
+learns nothing about scheduling or messaging. The helper is ten lines, not a
+subsystem.
 
 ## 5. Build checklist
 

@@ -6,13 +6,13 @@ catbird is a consumer of this. Package `stream`; tables `cb_stream_*`.
 ## 1. The model in five sentences
 
 Producers `INSERT` messages inside their own transaction — that is the whole write
-path. A **assigner** (a tiny, notify-driven ticker) assigns contiguous, commit-ordered
-**positions** to newly visible rows; nothing downstream ever reads an unassigned row.
-**Cursors** consume by cursor: read after position N, process, advance —
-optionally inside one transaction with their own effects (exactly-once processing).
-**Queues** consume by **range lease**: claim `[from, to]` with a single counter
-bump, process each message, retry failures through the pending table, close the lease.
-Retention drops whole partitions whose positions every consumer has passed, subject to an
+path. An **assigner** (a tiny ticker job) assigns contiguous, commit-ordered
+**positions** to newly visible rows. Nothing downstream ever reads an unassigned row.
+**Cursors** read after position N, process, advance. A cursor may do that inside
+one transaction with its own effects, which gives exactly-once processing.
+**Queues** consume by **range claim**: claim `[from, to]` with a single counter
+bump, process each message, fail the exceptions by position, close the claim.
+Retention drops whole partitions once every consumer has passed them, subject to an
 age cap that wins over laggards.
 
 ## 2. Why an assigner (D1) — the correctness core
@@ -45,11 +45,11 @@ safe.
   `WHERE position > $cursor ORDER BY position` and is trivially, provably right.
 
 **Mechanism.** Messages insert with `position NULL`. The assigner runs on the
-kernel ticker, per stream with unassigned rows. Wakeups are staged (D17): a plain
-fixed-interval poll first (~50–250ms, configurable — this is the correctness path
-and all M1–M4 need), accelerated at M5 by a NOTIFY wake with a small debounce
-(~10–25ms) once the kernel notifier lands with wire. Correctness never depends on
-a notification arriving; the tick remains the safety net:
+kernel ticker, per stream with unassigned rows. Wakeups are staged (D17). Until M5
+the assigner wakes on a plain fixed-interval poll (~50–250ms, configurable); that
+alone is correct, and it is all M1–M4 need. M5 adds a NOTIFY wake with a small
+debounce (~10–25ms), once the kernel notifier lands with wire. Correctness never
+depends on a notification arriving; the tick remains the safety net:
 
 ```sql
 -- Only one process may number a stream at a time. The try-lock enforces
@@ -116,14 +116,15 @@ Properties that fall out:
   there from day one (one line, costs nothing without listeners); processes start
   *listening* at M5 (D17) — until then consumers wake on their own tick.
 
-**The honest costs.** (1) One extra `UPDATE` per message — double heap/WAL traffic
-versus insert-only. At hundreds/sec this is noise; it would matter at Kafka scale,
-which is a stated non-goal. (2) A delivery latency floor. Poll-only (M1–M4): roughly one to two
-tick intervals end-to-end — ~100–500ms depending on configuration. With the NOTIFY
-accelerator (M5): **~30–80ms end-to-end** for *all* consumers, queues
-included. This replaces the vision's "sub-50ms" claim (README amendment 4). The audience —
-emails, indexers, notifications, flow steps — does not feel 50ms. (3) A latency
-spike if the node running the assigner dies mid-tick (the next tick, anywhere, picks up).
+**The honest costs.** First: one extra `UPDATE` per message, so double the heap and
+WAL traffic of insert-only. At hundreds of messages per second this is noise. It
+would matter at Kafka scale, which is a stated non-goal. Second: a delivery latency
+floor. Poll-only (M1–M4) it is one to two tick intervals end-to-end, ~100–500ms
+depending on configuration. The NOTIFY accelerator (M5) brings it to
+**~30–80ms end-to-end** for all consumers, queues included. This replaces the
+vision's "sub-50ms" claim (README amendment 4); emails, indexers, notifications and
+flow steps do not feel 50ms. Third: a latency spike when the node running the
+assigner dies mid-tick. The next tick, on any node, picks up.
 
 ## 3. Table shape
 
@@ -145,19 +146,22 @@ cb_stream_cursors   stream · name PK(stream,name) · position (everything ≤ i
                    processed — the ack AND the retention floor) · filter columns
                    (§4) · failure_policy ('block'|'dlq') · created_at
 cb_stream_queues
-                   stream · name PK(stream,name) · claim_next (highest position
-                   handed to a lease — NOT an ack) · watermark (highest position
-                   below which all leases are closed — the retention floor) ·
-                   filter columns (§4) · retry policy columns (§7) · created_at
+                   stream · name PK(stream,name) · claimed_position (highest
+                   position handed to a claim — NOT an ack) · closed_position
+                   (highest position below which all claims are closed — the
+                   retention floor) · claim_ttl (the default terms for claims
+                   that don't choose, D23) · filter columns (§4) ·
+                   retry policy columns (§7) · created_at
                    Two tables, not one with a mode column: every column means
                    exactly one thing, cross-mode misuse is structurally
                    impossible, and the janitor cannot read the wrong floor. One
                    consumer *name* per stream across both tables — no cross-table
                    PK exists, so ensure enforces it under the setup advisory lock.
-cb_stream_leases    stream · queue · from_position · to_position · worker · state
-                   ('live'|'released'|'closed' — closed rows linger only until
-                   the watermark passes, §5) · created_at   (tiny, mostly empty)
-cb_stream_workers   worker id PK · last_heartbeat            (UNLOGGED — see §11)
+cb_stream_claims    stream · queue · from_position · to_position · consumer ·
+                   closed (closed rows linger only until the closed position
+                   passes, §5) · ttl (this claim's terms — what extend renews
+                   and adoption inherits) · expires_at (past it, anyone may
+                   adopt — D23) · created_at               (tiny, mostly empty)
 cb_stream_pending  id PK · stream · topic · payload · headers · deliver_at ·
                    key (nullable — lets delivery swap the dedup ref on
                    delivery, D19). Purely delayed messages: a retry is just a
@@ -180,19 +184,21 @@ Column discipline (settled while writing the first migration):
 - **Types** (D20): enums for closed sets, text + CHECK for sets expected to grow.
   Enums validate at the function-parameter boundary — where the cross-language
   contract lives — so a foreign caller's typo dies at bind time.
-- **Integrity, three tiers**: references *into the log* (cursors, watermarks,
-  lease ranges) are coordinates, not FKs — retention drops their targets by
-  design, and no unique target exists on a partitioned position anyway. The *hot
-  path* carries no FK (a check is a hidden per-insert join; publish's explicit
-  PK read gives a better error). The *cold config tables* do: `cursor`,
-  `queue`, `pending` → `cb_streams(name) ON DELETE CASCADE`, lease →
-  queue, plus the arithmetic CHECKs (`watermark <= claim_next`,
-  `from_position <= to_position`, `jsonb_typeof(headers) = 'object'`).
-- **Column strictness follows the consumer**: `topic` nullable (absence feeds
-  filters, where SQL's three-valued logic does the right thing) · `payload`
-  NOT NULL DEFAULT 'null' (absence feeds decoders — JSON null is the one
-  canonical "no data") · `headers` NOT NULL DEFAULT '{}' + object CHECK (SQL
-  itself reads keys and `||`-merges; a scalar would corrupt silently).
+- **Integrity, three tiers.** References *into the log* — cursor and closed
+  positions, claim ranges — are plain numbers, not FKs. Retention drops their
+  targets by design, and a partitioned position has no unique index to point at
+  anyway. The *hot path* carries no FK either: an FK check is a hidden join on
+  every insert, and publish's explicit PK read gives a better error. The *cold
+  config tables* do get real integrity: `cursor`, `queue`, `pending` →
+  `cb_streams(name) ON DELETE CASCADE`, claim → queue, plus the arithmetic
+  CHECKs (`closed_position <= claimed_position`, `from_position <= to_position`,
+  `jsonb_typeof(headers) = 'object'`).
+- **Column strictness follows who reads the column.** `topic` is nullable:
+  absence feeds filters, and SQL's three-valued logic does the right thing with
+  NULL there. `payload` is NOT NULL DEFAULT 'null': absence feeds decoders, and
+  JSON null is the one canonical "no data". `headers` is NOT NULL DEFAULT '{}'
+  with an object CHECK: SQL itself reads keys and merges with `||`, and a scalar
+  there would corrupt silently.
 - **Naming authority is the migrations**, not these sketches — notably the
   column is `stream_name` in DDL (kills plpgsql parameter ambiguity) while
   sketches abbreviate to `stream`. Semantics here, identifiers there.
@@ -215,18 +221,18 @@ Column discipline (settled while writing the first migration):
 - **Function visibility** (PostGIS's convention): `cb_*` is public — listed in
   `docs/sql-api.md`, stable, breaking changes are versioned events. `_cb_*` is
   internal — no stability promise, may change in any migration. Public by
-  necessity: the foreign-worker contract (claim / complete / fail / signal /
-  heartbeat), `cb_stream_publish`, `cb_stream_fail`, `cb_valid_name` (users
+  necessity: the foreign-worker contract (claim / extend / complete / fail /
+  signal), `cb_stream_publish`, `cb_stream_fail`, `cb_valid_name` (users
   pre-validate against it). Internal as they land: `_cb_valid_stream_name`,
-  the notify-append tail, backoff, cron-next, delivery, the lease sweeper, janitors — and
+  the notify-append tail, backoff, cron-next, delivery, janitors — and
   decide the assigner's marker when building it (only catbird's own ticker
   and consume paths call it, so it leans internal).
 
 ## 4. Cursors (cursor mode)
 
-One logical reader per cursor — order *requires* that; parallelism comes from more
-cursors or sharding by key (as the flow projection does, 03 §4). The Go API offers
-two shapes:
+One logical reader per cursor: order *requires* that. Parallelism comes from more
+cursors, or from sharding by key the way the flow projection does (03 §4). The Go
+API offers two shapes:
 
 ```go
 // exactly-once: effects + ack in one transaction (the same-DB superpower)
@@ -236,15 +242,14 @@ stream.Consume(ctx, pool, "orders", "indexer", func(ctx context.Context, tx pgx.
 stream.ConsumeFunc(ctx, pool, "orders", "mailer", func(ctx context.Context, batch []stream.Message) error { … })
 ```
 
-Internals of one iteration: `SELECT … FROM cb_stream_cursors … FOR UPDATE` (pins the
-cursor row — a second competing reader blocks rather than corrupts), read
-`position > cursor ORDER BY position LIMIT n` (no upper bound: the assigner
-stamps rows and bumps the counter atomically, so every visible position belongs
-to a complete batch),
-run the handler, `UPDATE … SET position = $high`, commit. Failure semantics per
-cursor config: `block` (default — retry the batch with backoff in place; ordered
-means ordered) or `dlq` (append the poison message to the DLQ stream, advance past
-it).
+One iteration works like this. `SELECT … FROM cb_stream_cursors … FOR UPDATE` pins
+the cursor row, so a second competing reader blocks instead of double-processing.
+Read `position > cursor ORDER BY position LIMIT n`. No upper bound is needed: the
+assigner stamps rows and bumps the counter atomically, so every visible position
+belongs to a complete batch. Run the handler. `UPDATE … SET position = $high`,
+commit. On failure the cursor's config decides. `block` (the default) retries the
+batch with backoff, in place — ordered means ordered. `dlq` appends the poison
+message to the DLQ stream and advances past it.
 
 The exactly-once loop is small enough to show whole:
 
@@ -287,117 +292,229 @@ func Consume(ctx context.Context, pool *pgxpool.Pool, stream, cursor string,
 }
 ```
 
-**The filtering contract (owned here; 02 and 03 refer back):** SQL evaluates only
-cheap predicates — an optional equality match on one header key (how flow shards
+**The filtering contract (owned here; 02 and 03 refer back).** SQL evaluates only
+cheap predicates: an optional equality match on one header key (how flow shards
 route, 03 §4) and an optional topic *prefix*. Wildcard topic patterns (`?`/`*`)
-are matched **in Go only**, by the ported trie, after the batch read — the
-matcher exists once, never twice. Either way the cursor advances over skipped
-rows. (No consumer-targeting predicate exists: retries live in per-queue retry
-streams, D21, so ownership is a place, not a filter.)
+are matched **in Go only**, by the ported trie, after the batch read. The matcher
+exists once, never twice. Either way the cursor advances over skipped rows. There
+is no consumer-targeting predicate at all: retries live in per-queue retry
+streams (D21), so ownership is a place, not a filter.
 
-Freshness is also a per-consumer policy, not a message property: a handler that
-doesn't want old messages skips anything whose `created_at` is older than its
-own tolerance — one line, and different consumers can differ (the same message
-may be worthless to the mailer after five minutes and still wanted by an audit
-consumer). This replaces today's per-message `expires_at`. If claim-time
-skipping ever proves worth it, it becomes a queue policy column beside the
-retry columns — later, if asked.
+Freshness is also a per-consumer policy, not a message property. A handler that
+doesn't want old messages skips anything whose `created_at` is older than its own
+tolerance — one line. Different consumers can differ: the same message may be
+worthless to the mailer after five minutes and still wanted by an audit consumer.
+This replaces today's per-message `expires_at`. If claim-time skipping ever
+proves worth it, it becomes a queue policy column beside the retry columns.
+Later, if asked.
 
-## 5. Queues (range leases) — the pgmq/pgq re-evaluation (D2)
+## 5. Queues (range claims) — the pgmq/pgq re-evaluation (D2)
 
 Your note asked whether the vision's pgmq/pgq hybrid is the optimum. It isn't quite:
 once positions are contiguous (D1), per-message SKIP-LOCKED claiming — pgmq's core —
 becomes unnecessary machinery. Claiming a batch is a **single counter bump**:
 
 ```sql
-CREATE FUNCTION cb_stream_claim(stream text, queue text, worker text, batch int)
-RETURNS TABLE (from_position bigint, to_position bigint)
+CREATE FUNCTION cb_stream_claim(
+    stream text, queue text, consumer text, batch_size int DEFAULT 100,
+    ttl interval DEFAULT NULL, -- this call's terms; NULL = the queue's claim_ttl
+    OUT from_position bigint, -- NULL when there is nothing to claim
+    OUT to_position   bigint,
+    OUT expires_at    timestamptz -- the deadline: finish or extend before it
+)
 LANGUAGE plpgsql AS $$
 DECLARE
-    _high bigint; _from bigint; _to bigint;
+    _ttl interval;
+    _claimed bigint;
+    _last bigint;
 BEGIN
-    -- 1. adopt a released (crashed-worker) lease first — cold path, tiny table
-    UPDATE cb_stream_leases l
-    SET worker = cb_stream_claim.worker, state = 'live'
-    WHERE (l.stream, l.queue, l.from_position) = (
-        SELECT r.stream, r.queue, r.from_position FROM cb_stream_leases r
-        WHERE r.stream = cb_stream_claim.stream AND r.queue = cb_stream_claim.queue
-          AND r.state = 'released'
-        LIMIT 1 FOR UPDATE SKIP LOCKED)
-    RETURNING l.from_position, l.to_position INTO _from, _to;
+    SELECT coalesce(cb_stream_claim.ttl, q.claim_ttl) INTO _ttl FROM cb_stream_queues q
+    WHERE q.stream_name = cb_stream_claim.stream AND q.name = cb_stream_claim.queue;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'catbird: queue %.% not defined',
+            cb_stream_claim.stream, cb_stream_claim.queue;
+    END IF;
+
+    -- 1. adopt an expired claim first: work a dead consumer left behind.
+    --    Cold path, tiny table. The terms describe the workload, not the
+    --    owner, so adoption inherits the row's ttl unless this call overrides.
+    UPDATE cb_stream_claims c
+    SET consumer = cb_stream_claim.consumer,
+        ttl = coalesce(cb_stream_claim.ttl, c.ttl),
+        expires_at = clock_timestamp() + coalesce(cb_stream_claim.ttl, c.ttl)
+    WHERE (c.stream_name, c.queue_name, c.from_position) = (
+        SELECT r.stream_name, r.queue_name, r.from_position
+        FROM cb_stream_claims r
+        WHERE r.stream_name = cb_stream_claim.stream
+          AND r.queue_name  = cb_stream_claim.queue
+          AND NOT r.closed
+          AND r.expires_at <= clock_timestamp()
+        ORDER BY r.from_position
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED)
+    RETURNING c.from_position, c.to_position, c.expires_at
+    INTO from_position, to_position, expires_at;
     IF FOUND THEN
-        RETURN QUERY VALUES (_from, _to); RETURN;
+        RETURN;
     END IF;
 
     -- 2. hot path: one row lock, no scan — bump the counter to the assigned high
-    SELECT s.last_position INTO _high FROM cb_streams s
+    SELECT q.claimed_position INTO _claimed FROM cb_stream_queues q
+    WHERE q.stream_name = cb_stream_claim.stream AND q.name = cb_stream_claim.queue
+    FOR UPDATE;
+
+    SELECT s.last_position INTO _last FROM cb_streams s
     WHERE s.name = cb_stream_claim.stream;
 
-    WITH cur AS (
-        SELECT g.claim_next FROM cb_stream_queues g
-        WHERE g.stream = cb_stream_claim.stream AND g.name = cb_stream_claim.queue FOR UPDATE
-    )
-    UPDATE cb_stream_queues g
-    SET claim_next = least(cur.claim_next + batch, _high)
-    FROM cur
-    WHERE g.stream = cb_stream_claim.stream AND g.name = cb_stream_claim.queue
-      AND cur.claim_next < _high
-    RETURNING cur.claim_next + 1, g.claim_next INTO _from, _to;
-    IF _from IS NULL THEN RETURN; END IF;   -- caught up, nothing to claim
+    IF _claimed >= _last THEN
+        RETURN; -- caught up; from_position stays NULL
+    END IF;
 
-    INSERT INTO cb_stream_leases (stream, queue, from_position, to_position, worker, state)
-    VALUES (stream, queue, _from, _to, worker, 'live');
-    RETURN QUERY VALUES (_from, _to);
+    from_position := _claimed + 1;
+    to_position := least(_claimed + cb_stream_claim.batch_size, _last);
+    expires_at := clock_timestamp() + _ttl;
+
+    UPDATE cb_stream_queues q SET claimed_position = cb_stream_claim.to_position
+    WHERE q.stream_name = cb_stream_claim.stream AND q.name = cb_stream_claim.queue;
+
+    INSERT INTO cb_stream_claims
+        (stream_name, queue_name, from_position, to_position, consumer, ttl, expires_at)
+    VALUES (cb_stream_claim.stream, cb_stream_claim.queue,
+        cb_stream_claim.from_position, cb_stream_claim.to_position,
+        cb_stream_claim.consumer, _ttl, cb_stream_claim.expires_at);
 END;
 $$;
 
--- Closing advances the watermark over contiguous closed ranges. Ranges are
--- contiguous by construction (the counter bump), so this is a simple chase:
-CREATE FUNCTION cb_stream_close_lease(stream text, queue text, from_position bigint)
-RETURNS void LANGUAGE plpgsql AS $$
-DECLARE _w bigint;
+-- Push the claim's deadline out: expires_at becomes now + the claim's stored
+-- ttl. Call it after each message, from the handler loop — the call then means
+-- "I am still making progress". A timer may call it instead, but only when the
+-- handler itself is killed after a timeout; a timer that fires regardless of
+-- progress keeps a stuck handler's claim alive forever.
+-- The ttl argument applies to this renewal only and must be positive —
+-- extending always moves the deadline forward. To give a claim back, use
+-- cb_stream_release_claim.
+-- Returns the new deadline. Returns NULL when the claim is not yours anymore:
+-- it expired and another consumer adopted it. Stop processing the range.
+CREATE FUNCTION cb_stream_extend_claim(stream text, queue text, consumer text, from_position bigint,
+                                       ttl interval DEFAULT NULL)
+RETURNS timestamptz LANGUAGE plpgsql AS $$
+DECLARE
+    _expires_at timestamptz;
 BEGIN
-    UPDATE cb_stream_leases SET state = 'closed'
-    WHERE (cb_stream_leases.stream, cb_stream_leases.queue, cb_stream_leases.from_position)
-        = (stream, queue, from_position);
+    IF ttl <= '0' THEN
+        RAISE EXCEPTION 'catbird: invalid ttl %', ttl;
+    END IF;
 
-    SELECT g.watermark INTO _w FROM cb_stream_queues g
-    WHERE g.stream = cb_stream_close_lease.stream AND g.name = cb_stream_close_lease.queue FOR UPDATE;
+    UPDATE cb_stream_claims c
+    SET expires_at = clock_timestamp() + coalesce(cb_stream_extend_claim.ttl, c.ttl)
+    WHERE c.stream_name   = cb_stream_extend_claim.stream
+      AND c.queue_name    = cb_stream_extend_claim.queue
+      AND c.consumer      = cb_stream_extend_claim.consumer
+      AND c.from_position = cb_stream_extend_claim.from_position
+      AND NOT c.closed
+    RETURNING c.expires_at INTO _expires_at;
+    RETURN _expires_at;
+END; $$;
+
+-- Hand the whole claim back: it expires immediately, so the next
+-- cb_stream_claim call may adopt it. Use it when you processed nothing and
+-- cannot continue. No-op when the claim is no longer yours, same as close.
+CREATE FUNCTION cb_stream_release_claim(stream text, queue text, consumer text, from_position bigint)
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE cb_stream_claims c
+    SET expires_at = clock_timestamp()
+    WHERE c.stream_name   = cb_stream_release_claim.stream
+      AND c.queue_name    = cb_stream_release_claim.queue
+      AND c.consumer      = cb_stream_release_claim.consumer
+      AND c.from_position = cb_stream_release_claim.from_position
+      AND NOT c.closed;
+END; $$;
+
+CREATE FUNCTION cb_stream_close_claim(stream text, queue text, consumer text, from_position bigint)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    _closed bigint;
+    _to bigint;
+BEGIN
+    -- Only the current owner may close: a consumer that lost its claim to
+    -- adoption gets a no-op, not an error — losing a claim is a legal race
+    -- outcome under at-least-once.
+    UPDATE cb_stream_claims c SET closed = true
+    WHERE c.stream_name   = cb_stream_close_claim.stream
+      AND c.queue_name    = cb_stream_close_claim.queue
+      AND c.consumer      = cb_stream_close_claim.consumer
+      AND c.from_position = cb_stream_close_claim.from_position
+      AND NOT c.closed;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+
+    -- Move the closed position forward over adjacent closed claims until an
+    -- open claim stops it. Delete every claim it passes: the table only
+    -- holds work in progress.
+    SELECT q.closed_position INTO _closed FROM cb_stream_queues q
+    WHERE q.stream_name = cb_stream_close_claim.stream AND q.name = cb_stream_close_claim.queue
+    FOR UPDATE;
     LOOP
-        DELETE FROM cb_stream_leases l
-        WHERE l.stream = cb_stream_close_lease.stream AND l.queue = cb_stream_close_lease.queue
-          AND l.state = 'closed' AND l.from_position = _w + 1
-        RETURNING l.to_position INTO _w;
+        DELETE FROM cb_stream_claims c
+        WHERE c.stream_name   = cb_stream_close_claim.stream
+          AND c.queue_name    = cb_stream_close_claim.queue
+          AND c.from_position = _closed + 1
+          AND c.closed
+        RETURNING c.to_position INTO _to;
         EXIT WHEN NOT FOUND;
+        _closed := _to;
     END LOOP;
-    UPDATE cb_stream_queues g SET watermark = _w
-    WHERE g.stream = cb_stream_close_lease.stream AND g.name = cb_stream_close_lease.queue;
-END;
-$$;
+    UPDATE cb_stream_queues q SET closed_position = _closed
+    WHERE q.stream_name = cb_stream_close_claim.stream AND q.name = cb_stream_close_claim.queue
+      AND q.closed_position < _closed;
+END; $$;
 ```
 
 No scan, no anti-join, no lock queue — one hot row per queue. Before bumping the
-counter, a worker first adopts any `released` lease (`FOR UPDATE SKIP LOCKED` on the
-tiny lease table — cold path, fine). Then per message in the range: run the handler;
+counter, a consumer first adopts any expired claim (`FOR UPDATE SKIP LOCKED` on the
+tiny claim table — cold path, fine). Then per message in the range: run the handler;
 on failure, `cb_stream_fail` publishes a retry to the queue's retry stream or
 the DLQ per policy (§7, D21).
-A lease closes when every message *fetched for it* is handled (succeeded, retried,
+A claim closes when every message *fetched for it* is handled (succeeded, retried,
 or dead-lettered) — defined over what was fetched, not the position range, so a
-partition dropped mid-lease (§10) cannot wedge it. On close, delete the lease and
-advance the queue `watermark` over contiguous closed ranges. The watermark is the
-queue's retention floor. An adopted lease may re-handle messages the dead worker
-already resolved; that is why `cb_stream_fail` is idempotent (§7).
+partition dropped mid-claim (§10) cannot wedge it. On close, mark it closed
+and advance the queue's `closed_position` over contiguous closed claims, deleting
+them as it passes — the claim table only ever holds the working set. The closed
+position is the queue's retention floor. An adopted claim may re-handle messages
+the dead consumer already resolved; that is why `cb_stream_fail` is idempotent (§7).
 
-Liveness: a background goroutine per worker process heartbeats `cb_stream_workers`
-(one row per worker per interval — decoupled from handler duration, exactly as the
-vision demands). A lease sweeper (kernel ticker) flips leases of stale workers to
-`released`. A crashed worker's whole range is redelivered — coarser duplicates than
-per-message claims, the price of the simpler mechanism; at-least-once either way.
+Liveness is per claim, not per process (D23 — KIP-932's acquisition lock): every
+claim carries its terms (`ttl`) and its deadline (`expires_at`). The terms
+resolve in one direction: the queue's `claim_ttl` is the default, a `ttl`
+argument at claim time overrides it, and the row stores the result — extend
+renews under the stored terms, adoption inherits them. (SQS's exact scheme:
+queue-level default, per-receive override, per-message change.) Finish or extend
+before the deadline, or the claim becomes available and the next
+`cb_stream_claim` call adopts it. There are no heartbeats, no consumer registry,
+and no sweeper. Failure detection happens at the moment another consumer asks
+for work — the same way everything else here is decided by a lock at the point
+of contention, not by a background monitor. It also catches what heartbeats
+cannot. A process that is alive but stuck on one message keeps heartbeating, so
+its claim never comes back. A claim that stops being extended always does. One
+rule keeps that true: extend from the handler loop, between messages, so each
+call means real progress. A timer may extend instead, but only when the handler
+itself is killed after a timeout — then the extending stops when the work stops.
+A consumer that must stop early hands work back instead: `release` returns the
+whole claim, and a future `split` returns the unprocessed tail. A crashed
+consumer's whole range is redelivered. Those duplicates are coarser than
+per-message claims would produce; that is the price of the simpler mechanism,
+and it is at-least-once either way.
 
-What survives from each lineage: **pgq** — positions, batches, ticker, retention by
-rotation; **pgmq** — nothing on the hot path; SKIP LOCKED survives only on the cold
-lease-adoption path and in the lease sweeper. Today's queue semantics (`Send`/`Read`
-with hide) are *not* re-exposed; the queue API replaces them.
+What survives from each lineage. From **pgq**: positions, batches, the ticker,
+retention by rotation. From **pgmq**: nothing on the hot path. Its visibility
+timeout returns as the claim TTL, per range instead of per message — and at
+batch size 1 the range *is* a message, so the emulation is exact:
+`read`/`set_vt`/`delete` map to claim/extend/close, and `release` is "make it
+available now". SKIP LOCKED survives only on the cold claim-adoption path.
+Today's queue semantics (`Send`/`Read` with hide) are *not* re-exposed; the
+stream queue API replaces them.
 
 ## 6. Waiting messages and schedules — one delivery job, two tables (D3)
 
@@ -409,11 +526,11 @@ Their life is: born, wait until `deliver_at`, delivered, gone.
 | Delayed delivery | `deliver_at` in the future |
 | Retry with backoff | An ordinary delayed publish (D21): `cb_stream_fail` targets the failing queue's retry stream `sr.<base>.<queue>` with `delay = backoff(n)` and the attempt count in headers. Only that queue consumes its retry stream, so no other consumer ever sees the retry — ownership by place, not by stamp — and the next failure backs off from `n+1`, not from 1 |
 
-Cron does **not** share this table. A schedule is *config*, not data: it has an
-identity — `PK (stream, name)`, which is what ensure updates when a deploy
-changes a spec — and it survives every delivery, re-arming instead of being
-deleted. (A cron row in pending would have no key to find it by; today's
-`cb_task_schedules` got this right.) So `cb_stream_schedules`: PK(stream, name)
+Cron does **not** share this table. A schedule is *config*, not data. It has an
+identity, `PK (stream, name)`, and that identity is what ensure updates when a
+deploy changes a spec. It survives every delivery and re-arms instead of being
+deleted. A cron row in pending would have no key to find it by; today's
+`cb_task_schedules` got this right. So `cb_stream_schedules`: PK(stream, name)
 · `cron_spec` · `catch_up_policy` (`skip`\|`all`, ported from today's scheduler
 including the on-time-tick fix from #45) · a topic/payload/headers template ·
 `next_at`.
@@ -506,7 +623,7 @@ backoff_base interval · backoff_max interval · on_exhaust ('dlq'|'drop')
 `cb_stream_fail(stream, queue, position, error)` has no mechanism of its own
 (D21): it reads the failing message, then *publishes* — to the queue's retry
 stream with a backoff delay, or to the base stream's DLQ when attempts are
-exhausted. Idempotency under duplicate fails (a crashed-and-adopted lease
+exhausted. Idempotency under duplicate fails (a crashed-and-adopted claim
 reporting the same failure twice) is the dedup key; the retry stream is created
 lazily, like the DLQ.
 
@@ -532,7 +649,7 @@ BEGIN
     END IF;
     SELECT * INTO _g FROM cb_stream_queues g
     WHERE g.stream = cb_stream_fail.stream AND g.name = cb_stream_fail.queue;
-    -- still readable: the queue's watermark hasn't passed an unresolved message
+    -- still readable: the queue's closed position hasn't passed an unresolved message
     SELECT * INTO _m FROM cb_stream_messages m
     WHERE m.stream = cb_stream_fail.stream AND m.position = cb_stream_fail.position;
 
@@ -588,8 +705,8 @@ stays in Go.
 
 One `key` parameter, no policy option. Two cases:
 
-1. **The key is unknown** → claim it and store the message (into the log now,
-   or into pending if it has a future release).
+1. **The key is unknown** → claim it and store the message: into the log now,
+   or into pending when its delivery time is in the future.
 2. **The key is known** → the publish is skipped and the existing ref is
    returned — today's `concurrency_key` semantics, the atomic `WHERE FALSE` +
    `UNION ALL` pattern verbatim. `ref_kind` tells you what you hit: a delivered
@@ -740,14 +857,16 @@ END;
 $$;
 ```
 
-Sketch-level notes: real code prefixes parameters per the existing
+Sketch-level notes. Real code prefixes parameters, per the existing
 `cb_send.queue`-style qualification convention. Function shape rule: **always
-exactly one row → OUT params; zero-or-more rows → RETURNS TABLE** (so
-`cb_stream_claim` keeps its table form — "nothing to claim" is zero rows). The
-batch variant is the same shape over `unnest()` with one assigner notify per
-touched stream. `_cb_stream_deliver_pending` owes three things per delivered message: swap the
-dedup ref from `pending` to the delivered message, notify the assigner, and fire
-the stream's wire nudge — delivery *is* the append, so the nudges move with it.
+exactly one row → OUT params; zero-or-more rows → RETURNS TABLE**.
+`cb_stream_claim` follows the OUT form: it always returns one row, and "nothing
+to claim" is NULLs, so callers do a null check instead of handling zero rows.
+The batch variant is the same shape over `unnest()`, with one assigner notify
+per touched stream. `_cb_stream_deliver_pending` owes three things per delivered
+message: swap the dedup ref from `pending` to the delivered message, notify the
+assigner, and fire the stream's wire notify. Delivery *is* the append, so the
+notifies move with it.
 
 ## 9. Dead letters (D6)
 
@@ -771,10 +890,10 @@ range partition can no longer be created without locking and moving data.
 **Granularity is per-stream config, sized to keep each stream at ~2–15
 partitions:** weekly by default, daily for hot streams (the bus), monthly for
 long-retention flow audit streams. This sizing rule is what keeps cursor reads
-cheap with no further machinery — reads filter on `position` while partitions are
-ranged on `created_at`, so Postgres cannot prune them, and every read is a
-MergeAppend over one index probe per partition of that stream; with a handful of
-partitions, that's negligible. Deferred, with an explicit trigger: only if a
+cheap with no further machinery. Reads filter on `position` while partitions are
+ranged on `created_at`, so Postgres cannot prune partitions for a read; every
+read is a MergeAppend with one index probe per partition of that stream. With a
+handful of partitions, that is negligible. Deferred, with an explicit trigger: only if a
 stream ever genuinely needs fine granularity × long retention (>20 partitions on
 one stream), add a small partition catalog (per-partition min/max position,
 maintained by the janitor) so reads can derive a `created_at` prune predicate.
@@ -786,10 +905,10 @@ straddle any fixed slack.
 on the kernel ticker:
 
 ```
-floor = min( cursor positions …, queue watermarks …, pinned? )
+floor = min( cursor positions …, queue closed positions …, pinned? )
 drop partition P when max(position in P) < floor AND age(P) > min_age
 AGE CAP: when age(P) > max_age, drop anyway; force-advance every lagging
-         consumer — cursor positions AND queue claim_next/watermark — to
+         consumer — cursor positions AND queue claimed/closed positions — to
          max(position in P) + 1, computed inside the drop transaction, and
          publish a `$sys.data_loss` event to the bus
 ```
@@ -804,8 +923,8 @@ Force-advance mechanics: the target is `max(position in P) + 1` *recomputed at d
 time*, not the next partition's min position — a long-running insert can commit
 into P at the last moment and receive a fresh high position, and `DROP`'s ACCESS
 EXCLUSIVE lock serializes with exactly that insert, so the recomputation sees it.
-Queues advance both `claim_next` and `watermark` (taking `max` with current
-values); a live lease whose fetched rows were dropped treats them as handled (§5).
+Queues advance both `claimed_position` and `closed_position` (taking `max` with current
+values); a live claim whose fetched rows were dropped treats them as handled (§5).
 System events like `$sys.data_loss` are ordinary bus messages under the reserved
 `$sys.` topic prefix — anyone can subscribe; the dashboard should.
 
@@ -813,9 +932,8 @@ System events like `$sys.data_loss` are ordinary bus messages under the reserved
 
 - **Postgres 14+** (D16): mature declarative partitioning, `ON CONFLICT` on
   partitioned tables, performance work we rely on. 13 is EOL.
-- `cb_stream_workers` is UNLOGGED: after crash recovery **or failover to a replica**
-  it comes back empty → all leases sweep to `released` → mass redelivery of
-  in-flight work. Legal under at-least-once; document it loudly.
+- Claims are ordinary logged rows, so failover to a replica keeps in-flight
+  claims and their deadlines (D23) — no mass redelivery on promotion.
 - Hot-path rules kept: no joins on reads (`position > x` range scans), no advisory
   locks outside the assigner's try-lock, no N+1. The cursor and queue rows are the only contended
   row; batch sizes amortize it.
@@ -835,7 +953,8 @@ System events like `$sys.data_loss` are ordinary bus messages under the reserved
    it, the try-lock decides.
 4. Ordered consume (both Go shapes); cursor/queue ensure with the
    cross-table name check under the setup advisory lock; start positions.
-5. Queues: lease claim / adopt / close, heartbeat goroutine, lease sweeper.
+5. Queues: claim / adopt / extend / close — per-claim TTL expiry (D23); no
+   heartbeats, no sweeper.
 6. `cb_stream_fail` + policy columns; `_cb_stream_deliver_pending` + the
    schedule scan (cron re-arm).
 7. Dedup table + prune janitor; DLQ append + `Redrive`.
@@ -856,8 +975,8 @@ System events like `$sys.data_loss` are ordinary bus messages under the reserved
      main stream gained no rows).
    - Exactly-once: consumer transaction aborts after effects → redelivered → effects
      appear exactly once.
-   - Lease crash: kill a worker mid-range; lease sweeper releases; another worker adopts;
-     duplicates ≤ range size.
+   - Claim crash: kill a consumer mid-range; its claim expires; another consumer
+     adopts; duplicates ≤ range size.
    - Retention: age cap force-advances an abandoned cursor and emits the loss event.
    - The key rule: any same-key publish while the key is known (waiting or
      delivered) is skipped and returns the existing ref with `existing = true`.

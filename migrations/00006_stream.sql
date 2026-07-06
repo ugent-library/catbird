@@ -7,7 +7,7 @@ CREATE FUNCTION cb_valid_name(name text)
 RETURNS boolean
 LANGUAGE sql IMMUTABLE AS $$
     SELECT name IS NOT NULL
-       AND name !~ '__'   -- '__' is reserved: it encodes dots in partition names
+       AND name !~ '__'   -- '__' is reserved, it encodes dots in partition names
        AND name ~ '^[a-z][a-z0-9_]*$'
        AND octet_length(name) <= 20
 $$;
@@ -87,6 +87,32 @@ ALTER SEQUENCE cb_stream_messages_id_seq OWNED BY cb_stream_messages.id;
 
 CREATE INDEX ON cb_stream_messages (stream_name, position);
 
+CREATE TABLE cb_stream_queues (
+    stream_name text NOT NULL REFERENCES cb_streams(name) ON DELETE CASCADE,
+    name text NOT NULL CHECK (cb_valid_name(name)),
+    claimed_position bigint NOT NULL DEFAULT 0, -- everything at or below this position is claimed
+    closed_position bigint NOT NULL DEFAULT 0, -- everything at or below this position is claimed and closed
+    claim_ttl interval NOT NULL DEFAULT '30 seconds',
+    PRIMARY KEY (stream_name, name),
+    CHECK (closed_position <= claimed_position)
+);
+
+CREATE TABLE cb_stream_claims (
+    stream_name text NOT NULL,
+    queue_name text NOT NULL,
+    from_position bigint NOT NULL,
+    to_position bigint NOT NULL,
+    consumer text NOT NULL,
+    closed boolean NOT NULL DEFAULT false,
+    ttl interval NOT NULL,
+    expires_at timestamptz NOT NULL, -- past this moment any consumer may claim again
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (stream_name, queue_name, from_position),
+    FOREIGN KEY (stream_name, queue_name)
+        REFERENCES cb_stream_queues(stream_name, name) ON DELETE CASCADE,
+    CHECK (from_position <= to_position)
+);
+
 -- +goose statementbegin
 CREATE FUNCTION cb_stream_ensure(stream text)
 RETURNS void LANGUAGE plpgsql AS $$
@@ -111,23 +137,46 @@ END; $$;
 -- +goose statementbegin
 CREATE FUNCTION cb_stream_ensure_cursor(stream text, cursor text, start_position bigint DEFAULT NULL)
 RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    _start bigint;
 BEGIN
     IF NOT cb_valid_name(cb_stream_ensure_cursor.cursor) THEN
         RAISE EXCEPTION 'catbird: invalid cursor name %; use [a-z][a-z0-9_]*, max 20 bytes',
             cb_stream_ensure_cursor.cursor;
     END IF;
 
-    PERFORM 1 FROM cb_streams s WHERE s.name = cb_stream_ensure_cursor.stream;
+    -- NULL start = tail: skip everything already in the stream.
+    SELECT coalesce(cb_stream_ensure_cursor.start_position, s.last_position)
+    INTO _start FROM cb_streams s WHERE s.name = cb_stream_ensure_cursor.stream;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_ensure_cursor.stream;
     END IF;
 
     INSERT INTO cb_stream_cursors (stream_name, name, position)
-    VALUES (
-        cb_stream_ensure_cursor.stream,
-        cb_stream_ensure_cursor.cursor,
-        coalesce(cb_stream_ensure_cursor.start_position,
-            (SELECT s.last_position FROM cb_streams s WHERE s.name = cb_stream_ensure_cursor.stream), 0))
+    VALUES (cb_stream_ensure_cursor.stream, cb_stream_ensure_cursor.cursor, _start)
+    ON CONFLICT (stream_name, name) DO NOTHING;
+END; $$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE FUNCTION cb_stream_ensure_queue(stream text, queue text, start_position bigint DEFAULT NULL)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    _start bigint;
+BEGIN
+    IF NOT cb_valid_name(cb_stream_ensure_queue.queue) THEN
+        RAISE EXCEPTION 'catbird: invalid queue name %; use [a-z][a-z0-9_]*, max 20 bytes',
+            cb_stream_ensure_queue.queue;
+    END IF;
+
+    SELECT coalesce(cb_stream_ensure_queue.start_position, s.last_position)
+    INTO _start FROM cb_streams s WHERE s.name = cb_stream_ensure_queue.stream;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_ensure_queue.stream;
+    END IF;
+
+    INSERT INTO cb_stream_queues (stream_name, name, claimed_position, closed_position)
+    VALUES (cb_stream_ensure_queue.stream, cb_stream_ensure_queue.queue, _start, _start)
     ON CONFLICT (stream_name, name) DO NOTHING;
 END; $$;
 -- +goose statementend
@@ -385,9 +434,187 @@ BEGIN
 END; $$;
 -- +goose statementend
 
+-- +goose statementbegin
+CREATE FUNCTION cb_stream_claim(
+    stream     text,
+    queue      text,
+    consumer   text,
+    batch_size int      DEFAULT 100,
+    ttl        interval DEFAULT NULL, -- the queue's claim_ttl is used if NULL
+
+    OUT from_position bigint, -- NULL when there is nothing to claim
+    OUT to_position   bigint,
+    OUT expires_at    timestamptz
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    _ttl interval;
+    _claimed_pos bigint;
+    _last_pos bigint;
+BEGIN
+    SELECT coalesce(cb_stream_claim.ttl, q.claim_ttl) INTO _ttl FROM cb_stream_queues q
+    WHERE q.stream_name = cb_stream_claim.stream AND q.name = cb_stream_claim.queue;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'catbird: queue %.% not defined', cb_stream_claim.stream, cb_stream_claim.queue;
+    END IF;
+
+    ---- Try to adopt an expired claim. ----
+    UPDATE cb_stream_claims c
+    SET consumer = cb_stream_claim.consumer,
+        ttl = coalesce(cb_stream_claim.ttl, c.ttl),
+        expires_at = clock_timestamp() + coalesce(cb_stream_claim.ttl, c.ttl)
+    WHERE (c.stream_name, c.queue_name, c.from_position) = (
+        SELECT r.stream_name, r.queue_name, r.from_position
+        FROM cb_stream_claims r
+        WHERE r.stream_name = cb_stream_claim.stream
+          AND r.queue_name  = cb_stream_claim.queue
+          AND NOT r.closed
+          AND r.expires_at <= clock_timestamp()
+        ORDER BY r.from_position
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED)
+    RETURNING c.from_position, c.to_position, c.expires_at
+    INTO from_position, to_position, expires_at;
+    IF FOUND THEN
+        RETURN;
+    END IF;
+
+    ---- Claim a fresh range. ----
+    SELECT q.claimed_position INTO _claimed_pos FROM cb_stream_queues q
+    WHERE q.stream_name = cb_stream_claim.stream AND q.name = cb_stream_claim.queue
+    FOR UPDATE;
+
+    -- No lock needed on the streams row. last_position only grows,
+    -- so a stale read just means a slightly smaller range.
+    SELECT s.last_position INTO _last_pos FROM cb_streams s
+    WHERE s.name = cb_stream_claim.stream;
+
+    IF _claimed_pos >= _last_pos THEN
+        RETURN; -- caught up, return NULLs
+    END IF;
+
+    from_position := _claimed_pos + 1;
+    to_position := least(_claimed_pos + cb_stream_claim.batch_size, _last_pos);
+    expires_at := clock_timestamp() + _ttl;
+
+    UPDATE cb_stream_queues q SET claimed_position = cb_stream_claim.to_position
+    WHERE q.stream_name = cb_stream_claim.stream AND q.name = cb_stream_claim.queue;
+
+    INSERT INTO cb_stream_claims
+        (stream_name, queue_name, from_position, to_position, consumer, ttl, expires_at)
+    VALUES (cb_stream_claim.stream, cb_stream_claim.queue,
+        cb_stream_claim.from_position, cb_stream_claim.to_position,
+        cb_stream_claim.consumer, _ttl, cb_stream_claim.expires_at);
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- If ttl is NULL, the claim's existing ttl is used. Returns the new expires_at timestamp.
+CREATE FUNCTION cb_stream_extend_claim(
+    stream text, queue text,
+    consumer text,
+    from_position bigint,
+    ttl interval DEFAULT NULL
+)
+RETURNS timestamptz LANGUAGE plpgsql AS $$
+DECLARE
+    _expires_at timestamptz;
+BEGIN
+    IF cb_stream_extend_claim.ttl <= '0' THEN
+        RAISE EXCEPTION 'catbird: invalid ttl %', cb_stream_extend_claim.ttl;
+    END IF;
+
+    UPDATE cb_stream_claims c
+    SET expires_at = clock_timestamp() + coalesce(cb_stream_extend_claim.ttl, c.ttl)
+    WHERE c.stream_name   = cb_stream_extend_claim.stream
+      AND c.queue_name    = cb_stream_extend_claim.queue
+      AND c.consumer      = cb_stream_extend_claim.consumer
+      AND c.from_position = cb_stream_extend_claim.from_position
+      AND NOT c.closed
+    RETURNING c.expires_at INTO _expires_at;
+    RETURN _expires_at;
+END; $$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- the claim expires immediately, and the next cb_stream_claim call may adopt it.
+CREATE FUNCTION cb_stream_release_claim(
+    stream text,
+    queue text,
+    consumer text,
+    from_position bigint
+)
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE cb_stream_claims c
+    SET expires_at = clock_timestamp()
+    WHERE c.stream_name   = cb_stream_release_claim.stream
+      AND c.queue_name    = cb_stream_release_claim.queue
+      AND c.consumer      = cb_stream_release_claim.consumer
+      AND c.from_position = cb_stream_release_claim.from_position
+      AND NOT c.closed;
+END; $$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE FUNCTION cb_stream_close_claim(
+    stream text,
+    queue text,
+    consumer text,
+    from_position bigint
+)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    _closed_pos bigint;
+    _to_pos bigint;
+BEGIN
+    -- Only the current owner may close.
+    UPDATE cb_stream_claims c SET closed = true
+    WHERE c.stream_name   = cb_stream_close_claim.stream
+      AND c.queue_name    = cb_stream_close_claim.queue
+      AND c.consumer      = cb_stream_close_claim.consumer
+      AND c.from_position = cb_stream_close_claim.from_position
+      AND NOT c.closed;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+
+    -- Move the closed position forward over adjacent closed claims until an
+    -- open claim stops it. Delete every claim it passes, the table only
+    -- holds work in progress.
+    SELECT q.closed_position INTO _closed_pos FROM cb_stream_queues q
+    WHERE q.stream_name = cb_stream_close_claim.stream AND q.name = cb_stream_close_claim.queue
+    FOR UPDATE;
+
+    LOOP
+        DELETE FROM cb_stream_claims c
+        WHERE c.stream_name   = cb_stream_close_claim.stream
+          AND c.queue_name    = cb_stream_close_claim.queue
+          AND c.from_position = _closed_pos + 1
+          AND c.closed
+        RETURNING c.to_position INTO _to_pos;
+        EXIT WHEN NOT FOUND;
+        _closed_pos := _to_pos;
+    END LOOP;
+
+    UPDATE cb_stream_queues q SET closed_position = _closed_pos
+    WHERE q.stream_name = cb_stream_close_claim.stream AND q.name = cb_stream_close_claim.queue
+      AND q.closed_position < _closed_pos;
+END; $$;
+-- +goose statementend
+
 -- +goose down
 
+DROP FUNCTION cb_stream_close_claim(text, text, text, bigint);
+DROP FUNCTION cb_stream_release_claim(text, text, text, bigint);
+DROP FUNCTION cb_stream_extend_claim(text, text, text, bigint, interval);
+DROP FUNCTION cb_stream_claim(text, text, text, int, interval);
+DROP FUNCTION cb_stream_ensure_queue(text, text, bigint);
+DROP FUNCTION cb_stream_ensure_cursor(text, text, bigint);
 DROP FUNCTION cb_stream_read(text, text, int);
+DROP TABLE cb_stream_claims;
+DROP TABLE cb_stream_queues;
 DROP FUNCTION cb_stream_publish(text, text, jsonb, jsonb, text, interval, timestamptz);
 DROP FUNCTION cb_stream_ensure(text);
 DROP FUNCTION _cb_stream_deliver_pending(int);
