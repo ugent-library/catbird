@@ -209,4 +209,17 @@ BEGIN
     PERFORM pg_temp.check_claims('jobs', 'runner');
 END $$;
 
+
+
+\echo '== F. batch publish =='
+DO $$
+DECLARE _n int; _before bigint;
+BEGIN
+    SELECT last_pos INTO _before FROM cb_streams WHERE name = 'orders';
+    SELECT count(*) INTO _n
+    FROM cb_stream_publish_batch('orders', 'bulk', array_fill('1'::jsonb, ARRAY[100]));
+    ASSERT _n = 100, format('expected 100 ids, got %s', _n);
+    PERFORM _cb_stream_assign_positions('orders');
+    ASSERT (SELECT last_pos FROM cb_streams WHERE name = 'orders') >= _before + 100,        'batch not assigned';
+END $$;
 \echo 'ALL STREAM TESTS PASSED'

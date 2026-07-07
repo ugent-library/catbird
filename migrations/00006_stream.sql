@@ -397,6 +397,25 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+CREATE FUNCTION cb_stream_publish_payloads(stream text, topic text, payloads jsonb[])
+RETURNS SETOF bigint LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM cb_streams s WHERE s.name = cb_stream_publish_payloads.stream;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_publish_payloads.stream;
+    END IF;
+
+    RETURN QUERY
+    INSERT INTO cb_stream_messages (stream, topic, payload)
+    SELECT cb_stream_publish_payloads.stream, cb_stream_publish_payloads.topic, p
+    FROM unnest(cb_stream_publish_payloads.payloads) AS p
+    RETURNING id;
+
+    PERFORM _cb_stream_notify(cb_stream_publish_payloads.stream, cb_stream_publish_payloads.topic);
+END; $$;
+-- +goose statementend
+
+-- +goose statementbegin
 CREATE FUNCTION _cb_stream_assign_positions(stream text, batch_size int DEFAULT 5000)
 RETURNS int
 LANGUAGE plpgsql AS $$
@@ -912,6 +931,7 @@ DROP FUNCTION cb_stream_ensure_cursor(text, text, bigint);
 DROP FUNCTION cb_stream_read(text, text, int);
 DROP TABLE cb_stream_claims;
 DROP TABLE cb_stream_queues;
+DROP FUNCTION cb_stream_publish_payloads(text, text, jsonb[], jsonb);
 DROP FUNCTION cb_stream_publish(text, text, jsonb, jsonb, text, interval, timestamptz);
 DROP FUNCTION _cb_stream_publish(text, text, jsonb, jsonb, text, interval, timestamptz);
 DROP FUNCTION cb_stream_ensure(text);
