@@ -311,4 +311,66 @@ BEGIN
     ASSERT ok, 'table CHECK did not reject a calendar interval';
 END $$;
 
+\echo '== H. retention: ensure-set, prune, forever, gap read =='
+-- 'audit' carries a 7-day retention, set through ensure
+SELECT cb_stream_ensure('audit', '7 days');
+SELECT p.ref_id FROM generate_series(1,10) g,
+    LATERAL cb_stream_publish('audit', 'evt', to_jsonb(g)) p;
+SELECT _cb_stream_assign_positions('audit');
+UPDATE cb_stream_messages SET created_at = clock_timestamp() - interval '10 days'
+WHERE stream = 'audit' AND pos <= 6;
+SELECT cb_stream_ensure_cursor('audit', 'reader', 0);
+-- 'keepall' sets no retention: keep forever
+SELECT cb_stream_ensure('keepall');
+SELECT p.ref_id FROM generate_series(1,3) g,
+    LATERAL cb_stream_publish('keepall', 'evt', to_jsonb(g)) p;
+SELECT _cb_stream_assign_positions('keepall');
+UPDATE cb_stream_messages SET created_at = clock_timestamp() - interval '10 days'
+WHERE stream = 'keepall';
+DO $$
+DECLARE _deleted bigint; _others_before bigint; _others_after bigint;
+BEGIN
+    SELECT count(*) INTO _others_before
+    FROM cb_stream_messages WHERE stream NOT IN ('audit', 'keepall');
+
+    -- column path: no argument -> the stream's own 7-day retention applies
+    _deleted := _cb_stream_prune_messages('audit');
+    ASSERT _deleted = 6, format('expected 6 pruned via column, got %s', _deleted);
+    ASSERT (SELECT count(*) FROM cb_stream_messages WHERE stream = 'audit') = 4,
+        'survivor count wrong';
+
+    -- forever: no retention configured, so old messages are kept
+    ASSERT _cb_stream_prune_messages('keepall') = 0, 'forever stream pruned';
+    ASSERT (SELECT count(*) FROM cb_stream_messages WHERE stream = 'keepall') = 3,
+        'forever stream lost messages';
+
+    -- cross-partition safety: pruning 'audit' touched no other stream
+    SELECT count(*) INTO _others_after
+    FROM cb_stream_messages WHERE stream NOT IN ('audit', 'keepall');
+    ASSERT _others_after = _others_before,
+        format('prune hit other streams: %s -> %s', _others_before, _others_after);
+
+    -- position tracking skips the gap: one read returns the 4 survivors and the
+    -- cursor lands on the tail, no churn over the 6 deleted positions
+    ASSERT (SELECT count(*) FROM cb_stream_read('audit', 'reader', 100)) = 4,
+        'read did not skip the pruned gap';
+    ASSERT (SELECT pos FROM cb_stream_cursors WHERE stream = 'audit' AND name = 'reader') = 10,
+        'cursor did not land on the surviving tail';
+
+    -- survivors are recent, so a second prune removes nothing
+    ASSERT _cb_stream_prune_messages('audit') = 0, 'second prune deleted survivors';
+
+    -- ensure follows the coalesce pattern: a bare re-ensure leaves retention,
+    -- a value changes it, and the column CHECK rejects a nonsensical <= 0
+    PERFORM cb_stream_ensure('audit');
+    ASSERT (SELECT retention FROM cb_streams WHERE name = 'audit') = interval '7 days',
+        'bare re-ensure changed retention';
+    PERFORM cb_stream_ensure('audit', '14 days');
+    ASSERT (SELECT retention FROM cb_streams WHERE name = 'audit') = interval '14 days',
+        'ensure did not change retention';
+    BEGIN
+        PERFORM cb_stream_ensure('audit', '0');
+        ASSERT false, 'zero retention not rejected';
+    EXCEPTION WHEN check_violation THEN NULL; END;
+END $$;
 \echo 'ALL STREAM TESTS PASSED'

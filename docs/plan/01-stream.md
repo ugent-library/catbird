@@ -879,55 +879,84 @@ reset, a `cb_redriven_from` header). Because it is just a stream: it has retenti
 it can be consumed (alerting), and the dashboard lists it for free. No special
 machinery anywhere.
 
-## 10. Partition lifecycle and retention (D7)
+## 10. Retention (D7)
 
-**Creation is proactive, and there is no DEFAULT partition.** A kernel-ticker job
-pre-creates each stream's next range partition ahead of time (keep two future
-partitions standing; alert when the job falls behind), so a publish never meets a
-missing partition — and if one ever does, it fails loudly. The tempting
-DEFAULT-partition safety net is a trap: once rows land in it, the overlapping
-range partition can no longer be created without locking and moving data.
+**Retention is the stream's one storage knob.** `cb_streams.retention` is an
+interval set through `cb_stream_ensure(stream, retention)` on the established
+coalesce pattern — a NULL argument leaves it, a value sets or changes it, exactly
+like `cb_stream_ensure_queue`'s policy fields. **NULL on the row means keep
+forever** (the default); a `CHECK` rejects zero or negative. One accepted gap,
+shared with every coalesced policy field: a NULL argument cannot *reset* a
+bounded stream back to forever — rare enough to leave to a raw `UPDATE` for now,
+with a negative-interval sentinel (never `0`, which reads as "delete now") the
+in-pattern fix if it ever matters. There is no granularity or partition knob —
+the user says how long to keep, never how it is stored.
 
-**Granularity is per-stream config, sized to keep each stream at ~2–15
-partitions:** weekly by default, daily for hot streams (the bus), monthly for
-long-retention flow audit streams. This sizing rule is what keeps cursor reads
-cheap with no further machinery. Reads filter on `position` while partitions are
-ranged on `created_at`, so Postgres cannot prune partitions for a read; every
-read is a MergeAppend with one index probe per partition of that stream. With a
-handful of partitions, that is negligible. Deferred, with an explicit trigger: only if a
-stream ever genuinely needs fine granularity × long retention (>20 partitions on
-one stream), add a small partition catalog (per-partition min/max position,
-maintained by the janitor) so reads can derive a `created_at` prune predicate.
-The naive shortcut — `created_at >= last_seen − slack` — is incorrect:
-long-running transactions carry old timestamps but receive high positions, and
-straddle any fixed slack.
+**MVP mechanism: a batched delete, not a partition drop.**
+`_cb_stream_prune_messages(stream, retention?, batch)` deletes messages past the
+cutoff in bounded `FOR UPDATE SKIP LOCKED` batches; the retention argument is
+optional and overrides the column, and NULL either way means forever, so the call
+is a no-op. The message table is partitioned **by stream only** (`LIST`) — one
+partition per stream, created at ensure, covering all time. No time
+sub-partitioning, which buys two properties:
 
-**Dropping** is per-stream policy, all floors intersected, evaluated by a janitor
-on the kernel ticker:
+- **Publishing never depends on the janitor.** There is no future partition to
+  pre-create, so a missing ticker only means no purge (messages accumulate,
+  safe) — never a failed insert. Cleanup degrades; the write path never does.
+- **No force-advance.** Reads and claims track *positions*, not rows, so a deleted
+  span is transparent: a cursor's next read selects the surviving positions and
+  jumps the gap in one step; a queue claim over a gap fetches fewer rows and
+  closes normally. (The one cost: a consumer absent longer than the whole window
+  churns empty claims once through the dead zone — bounded and one-time.)
 
-```
-floor = min( cursor positions …, queue closed positions …, pinned? )
-drop partition P when max(position in P) < floor AND age(P) > min_age
-AGE CAP: when age(P) > max_age, drop anyway; force-advance every lagging
-         consumer — cursor positions AND queue claimed/closed positions — to
-         max(position in P) + 1, computed inside the drop transaction, and
-         publish a `$sys.data_loss` event to the bus
-```
+The price versus a partition `DROP` is autovacuum. `DELETE` leaves dead tuples;
+append-at-tail / delete-at-head is the friendly FIFO case — the heap plateaus at
+about one window of live data and freed space is reused — but a busy stream needs
+autovacuum tuned to keep pace or it bloats. This is the classic Postgres-as-queue
+tradeoff, taken knowingly for MVP simplicity.
 
-The age cap is what makes abandoned consumers survivable and is **structural, not
-optional** — under fan-out-on-read (02) a lagging cursor pins storage shared by
-everyone. Flow event streams add a third floor: all runs with events in P are
-terminal (03 §8). `DROP` is instant and leaves no dead tuples — this is the answer
-to pgmq-style delete bloat, unchanged from the vision.
+**Forever (NULL) is an explicit opt-in** for the log-as-record cases — event
+sourcing, audit, a DLQ kept until someone triages or redrives it. It maps to the
+same one-partition layout with no drop: the stream grows unbounded, by choice.
+Bounded is the norm; forever is deliberate.
 
-Force-advance mechanics: the target is `max(position in P) + 1` *recomputed at drop
-time*, not the next partition's min position — a long-running insert can commit
-into P at the last moment and receive a fresh high position, and `DROP`'s ACCESS
-EXCLUSIVE lock serializes with exactly that insert, so the recomputation sees it.
-Queues advance both `claimed_position` and `closed_position` (taking `max` with current
-values); a live claim whose fetched rows were dropped treats them as handled (§5).
-System events like `$sys.data_loss` are ordinary bus messages under the reserved
-`$sys.` topic prefix — anyone can subscribe; the dashboard should.
+**Retention is a hard cap.** When it drops data a slow or absent consumer never
+reached, that consumer loses the span — by policy, not a bug. Under fan-out (02) a
+lagging cursor otherwise pins storage shared by everyone, so the cap has to win.
+
+### Deferred: drop-based retention, per stream (the escape hatch)
+
+For a busy, long-lived, retained stream where `DELETE`/autovacuum churn hurts,
+range sub-partition **that one stream** so retention becomes an `O(1)` `DROP` with
+zero dead tuples. Left out of the MVP because it earns its complexity only there,
+and it is additive — one stream at a time, no global tax. The shape when it lands:
+
+- **The window is engine-derived and fixed, sized to *retention*, not lifetime.**
+  Live partitions ≈ `retention / window`, so a forever-lived stream does **not**
+  accumulate leaves — old ones drop off the back. Long retention → coarse windows
+  (monthly); short retention → fine (hourly); aim for ~a dozen live partitions.
+  Over-retention is up to one window (a partition survives until its *newest* row
+  clears the cutoff), so a large window suits only a coarse retention, and a hard
+  "delete within exactly R" rule tolerates no window slack at all.
+- **No DEFAULT partition** — once rows land in it, the overlapping range partition
+  can no longer be created without moving data. Pre-create ahead instead; a
+  missing partition fails loudly.
+- **Force-advance returns with the drop.** Recompute the floor as
+  `max(position in P) + 1` *inside the drop transaction* — a long-running insert
+  can commit a fresh high position into P at the last moment, and `DROP`'s ACCESS
+  EXCLUSIVE lock serializes with exactly that — then advance every lagging cursor
+  and queue (`claimed`/`closed`) to it and emit a `$sys.data_loss` event.
+- Reads filter on `position` while partitions range on `created_at`, so Postgres
+  cannot prune partitions for a read; with a handful of partitions the
+  MergeAppend-with-one-probe-each is negligible. Only if a stream needs fine
+  granularity × long retention (>~20 partitions) add a per-partition min/max
+  position catalog so reads derive a `created_at` predicate — the naive
+  `created_at >= last_seen − slack` is wrong (long transactions carry old
+  timestamps but high positions, straddling any fixed slack).
+
+**Also deferred: a size cap** (a `retention.bytes` analog). Time retention still
+lets a burst blow up disk inside the window; naming it so it is a known deferral,
+not an omission.
 
 ## 11. Operational notes
 

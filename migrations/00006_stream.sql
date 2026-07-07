@@ -35,7 +35,8 @@ $$;
 
 CREATE TABLE cb_streams (
     name text PRIMARY KEY CHECK (_cb_valid_stream_name(name)),
-    last_pos bigint NOT NULL DEFAULT 0
+    last_pos bigint NOT NULL DEFAULT 0,
+    retention interval CHECK (retention IS NULL OR retention > interval '0') -- NULL = keep forever
 );
 
 CREATE TABLE cb_stream_cursors (
@@ -162,18 +163,13 @@ BEGIN
     INSERT INTO cb_streams (name) VALUES (_cb_stream_ensure.stream) ON CONFLICT DO NOTHING;
 
     EXECUTE format(
-        'CREATE TABLE IF NOT EXISTS %I PARTITION OF cb_stream_messages
-         FOR VALUES IN (%L) PARTITION BY RANGE (created_at)',
+        'CREATE TABLE IF NOT EXISTS %I PARTITION OF cb_stream_messages FOR VALUES IN (%L)',
         _partition, _cb_stream_ensure.stream);
-    EXECUTE format( -- TODO temporary
-        'CREATE TABLE IF NOT EXISTS %I PARTITION OF %I
-         FOR VALUES FROM (%L) TO (%L)',
-        _partition || '__dev', _partition, '2000-01-01', '2100-01-01');
 END; $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION cb_stream_ensure(stream text)
+CREATE FUNCTION cb_stream_ensure(stream text, retention interval DEFAULT NULL)
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
     IF NOT cb_valid_name(cb_stream_ensure.stream) THEN
@@ -182,6 +178,14 @@ BEGIN
     END IF;
 
     PERFORM _cb_stream_ensure(cb_stream_ensure.stream);
+
+    -- Retention on the established coalesce pattern (like cb_stream_ensure_queue):
+    -- a NULL argument leaves it, a value sets or changes it; NULL on the row means
+    -- keep forever. Accepted gap, shared with every coalesced field -- a NULL
+    -- argument cannot reset a bounded stream back to forever (rare; raw UPDATE for now).
+    UPDATE cb_streams s
+    SET retention = coalesce(cb_stream_ensure.retention, s.retention)
+    WHERE s.name = cb_stream_ensure.stream;
 END; $$;
 -- +goose statementend
 
@@ -665,6 +669,39 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
+CREATE FUNCTION _cb_stream_prune_messages(stream text, batch_size int DEFAULT 10000)
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+    _retention interval;
+    _n bigint;
+BEGIN
+    SELECT s.retention INTO _retention
+    FROM cb_streams s WHERE s.name = _cb_stream_prune_messages.stream;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'catbird: stream % not defined', _cb_stream_prune_messages.stream;
+    END IF;
+    IF _retention IS NULL THEN
+        RETURN 0;
+    END IF;
+
+    WITH doomed AS (
+        SELECT m.ctid FROM cb_stream_messages m
+        WHERE m.stream = _cb_stream_prune_messages.stream
+          AND m.created_at < clock_timestamp() - _retention
+        ORDER BY m.pos
+        LIMIT _cb_stream_prune_messages.batch_size
+        FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM cb_stream_messages m USING doomed d
+    WHERE m.stream = _cb_stream_prune_messages.stream
+      AND m.ctid = d.ctid;
+
+    GET DIAGNOSTICS _n = ROW_COUNT;
+    RETURN _n;
+END; $$;
+-- +goose statementend
+
+-- +goose statementbegin
 CREATE FUNCTION cb_stream_read(stream text, cursor text, batch_size int DEFAULT 100)
 RETURNS SETOF cb_stream_messages
 LANGUAGE plpgsql AS $$
@@ -1088,6 +1125,7 @@ END; $$;
 -- +goose down
 
 DROP FUNCTION _cb_stream_deliver_schedules(int);
+DROP FUNCTION _cb_stream_prune_messages(text, int);
 DROP FUNCTION cb_stream_delete_schedule(text, text);
 DROP FUNCTION cb_stream_ensure_schedule(text, text, interval, text, jsonb, jsonb, cb_catch_up_policy, timestamptz);
 DROP TABLE cb_stream_schedules;
@@ -1109,7 +1147,7 @@ DROP TABLE cb_stream_queues;
 DROP FUNCTION cb_stream_publish_payloads(text, text, jsonb[]);
 DROP FUNCTION cb_stream_publish(text, text, jsonb, jsonb, text, interval, timestamptz);
 DROP FUNCTION _cb_stream_publish(text, text, jsonb, jsonb, text, interval, timestamptz);
-DROP FUNCTION cb_stream_ensure(text);
+DROP FUNCTION cb_stream_ensure(text, interval);
 DROP FUNCTION _cb_stream_ensure(text);
 DROP FUNCTION _cb_stream_deliver_pending(int);
 DROP FUNCTION _cb_stream_assign_positions(text, int);
