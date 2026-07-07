@@ -113,8 +113,8 @@ BEGIN
     INSERT INTO cb_stream_messages (stream, topic, payload, headers)
     VALUES ('fe.' || flow, 'run_requested',
             jsonb_build_object('run_id', _id, 'input', input),
-            jsonb_build_object('run_id', _id,
-                'shard', abs(hashint8(_id)) % (SELECT f.shards FROM cb_flows f
+            jsonb_build_object('cb_run_id', _id,
+                'cb_shard', abs(hashint8(_id)) % (SELECT f.shards FROM cb_flows f
                                                WHERE f.name = cb_flow_run.flow)));
     PERFORM pg_notify(current_schema || '.cbs_fe.' || flow, '');
     RETURN QUERY VALUES (_id, false);
@@ -175,7 +175,7 @@ BEGIN
     FOR _e IN
         SELECT m.position, m.topic, m.payload FROM cb_stream_messages m
         WHERE m.stream = _stream AND m.position > _pos AND m.position <= _high
-          AND (m.headers->>'shard')::int = shard           -- 01 §4 header filter
+          AND (m.headers->>'cb_shard')::int = shard           -- 01 §4 header filter
         ORDER BY m.position LIMIT batch
     LOOP
         CASE _e.topic
@@ -392,8 +392,8 @@ BEGIN
     END IF;
     _stream := 'fe.' || _flow;
     _hdrs   := jsonb_build_object(
-        'run_id', run_id,
-        'shard',  abs(hashint8(run_id)) % _shards);
+        'cb_run_id', run_id,
+        'cb_shard',  abs(hashint8(run_id)) % _shards);
 
     -- Claim this attempt's resolution. Exactly one of complete/fail wins per
     -- (run, step, attempt). The loser appends NOTHING. So a redelivered

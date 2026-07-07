@@ -616,8 +616,10 @@ therefore invisible to non-Go workers and to SQL. Move the *policy* into columns
 `cb_stream_queues` (and per-step overrides in flow, 03 §6):
 
 ```
-max_attempts int · backoff_kind ('none'|'fixed'|'full_jitter') ·
-backoff_base interval · backoff_max interval · on_exhaust ('dlq'|'drop')
+max_attempts int · backoff_kind (enum: 'none'|'fixed'|'full_jitter', D20) ·
+backoff_base interval · backoff_max interval ·
+after_max_attempts (enum: 'dlq'|'drop'; 'reroute' + a reroute_stream column may
+join it later — appending to an enum is an ordinary migration, D20)
 ```
 
 `cb_stream_fail(stream, queue, position, error)` has no mechanism of its own
@@ -653,21 +655,20 @@ BEGIN
     SELECT * INTO _m FROM cb_stream_messages m
     WHERE m.stream = cb_stream_fail.stream AND m.position = cb_stream_fail.position;
 
-    _attempt := coalesce((_m.headers->>'attempt')::int, 0) + 1;
+    _attempt := coalesce((_m.headers->>'cb_attempt')::int, 0) + 1;
     -- retries of retries keep pointing at the first position
-    _origin  := coalesce((_m.headers->>'original_position')::bigint,
+    _origin  := coalesce((_m.headers->>'cb_origin_position')::bigint,
                          cb_stream_fail.position);
 
     IF _attempt >= _g.max_attempts THEN
-        IF _g.on_exhaust = 'dlq' THEN
+        IF _g.after_max_attempts = 'dlq' THEN
             -- exhaustion goes to the BASE stream's DLQ, not the retry stream's
             PERFORM cb_stream_publish(
                 _dp || _base, _m.topic, _m.payload,
                 _m.headers || jsonb_build_object(
-                    'origin_stream', cb_stream_fail.stream,
-                    'original_position', _origin,
+                                        'cb_origin_position', _origin,
                     'queue', cb_stream_fail.queue, 'attempts', _attempt,
-                    'last_error', cb_stream_fail.error,
+                    'cb_error', cb_stream_fail.error,
                     'failed_at', clock_timestamp()),
                 key => cb_stream_fail.queue || ':' || _origin);
         END IF;
@@ -679,8 +680,8 @@ BEGIN
     PERFORM cb_stream_publish(
         _rp || _base || '.' || cb_stream_fail.queue,
         _m.topic, _m.payload,
-        _m.headers || jsonb_build_object('attempt', _attempt,
-                                         'original_position', _origin),
+        _m.headers || jsonb_build_object('cb_attempt', _attempt,
+                                         'cb_origin_position', _origin),
         key   => cb_stream_fail.queue || ':' || _origin || ':' || _attempt,
         delay => cb_backoff(_g.backoff_kind, _g.backoff_base,
                             _g.backoff_max, _attempt));
@@ -872,9 +873,9 @@ notifies move with it.
 
 A DLQ is an ordinary stream named `sd.<stream>` (`fd.<flow>` for flows), created lazily on first use.
 Exhausted messages are appended there with headers
-`{origin_stream, original_position, queue, attempts, last_error, failed_at}`. Replay is
+`{cb_queue, cb_attempts, cb_error, cb_origin_position}`. Replay is
 `stream.Redrive(dlq, n)` — republish to the origin stream (new position, attempt
-reset, a `redriven_from` header). Because it is just a stream: it has retention,
+reset, a `cb_redriven_from` header). Because it is just a stream: it has retention,
 it can be consumed (alerting), and the dashboard lists it for free. No special
 machinery anywhere.
 
