@@ -3,6 +3,7 @@
 CREATE TYPE cb_ref_kind AS ENUM ('message', 'pending');
 CREATE TYPE cb_backoff_kind AS ENUM ('none', 'fixed', 'full_jitter');
 CREATE TYPE cb_fail_policy AS ENUM ('dead_letter', 'drop');
+CREATE TYPE cb_catch_up_policy AS ENUM ('skip', 'all');
 
 -- +goose statementbegin
 CREATE FUNCTION cb_valid_name(name text)
@@ -122,6 +123,25 @@ CREATE TABLE cb_stream_claims (
     CHECK (from_pos <= to_pos)
 );
 
+CREATE TABLE cb_stream_schedules (
+    stream   text NOT NULL REFERENCES cb_streams(name) ON DELETE CASCADE,
+    name     text NOT NULL CHECK (cb_valid_name(name)),
+    every    interval NOT NULL CHECK (
+        every > interval '0'
+        AND extract(day   FROM every) = 0   -- fixed durations only: no day/month/year
+        AND extract(month FROM every) = 0   -- component, so the epoch math in
+        AND extract(year  FROM every) = 0   -- _cb_stream_deliver_schedules is exact
+    ),
+    catch_up cb_catch_up_policy NOT NULL DEFAULT 'skip',
+    topic    text,
+    payload  jsonb NOT NULL DEFAULT '{}',
+    headers  jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(headers) = 'object'),
+    next_at  timestamptz NOT NULL, -- when this schedule fires next
+    PRIMARY KEY (stream, name)
+);
+
+CREATE INDEX ON cb_stream_schedules (next_at);
+
 -- +goose statementbegin
 -- The internal version accepts the dotted names used by retry
 -- and dead letter streams.
@@ -233,6 +253,106 @@ BEGIN
         max_crashes  = coalesce(cb_stream_ensure_queue.max_crashes,  q.max_crashes)
     WHERE q.stream = cb_stream_ensure_queue.stream
       AND q.name = cb_stream_ensure_queue.queue;
+END; $$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE FUNCTION cb_stream_ensure_schedule(
+    stream   text,
+    name     text,
+    every    interval    DEFAULT NULL,
+    topic    text        DEFAULT NULL,
+    payload  jsonb       DEFAULT NULL,
+    headers  jsonb       DEFAULT NULL,
+    catch_up cb_catch_up_policy DEFAULT NULL,
+    start_at timestamptz DEFAULT NULL
+)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    _next_at timestamptz;
+BEGIN
+    IF NOT cb_valid_name(cb_stream_ensure_schedule.name) THEN
+        RAISE EXCEPTION 'catbird: invalid schedule name %; use [a-z][a-z0-9_]*, max 20 bytes',
+            cb_stream_ensure_schedule.name;
+    END IF;
+
+    -- Same reservation as publish: cb_ header keys are catbird's own.
+    IF cb_stream_ensure_schedule.headers IS NOT NULL
+       AND EXISTS (SELECT 1 FROM jsonb_object_keys(cb_stream_ensure_schedule.headers) AS k
+                   WHERE left(k, 3) = 'cb_') THEN
+        RAISE EXCEPTION 'catbird: header keys starting with cb_ are reserved';
+    END IF;
+
+    PERFORM 1 FROM cb_streams s WHERE s.name = cb_stream_ensure_schedule.stream;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_ensure_schedule.stream;
+    END IF;
+
+    -- every is required when the schedule is created.
+    IF cb_stream_ensure_schedule.every IS NULL
+       AND NOT EXISTS (SELECT 1 FROM cb_stream_schedules sc
+                       WHERE sc.stream = cb_stream_ensure_schedule.stream
+                         AND sc.name   = cb_stream_ensure_schedule.name) THEN
+        RAISE EXCEPTION 'catbird: schedule %.% needs an interval',
+            cb_stream_ensure_schedule.stream, cb_stream_ensure_schedule.name;
+    END IF;
+
+    IF cb_stream_ensure_schedule.every IS NOT NULL
+       AND (extract(day   FROM cb_stream_ensure_schedule.every) <> 0
+         OR extract(month FROM cb_stream_ensure_schedule.every) <> 0
+         OR extract(year  FROM cb_stream_ensure_schedule.every) <> 0) THEN
+        RAISE EXCEPTION 'catbird: schedule interval must be hours or less (got %); days, months and years need cron',
+            cb_stream_ensure_schedule.every;
+    END IF;
+
+    INSERT INTO cb_stream_schedules (stream, name, every, topic, payload, headers, catch_up, next_at)
+    VALUES (
+        cb_stream_ensure_schedule.stream,
+        cb_stream_ensure_schedule.name,
+        cb_stream_ensure_schedule.every,
+        cb_stream_ensure_schedule.topic,
+        coalesce(cb_stream_ensure_schedule.payload, '{}'),
+        coalesce(cb_stream_ensure_schedule.headers, '{}'),
+        coalesce(cb_stream_ensure_schedule.catch_up, 'skip'),
+        coalesce(cb_stream_ensure_schedule.start_at,
+                 clock_timestamp() + cb_stream_ensure_schedule.every)
+    )
+    ON CONFLICT ON CONSTRAINT cb_stream_schedules_pkey DO NOTHING;
+
+    UPDATE cb_stream_schedules sc
+    SET every    = coalesce(cb_stream_ensure_schedule.every,    sc.every),
+        topic    = coalesce(cb_stream_ensure_schedule.topic,    sc.topic),
+        payload  = coalesce(cb_stream_ensure_schedule.payload,  sc.payload),
+        headers  = coalesce(cb_stream_ensure_schedule.headers,  sc.headers),
+        catch_up = coalesce(cb_stream_ensure_schedule.catch_up, sc.catch_up),
+        next_at  = CASE
+            WHEN cb_stream_ensure_schedule.every
+                 IS DISTINCT FROM sc.every
+                 AND cb_stream_ensure_schedule.every IS NOT NULL
+            THEN clock_timestamp() + cb_stream_ensure_schedule.every
+            ELSE coalesce(cb_stream_ensure_schedule.start_at, sc.next_at)
+        END
+    WHERE sc.stream = cb_stream_ensure_schedule.stream
+      AND sc.name   = cb_stream_ensure_schedule.name
+    RETURNING sc.next_at INTO _next_at;
+
+    PERFORM pg_notify(current_schema || '.cb_tick',
+        to_char(_next_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+END; $$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE FUNCTION cb_stream_delete_schedule(stream text, name text)
+RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE
+    _found boolean;
+BEGIN
+    DELETE FROM cb_stream_schedules sc
+    WHERE sc.stream = cb_stream_delete_schedule.stream
+      AND sc.name   = cb_stream_delete_schedule.name
+    RETURNING true INTO _found;
+
+    RETURN coalesce(_found, false);
 END; $$;
 -- +goose statementend
 
@@ -370,7 +490,7 @@ BEGIN
             _cb_stream_publish.key
         );
 
-        PERFORM pg_notify(current_schema || '.cb_pending',
+        PERFORM pg_notify(current_schema || '.cb_tick',
             to_char(_deliver_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
 
         RETURN;
@@ -490,6 +610,55 @@ BEGIN
 
         _n := _n + 1;
     END LOOP;
+    RETURN _n;
+END;
+$$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE FUNCTION _cb_stream_deliver_schedules(batch_size int DEFAULT 500)
+RETURNS int LANGUAGE plpgsql AS $$
+DECLARE
+    _schedule cb_stream_schedules;
+    _due_ticks int;  -- ticks due from next_at through now, inclusive (always >= 1)
+    _fire_ticks int; -- how many of those ticks this policy actually emits
+    _n int := 0;     -- messages published, the return value (matches _cb_stream_deliver_pending)
+BEGIN
+    FOR _schedule IN
+        SELECT * FROM cb_stream_schedules
+        WHERE next_at <= clock_timestamp()
+        ORDER BY next_at LIMIT _cb_stream_deliver_schedules.batch_size
+        FOR UPDATE SKIP LOCKED
+    LOOP
+        -- Ticks due from next_at through now -- at least one, since the row is due.
+        _due_ticks := floor(extract(epoch FROM clock_timestamp() - _schedule.next_at)
+            / extract(epoch FROM _schedule.every))::int + 1;
+
+        -- 'all' replays every missed tick. 'skip' fires only an on-time tick
+        -- (_due_ticks = 1) and skips the backlog (_due_ticks > 1).
+        _fire_ticks := CASE WHEN _schedule.catch_up = 'all' THEN _due_ticks
+                            WHEN _due_ticks = 1             THEN 1
+                            ELSE 0 END;
+
+        IF _fire_ticks > 0 THEN
+            INSERT INTO cb_stream_messages (stream, topic, payload, headers)
+            SELECT _schedule.stream, _schedule.topic, _schedule.payload, _schedule.headers
+            FROM generate_series(1, _fire_ticks);
+
+            PERFORM _cb_stream_notify(_schedule.stream, _schedule.topic);
+
+            _n := _n + _fire_ticks;
+        END IF;
+
+        -- Re-arm to the first tick after now, in one step. Same expression for
+        -- both policies: 'all' has just caught up to it, 'skip' jumps its
+        -- backlog past it. Anchored on the old next_at, so tick phase holds.
+        UPDATE cb_stream_schedules sc
+        SET next_at = _schedule.next_at + _schedule.every * _due_ticks
+        WHERE sc.stream = _schedule.stream
+          AND sc.name = _schedule.name;
+    END LOOP;
+
     RETURN _n;
 END;
 $$;
@@ -918,6 +1087,12 @@ END; $$;
 
 -- +goose down
 
+DROP FUNCTION _cb_stream_deliver_schedules(int);
+DROP FUNCTION cb_stream_delete_schedule(text, text);
+DROP FUNCTION cb_stream_ensure_schedule(text, text, interval, text, jsonb, jsonb, cb_catch_up_policy, timestamptz);
+DROP TABLE cb_stream_schedules;
+DROP TYPE cb_catch_up_policy;
+
 DROP FUNCTION cb_stream_fail(text, text, bigint, text);
 DROP FUNCTION _cb_stream_dead_letter(text, text, bigint, int, text);
 DROP FUNCTION _cb_backoff(cb_backoff_kind, interval, interval, int);
@@ -931,7 +1106,7 @@ DROP FUNCTION cb_stream_ensure_cursor(text, text, bigint);
 DROP FUNCTION cb_stream_read(text, text, int);
 DROP TABLE cb_stream_claims;
 DROP TABLE cb_stream_queues;
-DROP FUNCTION cb_stream_publish_payloads(text, text, jsonb[], jsonb);
+DROP FUNCTION cb_stream_publish_payloads(text, text, jsonb[]);
 DROP FUNCTION cb_stream_publish(text, text, jsonb, jsonb, text, interval, timestamptz);
 DROP FUNCTION _cb_stream_publish(text, text, jsonb, jsonb, text, interval, timestamptz);
 DROP FUNCTION cb_stream_ensure(text);

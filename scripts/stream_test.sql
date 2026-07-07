@@ -217,9 +217,98 @@ DECLARE _n int; _before bigint;
 BEGIN
     SELECT last_pos INTO _before FROM cb_streams WHERE name = 'orders';
     SELECT count(*) INTO _n
-    FROM cb_stream_publish_batch('orders', 'bulk', array_fill('1'::jsonb, ARRAY[100]));
+    FROM cb_stream_publish_payloads('orders', 'bulk', array_fill('1'::jsonb, ARRAY[100]));
     ASSERT _n = 100, format('expected 100 ids, got %s', _n);
     PERFORM _cb_stream_assign_positions('orders');
     ASSERT (SELECT last_pos FROM cb_streams WHERE name = 'orders') >= _before + 100,        'batch not assigned';
 END $$;
+\echo '== G. schedules: fire, catch-up, skip, re-arm, delete, interval guard =='
+SELECT cb_stream_ensure('beats');
+DO $$
+DECLARE _fired int;
+BEGIN
+    -- On-time tick: one-hour interval, next_at half an interval ago -> one fires,
+    -- and the appended message carries the schedule's template payload.
+    PERFORM cb_stream_ensure_schedule('beats', 'ontime',
+        every => '1 hour', topic => 'ontime', payload => '{"k":1}',
+        start_at => clock_timestamp() - interval '30 minutes');
+    _fired := _cb_stream_deliver_schedules();
+    ASSERT _fired = 1, format('on-time expected 1 fired, got %s', _fired);
+    ASSERT (SELECT count(*) FROM cb_stream_messages WHERE stream = 'beats' AND topic = 'ontime') = 1,
+        'on-time message not appended';
+    ASSERT (SELECT payload FROM cb_stream_messages WHERE stream = 'beats' AND topic = 'ontime')
+        = '{"k":1}'::jsonb, 'template payload not copied';
+    ASSERT (SELECT next_at FROM cb_stream_schedules WHERE name = 'ontime') > clock_timestamp(),
+        're-arm left next_at in the past';
+
+    -- 'all' catch-up: 3.5 intervals behind -> 4 ticks fire in one set-based insert.
+    PERFORM cb_stream_ensure_schedule('beats', 'catchup',
+        every => '1 hour', topic => 'catchup', catch_up => 'all',
+        start_at => clock_timestamp() - interval '3 hours 30 minutes');
+    _fired := _cb_stream_deliver_schedules();
+    ASSERT _fired = 4, format('all catch-up expected 4, got %s', _fired);
+    ASSERT (SELECT count(*) FROM cb_stream_messages WHERE stream = 'beats' AND topic = 'catchup') = 4,
+        'all catch-up did not append 4';
+    ASSERT (SELECT next_at FROM cb_stream_schedules WHERE name = 'catchup') > clock_timestamp(),
+        'catch-up next_at not in the future';
+
+    -- 'skip' with a whole missed tick behind it: fire nothing, jump ahead.
+    PERFORM cb_stream_ensure_schedule('beats', 'skipbeat',
+        every => '1 hour', topic => 'skipbeat', catch_up => 'skip',
+        start_at => clock_timestamp() - interval '3 hours 30 minutes');
+    _fired := _cb_stream_deliver_schedules();
+    ASSERT _fired = 0, format('skip backlog expected 0, got %s', _fired);
+    ASSERT (SELECT count(*) FROM cb_stream_messages WHERE stream = 'beats' AND topic = 'skipbeat') = 0,
+        'skip backlog fired anyway';
+    ASSERT (SELECT next_at FROM cb_stream_schedules WHERE name = 'skipbeat') > clock_timestamp(),
+        'skip did not jump ahead';
+
+    -- 'skip' still fires an on-time tick: policy governs missed ticks only.
+    PERFORM cb_stream_ensure_schedule('beats', 'skipnow',
+        every => '1 hour', topic => 'skipnow', catch_up => 'skip',
+        start_at => clock_timestamp() - interval '30 minutes');
+    _fired := _cb_stream_deliver_schedules();
+    ASSERT _fired = 1, format('skip on-time expected 1, got %s', _fired);
+END $$;
+-- ensure re-arm and delete
+DO $$
+DECLARE _n1 timestamptz; _n2 timestamptz;
+BEGIN
+    PERFORM cb_stream_ensure_schedule('beats', 'stable', every => '2 hours');
+    SELECT next_at INTO _n1 FROM cb_stream_schedules WHERE name = 'stable';
+    -- re-ensure with the same interval keeps next_at (preserves any backlog),
+    -- while other fields coalesce-update
+    PERFORM cb_stream_ensure_schedule('beats', 'stable', every => '2 hours', payload => '{"v":9}');
+    SELECT next_at INTO _n2 FROM cb_stream_schedules WHERE name = 'stable';
+    ASSERT _n1 = _n2, 're-ensure with same interval moved next_at';
+    ASSERT (SELECT payload FROM cb_stream_schedules WHERE name = 'stable') = '{"v":9}'::jsonb,
+        'coalesce update did not apply payload';
+    -- changing the interval re-anchors next_at
+    PERFORM cb_stream_ensure_schedule('beats', 'stable', every => '3 hours');
+    ASSERT (SELECT next_at FROM cb_stream_schedules WHERE name = 'stable') <> _n2,
+        'interval change did not re-anchor next_at';
+    ASSERT (SELECT every FROM cb_stream_schedules WHERE name = 'stable') = interval '3 hours';
+    -- delete: true when present, false when absent, row gone
+    ASSERT cb_stream_delete_schedule('beats', 'stable'), 'delete of present returned false';
+    ASSERT NOT cb_stream_delete_schedule('beats', 'ghost'), 'delete of absent returned true';
+    ASSERT (SELECT count(*) FROM cb_stream_schedules WHERE name = 'stable') = 0, 'schedule not deleted';
+END $$;
+-- the interval guard rejects calendar durations, at the API and at the table
+DO $$
+DECLARE ok boolean;
+BEGIN
+    ok := false;
+    BEGIN
+        PERFORM cb_stream_ensure_schedule('beats', 'daily', every => '1 day');
+    EXCEPTION WHEN OTHERS THEN ok := SQLERRM LIKE 'catbird:%'; END;
+    ASSERT ok, 'ensure did not reject a calendar interval';
+    -- the table CHECK guards a direct insert too (pure-SQL client protection)
+    ok := false;
+    BEGIN
+        INSERT INTO cb_stream_schedules (stream, name, every, next_at)
+        VALUES ('beats', 'direct', '1 month', clock_timestamp());
+    EXCEPTION WHEN check_violation THEN ok := true; END;
+    ASSERT ok, 'table CHECK did not reject a calendar interval';
+END $$;
+
 \echo 'ALL STREAM TESTS PASSED'

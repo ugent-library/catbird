@@ -552,7 +552,7 @@ microseconds. A stuck row (say, a poisoned retry) is removed by hand:
 
 ```sql
 -- kernel-ticker job on every node — no leadership; SKIP LOCKED below divides
--- the work. Wakes on min(deliver_at) and on the '.cb_pending' notify that
+-- the work. Wakes on min(deliver_at) and on the '.cb_tick' notify that
 -- publish fires for new earlier rows
 CREATE FUNCTION _cb_stream_deliver_pending(batch int DEFAULT 500)
 RETURNS int LANGUAGE plpgsql AS $$
@@ -833,7 +833,7 @@ BEGIN
         INSERT INTO cb_stream_pending
             (id, stream, topic, payload, headers, deliver_at, key)
         VALUES (ref_id, stream, topic, payload, headers, _at, key);
-        PERFORM pg_notify(current_schema || '.cb_pending', to_char(_at AT TIME
+        PERFORM pg_notify(current_schema || '.cb_tick', to_char(_at AT TIME
             ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
             -- today's visible_at timestamp encoding, reused: the Go delivery job
             -- parses it and re-arms its timer if this is now the earliest
