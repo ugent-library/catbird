@@ -25,25 +25,27 @@ the one breaking release, at M6. Ground rules:
   `CLAUDE.md` ("rewrite in progress: new code lives in `stream/`/`flow/`/`wire/`
   per `docs/plan/`; the top-level API is frozen"). The note stops anyone,
   including future sessions, from improving code scheduled for deletion.
-- **Copy, don't rework, shared machinery.** The kernel notifier starts as a *copy*
+- **Copy, don't rework, shared machinery.** The shared notifier starts as a *copy*
   of `worker_notifier.go`, the LISTEN machinery. There is no `notifier.go`,
   despite CLAUDE.md saying so. Fix that stale reference in the first PR's
   CLAUDE.md note. `wire.go` contains a second, embedded listener; M5 consolidates
-  it onto the kernel notifier. `notify.go` is only the send helper and stays. The
+  it onto the shared notifier. `notify.go` is only the send helper and stays. The
   originals keep serving the old worker untouched until M6 deletes them.
   Temporary duplication is cheaper than destabilizing what raven runs on.
-- **Kernel lives in `internal/kernel/` during the transition**, not the root
-  package. D15 describes the *end state*. The trap this avoids: the final layout
-  puts kernel + facade in the root. Then `catbird.Publish` delegates to `stream`,
-  and `stream` imports the root for kernel types. That is an import cycle. Until
-  M6 the root simply stays the old API. Subpackages import `internal/kernel` plus
-  the root's existing `Conn`. The cycle is resolved once, at M6 (see there).
+- **Shared machinery lives under `internal/` during the transition**
+  (`internal/ticker`, `internal/migrate`; the M5 notifier joins them), not the
+  root package. D15 describes the *end state*. The trap this avoids: the final
+  layout puts the shared machinery + facade in the root. Then `catbird.Publish`
+  delegates to `stream`, and `stream` imports the root for shared types. That is
+  an import cycle. Until M6 the root simply stays the old API. Subpackages import
+  the `internal/` packages plus the root's existing `Conn`. The cycle is resolved
+  once, at M6 (see there).
 - **Tests ride the existing rails.** `./scripts/test.sh` already runs
   `go test ./...`. New subpackages are picked up automatically, and the
   drop-and-recreate of `cb_tst` covers them. Each new package gets its own
   `TestMain` + `sync.Once` setup running its own migrations (the
   `catbird_test.go` pattern). `go test ./...` runs packages in parallel
-  processes, so the kernel migration runner takes an advisory lock. That is
+  processes, so the `internal/migrate` runner takes an advisory lock. That is
   already this codebase's setup convention.
 - **Migrations are per module and additive.** Each subpackage embeds its own
   `migrations/` FS with its own goose table (`cb_stream_migrations`, …). The
@@ -61,7 +63,7 @@ the one breaking release, at M6. Ground rules:
   runs in the default run.
 - **No `go.work` until M6.** Only the nested `cb` module needs it.
 
-Suggested first PRs, sized for momentum: (1) `internal/kernel/ticker.go` + tests —
+Suggested first PRs, sized for momentum: (1) `internal/ticker` + tests —
 small, self-contained, zero schema decisions, poll-only (D17); (2) the
 parameterized migration runner; (3) `stream/` DDL + `cb_stream_publish` + the
 failing torture test; (4) the assigner — torture test green, M1 latency gate
@@ -69,9 +71,10 @@ measured against the tick math.
 
 ---
 
-## M0 — kernel (small)
+## M0 — ticker + migration runner (small)
 
-Create `internal/kernel/` with two pieces. First, a **ticker facility**: it
+Create two `internal/` packages, `internal/ticker` and `internal/migrate`.
+First, a **ticker facility**: it
 registers periodic jobs, and the assigner, delivery, janitors, and relays all
 become registrations. There is **no leader election**. Every node runs every job,
 and each job's own locks decide who works: try-lock for the assigner, SKIP LOCKED
@@ -84,8 +87,8 @@ the notifier copy is deferred to M5. `Conn` stays where it is (root, public).
 
 *Exit:* a toy ticker job fires on its interval; two processes ticking the same
 lock-guarded job do each unit of work exactly once (the locks decide, no
-election); an extra wake source can be attached to a running job (the seam M5
-plugs into).
+election). The wake source itself is deferred to M5: it arrives as a third
+`select` case in the job loop.
 
 ## M1 — stream core: publish, assigner, ordered consume (the wall)
 
@@ -149,7 +152,7 @@ contract.
 
 ## M5 — NOTIFY wake-up, wire + inbox
 
-The kernel notifier arrives here: one LISTEN connection per process, subscribers
+The shared notifier arrives here: one LISTEN connection per process, subscribers
 registered by channel. Per the plumbing rules it is a **copy** of
 `worker_notifier.go`, and the original keeps serving the old worker. Wire's
 embedded listener is consolidated onto it in the same milestone. Two consumers of
@@ -185,8 +188,8 @@ old `migrations/` + `migrate.go` once nothing reads `cb_q_*`/`cb_t_*`. What
 remains is the thin umbrella: `Conn` and shared sentinels, the spine facade
 (`Publish`/`Bind`), and migration convenience. This is also where the facade
 import cycle is resolved. Both options stay open. Option one: the facade wraps
-the SQL functions directly, with no Go import of `stream`. Option two: kernel
-types move out of `internal/kernel` and the root imports `stream` freely.
+the SQL functions directly, with no Go import of `stream`. Option two: the
+shared types move out of `internal/` and the root imports `stream` freely.
 
 Tag before and after. This is the one hard breaking release, even by 0.x
 standards.
@@ -200,7 +203,7 @@ nothing outside history.
 
 | Current | Fate |
 |---|---|
-| `worker_notifier.go` (the LISTEN machinery — `notifier.go` does not exist; CLAUDE.md is stale), `notify.go` (send helper), wire.go's embedded listener | copied/consolidated into `internal/kernel` (M5, D17); originals serve the old worker until deleted at M6 |
+| `worker_notifier.go` (the LISTEN machinery — `notifier.go` does not exist; CLAUDE.md is stale), `notify.go` (send helper), wire.go's embedded listener | copied/consolidated into a shared `internal/` notifier package (M5, D17); originals serve the old worker until deleted at M6 |
 | `topic_trie.go`, `topic.go` | kept verbatim, used by relays (M3) |
 | `migrate.go` | parameterized per module (M0) |
 | `queue.go` + `cb_q_*` SQL | replaced by `stream` (M1–M2); `Send/Read/Hide/Delete` API retired |

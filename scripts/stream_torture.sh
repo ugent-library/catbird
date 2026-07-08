@@ -17,7 +17,7 @@ DURATION="${1:-8}"   # seconds of pgbench load; pass a bigger number for a longe
 
 docker exec catbird-postgres psql -U postgres -q \
   -c "DROP DATABASE IF EXISTS $DB;" -c "CREATE DATABASE $DB;"
-sed -n '/+goose up/,/+goose down/p' migrations/00006_stream.sql \
+sed -n '/+goose up/,/+goose down/p' stream/migrations/00001_stream.sql \
   | grep -v '\-\- +goose down' | "${PSQL[@]}"
 "${PSQL[@]}" -c "SELECT cb_stream_ensure('torture');"
 

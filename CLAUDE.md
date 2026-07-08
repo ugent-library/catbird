@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Catbird is a PostgreSQL-backed message queue with task and workflow (DAG) execution engine written in Go. PostgreSQL is the sole coordinator — no external services needed. Workers scale horizontally; the database handles message distribution and state management.
 
+## Rewrite in progress
+
+New code lives in `stream/`, `internal/ticker/`, and `internal/migrate/` (later `flow/` and `wire/`) per `docs/plan/`. The top-level API is **frozen**: bugfixes only, no improvements — everything here is scheduled for replacement. The new stream schema is goose-managed in `stream/migrations/` with its own version table (`cb_stream_migrations`), separate from the old `migrations/`. SQL scenario tests for it live in `scripts/stream_test.sql` (run via `./scripts/stream_test.sh`) until they are ported to the Go suite.
+
 ## Development Commands
 
 ```bash
@@ -41,7 +45,7 @@ There is no Makefile. Tests use a hardcoded DSN (`postgres://postgres:postgres@l
 **Key components:**
 - `client.go` — Public API facade; uses `Conn` interface (pool, conn, or tx)
 - `worker.go` — Claims and executes task/flow handlers; requires `*pgxpool.Pool`
-- `notifier.go` — Internal NOTIFY listener; manages dedicated LISTEN connection and timed wakeups
+- `worker_notifier.go` — Internal NOTIFY listener; manages dedicated LISTEN connection and timed wakeups
 - `flow.go` — Flow DSL, step construction, dependency validation
 - `task.go` — Task builder and handler reflection
 - `queue.go` — Queue send/read/publish/bind operations

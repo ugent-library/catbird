@@ -103,13 +103,13 @@ CREATE TABLE cb_stream_queues (
     name text NOT NULL CHECK (cb_valid_name(name)),
     claimed_pos bigint NOT NULL DEFAULT 0, -- everything at or below this position is claimed
     closed_pos bigint NOT NULL DEFAULT 0, -- everything at or below this position is claimed and closed
-    claim_ttl interval NOT NULL DEFAULT '30 seconds',
-    max_attempts int NOT NULL DEFAULT 3 CHECK (max_attempts > 0),
-    max_crashes int NOT NULL DEFAULT 3 CHECK (max_crashes > 0),
-    backoff_kind cb_backoff_kind NOT NULL DEFAULT 'full_jitter',
-    backoff_base interval NOT NULL DEFAULT '5 seconds',
-    backoff_max interval NOT NULL DEFAULT '5 minutes',
-    on_fail cb_fail_policy NOT NULL DEFAULT 'dead_letter',
+    claim_ttl interval NOT NULL,
+    max_attempts int NOT NULL CHECK (max_attempts > 0),
+    max_crashes int NOT NULL CHECK (max_crashes > 0),
+    backoff_kind cb_backoff_kind NOT NULL,
+    backoff_base interval NOT NULL,
+    backoff_max interval NOT NULL,
+    on_fail cb_fail_policy NOT NULL,
     PRIMARY KEY (stream, name),
     CHECK (closed_pos <= claimed_pos)
 );
@@ -202,9 +202,7 @@ BEGIN
 
     INSERT INTO cb_streams (name, retention)
     VALUES (cb_stream_ensure.stream, coalesce(cb_stream_ensure.retention, cb_forever()))
-    ON CONFLICT ON CONSTRAINT cb_streams_pkey DO UPDATE
-        SET retention = cb_stream_ensure.retention
-        WHERE cb_stream_ensure.retention IS NOT NULL;
+    ON CONFLICT ON CONSTRAINT cb_streams_pkey DO NOTHING;
 
     PERFORM _cb_stream_ensure_partition(cb_stream_ensure.stream);
 END; $$;
@@ -264,28 +262,31 @@ BEGIN
         RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_ensure_queue.stream;
     END IF;
 
-    INSERT INTO cb_stream_queues (stream, name, claimed_pos, closed_pos)
-    VALUES (cb_stream_ensure_queue.stream, cb_stream_ensure_queue.queue, _start, _start)
+    INSERT INTO cb_stream_queues
+        (stream, name, claimed_pos, closed_pos,
+         claim_ttl, max_attempts, max_crashes,
+         backoff_kind, backoff_base, backoff_max, on_fail)
+    VALUES (
+        cb_stream_ensure_queue.stream,
+        cb_stream_ensure_queue.queue,
+        _start, _start,
+        coalesce(cb_stream_ensure_queue.claim_ttl,    interval '30 seconds'),
+        coalesce(cb_stream_ensure_queue.max_attempts, 3),
+        coalesce(cb_stream_ensure_queue.max_crashes,  3),
+        coalesce(cb_stream_ensure_queue.backoff_kind, 'full_jitter'),
+        coalesce(cb_stream_ensure_queue.backoff_base, interval '5 seconds'),
+        coalesce(cb_stream_ensure_queue.backoff_max,  interval '5 minutes'),
+        coalesce(cb_stream_ensure_queue.on_fail,      'dead_letter')
+    )
     ON CONFLICT ON CONSTRAINT cb_stream_queues_pkey DO NOTHING;
-
-    UPDATE cb_stream_queues q
-    SET claim_ttl    = coalesce(cb_stream_ensure_queue.claim_ttl,    q.claim_ttl),
-        max_attempts = coalesce(cb_stream_ensure_queue.max_attempts, q.max_attempts),
-        backoff_kind = coalesce(cb_stream_ensure_queue.backoff_kind, q.backoff_kind),
-        backoff_base = coalesce(cb_stream_ensure_queue.backoff_base, q.backoff_base),
-        backoff_max  = coalesce(cb_stream_ensure_queue.backoff_max,  q.backoff_max),
-        on_fail      = coalesce(cb_stream_ensure_queue.on_fail,      q.on_fail),
-        max_crashes  = coalesce(cb_stream_ensure_queue.max_crashes,  q.max_crashes)
-    WHERE q.stream = cb_stream_ensure_queue.stream
-      AND q.name = cb_stream_ensure_queue.queue;
 END; $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION cb_stream_ensure_schedule(
+CREATE FUNCTION cb_stream_define_schedule(
     stream   text,
     name     text,
-    every    interval    DEFAULT NULL,
+    every    interval,
     topic    text        DEFAULT NULL,
     payload  jsonb       DEFAULT NULL,
     headers  jsonb       DEFAULT NULL,
@@ -296,73 +297,73 @@ RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
     _next_at timestamptz;
 BEGIN
-    IF NOT cb_valid_name(cb_stream_ensure_schedule.name) THEN
+    IF NOT cb_valid_name(cb_stream_define_schedule.name) THEN
         RAISE EXCEPTION 'catbird: invalid schedule name %; use [a-z][a-z0-9_]*, max 20 bytes',
-            cb_stream_ensure_schedule.name;
+            cb_stream_define_schedule.name;
     END IF;
 
-    -- Same reservation as publish: cb_ header keys are catbird's own.
-    IF cb_stream_ensure_schedule.headers IS NOT NULL
-       AND EXISTS (SELECT 1 FROM jsonb_object_keys(cb_stream_ensure_schedule.headers) AS k
+    IF cb_stream_define_schedule.every IS NULL THEN
+        RAISE EXCEPTION 'catbird: schedule %.% needs an interval',
+            cb_stream_define_schedule.stream, cb_stream_define_schedule.name;
+    END IF;
+
+    IF extract(day   FROM cb_stream_define_schedule.every) <> 0
+    OR extract(month FROM cb_stream_define_schedule.every) <> 0
+    OR extract(year  FROM cb_stream_define_schedule.every) <> 0 THEN
+        RAISE EXCEPTION 'catbird: schedule interval must be hours or less (got %); days, months and years need cron',
+            cb_stream_define_schedule.every;
+    END IF;
+
+    -- cb_ header keys are catbird's own.
+    IF cb_stream_define_schedule.headers IS NOT NULL
+       AND EXISTS (SELECT 1 FROM jsonb_object_keys(cb_stream_define_schedule.headers) AS k
                    WHERE left(k, 3) = 'cb_') THEN
         RAISE EXCEPTION 'catbird: header keys starting with cb_ are reserved';
     END IF;
 
-    PERFORM 1 FROM cb_streams s WHERE s.name = cb_stream_ensure_schedule.stream;
+    PERFORM 1 FROM cb_streams s WHERE s.name = cb_stream_define_schedule.stream;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_ensure_schedule.stream;
+        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_define_schedule.stream;
     END IF;
 
-    -- every is required when the schedule is created.
-    IF cb_stream_ensure_schedule.every IS NULL
-       AND NOT EXISTS (SELECT 1 FROM cb_stream_schedules sc
-                       WHERE sc.stream = cb_stream_ensure_schedule.stream
-                         AND sc.name   = cb_stream_ensure_schedule.name) THEN
-        RAISE EXCEPTION 'catbird: schedule %.% needs an interval',
-            cb_stream_ensure_schedule.stream, cb_stream_ensure_schedule.name;
-    END IF;
-
-    IF cb_stream_ensure_schedule.every IS NOT NULL
-       AND (extract(day   FROM cb_stream_ensure_schedule.every) <> 0
-         OR extract(month FROM cb_stream_ensure_schedule.every) <> 0
-         OR extract(year  FROM cb_stream_ensure_schedule.every) <> 0) THEN
-        RAISE EXCEPTION 'catbird: schedule interval must be hours or less (got %); days, months and years need cron',
-            cb_stream_ensure_schedule.every;
-    END IF;
-
-    INSERT INTO cb_stream_schedules (stream, name, every, topic, payload, headers, catch_up, next_at)
+    -- Topics are never empty; empty means none.
+    INSERT INTO cb_stream_schedules AS sc
+        (stream, name, every, topic, payload, headers, catch_up, next_at)
     VALUES (
-        cb_stream_ensure_schedule.stream,
-        cb_stream_ensure_schedule.name,
-        cb_stream_ensure_schedule.every,
-        cb_stream_ensure_schedule.topic,
-        coalesce(cb_stream_ensure_schedule.payload, '{}'),
-        coalesce(cb_stream_ensure_schedule.headers, '{}'),
-        coalesce(cb_stream_ensure_schedule.catch_up, 'skip'),
-        coalesce(cb_stream_ensure_schedule.start_at,
-                 clock_timestamp() + cb_stream_ensure_schedule.every)
+        cb_stream_define_schedule.stream,
+        cb_stream_define_schedule.name,
+        cb_stream_define_schedule.every,
+        nullif(cb_stream_define_schedule.topic, ''),
+        coalesce(cb_stream_define_schedule.payload, '{}'),
+        coalesce(cb_stream_define_schedule.headers, '{}'),
+        coalesce(cb_stream_define_schedule.catch_up, 'skip'),
+        coalesce(cb_stream_define_schedule.start_at,
+                 clock_timestamp() + cb_stream_define_schedule.every)
     )
-    ON CONFLICT ON CONSTRAINT cb_stream_schedules_pkey DO NOTHING;
-
-    UPDATE cb_stream_schedules sc
-    SET every    = coalesce(cb_stream_ensure_schedule.every,    sc.every),
-        topic    = coalesce(cb_stream_ensure_schedule.topic,    sc.topic),
-        payload  = coalesce(cb_stream_ensure_schedule.payload,  sc.payload),
-        headers  = coalesce(cb_stream_ensure_schedule.headers,  sc.headers),
-        catch_up = coalesce(cb_stream_ensure_schedule.catch_up, sc.catch_up),
+    ON CONFLICT ON CONSTRAINT cb_stream_schedules_pkey DO UPDATE
+    SET every    = excluded.every,
+        topic    = excluded.topic,
+        payload  = excluded.payload,
+        headers  = excluded.headers,
+        catch_up = excluded.catch_up,
         next_at  = CASE
-            WHEN cb_stream_ensure_schedule.every
-                 IS DISTINCT FROM sc.every
-                 AND cb_stream_ensure_schedule.every IS NOT NULL
-            THEN clock_timestamp() + cb_stream_ensure_schedule.every
-            ELSE coalesce(cb_stream_ensure_schedule.start_at, sc.next_at)
+            WHEN cb_stream_define_schedule.start_at IS NOT NULL
+                THEN cb_stream_define_schedule.start_at
+            WHEN sc.every IS DISTINCT FROM excluded.every
+                THEN clock_timestamp() + excluded.every
+            ELSE sc.next_at
         END
-    WHERE sc.stream = cb_stream_ensure_schedule.stream
-      AND sc.name   = cb_stream_ensure_schedule.name
+    -- an identical declaration writes nothing and notifies nothing
+    WHERE (sc.every, sc.topic, sc.payload, sc.headers, sc.catch_up)
+          IS DISTINCT FROM
+          (excluded.every, excluded.topic, excluded.payload, excluded.headers, excluded.catch_up)
+       OR cb_stream_define_schedule.start_at IS NOT NULL
     RETURNING sc.next_at INTO _next_at;
 
-    PERFORM pg_notify(current_schema || '.cb_tick',
-        to_char(_next_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+    IF _next_at IS NOT NULL THEN
+        PERFORM pg_notify(current_schema || '.cb_tick',
+            to_char(_next_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+    END IF;
 END; $$;
 -- +goose statementend
 
@@ -1183,7 +1184,7 @@ DROP FUNCTION _cb_stream_deliver_schedules(int);
 DROP FUNCTION _cb_stream_prune_messages(text, int);
 DROP FUNCTION _cb_stream_prune_keys(text, int);
 DROP FUNCTION cb_stream_delete_schedule(text, text);
-DROP FUNCTION cb_stream_ensure_schedule(text, text, interval, text, jsonb, jsonb, cb_catch_up_policy, timestamptz);
+DROP FUNCTION cb_stream_define_schedule(text, text, interval, text, jsonb, jsonb, cb_catch_up_policy, timestamptz);
 DROP TABLE cb_stream_schedules;
 DROP TYPE cb_catch_up_policy;
 

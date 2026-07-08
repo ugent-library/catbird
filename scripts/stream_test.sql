@@ -234,7 +234,7 @@ DECLARE _fired int;
 BEGIN
     -- On-time tick: one-hour interval, next_at half an interval ago -> one fires,
     -- and the appended message carries the schedule's template payload.
-    PERFORM cb_stream_ensure_schedule('beats', 'ontime',
+    PERFORM cb_stream_define_schedule('beats', 'ontime',
         every => '1 hour', topic => 'ontime', payload => '{"k":1}',
         start_at => clock_timestamp() - interval '30 minutes');
     _fired := _cb_stream_deliver_schedules();
@@ -247,7 +247,7 @@ BEGIN
         're-arm left next_at in the past';
 
     -- 'all' catch-up: 3.5 intervals behind -> 4 ticks fire in one set-based insert.
-    PERFORM cb_stream_ensure_schedule('beats', 'catchup',
+    PERFORM cb_stream_define_schedule('beats', 'catchup',
         every => '1 hour', topic => 'catchup', catch_up => 'all',
         start_at => clock_timestamp() - interval '3 hours 30 minutes');
     _fired := _cb_stream_deliver_schedules();
@@ -258,7 +258,7 @@ BEGIN
         'catch-up next_at not in the future';
 
     -- 'skip' with a whole missed tick behind it: fire nothing, jump ahead.
-    PERFORM cb_stream_ensure_schedule('beats', 'skipbeat',
+    PERFORM cb_stream_define_schedule('beats', 'skipbeat',
         every => '1 hour', topic => 'skipbeat', catch_up => 'skip',
         start_at => clock_timestamp() - interval '3 hours 30 minutes');
     _fired := _cb_stream_deliver_schedules();
@@ -269,30 +269,56 @@ BEGIN
         'skip did not jump ahead';
 
     -- 'skip' still fires an on-time tick: policy governs missed ticks only.
-    PERFORM cb_stream_ensure_schedule('beats', 'skipnow',
+    PERFORM cb_stream_define_schedule('beats', 'skipnow',
         every => '1 hour', topic => 'skipnow', catch_up => 'skip',
         start_at => clock_timestamp() - interval '30 minutes');
     _fired := _cb_stream_deliver_schedules();
     ASSERT _fired = 1, format('skip on-time expected 1, got %s', _fired);
 END $$;
--- ensure re-arm and delete
+-- define: declare semantics, no-op writes, re-arm and delete
 DO $$
-DECLARE _n1 timestamptz; _n2 timestamptz;
+DECLARE _n1 timestamptz; _n2 timestamptz; _x1 text; _x2 text; ok boolean;
 BEGIN
-    PERFORM cb_stream_ensure_schedule('beats', 'stable', every => '2 hours');
+    PERFORM cb_stream_define_schedule('beats', 'stable', every => '2 hours', payload => '{"v":9}');
     SELECT next_at INTO _n1 FROM cb_stream_schedules WHERE name = 'stable';
-    -- re-ensure with the same interval keeps next_at (preserves any backlog),
-    -- while other fields coalesce-update
-    PERFORM cb_stream_ensure_schedule('beats', 'stable', every => '2 hours', payload => '{"v":9}');
+
+    -- an identical declaration writes nothing: the row version is untouched
+    SELECT xmin::text INTO _x1 FROM cb_stream_schedules WHERE name = 'stable';
+    PERFORM cb_stream_define_schedule('beats', 'stable', every => '2 hours', payload => '{"v":9}');
+    SELECT xmin::text INTO _x2 FROM cb_stream_schedules WHERE name = 'stable';
+    ASSERT _x1 = _x2, 'identical declaration rewrote the row';
+
+    -- the call is the whole schedule: the same cadence keeps the phase,
+    -- and the omitted payload resets to its default
+    PERFORM cb_stream_define_schedule('beats', 'stable', every => '2 hours', topic => 'stable');
     SELECT next_at INTO _n2 FROM cb_stream_schedules WHERE name = 'stable';
-    ASSERT _n1 = _n2, 're-ensure with same interval moved next_at';
-    ASSERT (SELECT payload FROM cb_stream_schedules WHERE name = 'stable') = '{"v":9}'::jsonb,
-        'coalesce update did not apply payload';
-    -- changing the interval re-anchors next_at
-    PERFORM cb_stream_ensure_schedule('beats', 'stable', every => '3 hours');
+    ASSERT _n1 = _n2, 'same cadence moved next_at';
+    ASSERT (SELECT payload FROM cb_stream_schedules WHERE name = 'stable') = '{}'::jsonb,
+        'omitted payload was kept, not reset';
+    ASSERT (SELECT topic FROM cb_stream_schedules WHERE name = 'stable') = 'stable',
+        'declared topic not applied';
+
+    -- changing the cadence re-anchors next_at; the omitted topic is gone again
+    PERFORM cb_stream_define_schedule('beats', 'stable', every => '3 hours');
     ASSERT (SELECT next_at FROM cb_stream_schedules WHERE name = 'stable') <> _n2,
-        'interval change did not re-anchor next_at';
+        'cadence change did not re-anchor next_at';
     ASSERT (SELECT every FROM cb_stream_schedules WHERE name = 'stable') = interval '3 hours';
+    ASSERT (SELECT topic FROM cb_stream_schedules WHERE name = 'stable') IS NULL,
+        'omitted topic survived re-declaration';
+
+    -- an explicit start_at wins over the re-anchor: the deliberate state poke
+    PERFORM cb_stream_define_schedule('beats', 'stable', every => '4 hours',
+        start_at => clock_timestamp() + interval '10 minutes');
+    ASSERT (SELECT next_at FROM cb_stream_schedules WHERE name = 'stable')
+        < clock_timestamp() + interval '11 minutes', 'start_at did not win over the re-anchor';
+
+    -- a cadence is always required; an explicit NULL gets the catbird error
+    ok := false;
+    BEGIN
+        PERFORM cb_stream_define_schedule('beats', 'stable', every => NULL);
+    EXCEPTION WHEN OTHERS THEN ok := SQLERRM LIKE 'catbird:%'; END;
+    ASSERT ok, 'define with a NULL cadence was accepted';
+
     -- delete: true when present, false when absent, row gone
     ASSERT cb_stream_delete_schedule('beats', 'stable'), 'delete of present returned false';
     ASSERT NOT cb_stream_delete_schedule('beats', 'ghost'), 'delete of absent returned true';
@@ -304,7 +330,7 @@ DECLARE ok boolean;
 BEGIN
     ok := false;
     BEGIN
-        PERFORM cb_stream_ensure_schedule('beats', 'daily', every => '1 day');
+        PERFORM cb_stream_define_schedule('beats', 'daily', every => '1 day');
     EXCEPTION WHEN OTHERS THEN ok := SQLERRM LIKE 'catbird:%'; END;
     ASSERT ok, 'ensure did not reject a calendar interval';
     -- the table CHECK guards a direct insert too (pure-SQL client protection)
@@ -316,8 +342,8 @@ BEGIN
     ASSERT ok, 'table CHECK did not reject a calendar interval';
 END $$;
 
-\echo '== H. retention: ensure-set, prune, forever, gap read =='
--- 'audit' carries a 7-day retention, set through ensure
+\echo '== H. retention: initial value, prune, forever, gap read =='
+-- 'audit' carries a 7-day retention, an initial value at creation
 SELECT cb_stream_ensure('audit', '7 days');
 SELECT p.ref_id FROM generate_series(1,10) g,
     LATERAL cb_stream_publish('audit', 'evt', to_jsonb(g)) p;
@@ -367,15 +393,17 @@ BEGIN
     -- survivors are recent, so a second prune removes nothing
     ASSERT _cb_stream_prune_messages('audit') = 0, 'second prune deleted survivors';
 
-    -- ensure retention, three states through one argument: a bare re-ensure
-    -- leaves it, a value changes it, cb_forever() resets to forever
+    -- whatever a re-ensure mentions, an existing stream is never modified;
+    -- retention changes are plain UPDATEs
     PERFORM cb_stream_ensure('audit');
     ASSERT (SELECT retention FROM cb_streams WHERE name = 'audit') = interval '7 days',
         'bare re-ensure changed retention';
     PERFORM cb_stream_ensure('audit', '14 days');
-    ASSERT (SELECT retention FROM cb_streams WHERE name = 'audit') = interval '14 days',
-        'ensure did not change retention';
-    PERFORM cb_stream_ensure('audit', cb_forever());
+    ASSERT (SELECT retention FROM cb_streams WHERE name = 'audit') = interval '7 days',
+        're-ensure modified an existing stream';
+    UPDATE cb_streams SET retention = interval '14 days' WHERE name = 'audit';
+    ASSERT (SELECT retention FROM cb_streams WHERE name = 'audit') = interval '14 days';
+    UPDATE cb_streams SET retention = cb_forever() WHERE name = 'audit';
     ASSERT (SELECT retention FROM cb_streams WHERE name = 'audit') = cb_forever(),
         'cb_forever did not reset retention to forever';
 

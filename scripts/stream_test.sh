@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuild cb_scratch from migrations/00006_stream.sql, run the scenario tests
+# Rebuild cb_scratch from stream/migrations/00001_stream.sql, run the scenario tests
 # in scripts/stream_test.sql, then run the down section and verify it leaves
 # no catbird objects behind. Exits non-zero on the first failed assertion.
 set -euo pipefail
@@ -11,13 +11,13 @@ docker exec catbird-postgres psql -U postgres -q \
   -c "DROP DATABASE IF EXISTS cb_scratch;" \
   -c "CREATE DATABASE cb_scratch;"
 
-sed -n '/+goose up/,/+goose down/p' migrations/00006_stream.sql \
+sed -n '/+goose up/,/+goose down/p' stream/migrations/00001_stream.sql \
   | grep -v '\-\- +goose down' \
   | "${PSQL[@]}" -d cb_scratch
 
 "${PSQL[@]}" -d cb_scratch < scripts/stream_test.sql
 
-sed -n '/+goose down/,$p' migrations/00006_stream.sql \
+sed -n '/+goose down/,$p' stream/migrations/00001_stream.sql \
   | grep -v '\-\- +goose down' \
   | "${PSQL[@]}" -d cb_scratch
 
