@@ -69,14 +69,14 @@ CREATE INDEX ON cb_stream_pending (deliver_at);
 
 CREATE TABLE cb_stream_keys (
     stream text NOT NULL REFERENCES cb_streams(name) ON DELETE CASCADE,
-    key         text NOT NULL,
-    ref_kind    cb_ref_kind NOT NULL,
-    ref_id      bigint NOT NULL,
-    created_at  timestamptz NOT NULL DEFAULT now(),
+    key            text NOT NULL,
+    ref_kind       cb_ref_kind NOT NULL,
+    ref_id         bigint NOT NULL,
+    ref_created_at timestamptz NOT NULL DEFAULT now(), -- bumped when ref_kind changes from 'pending' to 'message'
     PRIMARY KEY (stream, key)
 );
 
-CREATE INDEX ON cb_stream_keys (stream, created_at);
+CREATE INDEX ON cb_stream_keys (stream, ref_created_at);
 
 -- No identity column: identity on partitioned tables needs Postgres 17, and
 -- the floor is 14 (plan D16). Explicit sequence instead; OWNED BY keeps
@@ -628,7 +628,7 @@ BEGIN
         RETURNING id INTO _msg_id;
         -- If the message has a key, update it.
         UPDATE cb_stream_keys k
-        SET ref_kind = 'message', ref_id = _msg_id
+        SET ref_kind = 'message', ref_id = _msg_id, ref_created_at = now()
         WHERE k.ref_kind = 'pending' AND k.ref_id = _p.id AND k.stream = _p.stream;
 
         PERFORM _cb_stream_notify(_p.stream, _p.topic);
@@ -716,6 +716,39 @@ BEGIN
     DELETE FROM cb_stream_messages m USING doomed d
     WHERE m.stream = _cb_stream_prune_messages.stream
       AND m.ctid = d.ctid;
+
+    GET DIAGNOSTICS _n = ROW_COUNT;
+    RETURN _n;
+END; $$;
+-- +goose statementend
+
+-- +goose statementbegin
+CREATE FUNCTION _cb_stream_prune_keys(stream text, batch_size int DEFAULT 10000)
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+    _retention interval;
+    _n bigint;
+BEGIN
+    SELECT s.retention INTO _retention
+    FROM cb_streams s WHERE s.name = _cb_stream_prune_keys.stream;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'catbird: stream % not defined', _cb_stream_prune_keys.stream;
+    END IF;
+    IF _retention < interval '0' THEN  -- cb_forever() sentinel: nothing to prune
+        RETURN 0;
+    END IF;
+
+    WITH doomed AS (
+        SELECT k.ctid FROM cb_stream_keys k
+        WHERE k.stream = _cb_stream_prune_keys.stream
+          AND k.ref_kind = 'message'  -- keep undelivered 'pending' keys
+          AND k.ref_created_at < clock_timestamp() - _retention
+        ORDER BY k.ref_created_at
+        LIMIT _cb_stream_prune_keys.batch_size
+        FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM cb_stream_keys k USING doomed d
+    WHERE k.ctid = d.ctid;
 
     GET DIAGNOSTICS _n = ROW_COUNT;
     RETURN _n;
@@ -1148,6 +1181,7 @@ END; $$;
 
 DROP FUNCTION _cb_stream_deliver_schedules(int);
 DROP FUNCTION _cb_stream_prune_messages(text, int);
+DROP FUNCTION _cb_stream_prune_keys(text, int);
 DROP FUNCTION cb_stream_delete_schedule(text, text);
 DROP FUNCTION cb_stream_ensure_schedule(text, text, interval, text, jsonb, jsonb, cb_catch_up_policy, timestamptz);
 DROP TABLE cb_stream_schedules;

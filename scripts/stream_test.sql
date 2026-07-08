@@ -390,4 +390,63 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN ok := SQLERRM LIKE 'catbird:%'; END;
     ASSERT ok, 'non-sentinel negative not rejected';
 END $$;
+\echo '== I. key prune: age out, keep pending, forever, delivery refresh =='
+-- 'ledger' holds keyed messages under a 7-day retention
+SELECT cb_stream_ensure('ledger', '7 days');
+SELECT p.ref_id FROM cb_stream_publish('ledger', 't', '1', key => 'old') p;
+SELECT p.ref_id FROM cb_stream_publish('ledger', 't', '2', key => 'young') p;
+-- 'stuck' waits undelivered for an hour; its key must outlive any retention
+SELECT p.ref_id FROM cb_stream_publish('ledger', 't', '3', key => 'stuck', delay => '1 hour') p;
+SELECT _cb_stream_assign_positions('ledger');
+UPDATE cb_stream_keys SET ref_created_at = clock_timestamp() - interval '10 days'
+WHERE stream = 'ledger' AND key IN ('old', 'stuck');
+-- 'orders' never set a retention, so even ancient keys are kept
+UPDATE cb_stream_keys SET ref_created_at = clock_timestamp() - interval '10 days'
+WHERE stream = 'orders' AND key = 'k1';
+DO $$
+DECLARE _deleted bigint; _others_before bigint; _others_after bigint; ok boolean;
+BEGIN
+    SELECT count(*) INTO _others_before FROM cb_stream_keys WHERE stream <> 'ledger';
+
+    _deleted := _cb_stream_prune_keys('ledger');
+    ASSERT _deleted = 1, format('expected 1 key pruned, got %s', _deleted);
+    ASSERT (SELECT count(*) FROM cb_stream_keys WHERE stream = 'ledger' AND key = 'old') = 0,
+        'aged key survived';
+    ASSERT (SELECT count(*) FROM cb_stream_keys WHERE stream = 'ledger' AND key = 'young') = 1,
+        'young key pruned';
+    ASSERT (SELECT ref_kind FROM cb_stream_keys WHERE stream = 'ledger' AND key = 'stuck') = 'pending',
+        'undelivered pending key pruned';
+    -- messages are the other janitor's job: key prune left them alone
+    ASSERT (SELECT count(*) FROM cb_stream_messages WHERE stream = 'ledger') = 2,
+        'key prune touched messages';
+
+    -- forever stream: prune is a no-op even for ancient keys
+    ASSERT _cb_stream_prune_keys('orders') = 0, 'forever stream pruned keys';
+
+    -- pruning 'ledger' touched no other stream's keys
+    SELECT count(*) INTO _others_after FROM cb_stream_keys WHERE stream <> 'ledger';
+    ASSERT _others_after = _others_before,
+        format('key prune hit other streams: %s -> %s', _others_before, _others_after);
+
+    -- undefined stream raises
+    ok := false;
+    BEGIN PERFORM _cb_stream_prune_keys('ghost');
+    EXCEPTION WHEN OTHERS THEN ok := SQLERRM LIKE 'catbird:%'; END;
+    ASSERT ok, 'undefined stream did not raise';
+END $$;
+-- the delivery refresh: a key that waited out the whole retention window gets a
+-- fresh clock when its message is delivered — without the ref_created_at bump
+-- in _cb_stream_deliver_pending the next prune would delete this key while the
+-- message it guards is minutes old, letting a duplicate publish through
+SELECT p.ref_id FROM cb_stream_publish('ledger', 't', '4', key => 'reborn', delay => '1 millisecond') p;
+UPDATE cb_stream_keys SET ref_created_at = clock_timestamp() - interval '10 days'
+WHERE stream = 'ledger' AND key = 'reborn';
+SELECT pg_sleep(0.02);
+DO $$ BEGIN
+    ASSERT _cb_stream_deliver_pending() = 1, 'reborn not delivered';
+    ASSERT _cb_stream_prune_keys('ledger') = 0, 'prune deleted a just-delivered key';
+    ASSERT (SELECT ref_kind FROM cb_stream_keys WHERE stream = 'ledger' AND key = 'reborn') = 'message',
+        'reborn key gone or not swapped';
+END $$;
+
 \echo 'ALL STREAM TESTS PASSED'
