@@ -474,7 +474,8 @@ END; $$;
 
 No scan, no anti-join, no lock queue — one hot row per queue. Before bumping the
 counter, a consumer first adopts any expired claim (`FOR UPDATE SKIP LOCKED` on the
-tiny claim table — cold path, fine). Then per message in the range: run the handler;
+tiny claim table — cold path, fine). The sketch above shows a plain re-hand-out;
+adoption actually runs the **crash ladder** described below. Then per message in the range: run the handler;
 on failure, `cb_stream_fail` publishes a retry to the queue's retry stream or
 the DLQ per policy (§7, D21).
 A claim closes when every message *fetched for it* is handled (succeeded, retried,
@@ -503,9 +504,30 @@ call means real progress. A timer may extend instead, but only when the handler
 itself is killed after a timeout — then the extending stops when the work stops.
 A consumer that must stop early hands work back instead: `release` returns the
 whole claim, and a future `split` returns the unprocessed tail. A crashed
-consumer's whole range is redelivered. Those duplicates are coarser than
-per-message claims would produce; that is the price of the simpler mechanism,
-and it is at-least-once either way.
+consumer's range is redelivered whole — coarser duplicates than per-message
+claims would produce, the price of the simpler mechanism, and at-least-once
+either way. A range that *keeps* crashing does not redeliver forever, though: the
+crash ladder narrows it and dead-letters the message that proves to be the problem.
+
+**The crash ladder.** A single poison message would otherwise crash every
+consumer that adopts its range, endlessly. So each claim carries a `crashes`
+count, bumped on every adoption and bounded by the queue's `max_crashes`. Below
+the limit an expired claim is re-handed whole — an ordinary retry. At the limit
+the range stops going out whole: the adopter gets its **head message alone**, and
+the tail respawns as an already-expired claim carrying the count, so the next
+adopter isolates the next message and the range narrows to one at a time. A lone
+message that crashes with its count already past the limit is the proven culprit —
+it is dead-lettered, its claim closed, and `closed_position` advances past it. The
+**solo-trial rule** makes that safe: a count can only climb past the limit by
+crashing while *alone* in its claim, so nothing is dead-lettered without at least
+one isolated attempt — a message that failed only as collateral in a wider crash
+is never blamed.
+
+Two invariants hold across every branch (`stream_test.sql` checks them after each
+step): open and closed claims exactly tile `(closed_position, claimed_position]` —
+no gaps, no overlaps — and both positions only ever grow. Whoever splits or removes
+a claim must leave the tiling intact, or the closed position stalls and messages
+are lost to retention.
 
 What survives from each lineage. From **pgq**: positions, batches, the ticker,
 retention by rotation. From **pgmq**: nothing on the hot path. Its visibility
