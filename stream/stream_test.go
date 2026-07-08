@@ -177,6 +177,82 @@ func TestPublishRefs(t *testing.T) {
 	}
 }
 
+func TestConsume(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	if err := Ensure(ctx, pool, "go_c"); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureCursor(ctx, pool, "go_c", "worker", CursorOpts{StartPos: At(0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	publish := func(from, to int) {
+		t.Helper()
+		for i := from; i <= to; i++ {
+			if _, err := Publish(ctx, pool, "go_c", "t", i); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_c')"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	publish(1, 5)
+
+	got := make(chan Message, 16)
+	failedOnce := false // only the consumer goroutine touches it
+	cctx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() {
+		done <- Consume(cctx, pool, "go_c", "worker", func(_ context.Context, batch []Message) error {
+			if !failedOnce {
+				failedOnce = true
+				return errors.New("boom")
+			}
+			for _, m := range batch {
+				got <- m
+			}
+			return nil
+		}, ConsumeOpts{PollInterval: 20 * time.Millisecond})
+	}()
+
+	expect := func(from, to int) {
+		t.Helper()
+		for i := from; i <= to; i++ {
+			select {
+			case m := <-got:
+				if m.Pos != int64(i) {
+					t.Fatalf("pos = %d, want %d", m.Pos, i)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("timed out waiting for pos %d", i)
+			}
+		}
+	}
+
+	// the failed first batch rolls back and redelivers whole, in order
+	expect(1, 5)
+
+	// caught up: new messages arrive on the next tick
+	publish(6, 7)
+	expect(6, 7)
+
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("consume returned %v, want context.Canceled", err)
+	}
+
+	// an undefined cursor fails fast instead of retrying
+	err := Consume(ctx, pool, "go_c", "ghost", func(context.Context, []Message) error {
+		return nil
+	})
+	if !errors.Is(err, ErrNotDefined) {
+		t.Fatalf("consume on undefined cursor returned %v, want ErrNotDefined", err)
+	}
+}
+
 func TestDefineSchedule(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
