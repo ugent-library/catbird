@@ -33,10 +33,17 @@ RETURNS void LANGUAGE sql AS $$
 $$;
 -- +goose statementend
 
+-- +goose statementbegin
+CREATE FUNCTION cb_forever() RETURNS interval LANGUAGE sql IMMUTABLE AS $$
+    SELECT interval '-1 second'
+$$;
+-- +goose statementend
+
 CREATE TABLE cb_streams (
     name text PRIMARY KEY CHECK (_cb_valid_stream_name(name)),
     last_pos bigint NOT NULL DEFAULT 0,
-    retention interval CHECK (retention IS NULL OR retention > interval '0') -- NULL = keep forever
+    retention interval NOT NULL DEFAULT cb_forever()
+        CHECK (retention = cb_forever() OR retention > interval '0')
 );
 
 CREATE TABLE cb_stream_cursors (
@@ -144,27 +151,36 @@ CREATE TABLE cb_stream_schedules (
 CREATE INDEX ON cb_stream_schedules (next_at);
 
 -- +goose statementbegin
--- The internal version accepts the dotted names used by retry
--- and dead letter streams.
+-- Create the stream's physical partition. Shared by cb_stream_ensure
+-- and _cb_stream_ensure.
 -- Partition names encode dots as '__'.
-CREATE FUNCTION _cb_stream_ensure(stream text)
+CREATE FUNCTION _cb_stream_ensure_partition(stream text)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
-    _partition text;
+    _partition text := 'cbm__' || replace(_cb_stream_ensure_partition.stream, '.', '__');
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('cb_stream_ensure'));
+    EXECUTE format(
+        'CREATE TABLE IF NOT EXISTS %I PARTITION OF cb_stream_messages FOR VALUES IN (%L)',
+        _partition, _cb_stream_ensure_partition.stream);
+END; $$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- The internal version accepts the dotted names used by retry and dead letter
+-- streams.
+CREATE FUNCTION _cb_stream_ensure(stream text, retention interval DEFAULT NULL)
+RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
     IF NOT _cb_valid_stream_name(_cb_stream_ensure.stream) THEN
         RAISE EXCEPTION 'catbird: invalid stream name %', _cb_stream_ensure.stream;
     END IF;
 
-    _partition := 'cbm__' || replace(_cb_stream_ensure.stream, '.', '__');
+    INSERT INTO cb_streams (name, retention)
+    VALUES (_cb_stream_ensure.stream, coalesce(_cb_stream_ensure.retention, cb_forever()))
+    ON CONFLICT DO NOTHING;
 
-    PERFORM pg_advisory_xact_lock(hashtext('cb_stream_ensure'));
-
-    INSERT INTO cb_streams (name) VALUES (_cb_stream_ensure.stream) ON CONFLICT DO NOTHING;
-
-    EXECUTE format(
-        'CREATE TABLE IF NOT EXISTS %I PARTITION OF cb_stream_messages FOR VALUES IN (%L)',
-        _partition, _cb_stream_ensure.stream);
+    PERFORM _cb_stream_ensure_partition(_cb_stream_ensure.stream);
 END; $$;
 -- +goose statementend
 
@@ -177,15 +193,20 @@ BEGIN
             cb_stream_ensure.stream;
     END IF;
 
-    PERFORM _cb_stream_ensure(cb_stream_ensure.stream);
+    IF cb_stream_ensure.retention IS NOT NULL
+       AND cb_stream_ensure.retention <= interval '0'
+       AND cb_stream_ensure.retention <> cb_forever() THEN
+        RAISE EXCEPTION 'catbird: retention must be positive, or cb_forever() for no limit (got %)',
+            cb_stream_ensure.retention;
+    END IF;
 
-    -- Retention on the established coalesce pattern (like cb_stream_ensure_queue):
-    -- a NULL argument leaves it, a value sets or changes it; NULL on the row means
-    -- keep forever. Accepted gap, shared with every coalesced field -- a NULL
-    -- argument cannot reset a bounded stream back to forever (rare; raw UPDATE for now).
-    UPDATE cb_streams s
-    SET retention = coalesce(cb_stream_ensure.retention, s.retention)
-    WHERE s.name = cb_stream_ensure.stream;
+    INSERT INTO cb_streams (name, retention)
+    VALUES (cb_stream_ensure.stream, coalesce(cb_stream_ensure.retention, cb_forever()))
+    ON CONFLICT ON CONSTRAINT cb_streams_pkey DO UPDATE
+        SET retention = cb_stream_ensure.retention
+        WHERE cb_stream_ensure.retention IS NOT NULL;
+
+    PERFORM _cb_stream_ensure_partition(cb_stream_ensure.stream);
 END; $$;
 -- +goose statementend
 
@@ -680,7 +701,7 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'catbird: stream % not defined', _cb_stream_prune_messages.stream;
     END IF;
-    IF _retention IS NULL THEN
+    IF _retention < interval '0' THEN  -- cb_forever() sentinel: nothing to prune
         RETURN 0;
     END IF;
 
@@ -1106,7 +1127,8 @@ BEGIN
 
     _retry_stream := 'sr.' || _base_name || '.' || cb_stream_fail.queue;
 
-    PERFORM _cb_stream_ensure(_retry_stream);
+    -- retry messages are handled history: keep a bounded window, not forever
+    PERFORM _cb_stream_ensure(_retry_stream, interval '7 days');
     PERFORM cb_stream_ensure_queue(_retry_stream, cb_stream_fail.queue, 0);
 
     PERFORM _cb_stream_publish(
@@ -1148,7 +1170,8 @@ DROP FUNCTION cb_stream_publish_payloads(text, text, jsonb[]);
 DROP FUNCTION cb_stream_publish(text, text, jsonb, jsonb, text, interval, timestamptz);
 DROP FUNCTION _cb_stream_publish(text, text, jsonb, jsonb, text, interval, timestamptz);
 DROP FUNCTION cb_stream_ensure(text, interval);
-DROP FUNCTION _cb_stream_ensure(text);
+DROP FUNCTION _cb_stream_ensure(text, interval);
+DROP FUNCTION _cb_stream_ensure_partition(text);
 DROP FUNCTION _cb_stream_deliver_pending(int);
 DROP FUNCTION _cb_stream_assign_positions(text, int);
 DROP FUNCTION _cb_stream_notify(text, text);
@@ -1157,6 +1180,7 @@ DROP TABLE cb_stream_cursors;
 DROP TABLE cb_stream_keys;
 DROP TABLE cb_stream_pending;
 DROP TABLE cb_streams;
+DROP FUNCTION cb_forever(); -- after cb_streams: its default and CHECK depend on it
 DROP FUNCTION _cb_valid_stream_name(text);
 DROP FUNCTION cb_valid_name(text);
 DROP TYPE cb_ref_kind;

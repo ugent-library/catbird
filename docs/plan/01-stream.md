@@ -882,15 +882,20 @@ machinery anywhere.
 ## 10. Retention (D7)
 
 **Retention is the stream's one storage knob.** `cb_streams.retention` is an
-interval set through `cb_stream_ensure(stream, retention)` on the established
-coalesce pattern — a NULL argument leaves it, a value sets or changes it, exactly
-like `cb_stream_ensure_queue`'s policy fields. **NULL on the row means keep
-forever** (the default); a `CHECK` rejects zero or negative. One accepted gap,
-shared with every coalesced policy field: a NULL argument cannot *reset* a
-bounded stream back to forever — rare enough to leave to a raw `UPDATE` for now,
-with a negative-interval sentinel (never `0`, which reads as "delete now") the
-in-pattern fix if it ever matters. There is no granularity or partition knob —
-the user says how long to keep, never how it is stored.
+interval set through `cb_stream_ensure(stream, retention)`. One argument carries
+three states — the coalesce pattern plus a sentinel for the one plain-`NULL`
+can't carry: a **NULL** argument leaves the current setting (like every `ensure`
+field), a **positive** argument sets a bounded retention, and **`cb_forever()`**
+sets *forever*. Values are stored verbatim — what you pass is what's stored — so
+`ensure` is a plain `coalesce`, exactly like `cb_stream_ensure_queue`. Only the
+exact sentinel means forever; `0` or any other negative raises rather than
+silently becoming "keep forever". The column is **`NOT NULL DEFAULT
+cb_forever()`** (a `CHECK` allows only the sentinel or a positive duration):
+retention is always a deliberate set value, never `NULL` — a `NULL` would be
+indistinguishable from a forgotten write, so the stored sentinel is the more
+bug-resistant representation, and it also lets `ensure` reset a stream back to
+forever. There is no granularity or partition knob — the user says how
+long to keep, never how it is stored.
 
 **MVP mechanism: a batched delete, not a partition drop.**
 `_cb_stream_prune_messages(stream, retention?, batch)` deletes messages past the
@@ -923,6 +928,15 @@ Bounded is the norm; forever is deliberate.
 **Retention is a hard cap.** When it drops data a slow or absent consumer never
 reached, that consumer loses the span — by policy, not a bug. Under fan-out (02) a
 lagging cursor otherwise pins storage shared by everyone, so the cap has to win.
+
+**Auto-created streams get a creation-time default.** `_cb_stream_ensure` takes an
+optional retention set once at insert (`ON CONFLICT DO NOTHING`, so it never
+re-stamps or clobbers a later change). The rule is *drop what's handled, keep what
+hasn't*: a retry stream `sr.<base>.<queue>` defaults to a bounded window (its
+messages are handled — re-consumed or escalated — so old ones are just history),
+while a DLQ `sd.<base>` defaults to forever (its messages are unhandled, waiting
+for a human, and a timer silently dropping un-triaged failures is the one default
+that burns trust). User streams default to forever via the column.
 
 ### Deferred: drop-based retention, per stream (the escape hatch)
 

@@ -156,6 +156,11 @@ BEGIN
         'exhausted message not dead-lettered';
     ASSERT (SELECT headers->>'cb_origin_pos' FROM cb_stream_messages
             WHERE stream = 'sd.bills') = '1', 'origin lost';
+    -- auto-created stream retention defaults: retry bounded, DLQ forever
+    ASSERT (SELECT retention FROM cb_streams WHERE name = 'sr.bills.payer') = interval '7 days',
+        'retry stream default retention wrong';
+    ASSERT (SELECT retention FROM cb_streams WHERE name = 'sd.bills') = cb_forever(),
+        'dead-letter stream should keep forever';
 END $$;
 -- on_fail = 'drop': retries stop, nothing archived
 SELECT cb_stream_ensure('junk');
@@ -328,7 +333,7 @@ SELECT _cb_stream_assign_positions('keepall');
 UPDATE cb_stream_messages SET created_at = clock_timestamp() - interval '10 days'
 WHERE stream = 'keepall';
 DO $$
-DECLARE _deleted bigint; _others_before bigint; _others_after bigint;
+DECLARE _deleted bigint; _others_before bigint; _others_after bigint; ok boolean;
 BEGIN
     SELECT count(*) INTO _others_before
     FROM cb_stream_messages WHERE stream NOT IN ('audit', 'keepall');
@@ -339,7 +344,9 @@ BEGIN
     ASSERT (SELECT count(*) FROM cb_stream_messages WHERE stream = 'audit') = 4,
         'survivor count wrong';
 
-    -- forever: no retention configured, so old messages are kept
+    -- forever: a new stream defaults to cb_forever(), so old messages are kept
+    ASSERT (SELECT retention FROM cb_streams WHERE name = 'keepall') = cb_forever(),
+        'new stream did not default to forever';
     ASSERT _cb_stream_prune_messages('keepall') = 0, 'forever stream pruned';
     ASSERT (SELECT count(*) FROM cb_stream_messages WHERE stream = 'keepall') = 3,
         'forever stream lost messages';
@@ -360,17 +367,27 @@ BEGIN
     -- survivors are recent, so a second prune removes nothing
     ASSERT _cb_stream_prune_messages('audit') = 0, 'second prune deleted survivors';
 
-    -- ensure follows the coalesce pattern: a bare re-ensure leaves retention,
-    -- a value changes it, and the column CHECK rejects a nonsensical <= 0
+    -- ensure retention, three states through one argument: a bare re-ensure
+    -- leaves it, a value changes it, cb_forever() resets to forever
     PERFORM cb_stream_ensure('audit');
     ASSERT (SELECT retention FROM cb_streams WHERE name = 'audit') = interval '7 days',
         'bare re-ensure changed retention';
     PERFORM cb_stream_ensure('audit', '14 days');
     ASSERT (SELECT retention FROM cb_streams WHERE name = 'audit') = interval '14 days',
         'ensure did not change retention';
-    BEGIN
-        PERFORM cb_stream_ensure('audit', '0');
-        ASSERT false, 'zero retention not rejected';
-    EXCEPTION WHEN check_violation THEN NULL; END;
+    PERFORM cb_stream_ensure('audit', cb_forever());
+    ASSERT (SELECT retention FROM cb_streams WHERE name = 'audit') = cb_forever(),
+        'cb_forever did not reset retention to forever';
+
+    -- 0 and any non-sentinel negative are rejected with a catbird error, never
+    -- silently coerced to forever
+    ok := false;
+    BEGIN PERFORM cb_stream_ensure('audit', interval '0');
+    EXCEPTION WHEN OTHERS THEN ok := SQLERRM LIKE 'catbird:%'; END;
+    ASSERT ok, 'zero retention not rejected';
+    ok := false;
+    BEGIN PERFORM cb_stream_ensure('audit', interval '-5 days');
+    EXCEPTION WHEN OTHERS THEN ok := SQLERRM LIKE 'catbird:%'; END;
+    ASSERT ok, 'non-sentinel negative not rejected';
 END $$;
 \echo 'ALL STREAM TESTS PASSED'
