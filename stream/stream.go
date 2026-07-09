@@ -21,7 +21,11 @@ type Conn interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-var ErrNotDefined = errors.New("catbird: not defined")
+var (
+	ErrInvalid    = errors.New("catbird: invalid argument")
+	ErrNotDefined = errors.New("catbird: not defined")
+	ErrNotFound   = errors.New("catbird: not found")
+)
 
 // Forever mirrors cb_forever(): a retention with no limit.
 const Forever = -time.Second
@@ -98,14 +102,24 @@ func nullTime(t time.Time) *time.Time {
 }
 
 // wrapErr translates the SQL surface's raised errors into the package
-// sentinels so callers can use errors.Is.
+// sentinels so callers can use errors.Is. The SQLSTATE codes are declared
+// at the top of stream/migrations/00001_stream.sql.
 func wrapErr(err error) error {
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) &&
-		strings.HasPrefix(pgErr.Message, "catbird:") &&
-		strings.HasSuffix(pgErr.Message, "not defined") {
-		return fmt.Errorf("%w: %s", ErrNotDefined,
-			strings.TrimPrefix(pgErr.Message, "catbird: "))
+	if !errors.As(err, &pgErr) {
+		return err
 	}
-	return err
+	var sentinel error
+	switch pgErr.Code {
+	case "IRD01":
+		sentinel = ErrInvalid
+	case "IRD02":
+		sentinel = ErrNotDefined
+	case "IRD03":
+		sentinel = ErrNotFound
+	default:
+		return err
+	}
+	return fmt.Errorf("%w: %s", sentinel,
+		strings.TrimPrefix(pgErr.Message, "catbird: "))
 }

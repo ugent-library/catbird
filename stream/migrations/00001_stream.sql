@@ -1,5 +1,13 @@
 -- +goose up
 
+-- Every error this API raises carries one of these SQLSTATE codes, so
+-- clients classify by code instead of parsing message text:
+--   IRD01  invalid argument  the call itself is malformed
+--   IRD02  not defined       the stream, queue, cursor or schedule does not exist
+--   IRD03  not found         the message does not exist
+-- Why IRD: the natural prefix CB sits in the SQLSTATE class range the
+-- standard reserves for itself (0-4, A-H).
+
 CREATE TYPE cb_ref_kind AS ENUM ('message', 'pending');
 CREATE TYPE cb_backoff_kind AS ENUM ('none', 'fixed', 'full_jitter');
 CREATE TYPE cb_fail_policy AS ENUM ('dead_letter', 'drop');
@@ -173,7 +181,7 @@ CREATE FUNCTION _cb_stream_ensure(stream text, retention interval DEFAULT NULL)
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
     IF NOT _cb_valid_stream_name(_cb_stream_ensure.stream) THEN
-        RAISE EXCEPTION 'catbird: invalid stream name %', _cb_stream_ensure.stream;
+        RAISE EXCEPTION 'catbird: invalid stream name %', _cb_stream_ensure.stream USING ERRCODE = 'IRD01';
     END IF;
 
     INSERT INTO cb_streams (name, retention)
@@ -190,14 +198,14 @@ RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
     IF NOT cb_valid_name(cb_stream_ensure.stream) THEN
         RAISE EXCEPTION 'catbird: invalid stream name %; use [a-z][a-z0-9_]*, max 20 bytes',
-            cb_stream_ensure.stream;
+            cb_stream_ensure.stream USING ERRCODE = 'IRD01';
     END IF;
 
     IF cb_stream_ensure.retention IS NOT NULL
        AND cb_stream_ensure.retention <= interval '0'
        AND cb_stream_ensure.retention <> cb_forever() THEN
         RAISE EXCEPTION 'catbird: retention must be positive, or cb_forever() for no limit (got %)',
-            cb_stream_ensure.retention;
+            cb_stream_ensure.retention USING ERRCODE = 'IRD01';
     END IF;
 
     INSERT INTO cb_streams (name, retention)
@@ -216,14 +224,14 @@ DECLARE
 BEGIN
     IF NOT cb_valid_name(cb_stream_ensure_cursor.cursor) THEN
         RAISE EXCEPTION 'catbird: invalid cursor name %; use [a-z][a-z0-9_]*, max 20 bytes',
-            cb_stream_ensure_cursor.cursor;
+            cb_stream_ensure_cursor.cursor USING ERRCODE = 'IRD01';
     END IF;
 
     -- NULL start = tail: skip everything already in the stream.
     SELECT coalesce(cb_stream_ensure_cursor.start_pos, s.last_pos)
     INTO _start FROM cb_streams s WHERE s.name = cb_stream_ensure_cursor.stream;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_ensure_cursor.stream;
+        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_ensure_cursor.stream USING ERRCODE = 'IRD02';
     END IF;
 
     INSERT INTO cb_stream_cursors (stream, name, pos)
@@ -251,7 +259,7 @@ DECLARE
 BEGIN
     IF NOT cb_valid_name(cb_stream_ensure_queue.queue) THEN
         RAISE EXCEPTION 'catbird: invalid queue name %; use [a-z][a-z0-9_]*, max 20 bytes',
-            cb_stream_ensure_queue.queue;
+            cb_stream_ensure_queue.queue USING ERRCODE = 'IRD01';
     END IF;
 
     SELECT coalesce(cb_stream_ensure_queue.start_pos, s.last_pos)
@@ -259,7 +267,7 @@ BEGIN
     FROM cb_streams s
     WHERE s.name = cb_stream_ensure_queue.stream;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_ensure_queue.stream;
+        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_ensure_queue.stream USING ERRCODE = 'IRD02';
     END IF;
 
     INSERT INTO cb_stream_queues
@@ -299,31 +307,31 @@ DECLARE
 BEGIN
     IF NOT cb_valid_name(cb_stream_define_schedule.name) THEN
         RAISE EXCEPTION 'catbird: invalid schedule name %; use [a-z][a-z0-9_]*, max 20 bytes',
-            cb_stream_define_schedule.name;
+            cb_stream_define_schedule.name USING ERRCODE = 'IRD01';
     END IF;
 
     IF cb_stream_define_schedule.every IS NULL THEN
         RAISE EXCEPTION 'catbird: schedule %.% needs an interval',
-            cb_stream_define_schedule.stream, cb_stream_define_schedule.name;
+            cb_stream_define_schedule.stream, cb_stream_define_schedule.name USING ERRCODE = 'IRD01';
     END IF;
 
     IF extract(day   FROM cb_stream_define_schedule.every) <> 0
     OR extract(month FROM cb_stream_define_schedule.every) <> 0
     OR extract(year  FROM cb_stream_define_schedule.every) <> 0 THEN
         RAISE EXCEPTION 'catbird: schedule interval must be hours or less (got %); days, months and years need cron',
-            cb_stream_define_schedule.every;
+            cb_stream_define_schedule.every USING ERRCODE = 'IRD01';
     END IF;
 
     -- cb_ header keys are catbird's own.
     IF cb_stream_define_schedule.headers IS NOT NULL
        AND EXISTS (SELECT 1 FROM jsonb_object_keys(cb_stream_define_schedule.headers) AS k
                    WHERE left(k, 3) = 'cb_') THEN
-        RAISE EXCEPTION 'catbird: header keys starting with cb_ are reserved';
+        RAISE EXCEPTION 'catbird: header keys starting with cb_ are reserved' USING ERRCODE = 'IRD01';
     END IF;
 
     PERFORM 1 FROM cb_streams s WHERE s.name = cb_stream_define_schedule.stream;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_define_schedule.stream;
+        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_define_schedule.stream USING ERRCODE = 'IRD02';
     END IF;
 
     -- Topics are never empty; empty means none.
@@ -401,7 +409,7 @@ BEGIN
     -- Header keys starting with cb_ are for catbird's own use.
     IF EXISTS (SELECT 1 FROM jsonb_object_keys(cb_stream_publish.headers) AS k
                WHERE left(k, 3) = 'cb_') THEN
-        RAISE EXCEPTION 'catbird: header keys starting with cb_ are reserved';
+        RAISE EXCEPTION 'catbird: header keys starting with cb_ are reserved' USING ERRCODE = 'IRD01';
     END IF;
 
     SELECT p.ref_kind, p.ref_id, p.existing INTO ref_kind, ref_id, existing
@@ -437,7 +445,7 @@ BEGIN
 
     -- Validate arguments.
     IF delay IS NOT NULL AND _cb_stream_publish.deliver_at IS NOT NULL THEN
-        RAISE EXCEPTION 'catbird: cannot specify both delay and deliver_at';
+        RAISE EXCEPTION 'catbird: cannot specify both delay and deliver_at' USING ERRCODE = 'IRD01';
     END IF;
 
     _deliver_at := coalesce(_cb_stream_publish.deliver_at, clock_timestamp() + _cb_stream_publish.delay);
@@ -446,7 +454,7 @@ BEGIN
     -- Check the stream exists.
     PERFORM 1 FROM cb_streams s WHERE s.name = _cb_stream_publish.stream;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: stream % not defined', _cb_stream_publish.stream;
+        RAISE EXCEPTION 'catbird: stream % not defined', _cb_stream_publish.stream USING ERRCODE = 'IRD02';
     END IF;
 
     ---- Deduplication by key. ----
@@ -548,7 +556,7 @@ RETURNS SETOF bigint LANGUAGE plpgsql AS $$
 BEGIN
     PERFORM 1 FROM cb_streams s WHERE s.name = cb_stream_publish_payloads.stream;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_publish_payloads.stream;
+        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_publish_payloads.stream USING ERRCODE = 'IRD02';
     END IF;
 
     RETURN QUERY
@@ -700,7 +708,7 @@ BEGIN
     SELECT s.retention INTO _retention
     FROM cb_streams s WHERE s.name = _cb_stream_prune_messages.stream;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: stream % not defined', _cb_stream_prune_messages.stream;
+        RAISE EXCEPTION 'catbird: stream % not defined', _cb_stream_prune_messages.stream USING ERRCODE = 'IRD02';
     END IF;
     IF _retention < interval '0' THEN  -- cb_forever() sentinel: nothing to prune
         RETURN 0;
@@ -733,7 +741,7 @@ BEGIN
     SELECT s.retention INTO _retention
     FROM cb_streams s WHERE s.name = _cb_stream_prune_keys.stream;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: stream % not defined', _cb_stream_prune_keys.stream;
+        RAISE EXCEPTION 'catbird: stream % not defined', _cb_stream_prune_keys.stream USING ERRCODE = 'IRD02';
     END IF;
     IF _retention < interval '0' THEN  -- cb_forever() sentinel: nothing to prune
         RETURN 0;
@@ -770,7 +778,7 @@ BEGIN
     FOR UPDATE;
 
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: cursor %.% not defined', cb_stream_read.stream, cb_stream_read.cursor;
+        RAISE EXCEPTION 'catbird: cursor %.% not defined', cb_stream_read.stream, cb_stream_read.cursor USING ERRCODE = 'IRD02';
     END IF;
 
     SELECT max(b.pos) INTO _new_pos FROM (
@@ -862,7 +870,7 @@ BEGIN
     INTO _ttl, _max_crashes FROM cb_stream_queues q
     WHERE q.stream = cb_stream_claim.stream AND q.name = cb_stream_claim.queue;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: queue %.% not defined', cb_stream_claim.stream, cb_stream_claim.queue;
+        RAISE EXCEPTION 'catbird: queue %.% not defined', cb_stream_claim.stream, cb_stream_claim.queue USING ERRCODE = 'IRD02';
     END IF;
 
     ---- Try to adopt an expired claim. ----
@@ -991,7 +999,7 @@ DECLARE
     _expires_at timestamptz;
 BEGIN
     IF cb_stream_extend_claim.ttl <= '0' THEN
-        RAISE EXCEPTION 'catbird: invalid ttl %', cb_stream_extend_claim.ttl;
+        RAISE EXCEPTION 'catbird: invalid ttl %', cb_stream_extend_claim.ttl USING ERRCODE = 'IRD01';
     END IF;
 
     UPDATE cb_stream_claims c
@@ -1066,7 +1074,7 @@ BEGIN
                       _cb_backoff.max_delay);
         RETURN _cap * random();
     ELSE
-        RAISE EXCEPTION 'catbird: unknown backoff kind %', _cb_backoff.kind;
+        RAISE EXCEPTION 'catbird: unknown backoff kind %', _cb_backoff.kind USING ERRCODE = 'IRD01';
     END CASE;
 END; $$;
 -- +goose statementend
@@ -1135,7 +1143,7 @@ BEGIN
     WHERE m.stream = cb_stream_fail.stream AND m.pos = cb_stream_fail.pos;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'catbird: message %.% not found',
-            cb_stream_fail.stream, cb_stream_fail.pos;
+            cb_stream_fail.stream, cb_stream_fail.pos USING ERRCODE = 'IRD03';
     END IF;
 
     _base_name := CASE WHEN cb_stream_fail.stream LIKE '%.%'
@@ -1145,7 +1153,7 @@ BEGIN
     SELECT q.* INTO _q FROM cb_stream_queues q
     WHERE q.stream = _base_name AND q.name = cb_stream_fail.queue;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: queue %.% not defined', _base_name, cb_stream_fail.queue;
+        RAISE EXCEPTION 'catbird: queue %.% not defined', _base_name, cb_stream_fail.queue USING ERRCODE = 'IRD02';
     END IF;
 
     _attempt := coalesce((_m.headers->>'cb_attempt')::int, 0) + 1;

@@ -358,6 +358,139 @@ func TestRunJobs(t *testing.T) {
 	}
 }
 
+func TestConsumeQueue(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	if err := Ensure(ctx, pool, "go_cq"); err != nil {
+		t.Fatal(err)
+	}
+	// no backoff so the failed message retries immediately
+	if err := EnsureQueue(ctx, pool, "go_cq", "m", QueueOpts{
+		StartPos:    At(0),
+		BackoffKind: BackoffNone,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	jctx, cancel := context.WithCancel(ctx)
+	jobsDone := make(chan error, 1)
+	go func() {
+		jobsDone <- RunJobs(jctx, pool, JobsOpts{
+			AssignPositionsInterval: 20 * time.Millisecond,
+			DeliverInterval:         20 * time.Millisecond,
+		})
+	}()
+
+	for i := 1; i <= 5; i++ {
+		if _, err := Publish(ctx, pool, "go_cq", "t", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var mu sync.Mutex
+	counts := map[string]int{}
+	handled := make(chan struct{}, 32)
+	failedOnce := false
+	queueDone := make(chan error, 1)
+	go func() {
+		queueDone <- ConsumeQueue(jctx, pool, "go_cq", "m", func(_ context.Context, m Message) error {
+			mu.Lock()
+			defer mu.Unlock()
+			if string(m.Payload) == "3" && !failedOnce {
+				failedOnce = true
+				return errors.New("boom")
+			}
+			counts[string(m.Payload)]++
+			handled <- struct{}{}
+			return nil
+		}, ConsumeQueueOpts{PollInterval: 20 * time.Millisecond})
+	}()
+
+	// all five process; the failed one comes back through the retry stream
+	for range 5 {
+		select {
+		case <-handled:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for messages")
+		}
+	}
+	mu.Lock()
+	for i := 1; i <= 5; i++ {
+		if counts[strconv.Itoa(i)] != 1 {
+			t.Fatalf("counts = %v, want each of 1..5 exactly once", counts)
+		}
+	}
+	mu.Unlock()
+
+	var retried int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM cb_stream_messages WHERE stream = 'sr.go_cq.m'`).Scan(&retried); err != nil {
+		t.Fatal(err)
+	}
+	if retried != 1 {
+		t.Fatalf("retry stream holds %d messages, want 1", retried)
+	}
+
+	// the base queue drains: closed_pos reaches the tail
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var closed int64
+		if err := pool.QueryRow(ctx,
+			`SELECT closed_pos FROM cb_stream_queues WHERE stream = 'go_cq' AND name = 'm'`).Scan(&closed); err != nil {
+			t.Fatal(err)
+		}
+		if closed == 5 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("closed_pos = %d, want 5", closed)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cancel()
+	if err := <-queueDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("queue consume returned %v, want context.Canceled", err)
+	}
+	if err := <-jobsDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("jobs returned %v, want context.Canceled", err)
+	}
+
+	// adoption: a dead consumer's claim expires and another consumer takes it
+	if err := EnsureQueue(ctx, pool, "go_cq", "adopt", QueueOpts{
+		StartPos: At(0),
+		ClaimTTL: 50 * time.Millisecond,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`SELECT cb_stream_claim('go_cq', 'adopt', 'dead')`); err != nil {
+		t.Fatal(err)
+	}
+
+	adopted := make(chan Message, 16)
+	actx, acancel := context.WithCancel(ctx)
+	adoptDone := make(chan error, 1)
+	go func() {
+		adoptDone <- ConsumeQueue(actx, pool, "go_cq", "adopt", func(_ context.Context, m Message) error {
+			adopted <- m
+			return nil
+		}, ConsumeQueueOpts{PollInterval: 20 * time.Millisecond})
+	}()
+	for range 5 {
+		select {
+		case <-adopted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for the expired claim to be adopted")
+		}
+	}
+	acancel()
+	if err := <-adoptDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("adopting consume returned %v, want context.Canceled", err)
+	}
+}
+
 func TestDefineSchedule(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()

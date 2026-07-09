@@ -34,10 +34,6 @@ func Read(ctx context.Context, conn Conn, stream, cursor string, batchSize int) 
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	msgs, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Message, error) {
-		var m Message
-		err := row.Scan(&m.ID, &m.Stream, &m.Pos, &m.Topic, &m.Payload, &m.Headers, &m.CreatedAt)
-		return m, err
-	})
+	msgs, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Message])
 	return msgs, wrapErr(err)
 }

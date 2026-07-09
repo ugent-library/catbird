@@ -94,17 +94,17 @@ BEGIN
     ok := false;
     BEGIN
         PERFORM cb_stream_claim('orders', 'nope', 'c1', 3);
-    EXCEPTION WHEN OTHERS THEN ok := SQLERRM LIKE 'catbird:%'; END;
+    EXCEPTION WHEN SQLSTATE 'IRD02' THEN ok := true; END;
     ASSERT ok, 'undefined queue did not raise';
     ok := false;
     BEGIN
         PERFORM cb_stream_extend_claim('orders', 'mailer', 'c1', 1, ttl => '0');
-    EXCEPTION WHEN OTHERS THEN ok := SQLERRM LIKE 'catbird:%'; END;
+    EXCEPTION WHEN SQLSTATE 'IRD01' THEN ok := true; END;
     ASSERT ok, 'non-positive ttl did not raise';
     ok := false;
     BEGIN
         PERFORM cb_stream_publish('orders', 't', '1', headers => '{"cb_x": 1}');
-    EXCEPTION WHEN OTHERS THEN ok := SQLERRM LIKE 'catbird:%'; END;
+    EXCEPTION WHEN SQLSTATE 'IRD01' THEN ok := true; END;
     ASSERT ok, 'reserved cb_ header did not raise';
 END $$;
 
@@ -316,7 +316,7 @@ BEGIN
     ok := false;
     BEGIN
         PERFORM cb_stream_define_schedule('beats', 'stable', every => NULL);
-    EXCEPTION WHEN OTHERS THEN ok := SQLERRM LIKE 'catbird:%'; END;
+    EXCEPTION WHEN SQLSTATE 'IRD01' THEN ok := true; END;
     ASSERT ok, 'define with a NULL cadence was accepted';
 
     -- delete: true when present, false when absent, row gone
@@ -331,7 +331,7 @@ BEGIN
     ok := false;
     BEGIN
         PERFORM cb_stream_define_schedule('beats', 'daily', every => '1 day');
-    EXCEPTION WHEN OTHERS THEN ok := SQLERRM LIKE 'catbird:%'; END;
+    EXCEPTION WHEN SQLSTATE 'IRD01' THEN ok := true; END;
     ASSERT ok, 'ensure did not reject a calendar interval';
     -- the table CHECK guards a direct insert too (pure-SQL client protection)
     ok := false;
@@ -411,11 +411,11 @@ BEGIN
     -- silently coerced to forever
     ok := false;
     BEGIN PERFORM cb_stream_ensure('audit', interval '0');
-    EXCEPTION WHEN OTHERS THEN ok := SQLERRM LIKE 'catbird:%'; END;
+    EXCEPTION WHEN SQLSTATE 'IRD01' THEN ok := true; END;
     ASSERT ok, 'zero retention not rejected';
     ok := false;
     BEGIN PERFORM cb_stream_ensure('audit', interval '-5 days');
-    EXCEPTION WHEN OTHERS THEN ok := SQLERRM LIKE 'catbird:%'; END;
+    EXCEPTION WHEN SQLSTATE 'IRD01' THEN ok := true; END;
     ASSERT ok, 'non-sentinel negative not rejected';
 END $$;
 \echo '== I. key prune: age out, keep pending, forever, delivery refresh =='
@@ -459,7 +459,7 @@ BEGIN
     -- undefined stream raises
     ok := false;
     BEGIN PERFORM _cb_stream_prune_keys('ghost');
-    EXCEPTION WHEN OTHERS THEN ok := SQLERRM LIKE 'catbird:%'; END;
+    EXCEPTION WHEN SQLSTATE 'IRD02' THEN ok := true; END;
     ASSERT ok, 'undefined stream did not raise';
 END $$;
 -- the delivery refresh: a key that waited out the whole retention window gets a
