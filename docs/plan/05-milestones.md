@@ -108,16 +108,18 @@ materially worse than the tick math, stop and revisit D1 before building on it.
 The ~30–80ms end-state target is re-measured at M5 when the NOTIFY accelerator
 lands (D17).**
 
-## M2 — stream queue mode: claims, pending, retries, dedup, DLQ
+## M2 — stream queue mode: claims, pending, retries, dedup, dead letters
 
 01 §§5–9: range claims with per-claim TTL expiry and extend (D23), delivery of the
 pending table (delay; retries are delayed publishes to per-queue retry streams, D21)
 and the schedule table (cron), DB-side retry policy (`cb_stream_fail`), the
-keep-oldest key rule, DLQ + `Redrive`.
+keep-oldest key rule, dead letters + `Redrive`. Amended before M3 by D27/D28:
+claims as atoms with quarantine instead of the crash ladder, the loop-owned
+clock, `claim_batch_size` as queue policy, eager retry-stream birth.
 
 *Exit:* claim-crash test (kill consumer mid-range, claim expires, duplicates
 bounded by range size);
-poison message reaches DLQ after policy attempts with correct backoff timing;
+poison message reaches the dead letter stream after policy attempts with correct backoff timing;
 the key rule holds (skip-while-known, `existing` reported);
 schedules fire and re-arm honoring `catch_up_policy` (port scheduler tests'
 semantic core); throughput benchmark ≥ current `BenchmarkQueueThroughput`

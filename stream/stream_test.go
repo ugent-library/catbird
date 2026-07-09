@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -58,14 +59,14 @@ func setupTest(t *testing.T) *pgxpool.Pool {
 // claimRange claims the next batch for a consumer; ok reports whether there
 // was anything to claim.
 func claimRange(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
-	stream, queue, consumer string, batchSize int,
+	stream, queue, consumer string,
 ) (fromPos, toPos int64, ok bool) {
 	t.Helper()
 	var from, to *int64
 	var expiresAt *time.Time
 	if err := pool.QueryRow(ctx,
-		`SELECT c.from_pos, c.to_pos, c.expires_at FROM cb_stream_claim($1, $2, $3, $4) c`,
-		stream, queue, consumer, batchSize).Scan(&from, &to, &expiresAt); err != nil {
+		`SELECT c.from_pos, c.to_pos, c.expires_at FROM cb_stream_claim($1, $2, $3) c`,
+		stream, queue, consumer).Scan(&from, &to, &expiresAt); err != nil {
 		t.Fatal(err)
 	}
 	if from == nil {
@@ -526,10 +527,12 @@ func TestConsumeQueue(t *testing.T) {
 	}
 
 	// adoption: a dead consumer's claim expires and another consumer takes it
-	if err := EnsureQueue(ctx, pool, "go_cq", "adopt", QueueOpts{
-		StartPos: At(0),
-		ClaimTTL: 50 * time.Millisecond,
-	}); err != nil {
+	if err := EnsureQueue(ctx, pool, "go_cq", "adopt", QueueOpts{StartPos: At(0)}); err != nil {
+		t.Fatal(err)
+	}
+	// crash detection latency is engine mechanics, tuned on the row
+	if _, err := pool.Exec(ctx, `UPDATE cb_stream_queues SET claim_ttl = interval '50 milliseconds'
+		WHERE stream = 'go_cq' AND name = 'adopt'`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx,
@@ -683,7 +686,6 @@ func TestEnsureQueue(t *testing.T) {
 	}
 	if err := EnsureQueue(ctx, pool, "go_q", "mailer", QueueOpts{
 		StartPos:    At(0),
-		ClaimTTL:    time.Minute,
 		MaxAttempts: 5,
 		BackoffKind: BackoffFixed,
 		OnFail:      FailDrop,
@@ -704,20 +706,144 @@ func TestEnsureQueue(t *testing.T) {
 	}
 
 	row()
-	if claimTTL != "00:01:00" || maxAttempts != 5 || backoffKind != "fixed" || onFail != "drop" {
+	if claimTTL != "00:00:30" || maxAttempts != 5 || backoffKind != "fixed" || onFail != "drop" {
 		t.Fatalf("queue = %s %d %s %s", claimTTL, maxAttempts, backoffKind, onFail)
 	}
-	if maxCrashes != 3 { // unmentioned: the default
+	if maxCrashes != 3 { // engine mechanics: always the default at birth
 		t.Fatalf("max_crashes = %d, want the default 3", maxCrashes)
 	}
 
 	// ensure is birth-only: an existing queue is never modified
-	if err := EnsureQueue(ctx, pool, "go_q", "mailer", QueueOpts{MaxCrashes: 7}); err != nil {
+	if err := EnsureQueue(ctx, pool, "go_q", "mailer", QueueOpts{MaxAttempts: 9}); err != nil {
 		t.Fatal(err)
 	}
 	row()
 	if maxCrashes != 3 || maxAttempts != 5 || backoffKind != "fixed" {
 		t.Fatalf("queue after re-ensure = %d %d %s, want unchanged", maxCrashes, maxAttempts, backoffKind)
+	}
+
+	// declaring the queue declared its retry route: bounded history, the
+	// queue's stored terms copied, one message per claim
+	var retryBounded bool
+	if err := pool.QueryRow(ctx,
+		`SELECT retention = interval '7 days' FROM cb_streams WHERE name = 'sr.go_q.mailer'`).Scan(&retryBounded); err != nil {
+		t.Fatal(err)
+	}
+	if !retryBounded {
+		t.Fatal("retry stream not born with the queue, or with the wrong retention")
+	}
+	var retryBatch int
+	var retryTTL, retryOnFail string
+	if err := pool.QueryRow(ctx, `SELECT claim_batch_size, claim_ttl::text, on_fail::text
+		FROM cb_stream_queues WHERE stream = 'sr.go_q.mailer' AND name = 'mailer'`,
+	).Scan(&retryBatch, &retryTTL, &retryOnFail); err != nil {
+		t.Fatal(err)
+	}
+	if retryBatch != 1 || retryTTL != "00:00:30" || retryOnFail != "drop" {
+		t.Fatalf("retry queue row = batch %d, ttl %s, on_fail %s; want 1, the parent's ttl and policy",
+			retryBatch, retryTTL, retryOnFail)
+	}
+
+	// solo attribution is a constraint, not a convention
+	if _, err := pool.Exec(ctx,
+		`UPDATE cb_stream_queues SET claim_batch_size = 5 WHERE stream = 'sr.go_q.mailer'`); err == nil {
+		t.Fatal("a retry queue accepted a claim batch above 1")
+	}
+
+	// batch size is queue policy, born at ensure
+	if err := EnsureQueue(ctx, pool, "go_q", "sized", QueueOpts{StartPos: At(0), ClaimBatchSize: 7}); err != nil {
+		t.Fatal(err)
+	}
+	var batch int
+	if err := pool.QueryRow(ctx, `SELECT claim_batch_size FROM cb_stream_queues
+		WHERE stream = 'go_q' AND name = 'sized'`).Scan(&batch); err != nil {
+		t.Fatal(err)
+	}
+	if batch != 7 {
+		t.Fatalf("claim_batch_size = %d, want 7", batch)
+	}
+
+	// queues live on plain streams; engine-made streams are read with cursors
+	if err := EnsureQueue(ctx, pool, "sd.go_q", "triage"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("queue on a dotted stream returned %v, want ErrInvalid", err)
+	}
+}
+
+// the loop owns the clock: a handler slower than the claim ttl keeps its
+// claim through extension — processed once, nothing quarantined
+func TestConsumeQueueSlowHandler(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	if err := Ensure(ctx, pool, "go_slow"); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureQueue(ctx, pool, "go_slow", "s", QueueOpts{StartPos: At(0)}); err != nil {
+		t.Fatal(err)
+	}
+	// a short crash-detection window, so the handler outlives it three times
+	if _, err := pool.Exec(ctx, `UPDATE cb_stream_queues SET claim_ttl = interval '300 milliseconds'
+		WHERE stream = 'go_slow' AND name = 's'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Publish(ctx, pool, "go_slow", "t", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_slow')"); err != nil {
+		t.Fatal(err)
+	}
+
+	handled := make(chan struct{}, 4)
+	cctx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() {
+		done <- ConsumeQueue(cctx, pool, "go_slow", "s", func(hctx context.Context, m Message) error {
+			select {
+			case <-time.After(900 * time.Millisecond): // three claim ttls
+			case <-hctx.Done():
+				return hctx.Err()
+			}
+			handled <- struct{}{}
+			return nil
+		}, ConsumeQueueOpts{PollInterval: 20 * time.Millisecond})
+	}()
+
+	select {
+	case <-handled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the slow handler")
+	}
+
+	// the claim survived its handler: the range closes and nothing crashed
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var closed int64
+		if err := pool.QueryRow(ctx,
+			`SELECT closed_pos FROM cb_stream_queues WHERE stream = 'go_slow' AND name = 's'`).Scan(&closed); err != nil {
+			t.Fatal(err)
+		}
+		if closed == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("closed_pos = %d, want 1", closed)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var quarantined int
+	if err := pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM cb_stream_pending WHERE stream = 'sr.go_slow.s')
+		+ (SELECT count(*) FROM cb_stream_messages WHERE stream = 'sr.go_slow.s')`,
+	).Scan(&quarantined); err != nil {
+		t.Fatal(err)
+	}
+	if quarantined != 0 {
+		t.Fatalf("%d copies reached the retry stream, want none", quarantined)
+	}
+
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("consume returned %v, want context.Canceled", err)
 	}
 }
 
@@ -737,12 +863,16 @@ func TestClaims(t *testing.T) {
 	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_b')"); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsureQueue(ctx, pool, "go_b", "mailer", QueueOpts{StartPos: At(0)}); err != nil {
+	// batch size is queue policy: three per claim
+	if err := EnsureQueue(ctx, pool, "go_b", "mailer", QueueOpts{
+		StartPos:       At(0),
+		ClaimBatchSize: 3,
+	}); err != nil {
 		t.Fatal(err)
 	}
 
 	// c1 takes the first batch
-	if from, to, ok := claimRange(t, ctx, pool, "go_b", "mailer", "c1", 3); !ok || from != 1 || to != 3 {
+	if from, to, ok := claimRange(t, ctx, pool, "go_b", "mailer", "c1"); !ok || from != 1 || to != 3 {
 		t.Fatalf("claim = %d..%d, %v, want 1..3", from, to, ok)
 	}
 
@@ -750,8 +880,8 @@ func TestClaims(t *testing.T) {
 	var from2, to2 *int64
 	var exp *time.Time
 	if err := pool.QueryRow(ctx,
-		`SELECT c.from_pos, c.to_pos, c.expires_at FROM cb_stream_claim($1, $2, $3, $4, $5) c`,
-		"go_b", "mailer", "c2", 3, nullInterval(15*time.Minute)).Scan(&from2, &to2, &exp); err != nil {
+		`SELECT c.from_pos, c.to_pos, c.expires_at FROM cb_stream_claim($1, $2, $3, $4) c`,
+		"go_b", "mailer", "c2", nullInterval(15*time.Minute)).Scan(&from2, &to2, &exp); err != nil {
 		t.Fatal(err)
 	}
 	if from2 == nil || *from2 != 4 || *to2 != 5 {
@@ -767,7 +897,7 @@ func TestClaims(t *testing.T) {
 	}
 
 	// caught up: nothing to claim
-	if from, to, ok := claimRange(t, ctx, pool, "go_b", "mailer", "c1", 3); ok {
+	if from, to, ok := claimRange(t, ctx, pool, "go_b", "mailer", "c1"); ok {
 		t.Fatalf("claim past the tail = %d..%d, want nothing", from, to)
 	}
 	checkClaims(t, ctx, pool, "go_b", "mailer")
@@ -804,7 +934,7 @@ func TestClaims(t *testing.T) {
 	if _, err := pool.Exec(ctx, `SELECT cb_stream_release_claim('go_b', 'mailer', 'c1', 1)`); err != nil {
 		t.Fatal(err)
 	}
-	if from, to, ok := claimRange(t, ctx, pool, "go_b", "mailer", "c3", 10); !ok || from != 1 || to != 3 {
+	if from, to, ok := claimRange(t, ctx, pool, "go_b", "mailer", "c3"); !ok || from != 1 || to != 3 {
 		t.Fatalf("claim = %d..%d, %v, want to adopt 1..3", from, to, ok)
 	}
 	if err := pool.QueryRow(ctx,
@@ -845,7 +975,7 @@ func TestClaims(t *testing.T) {
 
 	// an undefined queue fails fast; a non-positive ttl is rejected
 	if _, err := pool.Exec(ctx,
-		`SELECT cb_stream_claim('go_b', 'nope', 'c1', 3)`); !errors.Is(wrapErr(err), ErrNotDefined) {
+		`SELECT cb_stream_claim('go_b', 'nope', 'c1')`); !errors.Is(wrapErr(err), ErrNotDefined) {
 		t.Fatalf("claim on undefined queue returned %v, want ErrNotDefined", err)
 	}
 	if _, err := pool.Exec(ctx,
@@ -878,12 +1008,12 @@ func TestFail(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if from, to, ok := claimRange(t, ctx, pool, "go_fail", "payer", "c1", 10); !ok || from != 1 || to != 1 {
+	if from, to, ok := claimRange(t, ctx, pool, "go_fail", "payer", "c1"); !ok || from != 1 || to != 1 {
 		t.Fatalf("claim = %d..%d, %v, want 1..1", from, to, ok)
 	}
 	// a duplicate fail for the same message collapses into one retry
 	for range 2 {
-		if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('go_fail', 'payer', 1, 'boom')`); err != nil {
+		if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('go_fail', 'payer', 'c1', 1, 'boom')`); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -918,10 +1048,10 @@ func TestFail(t *testing.T) {
 
 	// the second failure exhausts max_attempts: the message is archived with
 	// its origin, not retried again
-	if from, to, ok := claimRange(t, ctx, pool, "sr.go_fail.payer", "payer", "c1", 10); !ok || from != 1 || to != 1 {
+	if from, to, ok := claimRange(t, ctx, pool, "sr.go_fail.payer", "payer", "c1"); !ok || from != 1 || to != 1 {
 		t.Fatalf("retry claim = %d..%d, %v, want 1..1", from, to, ok)
 	}
-	if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('sr.go_fail.payer', 'payer', 1, 'boom again')`); err != nil {
+	if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('sr.go_fail.payer', 'payer', 'c1', 1, 'boom again')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `SELECT cb_stream_close_claim('sr.go_fail.payer', 'payer', 'c1', 1)`); err != nil {
@@ -935,13 +1065,18 @@ func TestFail(t *testing.T) {
 	if dead != 1 {
 		t.Fatalf("dead letter stream holds %d messages, want 1", dead)
 	}
-	var originPos string
+	var originPos, attempts string
 	if err := pool.QueryRow(ctx,
-		`SELECT headers->>'cb_origin_pos' FROM cb_stream_messages WHERE stream = 'sd.go_fail'`).Scan(&originPos); err != nil {
+		`SELECT headers->>'cb_origin_pos', headers->>'cb_attempts'
+		 FROM cb_stream_messages WHERE stream = 'sd.go_fail'`).Scan(&originPos, &attempts); err != nil {
 		t.Fatal(err)
 	}
 	if originPos != "1" {
 		t.Fatalf("cb_origin_pos = %s, want 1", originPos)
+	}
+	// the report names the kind of failure that exhausted the message
+	if attempts != "2" {
+		t.Fatalf("cb_attempts = %s, want 2", attempts)
 	}
 
 	// auto-created stream retention: retries are handled history and kept a
@@ -980,35 +1115,62 @@ func TestFail(t *testing.T) {
 	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_drop')"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, ok := claimRange(t, ctx, pool, "go_drop", "binman", "c1", 10); !ok {
+	if _, _, ok := claimRange(t, ctx, pool, "go_drop", "binman", "c1"); !ok {
 		t.Fatal("nothing to claim")
 	}
-	if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('go_drop', 'binman', 1, 'nope')`); err != nil {
+	if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('go_drop', 'binman', 'c1', 1, 'nope')`); err != nil {
 		t.Fatal(err)
 	}
-	var streams int
+	// the queue and its declared retry route exist; drop archived nothing
+	var streams, deadStreams int
 	if err := pool.QueryRow(ctx,
 		`SELECT count(*) FROM cb_streams WHERE name LIKE '%go\_drop%'`).Scan(&streams); err != nil {
 		t.Fatal(err)
 	}
-	if streams != 1 {
-		t.Fatalf("found %d go_drop streams, want just the base one", streams)
+	if streams != 2 {
+		t.Fatalf("found %d go_drop streams, want the base and its retry stream", streams)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM cb_streams WHERE name = 'sd.go_drop'`).Scan(&deadStreams); err != nil {
+		t.Fatal(err)
+	}
+	if deadStreams != 0 {
+		t.Fatal("drop policy created a dead letter stream")
+	}
+
+	// a superseded consumer's report is a silent no-op
+	if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('go_fail', 'payer', 'zombie', 1, 'late')`); err != nil {
+		t.Fatal(err)
+	}
+	var pendingAfter int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM cb_stream_pending WHERE stream = 'sr.go_fail.payer'`).Scan(&pendingAfter); err != nil {
+		t.Fatal(err)
+	}
+	if pendingAfter != 0 {
+		t.Fatalf("a fenced fail published %d retries, want none", pendingAfter)
 	}
 }
 
-// the crash ladder: whole-range redelivery below the limit, split at the
-// limit, solo trial, archive above it
-func TestCrashLadder(t *testing.T) {
+// the quarantine: whole-range redelivery below the crash limit, republish
+// to the retry stream at it, releases never count, solo crashers convict
+func TestQuarantine(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
 	if err := Ensure(ctx, pool, "go_ladder"); err != nil {
 		t.Fatal(err)
 	}
+	// no backoff, so quarantined copies are deliverable immediately
 	if err := EnsureQueue(ctx, pool, "go_ladder", "runner", QueueOpts{
-		StartPos:   At(0),
-		MaxCrashes: 1,
+		StartPos:    At(0),
+		BackoffKind: BackoffNone,
 	}); err != nil {
+		t.Fatal(err)
+	}
+	// one whole redelivery before quarantine, tuned on the row
+	if _, err := pool.Exec(ctx, `UPDATE cb_stream_queues SET max_crashes = 1
+		WHERE stream = 'go_ladder' AND name = 'runner'`); err != nil {
 		t.Fatal(err)
 	}
 	for i := 1; i <= 3; i++ {
@@ -1021,57 +1183,28 @@ func TestCrashLadder(t *testing.T) {
 	}
 
 	// a crashed consumer leaves its claim to run out; force that instantly
-	expire := func(fromPos int64) {
+	expire := func(stream string, fromPos int64) {
 		t.Helper()
 		if _, err := pool.Exec(ctx, `UPDATE cb_stream_claims SET expires_at = clock_timestamp()
-			WHERE stream = 'go_ladder' AND from_pos = $1`, fromPos); err != nil {
+			WHERE stream = $1 AND from_pos = $2`, stream, fromPos); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	// fresh claim, then one whole-range redelivery (crash 1 = the limit)
-	if from, to, ok := claimRange(t, ctx, pool, "go_ladder", "runner", "c1", 10); !ok || from != 1 || to != 3 {
+	if from, to, ok := claimRange(t, ctx, pool, "go_ladder", "runner", "c1"); !ok || from != 1 || to != 3 {
 		t.Fatalf("claim = %d..%d, %v, want 1..3", from, to, ok)
 	}
-	expire(1)
-	if from, to, ok := claimRange(t, ctx, pool, "go_ladder", "runner", "c2", 10); !ok || from != 1 || to != 3 {
+	expire("go_ladder", 1)
+	if from, to, ok := claimRange(t, ctx, pool, "go_ladder", "runner", "c2"); !ok || from != 1 || to != 3 {
 		t.Fatalf("claim = %d..%d, %v, want the whole 1..3 redelivered", from, to, ok)
 	}
 	checkClaims(t, ctx, pool, "go_ladder", "runner")
 
-	// at the limit nobody knows which message is to blame: the caller gets
-	// the head solo and the tail respawns already expired
-	expire(1)
-	if from, to, ok := claimRange(t, ctx, pool, "go_ladder", "runner", "c3", 10); !ok || from != 1 || to != 1 {
-		t.Fatalf("claim = %d..%d, %v, want the split head 1..1", from, to, ok)
-	}
-	checkClaims(t, ctx, pool, "go_ladder", "runner")
-	// message 1 was innocent: it closes normally
-	if _, err := pool.Exec(ctx, `SELECT cb_stream_close_claim('go_ladder', 'runner', 'c3', 1)`); err != nil {
-		t.Fatal(err)
-	}
-
-	// message 2 gets its solo slice, crashes alone, and is archived in the
-	// same call that hands message 3 its own trial
-	if from, to, ok := claimRange(t, ctx, pool, "go_ladder", "runner", "c4", 10); !ok || from != 2 || to != 2 {
-		t.Fatalf("claim = %d..%d, %v, want 2..2", from, to, ok)
-	}
-	expire(2)
-	if from, to, ok := claimRange(t, ctx, pool, "go_ladder", "runner", "c5", 10); !ok || from != 3 || to != 3 {
-		t.Fatalf("claim = %d..%d, %v, want 3..3", from, to, ok)
-	}
-	checkClaims(t, ctx, pool, "go_ladder", "runner")
-	var dead int
-	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM cb_stream_messages WHERE stream = 'sd.go_ladder'`).Scan(&dead); err != nil {
-		t.Fatal(err)
-	}
-	if dead != 1 {
-		t.Fatalf("dead letter stream holds %d messages, want the solo crasher", dead)
-	}
-
-	if _, err := pool.Exec(ctx, `SELECT cb_stream_close_claim('go_ladder', 'runner', 'c5', 3)`); err != nil {
-		t.Fatal(err)
+	// at the limit the range moves to the retry stream, one copy per message
+	expire("go_ladder", 1)
+	if from, to, ok := claimRange(t, ctx, pool, "go_ladder", "runner", "c3"); ok {
+		t.Fatalf("claim = %d..%d, want nothing: the range was quarantined", from, to)
 	}
 	var closedPos int64
 	if err := pool.QueryRow(ctx,
@@ -1081,15 +1214,148 @@ func TestCrashLadder(t *testing.T) {
 	if closedPos != 3 {
 		t.Fatalf("closed_pos = %d, want 3", closedPos)
 	}
-	var count int
-	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM cb_stream_claims WHERE stream = 'go_ladder'`).Scan(&count); err != nil {
+	checkClaims(t, ctx, pool, "go_ladder", "runner")
+
+	// the copies carry their crash count and become claimable
+	if _, err := pool.Exec(ctx, `SELECT _cb_stream_deliver_pending()`); err != nil {
 		t.Fatal(err)
 	}
-	if count != 0 {
-		t.Fatalf("%d claims left, want 0", count)
+	if _, err := pool.Exec(ctx, `SELECT _cb_stream_assign_positions('sr.go_ladder.runner')`); err != nil {
+		t.Fatal(err)
 	}
-	checkClaims(t, ctx, pool, "go_ladder", "runner")
+	var quarantined int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM cb_stream_messages
+		WHERE stream = 'sr.go_ladder.runner' AND headers->>'cb_crash' = '1'`).Scan(&quarantined); err != nil {
+		t.Fatal(err)
+	}
+	if quarantined != 3 {
+		t.Fatalf("%d quarantined copies with cb_crash 1, want 3", quarantined)
+	}
+
+	// a release is a handback, never a crash: the count stays put
+	if from, to, ok := claimRange(t, ctx, pool, "sr.go_ladder.runner", "runner", "c4"); !ok || from != 1 || to != 1 {
+		t.Fatalf("claim = %d..%d, %v, want the solo 1..1", from, to, ok)
+	}
+	if _, err := pool.Exec(ctx,
+		`SELECT cb_stream_release_claim('sr.go_ladder.runner', 'runner', 'c4', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if from, to, ok := claimRange(t, ctx, pool, "sr.go_ladder.runner", "runner", "c5"); !ok || from != 1 || to != 1 {
+		t.Fatalf("claim = %d..%d, %v, want the released 1..1 back", from, to, ok)
+	}
+	var crashes int
+	if err := pool.QueryRow(ctx, `SELECT crashes FROM cb_stream_claims
+		WHERE stream = 'sr.go_ladder.runner' AND from_pos = 1`).Scan(&crashes); err != nil {
+		t.Fatal(err)
+	}
+	if crashes != 0 {
+		t.Fatalf("crashes = %d after a release, want 0", crashes)
+	}
+
+	// a solo claim's true expiry convicts: past the allowance the message is
+	// archived with a crash report
+	expire("sr.go_ladder.runner", 1)
+	if from, to, ok := claimRange(t, ctx, pool, "sr.go_ladder.runner", "runner", "c6"); !ok || from != 2 || to != 2 {
+		t.Fatalf("claim = %d..%d, %v, want the next solo 2..2", from, to, ok)
+	}
+	checkClaims(t, ctx, pool, "sr.go_ladder.runner", "runner")
+	var deadCount int
+	var crashesHeader, errHeader string
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM cb_stream_messages
+		WHERE stream = 'sd.go_ladder'`).Scan(&deadCount); err != nil {
+		t.Fatal(err)
+	}
+	if deadCount != 1 {
+		t.Fatalf("dead letter stream holds %d messages, want the solo crasher", deadCount)
+	}
+	if err := pool.QueryRow(ctx, `SELECT headers->>'cb_crashes', headers->>'cb_error'
+		FROM cb_stream_messages WHERE stream = 'sd.go_ladder'`).Scan(&crashesHeader, &errHeader); err != nil {
+		t.Fatal(err)
+	}
+	if crashesHeader != "2" || errHeader != "crash limit reached" {
+		t.Fatalf("dead letter report = cb_crashes %s, cb_error %q", crashesHeader, errHeader)
+	}
+}
+
+// a failure the dead consumer already reported is not quarantined twice:
+// its retry copy carries the message from there
+func TestFailThenQuarantine(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	if err := Ensure(ctx, pool, "go_fq"); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureQueue(ctx, pool, "go_fq", "q", QueueOpts{
+		StartPos:    At(0),
+		MaxAttempts: 3,
+		BackoffKind: BackoffNone,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE cb_stream_queues SET max_crashes = 1
+		WHERE stream = 'go_fq' AND name = 'q'`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 2; i++ {
+		if _, err := Publish(ctx, pool, "go_fq", "t", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_fq')"); err != nil {
+		t.Fatal(err)
+	}
+
+	if from, to, ok := claimRange(t, ctx, pool, "go_fq", "q", "c1"); !ok || from != 1 || to != 2 {
+		t.Fatalf("claim = %d..%d, %v, want 1..2", from, to, ok)
+	}
+	if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('go_fq', 'q', 'c1', 1, 'boom')`); err != nil {
+		t.Fatal(err)
+	}
+
+	expire := func() {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `UPDATE cb_stream_claims SET expires_at = clock_timestamp()
+			WHERE stream = 'go_fq'`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expire()
+	if from, to, ok := claimRange(t, ctx, pool, "go_fq", "q", "c2"); !ok || from != 1 || to != 2 {
+		t.Fatalf("claim = %d..%d, %v, want the whole 1..2 redelivered", from, to, ok)
+	}
+	expire()
+	if from, to, ok := claimRange(t, ctx, pool, "go_fq", "q", "c3"); ok {
+		t.Fatalf("claim = %d..%d, want nothing: the range was quarantined", from, to)
+	}
+
+	// message 1 kept its reported-failure copy; message 2 got a crash copy
+	keyCount := func(key string) (n int) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM cb_stream_keys
+			WHERE stream = 'sr.go_fq.q' AND key = $1`, key).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := keyCount("q:1:a1"); n != 1 {
+		t.Fatal("the reported failure's retry copy is gone")
+	}
+	if n := keyCount("q:1:c1"); n != 0 {
+		t.Fatal("quarantine minted a second copy for a reported failure")
+	}
+	if n := keyCount("q:2:c1"); n != 1 {
+		t.Fatal("the crashed message got no quarantine copy")
+	}
+	// no backoff means both copies appended immediately, skipping pending
+	var copies int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM cb_stream_messages
+		WHERE stream = 'sr.go_fq.q'`).Scan(&copies); err != nil {
+		t.Fatal(err)
+	}
+	if copies != 2 {
+		t.Fatalf("retry stream holds %d copies, want 2", copies)
+	}
 }
 
 func TestPublishPayloads(t *testing.T) {
@@ -1542,5 +1808,321 @@ func TestDeliverSchedules(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO cb_stream_schedules (stream, name, every, next_at)
 		VALUES ('go_beats', 'direct', interval '1 month', clock_timestamp())`); !errors.As(err, &pgErr) || pgErr.Code != "23514" {
 		t.Fatalf("direct insert of a calendar cadence returned %v, want a check violation", err)
+	}
+}
+
+// a poison handler: panics become failed attempts, and attempts exhaust to
+// the dead letter stream through the real loop
+func TestConsumeQueuePoisonHandler(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	if err := Ensure(ctx, pool, "go_poison"); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureQueue(ctx, pool, "go_poison", "p", QueueOpts{
+		StartPos:    At(0),
+		MaxAttempts: 2,
+		BackoffKind: BackoffNone,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Publish(ctx, pool, "go_poison", "t", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	jctx, cancel := context.WithCancel(ctx)
+	jobsDone := make(chan error, 1)
+	go func() {
+		jobsDone <- RunJobs(jctx, pool, JobsOpts{
+			AssignPositionsInterval: 20 * time.Millisecond,
+			DeliverInterval:         20 * time.Millisecond,
+		})
+	}()
+
+	var mu sync.Mutex
+	calls := 0
+	queueDone := make(chan error, 1)
+	go func() {
+		queueDone <- ConsumeQueue(jctx, pool, "go_poison", "p", func(context.Context, Message) error {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+			panic("boom")
+		}, ConsumeQueueOpts{PollInterval: 20 * time.Millisecond})
+	}()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var dead int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM cb_stream_messages WHERE stream = 'sd.go_poison'`).Scan(&dead); err != nil {
+			t.Fatal(err)
+		}
+		if dead == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("poison message never reached the dead letter stream")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var attempts, errText, origin string
+	if err := pool.QueryRow(ctx, `SELECT headers->>'cb_attempts', headers->>'cb_error', headers->>'cb_origin_pos'
+		FROM cb_stream_messages WHERE stream = 'sd.go_poison'`).Scan(&attempts, &errText, &origin); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != "2" || origin != "1" {
+		t.Fatalf("dead letter report = attempts %s, origin %s; want 2 and 1", attempts, origin)
+	}
+	if !strings.HasPrefix(errText, "catbird: handler panic") {
+		t.Fatalf("cb_error = %q, want the recovered panic", errText)
+	}
+	mu.Lock()
+	if calls != 2 {
+		t.Fatalf("handler ran %d times, want 2", calls)
+	}
+	mu.Unlock()
+
+	cancel()
+	if err := <-queueDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("queue consume returned %v, want context.Canceled", err)
+	}
+	if err := <-jobsDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("jobs returned %v, want context.Canceled", err)
+	}
+}
+
+// worker pools: competing consumers split the stream and nothing is lost
+func TestConsumeQueueCompeting(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	if err := Ensure(ctx, pool, "go_pool"); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureQueue(ctx, pool, "go_pool", "w", QueueOpts{
+		StartPos:       At(0),
+		ClaimBatchSize: 7,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	payloads := make([]any, 50)
+	for i := range payloads {
+		payloads[i] = i + 1
+	}
+	if _, err := PublishPayloads(ctx, pool, "go_pool", "t", payloads); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_pool')"); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	counts := map[string]int{}
+	cctx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 3)
+	for range 3 {
+		go func() {
+			done <- ConsumeQueue(cctx, pool, "go_pool", "w", func(_ context.Context, m Message) error {
+				mu.Lock()
+				counts[string(m.Payload)]++
+				mu.Unlock()
+				return nil
+			}, ConsumeQueueOpts{PollInterval: 20 * time.Millisecond})
+		}()
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var closed int64
+		if err := pool.QueryRow(ctx,
+			`SELECT closed_pos FROM cb_stream_queues WHERE stream = 'go_pool' AND name = 'w'`).Scan(&closed); err != nil {
+			t.Fatal(err)
+		}
+		if closed == 50 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("closed_pos = %d, want 50", closed)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cancel()
+	for range 3 {
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("consume returned %v, want context.Canceled", err)
+		}
+	}
+
+	// at-least-once: every message was handled; claims are exclusive, so
+	// without expiries each exactly once
+	mu.Lock()
+	defer mu.Unlock()
+	for i := 1; i <= 50; i++ {
+		if counts[strconv.Itoa(i)] < 1 {
+			t.Fatalf("message %d was never handled", i)
+		}
+	}
+}
+
+// a frozen consumer discovers it lost its claim and stands down without
+// spending an attempt
+func TestConsumeQueueClaimLost(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	if err := Ensure(ctx, pool, "go_zombie"); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureQueue(ctx, pool, "go_zombie", "z", QueueOpts{StartPos: At(0)}); err != nil {
+		t.Fatal(err)
+	}
+	// a tiny claim window, so the freeze outlives it quickly
+	if _, err := pool.Exec(ctx, `UPDATE cb_stream_queues SET claim_ttl = interval '60 milliseconds'
+		WHERE stream = 'go_zombie' AND name = 'z'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Publish(ctx, pool, "go_zombie", "t", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_zombie')"); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{}, 4)
+	canceled := make(chan struct{}, 4)
+	cctx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() {
+		done <- ConsumeQueue(cctx, pool, "go_zombie", "z", func(hctx context.Context, m Message) error {
+			started <- struct{}{}
+			<-hctx.Done() // frozen: never finishes on its own
+			canceled <- struct{}{}
+			return hctx.Err()
+		}, ConsumeQueueOpts{PollInterval: 20 * time.Millisecond})
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler never started")
+	}
+
+	// the extend cadence keeps reviving the claim; force the loss in the gap
+	// between two extends: expire it, then let a competitor act on it — a
+	// solo expired claim is quarantined by the competitor's claim call
+	stolen := false
+	for range 200 {
+		if _, err := pool.Exec(ctx, `UPDATE cb_stream_claims SET expires_at = clock_timestamp()
+			WHERE stream = 'go_zombie'`); err != nil {
+			t.Fatal(err)
+		}
+		claimRange(t, ctx, pool, "go_zombie", "z", "thief")
+		var copies int
+		if err := pool.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM cb_stream_pending WHERE stream = 'sr.go_zombie.z')
+			+ (SELECT count(*) FROM cb_stream_messages WHERE stream = 'sr.go_zombie.z')`,
+		).Scan(&copies); err != nil {
+			t.Fatal(err)
+		}
+		if copies == 1 {
+			stolen = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !stolen {
+		t.Fatal("could not take the claim between two extends")
+	}
+
+	// the zombie's next extend discovers the loss and cancels its handler
+	select {
+	case <-canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the frozen handler was never canceled")
+	}
+
+	// the zombie spent no attempt: the only copy is the crash copy
+	var failKeys, crashKeys int
+	if err := pool.QueryRow(ctx, `SELECT
+		count(*) FILTER (WHERE key = 'z:1:a1'),
+		count(*) FILTER (WHERE key = 'z:1:c1')
+		FROM cb_stream_keys WHERE stream = 'sr.go_zombie.z'`).Scan(&failKeys, &crashKeys); err != nil {
+		t.Fatal(err)
+	}
+	if failKeys != 0 || crashKeys != 1 {
+		t.Fatalf("keys = %d fail, %d crash; want 0 and 1", failKeys, crashKeys)
+	}
+
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("consume returned %v, want context.Canceled", err)
+	}
+}
+
+// a retry actually waits its backoff before it can be delivered
+func TestRetryBackoffTiming(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	if err := Ensure(ctx, pool, "go_wait"); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureQueue(ctx, pool, "go_wait", "r", QueueOpts{
+		StartPos:    At(0),
+		MaxAttempts: 3,
+		BackoffKind: BackoffFixed,
+		BackoffBase: 300 * time.Millisecond,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Publish(ctx, pool, "go_wait", "t", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_wait')"); err != nil {
+		t.Fatal(err)
+	}
+	if from, to, ok := claimRange(t, ctx, pool, "go_wait", "r", "c1"); !ok || from != 1 || to != 1 {
+		t.Fatalf("claim = %d..%d, %v, want 1..1", from, to, ok)
+	}
+	if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('go_wait', 'r', 'c1', 1, 'boom')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// the copy is parked with the full fixed delay ahead of it
+	var wait float64
+	if err := pool.QueryRow(ctx, `SELECT extract(epoch FROM (deliver_at - clock_timestamp()))
+		FROM cb_stream_pending WHERE stream = 'sr.go_wait.r'`).Scan(&wait); err != nil {
+		t.Fatal(err)
+	}
+	if wait < 0.2 || wait > 0.31 {
+		t.Fatalf("retry scheduled %.3fs out, want about 0.3s", wait)
+	}
+
+	// not due yet: a delivery pass leaves it parked
+	if _, err := pool.Exec(ctx, `SELECT _cb_stream_deliver_pending()`); err != nil {
+		t.Fatal(err)
+	}
+	var parked int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM cb_stream_pending WHERE stream = 'sr.go_wait.r'`).Scan(&parked); err != nil {
+		t.Fatal(err)
+	}
+	if parked != 1 {
+		t.Fatal("the retry was delivered before its backoff passed")
+	}
+
+	// after the wait it delivers and is claimable
+	time.Sleep(350 * time.Millisecond)
+	if _, err := pool.Exec(ctx, `SELECT _cb_stream_deliver_pending()`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `SELECT _cb_stream_assign_positions('sr.go_wait.r')`); err != nil {
+		t.Fatal(err)
+	}
+	if from, to, ok := claimRange(t, ctx, pool, "sr.go_wait.r", "r", "c1"); !ok || from != 1 || to != 1 {
+		t.Fatalf("retry claim = %d..%d, %v, want 1..1 after the backoff", from, to, ok)
 	}
 }

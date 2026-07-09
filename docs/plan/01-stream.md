@@ -144,22 +144,25 @@ cb_stream_messages  PARTITION BY LIST (stream), then RANGE (created_at) per stre
                    indexes: (stream, position) btree per partition; nothing else hot
 cb_stream_cursors   stream · name PK(stream,name) · position (everything ≤ it is
                    processed — the ack AND the retention floor) · filter columns
-                   (§4) · failure_policy ('block'|'dlq') · created_at
+                   (§4) · failure_policy ('block'|'dead_letter') · created_at
 cb_stream_queues
                    stream · name PK(stream,name) · claimed_position (highest
                    position handed to a claim — NOT an ack) · closed_position
                    (highest position below which all claims are closed — the
-                   retention floor) · claim_ttl (the default terms for claims
-                   that don't choose, D23) · filter columns (§4) ·
-                   retry policy columns (§7) · created_at
+                   retention floor) · claim_ttl · claim_batch_size (the claim's
+                   terms — how long, how many; queue policy, no per-call
+                   override; retry queues pinned to 1, D23/D28) · filter
+                   columns (§4) · retry policy columns (§7) · created_at
                    Two tables, not one with a mode column: every column means
                    exactly one thing, cross-mode misuse is structurally
                    impossible, and the janitor cannot read the wrong floor. One
                    consumer *name* per stream across both tables — no cross-table
                    PK exists, so ensure enforces it under the setup advisory lock.
-cb_stream_claims    stream · queue · from_position · to_position · consumer ·
+cb_stream_claims    stream · queue · from_position · to_position (immutable
+                   after insert — claims are atoms, D28) · consumer ·
                    closed (closed rows linger only until the closed position
-                   passes, §5) · ttl (this claim's terms — what extend renews
+                   passes, §5) · released (a voluntary handback, never a
+                   crash — D28) · ttl (this claim's terms — what extend renews
                    and adoption inherits) · expires_at (past it, anyone may
                    adopt — D23) · created_at               (tiny, mostly empty)
 cb_stream_pending  id PK · stream · topic · payload · headers · deliver_at ·
@@ -248,8 +251,8 @@ Read `position > cursor ORDER BY position LIMIT n`. No upper bound is needed: th
 assigner stamps rows and bumps the counter atomically, so every visible position
 belongs to a complete batch. Run the handler. `UPDATE … SET position = $high`,
 commit. On failure the cursor's config decides. `block` (the default) retries the
-batch with backoff, in place — ordered means ordered. `dlq` appends the poison
-message to the DLQ stream and advances past it.
+batch with backoff, in place — ordered means ordered. `dead_letter` appends the
+poison message to the dead letter stream and advances past it.
 
 The exactly-once loop is small enough to show whole:
 
@@ -286,7 +289,7 @@ func Consume(ctx context.Context, pool *pgxpool.Pool, stream, cursor string,
 			// commit = effects + ack atomically: exactly-once processing
 		})
 		if err != nil {
-			applyGroupFailurePolicy(err) // block w/ backoff, or dlq + advance
+			applyGroupFailurePolicy(err) // block w/ backoff, or dead_letter + advance
 		}
 	}
 }
@@ -316,7 +319,7 @@ becomes unnecessary machinery. Claiming a batch is a **single counter bump**:
 
 ```sql
 CREATE FUNCTION cb_stream_claim(
-    stream text, queue text, consumer text, batch_size int DEFAULT 100,
+    stream text, queue text, consumer text,
     ttl interval DEFAULT NULL, -- this call's terms; NULL = the queue's claim_ttl
     OUT from_position bigint, -- NULL when there is nothing to claim
     OUT to_position   bigint,
@@ -325,10 +328,13 @@ CREATE FUNCTION cb_stream_claim(
 LANGUAGE plpgsql AS $$
 DECLARE
     _ttl interval;
+    _batch int;
     _claimed bigint;
     _last bigint;
 BEGIN
-    SELECT coalesce(cb_stream_claim.ttl, q.claim_ttl) INTO _ttl FROM cb_stream_queues q
+    -- batch size is queue policy (D28), not a caller choice
+    SELECT coalesce(cb_stream_claim.ttl, q.claim_ttl), q.claim_batch_size
+    INTO _ttl, _batch FROM cb_stream_queues q
     WHERE q.stream_name = cb_stream_claim.stream AND q.name = cb_stream_claim.queue;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'catbird: queue %.% not defined',
@@ -338,6 +344,9 @@ BEGIN
     -- 1. adopt an expired claim first: work a dead consumer left behind.
     --    Cold path, tiny table. The terms describe the workload, not the
     --    owner, so adoption inherits the row's ttl unless this call overrides.
+    --    The sketch shows the plain re-hand; the full branch also clears the
+    --    released flag, bumps crashes only on true expiry, and quarantines
+    --    solo or over-the-limit claims (D28, below).
     UPDATE cb_stream_claims c
     SET consumer = cb_stream_claim.consumer,
         ttl = coalesce(cb_stream_claim.ttl, c.ttl),
@@ -371,7 +380,7 @@ BEGIN
     END IF;
 
     from_position := _claimed + 1;
-    to_position := least(_claimed + cb_stream_claim.batch_size, _last);
+    to_position := least(_claimed + _batch, _last);
     expires_at := clock_timestamp() + _ttl;
 
     UPDATE cb_stream_queues q SET claimed_position = cb_stream_claim.to_position
@@ -386,10 +395,10 @@ END;
 $$;
 
 -- Push the claim's deadline out: expires_at becomes now + the claim's stored
--- ttl. Call it after each message, from the handler loop — the call then means
--- "I am still making progress". A timer may call it instead, but only when the
--- handler itself is killed after a timeout; a timer that fires regardless of
--- progress keeps a stuck handler's claim alive forever.
+-- ttl. The consume loop calls it on a cadence while work is in progress —
+-- between messages, or while a handler is still executing (D27). Extension
+-- tracks the work: a loop wedged anywhere stops calling, and the claim
+-- expires on its own.
 -- The ttl argument applies to this renewal only and must be positive —
 -- extending always moves the deadline forward. To give a claim back, use
 -- cb_stream_release_claim.
@@ -416,14 +425,16 @@ BEGIN
     RETURN _expires_at;
 END; $$;
 
--- Hand the whole claim back: it expires immediately, so the next
--- cb_stream_claim call may adopt it. Use it when you processed nothing and
--- cannot continue. No-op when the claim is no longer yours, same as close.
+-- Hand the whole claim back: it expires immediately and is marked released,
+-- so the next cb_stream_claim call may adopt it — without counting a crash
+-- (D28): a handback says nothing about any message. Use it when you processed
+-- nothing and cannot continue. No-op when the claim is no longer yours.
 CREATE FUNCTION cb_stream_release_claim(stream text, queue text, consumer text, from_position bigint)
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
     UPDATE cb_stream_claims c
-    SET expires_at = clock_timestamp()
+    SET expires_at = clock_timestamp(),
+        released   = true
     WHERE c.stream_name   = cb_stream_release_claim.stream
       AND c.queue_name    = cb_stream_release_claim.queue
       AND c.consumer      = cb_stream_release_claim.consumer
@@ -475,9 +486,9 @@ END; $$;
 No scan, no anti-join, no lock queue — one hot row per queue. Before bumping the
 counter, a consumer first adopts any expired claim (`FOR UPDATE SKIP LOCKED` on the
 tiny claim table — cold path, fine). The sketch above shows a plain re-hand-out;
-adoption actually runs the **crash ladder** described below. Then per message in the range: run the handler;
-on failure, `cb_stream_fail` publishes a retry to the queue's retry stream or
-the DLQ per policy (§7, D21).
+adoption actually runs the **quarantine** described below (D28). Then per message
+in the range: run the handler; on failure, `cb_stream_fail` publishes a retry to
+the queue's retry stream or the dead letter stream per policy (§7, D21).
 A claim closes when every message *fetched for it* is handled (succeeded, retried,
 or dead-lettered) — defined over what was fetched, not the position range, so a
 partition dropped mid-claim (§10) cannot wedge it. On close, mark it closed
@@ -499,46 +510,36 @@ for work — the same way everything else here is decided by a lock at the point
 of contention, not by a background monitor. It also catches what heartbeats
 cannot. A process that is alive but stuck on one message keeps heartbeating, so
 its claim never comes back. A claim that stops being extended always does. One
-rule keeps that true: extend from the handler loop, between messages, so each
-call means real progress. A timer may extend instead, but only when the handler
-itself is killed after a timeout — then the extending stops when the work stops.
-A consumer that must stop early hands work back instead: `release` returns the
-whole claim, and a future `split` returns the unprocessed tail. A crashed
-consumer's range is redelivered whole — coarser duplicates than per-message
-claims would produce, the price of the simpler mechanism, and at-least-once
-either way. A range that *keeps* crashing does not redeliver forever, though: the
-crash ladder narrows it and dead-letters the message that proves to be the problem.
-
-**The crash ladder.** A single poison message would otherwise crash every
-consumer that adopts its range, endlessly. So each claim carries a `crashes`
-count, bumped on every adoption and bounded by the queue's `max_crashes`. Below
-the limit an expired claim is re-handed whole — an ordinary retry. At the limit
-the range stops going out whole: the adopter gets its **head message alone**, and
-the tail respawns as an already-expired claim carrying the count, so the next
-adopter isolates the next message and the range narrows to one at a time. A lone
-message that crashes with its count already past the limit is the proven culprit —
-it is dead-lettered, its claim closed, and `closed_position` advances past it. The
-**solo-trial rule** makes that safe: a count can only climb past the limit by
-crashing while *alone* in its claim, so nothing is dead-lettered without at least
-one isolated attempt — a message that failed only as collateral in a wider crash
-is never blamed.
+rule keeps that true: extension is **earned** — the loop extends only while it
+is between messages or a handler is actually executing, never as a bare
+keep-alive (D27, detailed below). A consumer that must stop early hands work
+back instead: `release` returns the whole claim, marked released — a handback
+is never a crash (D28). A crashed consumer's range is redelivered whole —
+coarser duplicates than per-message claims would produce, the price of the
+simpler mechanism, and at-least-once either way. A range that *keeps* crashing
+does not redeliver forever, though: it is quarantined to the retry stream, one
+message at a time, and a message that keeps crashing alone is dead-lettered
+(D28, detailed below).
 
 Two invariants hold across every branch (`checkClaims` in the Go test suite
 checks them after each step): open and closed claims exactly tile `(closed_position, claimed_position]` —
-no gaps, no overlaps — and both positions only ever grow. Whoever splits or removes
-a claim must leave the tiling intact, or the closed position stalls and messages
-are lost to retention.
+no gaps, no overlaps — and both positions only ever grow. Claim boundaries
+never change after insert (D28), so the tiling holds structurally; a stalled
+closed position would mean messages lost to retention, which is why the checker
+stays in the suite anyway.
 
 What survives from each lineage. From **pgq**: positions, batches, the ticker,
 retention by rotation. From **pgmq**: nothing on the hot path. Its visibility
 timeout returns as the claim TTL, per range instead of per message — and at
-batch size 1 the range *is* a message, so the emulation is exact:
-`read`/`set_vt`/`delete` map to claim/extend/close, and `release` is "make it
-available now". SKIP LOCKED survives only on the cold claim-adoption path.
+`claim_batch_size` 1 the range *is* a message, so the emulation is exact for
+the happy path: `read`/`set_vt`/`delete` map to claim/extend/close, and
+`release` is "make it available now". One deliberate difference: a crashed
+message returns through quarantine with backoff (D28), not immediately. SKIP
+LOCKED survives only on the cold claim-adoption path.
 Today's queue semantics (`Send`/`Read` with hide) are *not* re-exposed; the
 stream queue API replaces them.
 
-### Possible: the consume loop owns the clock (not adopted)
+### The consume loop owns the clock (D27, adopted 2026-07-09)
 
 Sizing `claim_ttl` against the slowest handler is a known source of duplicate
 execution — pgmq and the old catbird both taught this. The contract is global
@@ -550,41 +551,156 @@ that caused it. Knowing the visibility-timeout semantics does not prevent it;
 the bug is two pieces of truth kept in two places with nothing enforcing their
 relationship. Removing this burden from the programmer is a goal.
 
-The candidate mechanism: **the loop extends the claim, and only ever for work
-that is finishing or within its declared time.** On a `ttl/2` cadence the
-consume loop extends while it is between messages, or while a handler runs
-inside a per-message time budget (in Go: a `HandlerTimeout` option — the one
-knob that remains, next to the handler code, naming the thing it measures).
-The moment neither holds, extending stops — and a claim that stops being
-extended always expires. D23's objection does not apply: the timer it forbids
-tracks process-aliveness ("not dead yet"); this one stops the moment the work
-stops deserving it. A wedged handler exhausts its budget, extension stops,
-adoption recovers the range within one `ttl`.
+The mechanism: **the loop extends the claim, and only ever for work that is
+actually in progress.** On a `ttl/2` cadence the consume loop extends
+while it is between messages or while a handler is still executing; the
+moment neither holds, extending stops — and a claim that stops being extended
+always expires. D23's objection does not apply: the timer it forbids tracks
+process-aliveness ("not dead yet"); this one tracks the work, and its outer
+bound is the process's own mortality. A wedged handler is not extended past
+its process: the next deploy, health-check restart, or operator kill turns
+the wedge into real silence, and the crash accounting picks up truthfully
+from there. The loop logs a handler that is still running at each extend, so
+a wedge is never silent — only slow. The Go shape keeps the rule honest: one
+select loop owns handler-done, the extend tick and cancellation, so extends
+only fire while the loop itself is responsive — a loop wedged in *any* call
+(a fetch, a fail, a close) stops extending by construction, not by policy.
 
-When the budget expires the loop cancels the handler's context, fails the
-message with a truthful timeout error — into the ordinary
-backoff/retry/dead-letter machinery, so a chronically slow message
-dead-letters saying *slow*, not "crash limit reached" — stops extending, and
-waits for the handler to return. A context-respecting handler returns promptly
-and the range continues. A truly stuck one wedges its consumer, but the claim
-expires underneath it, another consumer adopts the tail, and the consumer
-fence keeps the zombie from closing anything when it wakes: the queue flows,
-the broken process quarantines itself. And when an extend returns NULL
+A per-message time budget (a `HandlerTimeout` option: stop extending, cancel
+the handler's context, fail the message with a truthful timeout error) is the
+known opt-in accelerator — it converts a wedge into a verdict at handler
+granularity instead of waiting for the process to die. It is deliberately not
+in the MVP and must never get a finite default: an admin-started export that
+takes hours is correct code, and a default budget would kill it, re-run the
+hours from scratch on every retry, then archive it — a default has to protect
+the innocent before it polices the guilty. When an extend returns NULL
 mid-message — the claim was lost anyway, a pause longer than the ttl — the
 loop cancels the handler at once instead of noticing between messages,
-shrinking the double-execution window in the residual case.
+shrinking the double-execution window in the residual case. Handler panics
+are recovered and reported as ordinary failures: a panic is a verdict, not a
+crash.
 
-If adopted: `claim_ttl` demotes to failure-detection latency, a short default
-nobody sizes against handlers; claim expiry then means a real crash or an
-exceeded budget, so the crash ladder's counts become truthful. Nothing changes
-in SQL — extend, the fence, and keyed retries already carry the mechanism,
-which is the argument that this is loop policy, not substrate; thin
-foreign-language clients keep the manual extend contract. D23's "never from a
-background timer" would be amended to say a timer is legal exactly when a
-timeout bounds it. One optional hardening, a separate decision:
-`cb_stream_fail` takes no `consumer`, so a zombie's late fail after an adopter
-already succeeded cannot be fenced today — rare once the loop owns the clock,
-closable in SQL if wanted.
+Consequences: `claim_ttl` demotes to failure-detection latency, a short default
+nobody sizes against handlers; claim expiry then means a real death, so the
+crash accounting becomes truthful. Nothing changes in SQL — extend, the
+consumer fence (close, extend and release act only for the claim's current
+consumer; anyone else is a silent no-op), and keyed retries already carry the
+mechanism, which is the argument that this is loop policy, not substrate;
+thin foreign-language clients keep the manual extend contract. D23's "never
+from a background timer" is amended accordingly: extension must track the
+work — progress between messages, execution during one — with the process's
+own mortality as the outer bound and an optional budget as a tighter one. The
+zombie-fail gap this leaves (`cb_stream_fail` unfenced) is closed by D28
+below, which adds the `consumer` argument and the ownership fence.
+
+### Claims as atoms — quarantine replaces the crash ladder (D28, adopted 2026-07-09)
+
+The range-claim machinery is really two things. Allotment — two counters, FIFO
+hand-out, leases with a deadline, close whole, adopt after expiry — is simple
+and sound. Repair was the brittle half. The first design (the **crash
+ladder**) narrowed a crashing range by splitting it: the adopter got the head
+message alone, the tail respawned as an already-expired claim carrying the
+count, and a lone message crashing past `max_crashes` was dead-lettered on the
+strength of a solo-trial proof. It existed because claims are coarse — when a
+range goes bad nobody knows which message is guilty — but it made the tiling
+invariant a proof obligation on every present and future branch, with a
+silently stalled closed position (then retention eating unprocessed messages)
+as the failure mode. And the count it escalated on was polluted: `release`
+expired the claim in place, so adoption could not tell a graceful handback
+from a death. A rolling deploy — or a worker crash-looping for reasons
+unrelated to any message — handed a slow range back repeatedly, every handback
+counted as a crash, and an innocent, possibly never-attempted message was
+archived as "crash limit reached". A clean lie, and the operator reading the
+dead letter stream could not know the proof did not hold.
+
+The mechanism that replaces it: **the per-message machinery already exists —
+the retry streams — so use them for crashes too.** At the crash limit, do not
+split: republish the range's messages individually to the retry stream, a
+crash count in their headers (`cb_crash`, sibling to `cb_attempt`) and a
+backoff delay, dead-letter the ones whose count is exhausted, close the range.
+Claims become atoms — created whole, owned whole, closed whole; `from_pos` and
+`to_pos` never change after insert. Adoption drops to two branches: re-hand
+whole below the limit, quarantine at it. The tiling proof becomes nearly
+structural because nothing mutates range boundaries anymore. Crash-retry and
+error-retry converge on one escalation story — retry stream, then dead letter
+— and crashed messages gain what the ladder never gave them: backoff between
+deaths, instead of an immediate solo trial that kills the next adopter too.
+
+The bookkeeping becomes truthful at the same time. An **attempt** is a
+rendered verdict: the handler returned an error, the loop recovered its
+panic, or — once the opt-in budget ships — the loop timed it out; all
+deliberate reports, all message-scoped. A
+**crash** is silence only: the process died or paused past its deadline
+without reporting. A **release** is neither — it says nothing about any
+message — so claims carry a released flag and adoption bumps the crash count
+only for true expiries. `max_crashes` then demotes from an execution threshold
+to a granularity threshold: tripping it wrongly costs a deferred solo retry,
+not an archive, so it can be low and dumb. A bad deploy that trips it
+fleet-wide sends innocents on a detour through the retry stream, where they
+complete once the fleet heals — provided the outage is shorter than the
+conviction runway: solo claims keep crashing during a sustained outage, so
+with the defaults (`max_crashes` 3, backoff capped at 5 minutes) a fleet that
+dies continuously for roughly a quarter hour convicts everything cycling
+through it. A quarantined backlog also drains one message per claim call —
+hundreds per second per consumer, hours at incident scale. Both are policy
+numbers operators should know, not surprises. The terminal verdict — dead
+letter — rests only on per-message evidence: a message that kept crashing
+consumers while alone.
+
+Two policy changes complete it. **Batch size becomes queue policy**
+(`claim_batch_size` next to `claim_ttl`, born at ensure time, tuned by raw
+`UPDATE`), and the per-call `batch_size` argument disappears: batch is a
+property of the workload, not of a call, and it must be enforced — retry-queue
+rows are born with `claim_batch_size = 1`, so every claim there is solo by
+construction, every expiry fully attributable, and `cb_crash` a pure
+conviction count. Per-message close makes the duplicate window O(1) exactly
+where messages have already proven troublesome. The one-by-one unhappy path is
+deliberately slower and that is fine — backoff rate-limits it by design.
+Unlike `ttl`, batch gets no per-call override; an override could only break
+the attribution property. And **retry streams are born eagerly** in
+`cb_stream_ensure_queue` — declaring a queue declares its failure route,
+visible before the first incident — which deletes the consume loop's
+existence-probe (a permanent per-iteration tax the common case paid for the
+rare one) and the lazy ensures in `cb_stream_fail`. One birthplace per object:
+`sr.*` is born at ensure, `sd.*` stays lazily born in `_cb_stream_dead_letter`
+because its existence is policy-dependent (a `drop` queue never dead-letters);
+nothing is ever created twice or repaired silently.
+
+The decision log carries the amendments (D2, D21, D23, D25; D27 and D28 are
+the decisions). Schema: a released flag on claims, `claim_batch_size` on
+queues, eager retry-stream birth in ensure, `cb_stream_claim` loses
+`batch_size`. This composes with the loop-owned clock above: together, a
+claim expiry means a real crash and nothing else, panics are attempts, and
+the whole failure vocabulary is three words — verdict, silence, handback —
+each counted once, in one place.
+
+Settled while sketching (2026-07-09), so the sketch is unambiguous: queues
+exist on plain streams only — engine-made (dotted) streams are read with
+cursors, which makes `sd.*` a dead letter *stream* in vocabulary too (the
+plan retired "DLQ" with it). Escalation keys name their kind:
+`queue:origin:a<attempt>` for verdicts, `queue:origin:c<crash>` for
+convictions, `queue:origin:dead_letter` unchanged. A solo claim's first true
+expiry quarantines immediately — a crashed message comes back with normal
+backoff, which is what users expect. `on_fail` is the queue's single give-up
+policy, honored for crash exhaustion too; the conviction trail survives in
+the retry stream's seven-day history either way. Escalation policy has one
+home — the base queue row — for fails and quarantines alike; the retry queue
+row carries claim terms only (`claim_ttl` copied at birth, `claim_batch_size`
+pinned to 1 by CHECK; its other policy columns are birth copies, never
+consulted). The dead letter report stamps `cb_attempts` or `cb_crashes`,
+whichever exhausted the message, never one masquerading as the other.
+`cb_stream_fail` gains `consumer` (third, claim-family order) with an
+ownership fence — covering claim, not closed, no expiry test, silent no-op
+when fenced — so an expired-but-not-yet-adopted owner's verdict still lands
+and quarantine honors it. `max_crashes` keeps its default of 3. The Go `QueueOpts` carries workload
+policy only — start position, `claim_batch_size`, attempts, backoff, give-up
+policy; `claim_ttl` and `max_crashes` are engine mechanics with row defaults,
+tuned by raw `UPDATE` (exposing `claim_ttl` in Go would invite the exact
+size-it-against-your-handler mistake D27 removed). Redrive republishes through
+the public path, which rejects `cb_` headers — a redriven message starts life
+with clean counters by construction. Deleting queues and streams stays raw ops: declared
+objects have no deathplace in the MVP, and the future delete API / partition
+janitor must cover the `sr.*` and `sd.*` offspring when it lands.
 
 ## 6. Waiting messages and schedules — one delivery job, two tables (D3)
 
@@ -688,20 +804,27 @@ therefore invisible to non-Go workers and to SQL. Move the *policy* into columns
 ```
 max_attempts int · backoff_kind (enum: 'none'|'fixed'|'full_jitter', D20) ·
 backoff_base interval · backoff_max interval ·
-after_max_attempts (enum: 'dlq'|'drop'; 'reroute' + a reroute_stream column may
-join it later — appending to an enum is an ordinary migration, D20)
+after_max_attempts (enum: 'dead_letter'|'drop' — the queue's single give-up
+policy, honored for crash exhaustion too, D28; 'reroute' + a reroute_stream
+column may join it later — appending to an enum is an ordinary migration, D20)
 ```
 
-`cb_stream_fail(stream, queue, position, error)` has no mechanism of its own
-(D21): it reads the failing message, then *publishes* — to the queue's retry
-stream with a backoff delay, or to the base stream's DLQ when attempts are
-exhausted. Idempotency under duplicate fails (a crashed-and-adopted claim
-reporting the same failure twice) is the dedup key; the retry stream is created
-lazily, like the DLQ.
+`cb_stream_fail(stream, queue, consumer, position, error)` has no mechanism of
+its own (D21): it reads the failing message, then *publishes* — to the queue's
+retry stream with a backoff delay, or to the base stream's dead letters when
+attempts are exhausted. It acts only for the claim's current holder (the
+ownership fence, D28 — covering claim, not closed, no expiry test: an
+expired-but-not-yet-adopted owner's verdict still lands, a superseded zombie's
+is a silent no-op). Idempotency under duplicate fails (a crashed-and-adopted
+claim reporting the same failure twice) is the dedup key. The retry stream
+exists by declaration — `ensure_queue` births it (D28); only the dead letter
+stream is created lazily, on the first message that earns it.
 
 ```sql
-CREATE FUNCTION cb_stream_fail(stream text, queue text, position bigint, error text)
+CREATE FUNCTION cb_stream_fail(stream text, queue text, consumer text, position bigint, error text)
 RETURNS void LANGUAGE plpgsql AS $$
+-- sketch omits the ownership fence (D28): report only for the caller's own
+-- covering, unclosed claim; anyone superseded gets a silent no-op
 DECLARE
     _g cb_stream_queues; _m cb_stream_messages;
     _attempt int; _origin bigint; _base text; _rp text; _dp text;
@@ -731,8 +854,8 @@ BEGIN
                          cb_stream_fail.position);
 
     IF _attempt >= _g.max_attempts THEN
-        IF _g.after_max_attempts = 'dlq' THEN
-            -- exhaustion goes to the BASE stream's DLQ, not the retry stream's
+        IF _g.after_max_attempts = 'dead_letter' THEN
+            -- exhaustion goes to the BASE stream's dead letters, not the retry stream's
             PERFORM cb_stream_publish(
                 _dp || _base, _m.topic, _m.payload,
                 _m.headers || jsonb_build_object(
@@ -745,24 +868,22 @@ BEGIN
         RETURN;
     END IF;
 
-    -- the retry IS a delayed publish; the key makes duplicate fails collapse
-    PERFORM _cb_stream_ensure_internal(_rp || _base || '.' || cb_stream_fail.queue);
+    -- the retry IS a delayed publish; the key makes duplicate fails collapse.
+    -- The retry stream already exists: ensure_queue birthed it (D28).
     PERFORM cb_stream_publish(
         _rp || _base || '.' || cb_stream_fail.queue,
         _m.topic, _m.payload,
         _m.headers || jsonb_build_object('cb_attempt', _attempt,
                                          'cb_origin_position', _origin),
-        key   => cb_stream_fail.queue || ':' || _origin || ':' || _attempt,
+        key   => cb_stream_fail.queue || ':' || _origin || ':a' || _attempt,
         delay => cb_backoff(_g.backoff_kind, _g.backoff_base,
                             _g.backoff_max, _attempt));
 END;
 $$;
 ```
 
-(`_cb_stream_ensure_internal` is the ensure that accepts system-composed dotted
-names — the public one rejects dots. The worker claims from `<base>` and
-`sr.<base>.<queue>`; how it splits its batch appetite between them is a Go-side
-policy knob.)
+(The worker claims from `<base>` and `sr.<base>.<queue>`; each claim's size is
+the queue row's `claim_batch_size` — 1 on the retry stream, by CHECK (D28).)
 
 (`cb_backoff` is a pure function of the policy columns and attempt — fixed or
 full-jitter, ported from `backoff.go`.) A Python worker that calls it gets
@@ -941,12 +1062,16 @@ notifies move with it.
 
 ## 9. Dead letters (D6)
 
-A DLQ is an ordinary stream named `sd.<stream>` (`fd.<flow>` for flows), created lazily on first use.
-Exhausted messages are appended there with headers
-`{cb_queue, cb_attempts, cb_error, cb_origin_position}`. Replay is
-`stream.Redrive(dlq, n)` — republish to the origin stream (new position, attempt
-reset, a `cb_redriven_from` header). Because it is just a stream: it has retention,
-it can be consumed (alerting), and the dashboard lists it for free. No special
+A dead letter stream is an ordinary stream named `sd.<stream>` (`fd.<flow>` for
+flows), created lazily on first use — its existence is policy-dependent, so it
+is the one object still born at its point of use. Exhausted messages are
+appended there with headers `{cb_queue, cb_error, cb_origin_position}` plus
+`cb_attempts` or `cb_crashes` — whichever exhausted the message (D28). Replay is
+`stream.Redrive(deadLetters, n)` — republish to the origin stream (new position,
+counters reset by construction: the public publish path rejects `cb_` headers —
+plus a `cb_redriven_from` header). Because it is just a stream: it has
+retention, it can be read with a cursor (alerting, triage — queues exist on
+plain streams only, D28), and the dashboard lists it for free. No special
 machinery anywhere.
 
 ## 10. Retention (D7)
@@ -991,7 +1116,7 @@ autovacuum tuned to keep pace or it bloats. This is the classic Postgres-as-queu
 tradeoff, taken knowingly for MVP simplicity.
 
 **Forever (NULL) is an explicit opt-in** for the log-as-record cases — event
-sourcing, audit, a DLQ kept until someone triages or redrives it. It maps to the
+sourcing, audit, dead letters kept until someone triages or redrives them. It maps to the
 same one-partition layout with no drop: the stream grows unbounded, by choice.
 Bounded is the norm; forever is deliberate.
 
@@ -1004,7 +1129,7 @@ optional retention set once at insert (`ON CONFLICT DO NOTHING`, so it never
 re-stamps or clobbers a later change). The rule is *drop what's handled, keep what
 hasn't*: a retry stream `sr.<base>.<queue>` defaults to a bounded window (its
 messages are handled — re-consumed or escalated — so old ones are just history),
-while a DLQ `sd.<base>` defaults to forever (its messages are unhandled, waiting
+while a dead letter stream `sd.<base>` defaults to forever (its messages are unhandled, waiting
 for a human, and a timer silently dropping un-triaged failures is the one default
 that burns trust). User streams default to forever via the column.
 
@@ -1067,11 +1192,12 @@ not an omission.
    it, the try-lock decides.
 4. Ordered consume (both Go shapes); cursor/queue ensure with the
    cross-table name check under the setup advisory lock; start positions.
-5. Queues: claim / adopt / extend / close — per-claim TTL expiry (D23); no
-   heartbeats, no sweeper.
+5. Queues: claim / adopt / extend / release / close — per-claim TTL expiry
+   (D23); no heartbeats, no sweeper; the released flag and quarantine at the
+   crash limit (D28); `claim_batch_size` from the queue row.
 6. `cb_stream_fail` + policy columns; `_cb_stream_deliver_pending` + the
    schedule scan (cron re-arm).
-7. Dedup table + prune janitor; DLQ append + `Redrive`.
+7. Dedup table + prune janitor; dead letter append + `Redrive`.
 8. Partition pre-creation job (no DEFAULT partition); retention janitor with
    age-cap force-advance.
 9. Tests — the ones that gate everything else:
@@ -1087,6 +1213,15 @@ not an omission.
    - Retry isolation: queue A's retry lands in `sr.<base>.a` only — queue B and
      every cursor never see it, structurally (no filter to test; assert the
      main stream gained no rows).
+   - Fail-then-quarantine: fail a message, then crash its range before close →
+     exactly one live retry copy (quarantine's skip honors the reported
+     failure); the archived report says `cb_crashes` for crashes and
+     `cb_attempts` for verdicts, never one for the other.
+   - Release is not a crash: release a claim repeatedly across adoptions →
+     the crash count never moves; only a true expiry bumps it.
+   - Outage runway: continuous consumer death convicts a cycling message only
+     after `max_crashes` solo rounds, each backoff-separated — assert the
+     conviction latency matches policy, not luck.
    - Exactly-once: consumer transaction aborts after effects → redelivered → effects
      appear exactly once.
    - Claim crash: kill a consumer mid-range; its claim expires; another consumer

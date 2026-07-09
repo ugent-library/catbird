@@ -1,12 +1,11 @@
 package stream
 
-// TODO cleanup comments in this file
-
 import (
 	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -20,7 +19,8 @@ type ConsumeQueueOpts struct {
 	PollInterval time.Duration // 250ms: how often to look for new messages when caught up
 }
 
-const consumeQueueBatchSize = 100
+// errClaimLost reports that a claim expired and another consumer adopted it.
+var errClaimLost = errors.New("catbird: claim lost")
 
 // newConsumerName generates a unique name for a consumer. It consists
 // of the hostname, pid and a random suffix.
@@ -36,11 +36,9 @@ func newConsumerName() string {
 }
 
 // ConsumeQueue processes a queue's messages: unordered, at-least-once,
-// parallel across consumers. Failures are retried with the queue's backoff
-// policy and dead-lettered when attempts run out. A message slower than the
-// queue's claim_ttl is indistinguishable from a crash — size claim_ttl for
-// the slowest message the queue can see.
-// TODO auto extend the claim so that VT is no longer a programmer concern.
+// parallel across consumers. The claim is kept alive for as long as
+// a handler runs. Handler errors are retried with the queue's backoff policy
+// and dead-lettered or dropped when attempts run out.
 func ConsumeQueue(ctx context.Context, pool *pgxpool.Pool, stream, queue string,
 	handler func(ctx context.Context, msg Message) error,
 	opts ...ConsumeQueueOpts,
@@ -55,10 +53,8 @@ func ConsumeQueue(ctx context.Context, pool *pgxpool.Pool, stream, queue string,
 	}
 
 	consumer := newConsumerName()
-	// The queue's failed messages are republished to its retry stream, which
-	// exists once something has failed; probe until it does.
-	retryStream := "sr." + stream + "." + queue
-	retryReady := false
+	// Failed and crashed messages come back through the retry stream.
+	streams := []string{stream, "sr." + stream + "." + queue}
 
 	timer := time.NewTimer(poll)
 	defer timer.Stop()
@@ -80,25 +76,13 @@ func ConsumeQueue(ctx context.Context, pool *pgxpool.Pool, stream, queue string,
 
 		var loopErr error
 		worked := false
-
-		if !retryReady {
-			loopErr = pool.QueryRow(ctx,
-				`SELECT EXISTS (SELECT 1 FROM cb_stream_queues q WHERE q.stream = $1 AND q.name = $2)`,
-				retryStream, queue).Scan(&retryReady)
-		}
-		if loopErr == nil {
-			streams := []string{stream}
-			if retryReady {
-				streams = append(streams, retryStream)
+		for _, s := range streams {
+			n, err := consumeClaim(ctx, pool, s, queue, consumer, handler)
+			if err != nil {
+				loopErr = err
+				break
 			}
-			for _, s := range streams {
-				n, err := consumeClaim(ctx, pool, s, queue, consumer, handler)
-				if err != nil {
-					loopErr = err
-					break
-				}
-				worked = worked || n
-			}
+			worked = worked || n
 		}
 
 		switch {
@@ -130,8 +114,8 @@ func consumeClaim(ctx context.Context, pool *pgxpool.Pool, stream, queue, consum
 	var fromPos, toPos *int64
 	var expiresAt *time.Time
 	if err := pool.QueryRow(ctx,
-		`SELECT c.from_pos, c.to_pos, c.expires_at FROM cb_stream_claim($1, $2, $3, $4) c`,
-		stream, queue, consumer, consumeQueueBatchSize,
+		`SELECT c.from_pos, c.to_pos, c.expires_at FROM cb_stream_claim($1, $2, $3) c`,
+		stream, queue, consumer,
 	).Scan(&fromPos, &toPos, &expiresAt); err != nil {
 		return false, wrapErr(err)
 	}
@@ -161,37 +145,56 @@ func consumeClaim(ctx context.Context, pool *pgxpool.Pool, stream, queue, consum
 		return true, wrapErr(err)
 	}
 
+	// keep the claim alive: extend between messages when the deadline nears,
+	// and on a steady cadence while a handler runs. An empty extend should
+	// never happen while this loop runs on schedule — it means the process
+	// was frozen past the ttl and another consumer took the claim: stop.
 	ttl := time.Until(*expiresAt)
 	exp := *expiresAt
+	extend := func() (bool, error) {
+		var newExp *time.Time
+		if err := pool.QueryRow(ctx,
+			`SELECT cb_stream_extend_claim($1, $2, $3, $4)`,
+			stream, queue, consumer, *fromPos).Scan(&newExp); err != nil {
+			return false, wrapErr(err)
+		}
+		if newExp == nil {
+			return false, nil
+		}
+		exp = *newExp
+		return true, nil
+	}
+
 	for _, m := range msgs {
 		if ctx.Err() != nil {
 			release()
 			return true, ctx.Err()
 		}
 
-		// extend between messages when the claim nears its deadline; a NULL
-		// return means it expired and another consumer adopted it: stop
 		if time.Until(exp) < ttl/2 {
-			var newExp *time.Time
-			if err := pool.QueryRow(ctx,
-				`SELECT cb_stream_extend_claim($1, $2, $3, $4)`,
-				stream, queue, consumer, *fromPos).Scan(&newExp); err != nil {
-				return true, wrapErr(err)
+			ok, err := extend()
+			if err != nil {
+				return true, err
 			}
-			if newExp == nil {
-				return true, nil
+			if !ok {
+				return true, nil // adopted away; the new owner takes it from here
 			}
-			exp = *newExp
 		}
 
-		if err := handler(ctx, m); err != nil {
-			if ctx.Err() != nil {
-				release() // shutdown, not a failure: no attempt is spent
-				return true, ctx.Err()
-			}
+		verdict, err := runHandler(ctx, stream, queue, ttl, m, extend, handler)
+		switch {
+		case errors.Is(err, errClaimLost):
+			return true, nil
+		case err != nil:
+			return true, err // extends cannot be delivered; not the message's fault
+		case verdict == nil:
+		case ctx.Err() != nil:
+			release() // shutdown, not a failure: no attempt is spent
+			return true, ctx.Err()
+		default:
 			if _, err := pool.Exec(ctx,
-				`SELECT cb_stream_fail($1, $2, $3, $4)`,
-				stream, queue, m.Pos, err.Error()); err != nil {
+				`SELECT cb_stream_fail($1, $2, $3, $4, $5)`,
+				stream, queue, consumer, m.Pos, verdict.Error()); err != nil {
 				return true, wrapErr(err)
 			}
 		}
@@ -203,4 +206,58 @@ func consumeClaim(ctx context.Context, pool *pgxpool.Pool, stream, queue, consum
 		return true, wrapErr(err)
 	}
 	return true, nil
+}
+
+// runHandler runs one handler call while the extend cadence keeps the claim
+// alive. The verdict is the handler's own outcome — its error, or its panic
+// reported as one. err is the loop's outcome: errClaimLost when the claim
+// expired anyway and another consumer took it, or the failed extend. On a
+// non-nil err the handler is canceled and awaited first, so one consumer
+// never runs two handlers at once, and the verdict is meaningless.
+func runHandler(ctx context.Context, stream, queue string, ttl time.Duration, m Message,
+	extend func() (bool, error),
+	handler func(ctx context.Context, msg Message) error,
+) (verdict error, err error) {
+	hctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("catbird: handler panic: %v", r)
+			}
+		}()
+		done <- handler(hctx, m)
+	}()
+
+	interval := ttl / 2
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	started := time.Now()
+	for {
+		select {
+		case verdict := <-done:
+			return verdict, nil
+		case <-ticker.C:
+			ok, err := extend()
+			if err == nil && ok {
+				slog.Info("catbird: handler still running",
+					"stream", stream, "queue", queue, "pos", m.Pos,
+					"elapsed", time.Since(started))
+				continue
+			}
+			// the claim is no longer ours, or extends cannot be delivered:
+			// stop the handler and wait for it before handing off
+			cancel()
+			<-done
+			if err != nil {
+				return nil, err
+			}
+			return nil, errClaimLost
+		}
+	}
 }
