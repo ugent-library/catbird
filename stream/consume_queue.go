@@ -1,5 +1,7 @@
 package stream
 
+// TODO cleanup comments in this file
+
 import (
 	"context"
 	"crypto/rand"
@@ -38,6 +40,7 @@ func newConsumerName() string {
 // policy and dead-lettered when attempts run out. A message slower than the
 // queue's claim_ttl is indistinguishable from a crash — size claim_ttl for
 // the slowest message the queue can see.
+// TODO auto extend the claim so that VT is no longer a programmer concern.
 func ConsumeQueue(ctx context.Context, pool *pgxpool.Pool, stream, queue string,
 	handler func(ctx context.Context, msg Message) error,
 	opts ...ConsumeQueueOpts,

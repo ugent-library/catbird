@@ -538,6 +538,54 @@ available now". SKIP LOCKED survives only on the cold claim-adoption path.
 Today's queue semantics (`Send`/`Read` with hide) are *not* re-exposed; the
 stream queue API replaces them.
 
+### Possible: the consume loop owns the clock (not adopted)
+
+Sizing `claim_ttl` against the slowest handler is a known source of duplicate
+execution — pgmq and the old catbird both taught this. The contract is global
+(one number in queue config) but the violation is local: a handler grows a
+network call months later, and the person making that change never sees the
+number it just broke. The failure is probabilistic — only the slow tail, only
+under pressure — and surfaces as a duplicate side effect far from the code
+that caused it. Knowing the visibility-timeout semantics does not prevent it;
+the bug is two pieces of truth kept in two places with nothing enforcing their
+relationship. Removing this burden from the programmer is a goal.
+
+The candidate mechanism: **the loop extends the claim, and only ever for work
+that is finishing or within its declared time.** On a `ttl/2` cadence the
+consume loop extends while it is between messages, or while a handler runs
+inside a per-message time budget (in Go: a `HandlerTimeout` option — the one
+knob that remains, next to the handler code, naming the thing it measures).
+The moment neither holds, extending stops — and a claim that stops being
+extended always expires. D23's objection does not apply: the timer it forbids
+tracks process-aliveness ("not dead yet"); this one stops the moment the work
+stops deserving it. A wedged handler exhausts its budget, extension stops,
+adoption recovers the range within one `ttl`.
+
+When the budget expires the loop cancels the handler's context, fails the
+message with a truthful timeout error — into the ordinary
+backoff/retry/dead-letter machinery, so a chronically slow message
+dead-letters saying *slow*, not "crash limit reached" — stops extending, and
+waits for the handler to return. A context-respecting handler returns promptly
+and the range continues. A truly stuck one wedges its consumer, but the claim
+expires underneath it, another consumer adopts the tail, and the consumer
+fence keeps the zombie from closing anything when it wakes: the queue flows,
+the broken process quarantines itself. And when an extend returns NULL
+mid-message — the claim was lost anyway, a pause longer than the ttl — the
+loop cancels the handler at once instead of noticing between messages,
+shrinking the double-execution window in the residual case.
+
+If adopted: `claim_ttl` demotes to failure-detection latency, a short default
+nobody sizes against handlers; claim expiry then means a real crash or an
+exceeded budget, so the crash ladder's counts become truthful. Nothing changes
+in SQL — extend, the fence, and keyed retries already carry the mechanism,
+which is the argument that this is loop policy, not substrate; thin
+foreign-language clients keep the manual extend contract. D23's "never from a
+background timer" would be amended to say a timer is legal exactly when a
+timeout bounds it. One optional hardening, a separate decision:
+`cb_stream_fail` takes no `consumer`, so a zombie's late fail after an adopter
+already succeeded cannot be fenced today — rare once the loop owns the clock,
+closable in SQL if wanted.
+
 ## 6. Waiting messages and schedules — one delivery job, two tables (D3)
 
 `cb_stream_pending` holds one-shot messages that have not entered the log yet.
