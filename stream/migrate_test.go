@@ -28,4 +28,31 @@ func TestMigrate(t *testing.T) {
 	if forever != "-00:00:01" {
 		t.Fatalf("cb_forever() = %q", forever)
 	}
+
+	// Down leaves no catbird objects behind — no tables, partitions,
+	// sequences, functions or enum types. Only goose's version table stays.
+	if err := MigrateDownTo(t.Context(), db, 0); err != nil {
+		t.Fatalf("migrate down: %v", err)
+	}
+	var leftover int
+	if err := db.QueryRowContext(t.Context(), `SELECT count(*) FROM (
+		SELECT relname FROM pg_class
+		WHERE relname LIKE 'cb%' AND relname NOT LIKE 'cb\_stream\_migrations%'
+		  AND relkind IN ('r', 'p', 'S')
+		UNION ALL
+		SELECT proname FROM pg_proc
+		WHERE proname LIKE '%cb\_%' AND pronamespace = 'public'::regnamespace
+		UNION ALL
+		SELECT typname FROM pg_type
+		WHERE typname LIKE 'cb\_%' AND typtype = 'e') x`).Scan(&leftover); err != nil {
+		t.Fatal(err)
+	}
+	if leftover != 0 {
+		t.Fatalf("down left %d objects behind", leftover)
+	}
+
+	// the rest of the suite runs on the schema: bring it back
+	if err := MigrateUpTo(t.Context(), db, SchemaVersion); err != nil {
+		t.Fatalf("migrate up again: %v", err)
+	}
 }

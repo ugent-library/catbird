@@ -836,8 +836,8 @@ END; $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- Rules every branch of this function must preserve (scripts/stream_test.sql
--- checks them after every step):
+-- Rules every branch of this function must preserve (checkClaims in the Go
+-- test suite checks them after every step):
 --   1. Open and closed claims exactly cover the region between closed_pos
 --      and claimed_pos. No gaps, no overlaps. Whoever removes or splits a
 --      claim must leave the tiling intact, or the closed position stalls

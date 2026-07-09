@@ -523,8 +523,8 @@ crashing while *alone* in its claim, so nothing is dead-lettered without at leas
 one isolated attempt — a message that failed only as collateral in a wider crash
 is never blamed.
 
-Two invariants hold across every branch (`stream_test.sql` checks them after each
-step): open and closed claims exactly tile `(closed_position, claimed_position]` —
+Two invariants hold across every branch (`checkClaims` in the Go test suite
+checks them after each step): open and closed claims exactly tile `(closed_position, claimed_position]` —
 no gaps, no overlaps — and both positions only ever grow. Whoever splits or removes
 a claim must leave the tiling intact, or the closed position stalls and messages
 are lost to retention.
