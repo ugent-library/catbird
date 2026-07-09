@@ -253,6 +253,111 @@ func TestConsume(t *testing.T) {
 	}
 }
 
+func TestRunJobs(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	// a real retention so the prune job has something to enforce
+	if err := Ensure(ctx, pool, "go_jobs", EnsureOpts{Retention: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureCursor(ctx, pool, "go_jobs", "w", CursorOpts{StartPos: At(0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	jctx, cancel := context.WithCancel(ctx)
+	jobsDone := make(chan error, 1)
+	go func() {
+		jobsDone <- RunJobs(jctx, pool, JobsOpts{
+			AssignPositionsInterval: 20 * time.Millisecond,
+			DeliverInterval:         20 * time.Millisecond,
+			PruneInterval:           50 * time.Millisecond,
+		})
+	}()
+
+	got := make(chan Message, 16)
+	consumeDone := make(chan error, 1)
+	go func() {
+		consumeDone <- Consume(jctx, pool, "go_jobs", "w", func(_ context.Context, batch []Message) error {
+			for _, m := range batch {
+				got <- m
+			}
+			return nil
+		}, ConsumeOpts{PollInterval: 20 * time.Millisecond})
+	}()
+
+	expect := func(from, to int) {
+		t.Helper()
+		for i := from; i <= to; i++ {
+			select {
+			case m := <-got:
+				if m.Pos != int64(i) {
+					t.Fatalf("pos = %d, want %d", m.Pos, i)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("timed out waiting for pos %d", i)
+			}
+		}
+	}
+
+	// the assign job numbers messages: publish with no manual assign call
+	for i := 1; i <= 3; i++ {
+		if _, err := Publish(ctx, pool, "go_jobs", "t", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expect(1, 3)
+
+	// the deliver job moves a due delayed message into the stream
+	ref, err := Publish(ctx, pool, "go_jobs", "t", 4, PublishOpts{Delay: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Kind != RefPending {
+		t.Fatalf("ref = %+v, want pending", ref)
+	}
+	expect(4, 4)
+
+	// the deliver job fires a due schedule
+	if err := DefineSchedule(ctx, pool, "go_jobs", "beat", ScheduleOpts{
+		Every:   time.Hour,
+		StartAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	expect(5, 5)
+
+	// the prune job enforces retention on backdated rows
+	if _, err := pool.Exec(ctx, `UPDATE cb_stream_messages
+		SET created_at = now() - interval '2 hours'
+		WHERE stream = 'go_jobs' AND pos <= 3`); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var left int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM cb_stream_messages
+			WHERE stream = 'go_jobs' AND pos <= 3`).Scan(&left); err != nil {
+			t.Fatal(err)
+		}
+		if left == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("prune left %d backdated messages", left)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cancel()
+	if err := <-jobsDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("jobs returned %v, want context.Canceled", err)
+	}
+	if err := <-consumeDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("consume returned %v, want context.Canceled", err)
+	}
+}
+
 func TestDefineSchedule(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
