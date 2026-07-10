@@ -1,384 +1,420 @@
-# M3 spine — code dump for transcription
+# M3 spine — code dump for transcription (filtered reads)
 
-Settled decisions: two tables (relay owns cursor, bindings are the pattern list);
-relay runs as a ticker job; wildcard grammar is `*` (one token) / `#` (tail) per
-`topic_trie.go`; Unbind drops the pattern only, relay + cursor persist.
+Supersedes the earlier autocopy/bindings/relay dump on this path. That design
+is dead: no `cb_stream_bindings`, no relays, no relay ticker job, no
+destination kinds. Why and how the direction changed is recorded in
+`spine-usage-sketch.md` — short version: a consumer is a filter plus a
+position over a log, and queue retry semantics apply *in place* once queues
+take a server-side filter. Topics are the only filter dimension; payload
+filtering means promoting the field into the topic.
 
-Deferred out of M3: the `catbird.Publish`/`catbird.Bind` root facade (M6, import
-cycle) and enriching the NOTIFY payload beyond topic-only (M5, wire's call).
+Settled decisions:
 
-Build order: (1) migration, (2) port the trie + `Bind`/`Unbind`, (3) relay kind +
-runner + `RunJobs` wiring, (4) tests.
+- Filters are **birth policy** on queues and cursors, not read arguments —
+  competing consumers of one queue must agree (same reasoning as
+  `claim_batch_size`). Stored as the pattern verbatim plus a regex compiled
+  once at ensure. Changing a filter later is the ops layer: raw `UPDATE`
+  setting both `filter` and `filter_regex = _cb_stream_compile_filter(...)`.
+- Grammar unchanged: `*` one segment, `#` zero or more trailing segments,
+  final position only. One matcher implementation, in SQL; the Go trie stays
+  app-side (in-process dispatchers).
+- A `NULL` topic never matches a filter.
+- Retry queues never carry a filter: `sr.*` holds only this queue's own
+  failures, pre-filtered by construction.
+- `claim_batch_size` counts **positions**, not matches. A sparse filter
+  closes near-empty claims fast; cursor reads may return zero rows while
+  still advancing.
+- Edits go **in place** into `stream/migrations/00001_stream.sql` (schema is
+  pre-release; same precedent as the D27/D28 rework). No version bump.
+- No engine-created content indexes. Read SQL stays index-usable for later,
+  but the prefix column and the claim fast-forward optimization wait for a
+  deep-sparse-replay customer.
+
+Build order: (1) compiler + columns + ensure params, (2) read paths
+(`cb_stream_read`, new `cb_stream_read_claim`, quarantine predicate),
+(3) Go opts + fetch swap, (4) `cb_stream_publish_messages` + Go
+`PublishMessages`, (5) tests, (6) doc fixes.
 
 ---
 
-## 1. `stream/migrations/00002_spine.sql`
+## 1. Columns and constraint (table DDL)
+
+`cb_stream_cursors` gains:
 
 ```sql
--- +goose up
+    filter text,       -- topic filter pattern; NULL reads everything
+    filter_regex text  -- compiled by _cb_stream_compile_filter at ensure
+```
 
--- The root stream: one insert per Publish, bindings evaluated at read time.
--- 7-day age cap = relay lag + replay window (docs/plan/02-spine.md §1).
-SELECT _cb_stream_ensure('bus', interval '7 days');
+`cb_stream_queues` gains the same two columns, plus a named constraint next
+to `cb_stream_queues_retry_batch_size`:
 
--- Names each relay's cursor; a sequence keeps them short and unique so they fit
--- the single-segment, <=20-byte cursor-name rule.
-CREATE SEQUENCE cb_stream_relay_cursor_seq;
+```sql
+    CONSTRAINT cb_stream_queues_retry_no_filter
+        CHECK (left(stream, 3) <> 'sr.' OR filter IS NULL)
+```
 
--- One relay = one cursor over the source stream, per destination. The first
--- Bind to a destination creates this row and its cursor.
-CREATE TABLE cb_stream_relays (
-    stream           text NOT NULL REFERENCES cb_streams(name) ON DELETE CASCADE,
-    destination_kind text NOT NULL CHECK (cb_valid_name(destination_kind)), -- registered Go-side, not an enum
-    destination      text NOT NULL,
-    cursor           text NOT NULL, -- the cb_stream_cursors name this relay advances
-    PRIMARY KEY (stream, destination_kind, destination)
-);
+---
 
--- The pattern list feeding a relay's matcher. Adding or removing a pattern never
--- touches the cursor.
-CREATE TABLE cb_stream_bindings (
-    stream           text NOT NULL,
-    destination_kind text NOT NULL,
-    destination      text NOT NULL,
-    pattern          text NOT NULL, -- topic_trie grammar: '*' one token, '#' tail
-    identity_from    text,          -- inbox kind only (04); NULL otherwise
-    PRIMARY KEY (stream, destination_kind, destination, pattern),
-    FOREIGN KEY (stream, destination_kind, destination)
-        REFERENCES cb_stream_relays(stream, destination_kind, destination) ON DELETE CASCADE
-);
+## 2. `_cb_stream_compile_filter`
 
+Port of the old `cb_bind` validator + regex builder (migrations/
+00001_catbird.sql:384-462), reduced to one function that returns the
+compiled regex or raises. Place it near `cb_valid_name`.
+
+```sql
 -- +goose statementbegin
--- Route a topic pattern on a source stream to a destination. The first bind to a
--- (stream, kind, destination) creates that destination's relay and its cursor;
--- only that call's start_pos is honored. Idempotent: an identical bind writes
--- nothing.
-CREATE FUNCTION cb_stream_bind(
-    stream           text,
-    destination_kind text,
-    destination      text,
-    pattern          text,
-    start_pos        bigint DEFAULT NULL,
-    identity_from    text   DEFAULT NULL
-)
-RETURNS void LANGUAGE plpgsql AS $$
+-- Validate a topic filter and compile it to a regex. '*' matches one
+-- segment, '#' matches zero or more trailing segments and must be the
+-- final segment. Raises for anything else.
+CREATE FUNCTION _cb_stream_compile_filter(pattern text)
+RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
-    _cursor text;
+    _tokens text[];
+    _token text;
+    _i int;
+    _n int;
+    _regex text;
 BEGIN
-    IF NOT cb_valid_name(cb_stream_bind.destination_kind) THEN
-        RAISE EXCEPTION 'catbird: invalid destination kind %; use [a-z][a-z0-9_]*, max 20 bytes',
-            cb_stream_bind.destination_kind USING ERRCODE = 'IRD01';
+    IF _cb_stream_compile_filter.pattern IS NULL OR _cb_stream_compile_filter.pattern = '' THEN
+        RAISE EXCEPTION 'catbird: filter cannot be empty' USING ERRCODE = 'IRD01';
     END IF;
 
-    PERFORM 1 FROM cb_streams s WHERE s.name = cb_stream_bind.stream;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_bind.stream USING ERRCODE = 'IRD02';
+    IF _cb_stream_compile_filter.pattern !~ '^[a-zA-Z0-9._#*-]+$' THEN
+        RAISE EXCEPTION 'catbird: filter % may only contain a-z, A-Z, 0-9, ., _, -, * and #',
+            _cb_stream_compile_filter.pattern USING ERRCODE = 'IRD01';
     END IF;
 
-    -- One relay (one cursor) per destination. The first bind creates it; later
-    -- binds to the same destination inherit the existing cursor, so start_pos can
-    -- replay history only once.
-    INSERT INTO cb_stream_relays AS r (stream, destination_kind, destination, cursor)
-    VALUES (cb_stream_bind.stream, cb_stream_bind.destination_kind, cb_stream_bind.destination,
-            'relay_' || nextval('cb_stream_relay_cursor_seq'))
-    ON CONFLICT ON CONSTRAINT cb_stream_relays_pkey DO NOTHING
-    RETURNING r.cursor INTO _cursor;
-
-    IF _cursor IS NOT NULL THEN
-        PERFORM cb_stream_ensure_cursor(cb_stream_bind.stream, _cursor, cb_stream_bind.start_pos);
+    IF _cb_stream_compile_filter.pattern ~ '\.\.'
+    OR _cb_stream_compile_filter.pattern ~ '(^\.|\.$)' THEN
+        RAISE EXCEPTION 'catbird: filter % cannot contain empty segments',
+            _cb_stream_compile_filter.pattern USING ERRCODE = 'IRD01';
     END IF;
 
-    INSERT INTO cb_stream_bindings AS b
-        (stream, destination_kind, destination, pattern, identity_from)
-    VALUES (cb_stream_bind.stream, cb_stream_bind.destination_kind,
-            cb_stream_bind.destination, cb_stream_bind.pattern, cb_stream_bind.identity_from)
-    ON CONFLICT ON CONSTRAINT cb_stream_bindings_pkey DO NOTHING;
+    _tokens := string_to_array(_cb_stream_compile_filter.pattern, '.');
+    _n := array_length(_tokens, 1);
+    FOR _i IN 1.._n LOOP
+        _token := _tokens[_i];
+        IF _token = '#' AND _i <> _n THEN
+            RAISE EXCEPTION 'catbird: # must be the final segment of filter %',
+                _cb_stream_compile_filter.pattern USING ERRCODE = 'IRD01';
+        END IF;
+        IF _token <> '*' AND _token <> '#' AND _token ~ '[*#]' THEN
+            RAISE EXCEPTION 'catbird: * and # must be whole segments in filter %',
+                _cb_stream_compile_filter.pattern USING ERRCODE = 'IRD01';
+        END IF;
+    END LOOP;
+
+    IF _cb_stream_compile_filter.pattern = '#' THEN
+        RETURN '^[a-zA-Z0-9_-]+(\.[a-zA-Z0-9_-]+)*$';
+    END IF;
+
+    -- Strip a trailing '.#' (its zero-or-more tail is appended below),
+    -- escape literal dots, then widen '*' to one-segment matches.
+    _regex := regexp_replace(_cb_stream_compile_filter.pattern, '\.#$', '');
+    _regex := regexp_replace(_regex, '\.', '\\.', 'g');
+    _regex := regexp_replace(_regex, '\*', '[a-zA-Z0-9_-]+', 'g');
+
+    IF _cb_stream_compile_filter.pattern ~ '\.#$' THEN
+        -- 'a.#' also matches the bare 'a': the tail may be zero segments
+        RETURN '^' || _regex || '(\.[a-zA-Z0-9_-]+)*$';
+    END IF;
+    RETURN '^' || _regex || '$';
 END; $$;
 -- +goose statementend
+```
 
--- +goose statementbegin
--- Remove one pattern from a destination's routing. The relay and its cursor stay:
--- position is preserved and a relay with no patterns is simply skipped by the
--- runner. Returns whether a binding was removed.
-CREATE FUNCTION cb_stream_unbind(
-    stream           text,
-    destination_kind text,
-    destination      text,
-    pattern          text
-)
-RETURNS boolean LANGUAGE plpgsql AS $$
+---
+
+## 3. `cb_stream_ensure_cursor` — filter param
+
+Signature gains `filter text DEFAULT NULL`; the insert stores pattern and
+compiled regex. Birth-only like everything else in the function.
+
+```sql
+CREATE FUNCTION cb_stream_ensure_cursor(stream text, cursor text, start_pos bigint DEFAULT NULL, filter text DEFAULT NULL)
+```
+
+```sql
 DECLARE
-    _count int;
+    _start bigint;
+    _regex text;
+```
+
+after the stream check:
+
+```sql
+    IF cb_stream_ensure_cursor.filter IS NOT NULL THEN
+        _regex := _cb_stream_compile_filter(cb_stream_ensure_cursor.filter);
+    END IF;
+
+    INSERT INTO cb_stream_cursors (stream, name, pos, filter, filter_regex)
+    VALUES (cb_stream_ensure_cursor.stream, cb_stream_ensure_cursor.cursor, _start,
+            cb_stream_ensure_cursor.filter, _regex)
+    ON CONFLICT ON CONSTRAINT cb_stream_cursors_pkey DO NOTHING;
+```
+
+---
+
+## 4. `cb_stream_ensure_queue` — filter param
+
+Signature gains `filter text DEFAULT NULL` (last param; the Go client calls
+with named args). Compile once, store on the **base** queue row only:
+
+```sql
+DECLARE
+    _start bigint;
+    _regex text;
+```
+
+```sql
+    IF cb_stream_ensure_queue.filter IS NOT NULL THEN
+        _regex := _cb_stream_compile_filter(cb_stream_ensure_queue.filter);
+    END IF;
+```
+
+The base-row `INSERT` column list gains `filter, filter_regex` with values
+`cb_stream_ensure_queue.filter, _regex`. The retry-row `INSERT..SELECT` is
+**unchanged** — it does not copy the filter columns, so `sr.*` queues get
+NULL, which the `cb_stream_queues_retry_no_filter` constraint pins.
+
+---
+
+## 5. `cb_stream_read` — honor the cursor's filter
+
+The cursor advances over the whole scanned range; only matches return. The
+batch-bounding subquery stays unfiltered — `batch_size` counts scanned rows,
+so a filtered read may return fewer rows than `batch_size`, or none, while
+still advancing.
+
+```sql
+DECLARE
+    _pos bigint;
+    _regex text;
+    _new_pos bigint;
 BEGIN
-    DELETE FROM cb_stream_bindings b
-    WHERE b.stream           = cb_stream_unbind.stream
-      AND b.destination_kind = cb_stream_unbind.destination_kind
-      AND b.destination      = cb_stream_unbind.destination
-      AND b.pattern          = cb_stream_unbind.pattern;
-    GET DIAGNOSTICS _count = ROW_COUNT;
-    RETURN _count > 0;
+    SELECT c.pos, c.filter_regex INTO _pos, _regex FROM cb_stream_cursors c
+    WHERE c.stream = cb_stream_read.stream AND c.name = cb_stream_read.cursor
+    FOR UPDATE;
+```
+
+and in the RETURN QUERY:
+
+```sql
+    RETURN QUERY
+    SELECT m.* FROM cb_stream_messages m
+    WHERE m.stream = cb_stream_read.stream
+      AND m.pos > _pos AND m.pos <= _new_pos
+      AND (_regex IS NULL OR m.topic ~ _regex) -- a NULL topic never matches
+    ORDER BY m.pos;
+```
+
+Everything else (max-pos subquery, cursor UPDATE) is unchanged.
+
+---
+
+## 6. `cb_stream_read_claim` — claimed-range fetch moves into SQL
+
+Replaces the inline `SELECT ... WHERE pos BETWEEN` in `consume_queue.go`, so
+every client gets the queue's filter without knowing it exists. Positions in
+the range that don't match were never the queue's to handle; closing the
+claim still advances over them. (An undefined queue returns no rows rather
+than raising — the caller got the range from `cb_stream_claim`, which
+already raised.)
+
+```sql
+-- +goose statementbegin
+-- The messages of a claimed range, in order, honoring the queue's filter.
+CREATE FUNCTION cb_stream_read_claim(stream text, queue text, from_pos bigint, to_pos bigint)
+RETURNS SETOF cb_stream_messages
+LANGUAGE sql AS $$
+    SELECT m.*
+    FROM cb_stream_messages m
+    JOIN cb_stream_queues q
+      ON q.stream = cb_stream_read_claim.stream
+     AND q.name   = cb_stream_read_claim.queue
+    WHERE m.stream = cb_stream_read_claim.stream
+      AND m.pos BETWEEN cb_stream_read_claim.from_pos AND cb_stream_read_claim.to_pos
+      AND (q.filter_regex IS NULL OR m.topic ~ q.filter_regex)
+    ORDER BY m.pos;
+$$;
+-- +goose statementend
+```
+
+---
+
+## 7. `_cb_stream_quarantine` — the filter bug fix
+
+The quarantine loop republishes **every** message in the claimed range to
+`sr.*`. On a filtered queue that would quarantine messages the queue never
+delivered. `_q` (the base queue row) is already fetched for policy; the loop
+gains the predicate:
+
+```sql
+    FOR _m IN
+        SELECT m.* FROM cb_stream_messages m
+        WHERE m.stream = _stream AND m.pos BETWEEN _from_pos AND _to_pos
+          AND (_q.filter_regex IS NULL OR m.topic ~ _q.filter_regex)
+        ORDER BY m.pos
+    LOOP
+```
+
+(Harmless on retry-stream claims: `sr.*` messages carried their topics from
+matches, so they all pass the base filter.)
+
+`cb_stream_fail` needs no change: it is per-message, and a consumer can only
+fail a message it received — which the filtered fetch already selected.
+
+---
+
+## 8. `cb_stream_publish_messages` — per-message topics in batch append
+
+Requirement 2 from the usage sketch: one `Revise` emits many events with
+different topics; `cb_stream_publish_payloads` takes a single topic.
+Envelope form, minimal version: a validated loop over the public
+single-publish path, which keeps the `cb_` header guard, key dedup, and
+notify semantics without duplicating them. At bibliographic-edit batch sizes
+the loop is fine; the set-based temp-table design (sketched pre-Go-phase for
+bulk-import volume) stays the upgrade path if a profiler ever asks.
+
+```sql
+-- +goose statementbegin
+-- Batch publish with per-message topics, headers and keys. messages is a
+-- jsonb array of {payload, topic?, headers?, key?} envelopes. Returns one
+-- row per element, in input order.
+CREATE FUNCTION cb_stream_publish_messages(stream text, messages jsonb)
+RETURNS TABLE (ref_kind cb_ref_kind, ref_id bigint, existing boolean)
+LANGUAGE plpgsql AS $$
+DECLARE
+    _m jsonb;
+BEGIN
+    IF cb_stream_publish_messages.messages IS NULL
+    OR jsonb_typeof(cb_stream_publish_messages.messages) <> 'array' THEN
+        RAISE EXCEPTION 'catbird: messages must be a JSON array' USING ERRCODE = 'IRD01';
+    END IF;
+
+    FOR _m IN SELECT e.* FROM jsonb_array_elements(cb_stream_publish_messages.messages) e LOOP
+        IF _m->'payload' IS NULL THEN
+            RAISE EXCEPTION 'catbird: message without payload' USING ERRCODE = 'IRD01';
+        END IF;
+
+        RETURN QUERY
+        SELECT p.ref_kind, p.ref_id, p.existing
+        FROM cb_stream_publish(
+            cb_stream_publish_messages.stream,
+            _m->>'topic',
+            _m->'payload',
+            coalesce(_m->'headers', '{}'),
+            _m->>'key') p;
+    END LOOP;
 END; $$;
 -- +goose statementend
-
--- +goose down
-
-DROP FUNCTION cb_stream_unbind(text, text, text, text);
-DROP FUNCTION cb_stream_bind(text, text, text, text, bigint, text);
-DROP TABLE cb_stream_bindings;
-DROP TABLE cb_stream_relays;
-DROP SEQUENCE cb_stream_relay_cursor_seq;
-DELETE FROM cb_streams WHERE name = 'bus'; -- cascades to its cursors/messages rows
-DROP TABLE IF EXISTS cbm__bus;             -- the list partition _cb_stream_ensure created
 ```
-
-> After adding this file, bump `SchemaVersion` in `stream/migrate.go` to 2.
 
 ---
 
-## 2. Port the topic matcher into the stream package
+## 9. Down section additions
 
-Copy `topic_trie.go` and `topic.go` from the repo root into `stream/`, changing
-only the package line (`package catbird` → `package stream`). No logic changes —
-the reuse map says port as-is. `topic_trie.go` powers the relay matcher;
-`topic.go` (`matchTopic`) comes along for the bindings tests.
-
-```
-cp topic_trie.go stream/topic_trie.go   # then edit: package stream
-cp topic.go      stream/topic.go        # then edit: package stream
+```sql
+DROP FUNCTION cb_stream_publish_messages(text, jsonb);
+DROP FUNCTION cb_stream_read_claim(text, text, bigint, bigint);
+DROP FUNCTION _cb_stream_compile_filter(text);
 ```
 
-Grammar reminder (the code's, which now wins): `*` = one token, `#` = zero or more
-trailing tokens. The `?`/`*` phrasing in `docs/plan/02-spine.md §3` and `CLAUDE.md`
-is stale — fix it (see §6).
+`cb_stream_ensure_cursor`/`cb_stream_ensure_queue` drops need their new
+signatures. The columns and constraint go down with their tables.
 
 ---
 
-## 3. `stream/bind.go`
+## 10. Go changes
+
+`stream/cursor.go`:
 
 ```go
-package stream
-
-import "context"
-
-const busStream = "bus"
-
-// BindOpts tunes a binding. Zero fields mean the defaults.
-type BindOpts struct {
-	Stream       string // source root stream; "" means "bus"
-	StartPos     *int64 // honored only when this bind creates the relay's cursor
-	IdentityFrom string // inbox kind (04); "" otherwise
-}
-
-// Bind routes topics matching pattern on the source stream to a destination of
-// the given kind. The first bind to a (stream, kind, destination) creates that
-// destination's relay cursor; only that call's StartPos is honored. Idempotent.
-func Bind(ctx context.Context, conn Conn, kind, destination, pattern string, opts ...BindOpts) error {
-	var o BindOpts
-	if len(opts) > 0 {
-		o = opts[0]
-	}
-	stream := o.Stream
-	if stream == "" {
-		stream = busStream
-	}
-	_, err := conn.Exec(ctx,
-		`SELECT cb_stream_bind($1, $2, $3, $4, $5, $6)`,
-		stream, kind, destination, pattern, o.StartPos, nullText(o.IdentityFrom))
-	return wrapErr(err)
-}
-
-// Unbind removes one pattern from a destination's routing. The relay and its
-// cursor stay in place. Reports whether a binding was removed.
-func Unbind(ctx context.Context, conn Conn, kind, destination, pattern string, opts ...BindOpts) (bool, error) {
-	var o BindOpts
-	if len(opts) > 0 {
-		o = opts[0]
-	}
-	stream := o.Stream
-	if stream == "" {
-		stream = busStream
-	}
-	var deleted bool
-	err := conn.QueryRow(ctx,
-		`SELECT cb_stream_unbind($1, $2, $3, $4)`,
-		stream, kind, destination, pattern).Scan(&deleted)
-	return deleted, wrapErr(err)
+type CursorOpts struct {
+	// StartPos: where a new cursor begins ... (unchanged)
+	StartPos *int64
+	// Filter: topic filter, applied server-side. '*' matches one segment,
+	// '#' zero or more trailing segments. "" reads everything. The cursor
+	// advances over everything it scans, so a filtered read can return
+	// fewer messages than the batch size, or none.
+	Filter string
 }
 ```
 
----
+`EnsureCursor` passes `nullText(o.Filter)` as `$4`.
 
-## 4. `stream/relay.go`
+`stream/queue.go`: `QueueOpts` gains the same `Filter string` field (same
+doc comment, plus: fixed at the queue's creation; all consumers share it);
+`EnsureQueue` adds `filter => $N` to its named-args call.
+
+`stream/consume_queue.go`: the claimed-range fetch becomes
 
 ```go
-package stream
-
-import (
-	"context"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
-)
-
-const relayBatchSize = 100
-
-// RelayWriter materializes one matched message into a destination, inside the
-// relay's transaction. The destination write and the cursor advance commit
-// together, so the relay never duplicates into its destination.
-type RelayWriter func(ctx context.Context, tx pgx.Tx, destination string, m Message) error
-
-// relayKinds is the process-wide registry. The stream kind registers below;
-// flow and wire register theirs at import (M4/M5). A kind not registered in this
-// process means its relays are run by a node that did import it.
-var relayKinds = map[string]RelayWriter{}
-
-// RegisterRelayKind registers a destination kind's writer. Call it from an init
-// function so importing the package is enough to make the kind runnable.
-func RegisterRelayKind(kind string, w RelayWriter) { relayKinds[kind] = w }
-
-func init() {
-	// The stream kind forwards the message into another stream, unchanged.
-	RegisterRelayKind("stream", func(ctx context.Context, tx pgx.Tx, dest string, m Message) error {
-		_, err := tx.Exec(ctx,
-			`SELECT _cb_stream_publish($1, $2, $3, $4)`,
-			dest, m.Topic, m.Payload, m.Headers)
-		return wrapErr(err)
-	})
-}
-
-// relayDef is one relay plus the patterns feeding it. Column order matches the
-// query in relay() for RowToStructByPos.
-type relayDef struct {
-	Stream      string
-	Kind        string
-	Destination string
-	Cursor      string
-	Patterns    []string
-}
-
-// relay runs one pass over every relay that has at least one binding: read a
-// batch, forward the matches, advance the cursor — all in one transaction per
-// relay, which is exactly-once materialization. The trie is rebuilt each pass,
-// so binding changes take effect from the next batch.
-func relay(ctx context.Context, pool *pgxpool.Pool) (int, error) {
 	rows, err := pool.Query(ctx, `
-		SELECT r.stream, r.destination_kind, r.destination, r.cursor,
-		       array_agg(b.pattern) AS patterns
-		FROM cb_stream_relays r
-		JOIN cb_stream_bindings b
-		  ON b.stream           = r.stream
-		 AND b.destination_kind = r.destination_kind
-		 AND b.destination      = r.destination
-		GROUP BY r.stream, r.destination_kind, r.destination, r.cursor`)
-	if err != nil {
-		return 0, err
-	}
-	relays, err := pgx.CollectRows(rows, pgx.RowToStructByPos[relayDef])
-	if err != nil {
-		return 0, err
-	}
+		SELECT m.id, m.stream, m.pos, coalesce(m.topic, ''), m.payload, m.headers, m.created_at
+		FROM cb_stream_read_claim($1, $2, $3, $4) m`,
+		stream, *fromPos, *toPos)
+```
 
-	n := 0
-	for _, r := range relays {
-		if ctx.Err() != nil {
-			return n, ctx.Err()
-		}
-		w, ok := relayKinds[r.Kind]
-		if !ok {
-			continue // kind not registered here; another node runs it
-		}
-		match := newPatternSet(r.Patterns)
+(with the queue name — `$1..$4` = stream, queue, from, to).
 
-		wrote := 0
-		err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
-			// cb_stream_read takes FOR UPDATE on the cursor row: one worker
-			// advances a given relay at a time.
-			batch, err := Read(ctx, tx, r.Stream, r.Cursor, relayBatchSize)
-			if err != nil || len(batch) == 0 {
-				return err
-			}
-			for _, m := range batch {
-				if !match.has(m.Topic) {
-					continue
-				}
-				if err := w(ctx, tx, r.Destination, m); err != nil {
-					return err
-				}
-				wrote++
-			}
-			return nil
-			// commit: destination writes + cursor advance land together.
-		})
-		if err != nil {
-			continue // one relay's failure must not stall the others; retry next tick
-		}
-		n += wrote
-	}
-	return n, nil
+`stream/publish.go`:
+
+```go
+// BatchMessage is one element of PublishMessages.
+type BatchMessage struct {
+	Topic   string
+	Payload any
+	Headers map[string]any // cb_ keys are reserved
+	Key     string         // deduplication key: keep-oldest
 }
 
-// patternSet answers "does this topic match any of the relay's patterns" using
-// the ported trie.
-type patternSet struct{ t *topicTrie[struct{}] }
-
-func newPatternSet(patterns []string) patternSet {
-	t := newTopicTrie[struct{}]()
-	for _, p := range patterns {
-		t.add(p, struct{}{})
-	}
-	return patternSet{t}
-}
-
-func (p patternSet) has(topic string) bool { return len(p.t.match(topic, nil)) > 0 }
+func PublishMessages(ctx context.Context, conn Conn, stream string, msgs []BatchMessage) ([]Ref, error)
 ```
+
+marshals to one jsonb array and scans `(ref_kind, ref_id, existing)` per
+element from `cb_stream_publish_messages($1, $2)`.
 
 ---
 
-## 5. Wire the relay job into `RunJobs` (`stream/jobs.go`)
+## 11. Tests (`stream/stream_test.go`) — the M3 exit gate
 
-Add one field to `JobsOpts`:
-
-```go
-	RelayInterval time.Duration // 100ms: relay lag (bus -> destinations)
-```
-
-Default it alongside the others in `RunJobs`:
-
-```go
-	if o.RelayInterval <= 0 {
-		o.RelayInterval = 100 * time.Millisecond
-	}
-```
-
-Register the job next to `stream.assign` / `stream.deliver` / `stream.prune`:
-
-```go
-	t.Add(ticker.Job{Name: "stream.relay", Every: o.RelayInterval,
-		Run: func(ctx context.Context) (int, error) { return relay(ctx, pool) }})
-```
-
-> Relay lag is assign-tick + relay-tick: a bus message needs a position before an
-> ordered read returns it. That's the poll-only prediction; NOTIFY tightens it at M5.
+1. **TestCompileFilter** — grammar table ported from `bindings_test.go`,
+   driven through SQL: `SELECT $topic ~ _cb_stream_compile_filter($pattern)`
+   for the match cases, error cases assert IRD01 (`ErrInvalid`). Include:
+   zero-token tail (`a.#` matches `a`), bare `#`, mid-pattern `*`, rejected
+   `#` not final, rejected in-token wildcards, rejected empty segments.
+2. **TestFilteredQueue** — the ORCID shape: publish mixed topics, a queue
+   with `Filter: "record.work.#"` and `StartPos: At(0)`; consumers see only
+   matches; `closed_pos` advances over non-matches; a failed match lands in
+   `sr.*` and redelivers; **quarantine leaks nothing**: crash a claim whose
+   range holds matching and non-matching messages, assert only matching
+   copies appear in `sr.*`.
+3. **TestFilteredCursor** — filtered `Read` returns matches only, advances
+   over a batch with zero matches, and never returns NULL-topic messages;
+   an unfiltered cursor on the same stream sees everything (independence).
+4. **TestPublishMessages** — per-message topics land, headers/keys per
+   element work, key dedup returns `existing`, `cb_` header rejected,
+   element without payload rejected, refs come back in input order.
+5. **Replay** — late `EnsureQueue` with `StartPos: At(0)` + filter
+   materializes retained history into handler calls (the regression
+   incident's mechanical answer).
 
 ---
 
-## 6. Doc fixes (do as part of the work)
+## 12. Doc fixes (do as part of the work)
 
-- `docs/plan/02-spine.md §3`: change "today's grammar (`?` single token, `*` tail)"
-  to `*` single token / `#` tail, matching the ported `topic_trie.go`.
-- `CLAUDE.md` "What is Catbird?" bullet: same correction to the wildcard grammar.
-
----
-
-## 7. Tests to add (`stream/stream_test.go`) — the M3 exit gate
-
-1. **LiveView** — `Publish` into `bus` inside a tx, roll back; assert the
-   destination stream stays empty and no `<schema>.cbs_bus` notification fired.
-2. **Relay crash mid-batch → no duplicates** — kill the relay between write and
-   commit; the batch re-reads and re-writes cleanly; destination count == matched
-   count.
-3. **Late binding replays history** — publish to `bus`, then
-   `Bind("stream", dest, pattern, BindOpts{StartPos: At(0)})`; assert the relay
-   materializes the pre-binding history.
-4. **Ported `bindings_test.go` semantics** — the wildcard match cases over the new
-   tables.
+- `docs/plan/02-spine.md`: rewrite around filtered consumers + the wire
+  path; the bindings/relay chapter goes. The usage sketch's "collapse"
+  section is the outline.
+- `docs/plan/README.md`: new decision-log entry (read filters replace
+  routing; supersedes D8's fan-out framing — there is no fan-out).
+- `docs/plan/05-milestones.md`: M3 line becomes filtered reads + batch
+  envelopes.
+- `CLAUDE.md`: the "What is Catbird?" wildcard line still says `?`/`*` —
+  correct to `*` one segment / `#` trailing; drop "topic routing via
+  bindings" phrasing when the old surface goes.
+- `docs/plan/01-stream.md`: §4 (cursor read) and §5 (claims) gain the
+  filter semantics — scanned-range advancement, positions-not-matches
+  batch sizing, retry queues unfiltered by construction.
