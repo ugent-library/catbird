@@ -2,6 +2,7 @@ package catbird
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -69,6 +70,8 @@ type workerNotifier struct {
 	pool   *pgxpool.Pool
 	logger *slog.Logger
 
+	pollTimeout time.Duration // idle wait/ping deadline; 0 = defaultPollTimeout
+
 	mu   sync.Mutex
 	subs map[string][]*workerNotifyTarget // PG channel → list of targets
 }
@@ -135,6 +138,11 @@ func (n *workerNotifier) listenOnce(ctx context.Context, channels []string) erro
 
 	pgConn := conn.Conn()
 
+	timeout := n.pollTimeout
+	if timeout <= 0 {
+		timeout = defaultPollTimeout
+	}
+
 	for _, ch := range channels {
 		if _, listenErr := pgConn.Exec(ctx, "LISTEN "+pgx.Identifier{ch}.Sanitize()); listenErr != nil {
 			return listenErr
@@ -142,8 +150,24 @@ func (n *workerNotifier) listenOnce(ctx context.Context, channels []string) erro
 	}
 
 	for {
-		notification, waitErr := pgConn.WaitForNotification(ctx)
+		waitCtx, cancel := context.WithTimeout(ctx, timeout)
+		notification, waitErr := pgConn.WaitForNotification(waitCtx)
+		cancel()
 		if waitErr != nil {
+			// A clean timeout just means no notification arrived in this window — the
+			// connection may still be healthy. While the parent context is still live,
+			// ping to tell a quiet connection from one that has silently died: a healthy
+			// one keeps waiting, a dead one returns an error so listen() reconnects
+			// instead of blocking forever.
+			if errors.Is(waitErr, context.DeadlineExceeded) && ctx.Err() == nil {
+				pingCtx, pingCancel := context.WithTimeout(ctx, timeout)
+				pingErr := pgConn.Ping(pingCtx)
+				pingCancel()
+				if pingErr == nil {
+					continue
+				}
+				return pingErr
+			}
 			return waitErr
 		}
 

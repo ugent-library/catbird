@@ -17,6 +17,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// defaultPollTimeout bounds the periodic background queries a worker runs
+// (claim polls, hiding, heartbeat, schedule ticks, stop checks). It only
+// matters when a connection has stopped responding without failing — a
+// half-open socket where a read blocks forever and no error ever comes back.
+// Without it such a poll blocks its goroutine and leaks a pooled connection,
+// and nothing is ever logged; with it the poll returns an error, gets logged,
+// and the loop retries on a fresh connection.
+const defaultPollTimeout = 30 * time.Second
+
 type WorkerInfo struct {
 	ID              string             `json:"id"`
 	TaskHandlers    []*TaskHandlerInfo `json:"task_handlers"`
@@ -309,7 +318,10 @@ func (w *Worker) Start(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if _, err := w.pool.Exec(ctx, `SELECT * FROM cb_worker_heartbeat(id => $1);`, w.id); err != nil {
+				hbCtx, cancel := context.WithTimeout(ctx, defaultPollTimeout)
+				_, err := w.pool.Exec(hbCtx, `SELECT * FROM cb_worker_heartbeat(id => $1);`, w.id)
+				cancel()
+				if err != nil && ctx.Err() == nil {
 					w.logger.ErrorContext(ctx, "worker: cannot send heartbeat", "error", err)
 				}
 			}
@@ -334,26 +346,22 @@ func (w *Worker) Start(ctx context.Context) error {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 
+		runDue := func(query, kind string) {
+			runCtx, cancel := context.WithTimeout(ctx, defaultPollTimeout)
+			defer cancel()
+			var count int
+			if err := w.pool.QueryRow(runCtx, query).Scan(&count); err != nil && ctx.Err() == nil {
+				w.logger.ErrorContext(ctx, "worker: cannot run due schedules", "kind", kind, "error", err)
+			}
+		}
+
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				// Poll for due task schedules and execute them
-				var taskCount int
-				if err := w.pool.QueryRow(ctx,
-					`SELECT cb_execute_due_task_schedules(array(SELECT task_name FROM cb_task_schedules WHERE enabled), 32)`,
-				).Scan(&taskCount); err != nil {
-					// Ignore errors - likely no schedules exist yet
-				}
-
-				// Poll for due flow schedules and execute them
-				var flowCount int
-				if err := w.pool.QueryRow(ctx,
-					`SELECT cb_execute_due_flow_schedules(array(SELECT flow_name FROM cb_flow_schedules WHERE enabled), 32)`,
-				).Scan(&flowCount); err != nil {
-					// Ignore errors - likely no schedules exist yet
-				}
+				runDue(`SELECT cb_execute_due_task_schedules(array(SELECT task_name FROM cb_task_schedules WHERE enabled), 32)`, "task")
+				runDue(`SELECT cb_execute_due_flow_schedules(array(SELECT flow_name FROM cb_flow_schedules WHERE enabled), 32)`, "flow")
 			}
 		}
 	})
@@ -1363,10 +1371,16 @@ type claimLoopConfig[C any] struct {
 	wakeup        <-chan struct{} // NOTIFY signal; nil = timer-only fallback
 	fallbackDelay time.Duration   // poll interval when no NOTIFY arrives (default 2s)
 	logPollError  func(context.Context, error)
+	pollTimeout   time.Duration // per-poll deadline; 0 = defaultPollTimeout
 }
 
 func runClaimLoop[C any](shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup, cfg claimLoopConfig[C]) {
 	claims := make(chan C)
+
+	timeout := cfg.pollTimeout
+	if timeout <= 0 {
+		timeout = defaultPollTimeout
+	}
 
 	wg.Go(func() {
 		defer close(claims)
@@ -1379,9 +1393,15 @@ func runClaimLoop[C any](shutdownCtx, handlerCtx context.Context, wg *sync.WaitG
 			default:
 			}
 
-			msgs, err := cfg.pollClaims(shutdownCtx)
+			pollCtx, cancel := context.WithTimeout(shutdownCtx, timeout)
+			msgs, err := cfg.pollClaims(pollCtx)
+			cancel()
 			if err != nil {
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				// Only a shutdown of the whole worker ends the loop. A poll that
+				// hit the deadline above (or failed for any other reason) is a
+				// fault to log and retry on a fresh connection, not a reason to
+				// quit — checking the parent context tells the two apart.
+				if shutdownCtx.Err() != nil {
 					return
 				}
 
@@ -1673,7 +1693,14 @@ func isTaskCancelRequested(ctx context.Context, conn Conn, taskName string, runI
 }
 
 func isTaskCancelRequestedBestEffort(ctx context.Context, conn Conn, taskName string, runID int64) (bool, error) {
-	requested, err := isTaskCancelRequested(ctx, conn, taskName, runID)
+	primaryCtx := ctx
+	if ctx != nil {
+		var cancel context.CancelFunc
+		primaryCtx, cancel = context.WithTimeout(ctx, defaultPollTimeout)
+		defer cancel()
+	}
+
+	requested, err := isTaskCancelRequested(primaryCtx, conn, taskName, runID)
 	if err == nil || ctx == nil || ctx.Err() == nil {
 		return requested, err
 	}
@@ -1704,7 +1731,14 @@ func getFlowStatus(ctx context.Context, conn Conn, flowName string, runID int64)
 }
 
 func getFlowStatusBestEffort(ctx context.Context, conn Conn, flowName string, runID int64) (string, error) {
-	status, err := getFlowStatus(ctx, conn, flowName, runID)
+	primaryCtx := ctx
+	if ctx != nil {
+		var cancel context.CancelFunc
+		primaryCtx, cancel = context.WithTimeout(ctx, defaultPollTimeout)
+		defer cancel()
+	}
+
+	status, err := getFlowStatus(primaryCtx, conn, flowName, runID)
 	if err == nil || ctx == nil || ctx.Err() == nil {
 		return status, err
 	}
@@ -1941,7 +1975,9 @@ func startInFlightHider(handlerCtx context.Context, wg *sync.WaitGroup, interval
 			case <-handlerCtx.Done():
 				return
 			case <-ticker.C:
-				hideFn(handlerCtx)
+				hideCtx, cancel := context.WithTimeout(handlerCtx, defaultPollTimeout)
+				hideFn(hideCtx)
+				cancel()
 			}
 		}
 	})
