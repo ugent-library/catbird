@@ -179,7 +179,7 @@ feed once queues take a server-side filter:
 
 ```go
 stream.EnsureQueue(ctx, pool, "records", "orcid_push",
-    stream.QueueOpts{Filter: "record.work.#", StartPos: stream.At(0)})
+    stream.QueueOpts{Topic: "record.work.#", StartPos: stream.At(0)})
 stream.ConsumeQueue(ctx, pool, "records", "orcid_push", handlePush)
 ```
 
@@ -390,7 +390,7 @@ The open issues add future consumers; each lands on the same primitives.
 | 3 | Ordered consume, durable cursor, whole stream | exists (`Consume`) |
 | 4 | Work-stream queue semantics (retry, claims, parallel) | exists (`ConsumeQueue`) |
 | 5 | Same-tx explicit enqueue with dedup key | exists (`Publish` w/ `Key`) |
-| 6 | Server-side topic filter: queue policy + cursor reads | **the spine — new** |
+| 6 | Server-side filter: topic pattern + condition, queue policy + cursor reads | **the spine — new** |
 | 7 | Identity-keyed inbox, written explicitly by handlers | M5, no routing |
 | 8 | Ephemeral topic fan-out in-process | M5, no routing |
 | 9 | Durable run handle: status/output/cancel, queryable by app key (raven UI + ingest deliveries) | M4, no routing |
@@ -454,12 +454,19 @@ for deep replay over a sparse filter (activating `record.work.#` at
 `At(0)` against years of feed). Three commitments keep the consequences
 contained:
 
-1. **The filter language is topics, full stop.** The topic is the
-   producer-chosen, indexable filter key; a consumer that needs to select
-   on a payload field promotes that field into the topic (the LDN accept
-   endpoint derives its topic from the notification type). Payload gates
-   stay app-side (#132 already puts them there). One filterable column
-   means one index shape — no GIN-on-jsonb arms race taxing every publish.
+1. **The filter is two small languages, each doing one job.** `topic` — a
+   bare pattern, single, least verbose, the fast path, the only dimension
+   that can ever be index-assisted — plus an optional `condition` over
+   headers and payload: AND-only, parsed once at registration into
+   per-column jsonpath, MVP limited to nested-key existence and scalar
+   equality (a whitelist that grows deliberately). The condition is the
+   relief valve that keeps attributes out of topic strings — topic-only
+   filtering would stimulate cramming (`record.work.updated.public…`).
+   Documented rule: any condition costs a per-row jsonb evaluation and is
+   never index-assisted — topics select, conditions prune. Richer content
+   routing (#132's config-driven chains) stays app-side, and no jsonb
+   index ever exists on the stream. (`condition` also inherits the old
+   task DSL's role, so M4 step conditions can share the language.)
 2. **The engine never creates content indexes; correctness never depends
    on one.** Its read SQL is written index-usable (the compiled
    `prefix LIKE` + regex predicate), nothing more.

@@ -5,32 +5,57 @@ is dead: no `cb_stream_bindings`, no relays, no relay ticker job, no
 destination kinds. Why and how the direction changed is recorded in
 `spine-usage-sketch.md` — short version: a consumer is a filter plus a
 position over a log, and queue retry semantics apply *in place* once queues
-take a server-side filter. Topics are the only filter dimension; payload
-filtering means promoting the field into the topic.
+can read a subset. A filter is two small languages, each doing one job:
+`topic` — a bare topic pattern (single, least verbose, the fast path), and
+`condition` — an AND-only expression over `$.headers` and `$.payload`,
+parsed once at registration and disassembled into per-column jsonpath
+predicates. Documented rule: topic matching is the fast path; any condition
+costs a per-row jsonb evaluation and is never index-assisted — topics
+select, conditions prune, never the other way around.
 
 Settled decisions:
 
-- Filters are **birth policy** on queues and cursors, not read arguments —
-  competing consumers of one queue must agree (same reasoning as
-  `claim_batch_size`). Stored as the pattern verbatim plus a regex compiled
-  once at ensure. Changing a filter later is the ops layer: raw `UPDATE`
-  setting both `filter` and `filter_regex = _cb_stream_compile_filter(...)`.
-- Grammar unchanged: `*` one segment, `#` zero or more trailing segments,
-  final position only. One matcher implementation, in SQL; the Go trie stays
-  app-side (in-process dispatchers).
-- A `NULL` topic never matches a filter.
-- Retry queues never carry a filter: `sr.*` holds only this queue's own
-  failures, pre-filtered by construction.
+- Topic and condition are **birth policy** on queues and cursors, not read
+  arguments — competing consumers of one queue must agree (same reasoning
+  as `claim_batch_size`). Stored verbatim plus their compiled forms,
+  derived once at ensure. Changing them later is the ops layer: raw
+  `UPDATE` that re-derives the compiled columns by calling the same
+  compile functions.
+- Topic grammar unchanged: `*` one segment, `#` zero or more trailing
+  segments, final position only. One matcher implementation, in SQL; the
+  Go trie stays app-side (in-process dispatchers).
+- The condition MVP grammar is a whitelist — the parser is the validator,
+  so unsupported constructs fail loud at registration, and the emitted
+  jsonpath is generated, never user-authored:
+
+  ```
+  expr     := conjunct { "&&" conjunct }
+  conjunct := 'exists(' path ')'            -- nested-key existence
+            | path '==' scalar              -- nested-key scalar equality
+  path     := '$.' ("headers"|"payload") { "." ident }
+  scalar   := "string" | number | true | false
+  ```
+
+  Deliberately out of the MVP (start small and grow): quoted key segments
+  (`$."@type"` — LDN keys wait for this), array indexing, `null` equality
+  (`exists` covers presence), string escapes, and `&&` inside string
+  literals (it breaks the conjunct split, then fails the conjunct match —
+  loud, not silently wrong). `$.topic` is not part of this language at
+  all: the topic pattern is its own parameter.
+- A `NULL` message topic never matches a topic pattern.
+- Retry queues never carry a topic or condition: `sr.*` holds only this
+  queue's own failures, pre-filtered by construction.
 - `claim_batch_size` counts **positions**, not matches. A sparse filter
   closes near-empty claims fast; cursor reads may return zero rows while
   still advancing.
 - Edits go **in place** into `stream/migrations/00001_stream.sql` (schema is
   pre-release; same precedent as the D27/D28 rework). No version bump.
-- No engine-created content indexes. Read SQL stays index-usable for later,
-  but the prefix column and the claim fast-forward optimization wait for a
-  deep-sparse-replay customer.
+- No engine-created content indexes, and no jsonb index ever. Read SQL
+  stays index-usable on the topic side for later; the prefix column and
+  the claim fast-forward optimization wait for a deep-sparse-replay
+  customer.
 
-Build order: (1) compiler + columns + ensure params, (2) read paths
+Build order: (1) compilers + columns + ensure params, (2) read paths
 (`cb_stream_read`, new `cb_stream_read_claim`, quarantine predicate),
 (3) Go opts + fetch swap, (4) `cb_stream_publish_messages` + Go
 `PublishMessages`, (5) tests, (6) doc fixes.
@@ -42,32 +67,40 @@ Build order: (1) compiler + columns + ensure params, (2) read paths
 `cb_stream_cursors` gains:
 
 ```sql
-    filter text,       -- topic filter pattern; NULL reads everything
-    filter_regex text  -- compiled by _cb_stream_compile_filter at ensure
+    topic text,                 -- topic pattern; NULL reads every topic
+    topic_regex text,           -- compiled by _cb_stream_compile_topic at ensure
+    condition text,             -- headers/payload expression; NULL reads everything
+    condition_headers jsonpath, -- disassembled by _cb_stream_compile_condition at ensure
+    condition_payload jsonpath
 ```
 
-`cb_stream_queues` gains the same two columns, plus a named constraint next
-to `cb_stream_queues_retry_batch_size`:
+`cb_stream_queues` gains the same five columns, plus a named constraint
+next to `cb_stream_queues_retry_batch_size`:
 
 ```sql
-    CONSTRAINT cb_stream_queues_retry_no_filter
-        CHECK (left(stream, 3) <> 'sr.' OR filter IS NULL)
+    CONSTRAINT cb_stream_queues_retry_no_filters
+        CHECK (left(stream, 3) <> 'sr.' OR (topic IS NULL AND condition IS NULL))
 ```
 
 ---
 
-## 2. `_cb_stream_compile_filter`
+## 2. Registration-time compilers
+
+Two functions, placed near `cb_valid_name`. Both run once at ensure — row
+evaluation only ever sees their precompiled output.
+
+### `_cb_stream_compile_topic`
 
 Port of the old `cb_bind` validator + regex builder (migrations/
 00001_catbird.sql:384-462), reduced to one function that returns the
-compiled regex or raises. Place it near `cb_valid_name`.
+compiled regex or raises.
 
 ```sql
 -- +goose statementbegin
--- Validate a topic filter and compile it to a regex. '*' matches one
+-- Validate a topic pattern and compile it to a regex. '*' matches one
 -- segment, '#' matches zero or more trailing segments and must be the
 -- final segment. Raises for anything else.
-CREATE FUNCTION _cb_stream_compile_filter(pattern text)
+CREATE FUNCTION _cb_stream_compile_topic(pattern text)
 RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
     _tokens text[];
@@ -76,46 +109,46 @@ DECLARE
     _n int;
     _regex text;
 BEGIN
-    IF _cb_stream_compile_filter.pattern IS NULL OR _cb_stream_compile_filter.pattern = '' THEN
-        RAISE EXCEPTION 'catbird: filter cannot be empty' USING ERRCODE = 'IRD01';
+    IF _cb_stream_compile_topic.pattern IS NULL OR _cb_stream_compile_topic.pattern = '' THEN
+        RAISE EXCEPTION 'catbird: topic pattern cannot be empty' USING ERRCODE = 'IRD01';
     END IF;
 
-    IF _cb_stream_compile_filter.pattern !~ '^[a-zA-Z0-9._#*-]+$' THEN
-        RAISE EXCEPTION 'catbird: filter % may only contain a-z, A-Z, 0-9, ., _, -, * and #',
-            _cb_stream_compile_filter.pattern USING ERRCODE = 'IRD01';
+    IF _cb_stream_compile_topic.pattern !~ '^[a-zA-Z0-9._#*-]+$' THEN
+        RAISE EXCEPTION 'catbird: topic pattern % may only contain a-z, A-Z, 0-9, ., _, -, * and #',
+            _cb_stream_compile_topic.pattern USING ERRCODE = 'IRD01';
     END IF;
 
-    IF _cb_stream_compile_filter.pattern ~ '\.\.'
-    OR _cb_stream_compile_filter.pattern ~ '(^\.|\.$)' THEN
-        RAISE EXCEPTION 'catbird: filter % cannot contain empty segments',
-            _cb_stream_compile_filter.pattern USING ERRCODE = 'IRD01';
+    IF _cb_stream_compile_topic.pattern ~ '\.\.'
+    OR _cb_stream_compile_topic.pattern ~ '(^\.|\.$)' THEN
+        RAISE EXCEPTION 'catbird: topic pattern % cannot contain empty segments',
+            _cb_stream_compile_topic.pattern USING ERRCODE = 'IRD01';
     END IF;
 
-    _tokens := string_to_array(_cb_stream_compile_filter.pattern, '.');
+    _tokens := string_to_array(_cb_stream_compile_topic.pattern, '.');
     _n := array_length(_tokens, 1);
     FOR _i IN 1.._n LOOP
         _token := _tokens[_i];
         IF _token = '#' AND _i <> _n THEN
-            RAISE EXCEPTION 'catbird: # must be the final segment of filter %',
-                _cb_stream_compile_filter.pattern USING ERRCODE = 'IRD01';
+            RAISE EXCEPTION 'catbird: # must be the final segment of topic pattern %',
+                _cb_stream_compile_topic.pattern USING ERRCODE = 'IRD01';
         END IF;
         IF _token <> '*' AND _token <> '#' AND _token ~ '[*#]' THEN
-            RAISE EXCEPTION 'catbird: * and # must be whole segments in filter %',
-                _cb_stream_compile_filter.pattern USING ERRCODE = 'IRD01';
+            RAISE EXCEPTION 'catbird: * and # must be whole segments in topic pattern %',
+                _cb_stream_compile_topic.pattern USING ERRCODE = 'IRD01';
         END IF;
     END LOOP;
 
-    IF _cb_stream_compile_filter.pattern = '#' THEN
+    IF _cb_stream_compile_topic.pattern = '#' THEN
         RETURN '^[a-zA-Z0-9_-]+(\.[a-zA-Z0-9_-]+)*$';
     END IF;
 
     -- Strip a trailing '.#' (its zero-or-more tail is appended below),
     -- escape literal dots, then widen '*' to one-segment matches.
-    _regex := regexp_replace(_cb_stream_compile_filter.pattern, '\.#$', '');
+    _regex := regexp_replace(_cb_stream_compile_topic.pattern, '\.#$', '');
     _regex := regexp_replace(_regex, '\.', '\\.', 'g');
     _regex := regexp_replace(_regex, '\*', '[a-zA-Z0-9_-]+', 'g');
 
-    IF _cb_stream_compile_filter.pattern ~ '\.#$' THEN
+    IF _cb_stream_compile_topic.pattern ~ '\.#$' THEN
         -- 'a.#' also matches the bare 'a': the tail may be zero segments
         RETURN '^' || _regex || '(\.[a-zA-Z0-9_-]+)*$';
     END IF;
@@ -124,63 +157,144 @@ END; $$;
 -- +goose statementend
 ```
 
----
+### `_cb_stream_compile_condition`
 
-## 3. `cb_stream_ensure_cursor` — filter param
-
-Signature gains `filter text DEFAULT NULL`; the insert stores pattern and
-compiled regex. Birth-only like everything else in the function.
+The whitelist parser: splits on `&&`, matches each conjunct against the two
+supported shapes, sorts conjuncts by column, and re-joins each column's
+conjuncts into one generated jsonpath. Every regex is anchored, so anything
+unsupported fails the match and raises.
 
 ```sql
-CREATE FUNCTION cb_stream_ensure_cursor(stream text, cursor text, start_pos bigint DEFAULT NULL, filter text DEFAULT NULL)
+-- +goose statementbegin
+-- Parse a condition into per-column jsonpath predicates, once, at
+-- registration. Conjuncts are joined by '&&'; each is either
+-- exists($.headers.a.b) / exists($.payload.a.b), or
+-- $.headers.a.b == <scalar> with <scalar> a "string", a number, true or
+-- false. Anything else raises.
+CREATE FUNCTION _cb_stream_compile_condition(
+    condition text,
+    OUT condition_headers jsonpath,
+    OUT condition_payload jsonpath
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    _conjunct text;
+    _m text[];
+    _pred text;
+    _headers text[] := '{}';
+    _payload text[] := '{}';
+BEGIN
+    IF _cb_stream_compile_condition.condition IS NULL
+    OR btrim(_cb_stream_compile_condition.condition) = '' THEN
+        RAISE EXCEPTION 'catbird: condition cannot be empty' USING ERRCODE = 'IRD01';
+    END IF;
+
+    FOREACH _conjunct IN ARRAY regexp_split_to_array(_cb_stream_compile_condition.condition, '\s*&&\s*') LOOP
+        -- nested-key existence: exists($.headers.a.b)
+        _m := regexp_match(_conjunct,
+            '^\s*exists\(\$\.(headers|payload)((?:\.[a-zA-Z_][a-zA-Z0-9_]*)+)\)\s*$');
+        IF _m IS NOT NULL THEN
+            _pred := 'exists($' || _m[2] || ')';
+        ELSE
+            -- nested-key scalar equality: $.payload.a.b == <scalar>
+            _m := regexp_match(_conjunct,
+                '^\s*\$\.(headers|payload)((?:\.[a-zA-Z_][a-zA-Z0-9_]*)+)\s*==\s*("[^"\\]*"|-?[0-9]+(?:\.[0-9]+)?|true|false)\s*$');
+            IF _m IS NULL THEN
+                RAISE EXCEPTION 'catbird: unsupported condition near "%"; use exists($.headers.a.b) or $.payload.a.b == <scalar>, joined with &&',
+                    _conjunct USING ERRCODE = 'IRD01';
+            END IF;
+            _pred := '$' || _m[2] || ' == ' || _m[3];
+        END IF;
+
+        IF _m[1] = 'headers' THEN
+            _headers := _headers || _pred;
+        ELSE
+            _payload := _payload || _pred;
+        END IF;
+    END LOOP;
+
+    IF array_length(_headers, 1) > 0 THEN
+        condition_headers := array_to_string(_headers, ' && ')::jsonpath;
+    END IF;
+    IF array_length(_payload, 1) > 0 THEN
+        condition_payload := array_to_string(_payload, ' && ')::jsonpath;
+    END IF;
+END; $$;
+-- +goose statementend
+```
+
+---
+
+## 3. `cb_stream_ensure_cursor` — topic and condition params
+
+Signature gains the two params; the insert stores the sources verbatim and
+their compiled forms. Birth-only like everything else in the function.
+
+```sql
+CREATE FUNCTION cb_stream_ensure_cursor(stream text, cursor text, start_pos bigint DEFAULT NULL, topic text DEFAULT NULL, condition text DEFAULT NULL)
 ```
 
 ```sql
 DECLARE
     _start bigint;
     _regex text;
+    _headers jsonpath;
+    _payload jsonpath;
 ```
 
 after the stream check:
 
 ```sql
-    IF cb_stream_ensure_cursor.filter IS NOT NULL THEN
-        _regex := _cb_stream_compile_filter(cb_stream_ensure_cursor.filter);
+    IF cb_stream_ensure_cursor.topic IS NOT NULL THEN
+        _regex := _cb_stream_compile_topic(cb_stream_ensure_cursor.topic);
+    END IF;
+    IF cb_stream_ensure_cursor.condition IS NOT NULL THEN
+        SELECT c.condition_headers, c.condition_payload INTO _headers, _payload
+        FROM _cb_stream_compile_condition(cb_stream_ensure_cursor.condition) c;
     END IF;
 
-    INSERT INTO cb_stream_cursors (stream, name, pos, filter, filter_regex)
+    INSERT INTO cb_stream_cursors
+        (stream, name, pos, topic, topic_regex, condition, condition_headers, condition_payload)
     VALUES (cb_stream_ensure_cursor.stream, cb_stream_ensure_cursor.cursor, _start,
-            cb_stream_ensure_cursor.filter, _regex)
+            cb_stream_ensure_cursor.topic, _regex,
+            cb_stream_ensure_cursor.condition, _headers, _payload)
     ON CONFLICT ON CONSTRAINT cb_stream_cursors_pkey DO NOTHING;
 ```
 
 ---
 
-## 4. `cb_stream_ensure_queue` — filter param
+## 4. `cb_stream_ensure_queue` — topic and condition params
 
-Signature gains `filter text DEFAULT NULL` (last param; the Go client calls
-with named args). Compile once, store on the **base** queue row only:
+Signature gains `topic text DEFAULT NULL, condition text DEFAULT NULL`
+(last params; the Go client calls with named args). Compile once, store on
+the **base** queue row only:
 
 ```sql
 DECLARE
     _start bigint;
     _regex text;
+    _headers jsonpath;
+    _payload jsonpath;
 ```
 
 ```sql
-    IF cb_stream_ensure_queue.filter IS NOT NULL THEN
-        _regex := _cb_stream_compile_filter(cb_stream_ensure_queue.filter);
+    IF cb_stream_ensure_queue.topic IS NOT NULL THEN
+        _regex := _cb_stream_compile_topic(cb_stream_ensure_queue.topic);
+    END IF;
+    IF cb_stream_ensure_queue.condition IS NOT NULL THEN
+        SELECT c.condition_headers, c.condition_payload INTO _headers, _payload
+        FROM _cb_stream_compile_condition(cb_stream_ensure_queue.condition) c;
     END IF;
 ```
 
-The base-row `INSERT` column list gains `filter, filter_regex` with values
-`cb_stream_ensure_queue.filter, _regex`. The retry-row `INSERT..SELECT` is
-**unchanged** — it does not copy the filter columns, so `sr.*` queues get
-NULL, which the `cb_stream_queues_retry_no_filter` constraint pins.
+The base-row `INSERT` column list gains `topic, topic_regex, condition,
+condition_headers, condition_payload`. The retry-row `INSERT..SELECT` is
+**unchanged** — it does not copy these columns, so `sr.*` queues get NULL,
+which the `cb_stream_queues_retry_no_filters` constraint pins.
 
 ---
 
-## 5. `cb_stream_read` — honor the cursor's filter
+## 5. `cb_stream_read` — honor the cursor's topic and condition
 
 The cursor advances over the whole scanned range; only matches return. The
 batch-bounding subquery stays unfiltered — `batch_size` counts scanned rows,
@@ -191,9 +305,13 @@ still advancing.
 DECLARE
     _pos bigint;
     _regex text;
+    _headers jsonpath;
+    _payload jsonpath;
     _new_pos bigint;
 BEGIN
-    SELECT c.pos, c.filter_regex INTO _pos, _regex FROM cb_stream_cursors c
+    SELECT c.pos, c.topic_regex, c.condition_headers, c.condition_payload
+    INTO _pos, _regex, _headers, _payload
+    FROM cb_stream_cursors c
     WHERE c.stream = cb_stream_read.stream AND c.name = cb_stream_read.cursor
     FOR UPDATE;
 ```
@@ -205,9 +323,16 @@ and in the RETURN QUERY:
     SELECT m.* FROM cb_stream_messages m
     WHERE m.stream = cb_stream_read.stream
       AND m.pos > _pos AND m.pos <= _new_pos
-      AND (_regex IS NULL OR m.topic ~ _regex) -- a NULL topic never matches
+      AND (_regex IS NULL OR m.topic ~ _regex)          -- a NULL topic never matches
+      AND (_headers IS NULL OR m.headers @@ _headers)   -- lax: an error means no match
+      AND (_payload IS NULL OR m.payload @@ _payload)
     ORDER BY m.pos;
 ```
+
+(The written order is topic → headers → payload, cheap to expensive. The
+planner doesn't guarantee `AND` order; all three are sub-microsecond per
+row, so this stays plain — a CASE wrap is the documented knob if a deep
+replay profile ever shows payload evaluation dominating.)
 
 Everything else (max-pos subquery, cursor UPDATE) is unchanged.
 
@@ -216,15 +341,16 @@ Everything else (max-pos subquery, cursor UPDATE) is unchanged.
 ## 6. `cb_stream_read_claim` — claimed-range fetch moves into SQL
 
 Replaces the inline `SELECT ... WHERE pos BETWEEN` in `consume_queue.go`, so
-every client gets the queue's filter without knowing it exists. Positions in
-the range that don't match were never the queue's to handle; closing the
-claim still advances over them. (An undefined queue returns no rows rather
-than raising — the caller got the range from `cb_stream_claim`, which
-already raised.)
+every client gets the queue's topic and condition without knowing they
+exist. Positions in the range that don't match were never the queue's to
+handle; closing the claim still advances over them. (An undefined queue
+returns no rows rather than raising — the caller got the range from
+`cb_stream_claim`, which already raised.)
 
 ```sql
 -- +goose statementbegin
--- The messages of a claimed range, in order, honoring the queue's filter.
+-- The messages of a claimed range, in order, honoring the queue's topic
+-- and condition.
 CREATE FUNCTION cb_stream_read_claim(stream text, queue text, from_pos bigint, to_pos bigint)
 RETURNS SETOF cb_stream_messages
 LANGUAGE sql AS $$
@@ -235,7 +361,9 @@ LANGUAGE sql AS $$
      AND q.name   = cb_stream_read_claim.queue
     WHERE m.stream = cb_stream_read_claim.stream
       AND m.pos BETWEEN cb_stream_read_claim.from_pos AND cb_stream_read_claim.to_pos
-      AND (q.filter_regex IS NULL OR m.topic ~ q.filter_regex)
+      AND (q.topic_regex IS NULL OR m.topic ~ q.topic_regex)
+      AND (q.condition_headers IS NULL OR m.headers @@ q.condition_headers)
+      AND (q.condition_payload IS NULL OR m.payload @@ q.condition_payload)
     ORDER BY m.pos;
 $$;
 -- +goose statementend
@@ -248,19 +376,21 @@ $$;
 The quarantine loop republishes **every** message in the claimed range to
 `sr.*`. On a filtered queue that would quarantine messages the queue never
 delivered. `_q` (the base queue row) is already fetched for policy; the loop
-gains the predicate:
+gains the predicates:
 
 ```sql
     FOR _m IN
         SELECT m.* FROM cb_stream_messages m
         WHERE m.stream = _stream AND m.pos BETWEEN _from_pos AND _to_pos
-          AND (_q.filter_regex IS NULL OR m.topic ~ _q.filter_regex)
+          AND (_q.topic_regex IS NULL OR m.topic ~ _q.topic_regex)
+          AND (_q.condition_headers IS NULL OR m.headers @@ _q.condition_headers)
+          AND (_q.condition_payload IS NULL OR m.payload @@ _q.condition_payload)
         ORDER BY m.pos
     LOOP
 ```
 
-(Harmless on retry-stream claims: `sr.*` messages carried their topics from
-matches, so they all pass the base filter.)
+(Harmless on retry-stream claims: `sr.*` messages carried their topics and
+bodies from matches, so they all pass the base filter.)
 
 `cb_stream_fail` needs no change: it is per-message, and a consumer can only
 fail a message it received — which the filtered fetch already selected.
@@ -318,7 +448,8 @@ END; $$;
 ```sql
 DROP FUNCTION cb_stream_publish_messages(text, jsonb);
 DROP FUNCTION cb_stream_read_claim(text, text, bigint, bigint);
-DROP FUNCTION _cb_stream_compile_filter(text);
+DROP FUNCTION _cb_stream_compile_condition(text);
+DROP FUNCTION _cb_stream_compile_topic(text);
 ```
 
 `cb_stream_ensure_cursor`/`cb_stream_ensure_queue` drops need their new
@@ -334,19 +465,28 @@ signatures. The columns and constraint go down with their tables.
 type CursorOpts struct {
 	// StartPos: where a new cursor begins ... (unchanged)
 	StartPos *int64
-	// Filter: topic filter, applied server-side. '*' matches one segment,
-	// '#' zero or more trailing segments. "" reads everything. The cursor
-	// advances over everything it scans, so a filtered read can return
-	// fewer messages than the batch size, or none.
-	Filter string
+	// Topic: which topics this cursor reads, applied server-side. '*'
+	// matches one segment, '#' zero or more trailing segments. "" reads
+	// every topic. The cursor advances over everything it scans, so a
+	// filtered read can return fewer messages than the batch size, or
+	// none.
+	Topic string
+	// Condition: AND-only expression over headers and payload, parsed once
+	// at creation and applied server-side after the topic pattern. MVP
+	// forms: exists($.payload.a.b), $.headers.a.b == <scalar>. Slower than
+	// topic matching: costs a per-row jsonb evaluation, never
+	// index-assisted.
+	Condition string
 }
 ```
 
-`EnsureCursor` passes `nullText(o.Filter)` as `$4`.
+`EnsureCursor` passes `nullText(o.Topic)`, `nullText(o.Condition)` as `$4`,
+`$5`.
 
-`stream/queue.go`: `QueueOpts` gains the same `Filter string` field (same
-doc comment, plus: fixed at the queue's creation; all consumers share it);
-`EnsureQueue` adds `filter => $N` to its named-args call.
+`stream/queue.go`: `QueueOpts` gains the same `Topic`/`Condition` fields
+(same doc comments, plus: fixed at the queue's creation; all consumers
+share them); `EnsureQueue` adds `topic => …, condition => …` to its
+named-args call.
 
 `stream/consume_queue.go`: the claimed-range fetch becomes
 
@@ -380,24 +520,35 @@ element from `cb_stream_publish_messages($1, $2)`.
 
 ## 11. Tests (`stream/stream_test.go`) — the M3 exit gate
 
-1. **TestCompileFilter** — grammar table ported from `bindings_test.go`,
-   driven through SQL: `SELECT $topic ~ _cb_stream_compile_filter($pattern)`
-   for the match cases, error cases assert IRD01 (`ErrInvalid`). Include:
-   zero-token tail (`a.#` matches `a`), bare `#`, mid-pattern `*`, rejected
-   `#` not final, rejected in-token wildcards, rejected empty segments.
+1. **TestCompileTopic / TestCompileCondition** — grammar tables, driven
+   through SQL. Topic side, ported from `bindings_test.go`:
+   `SELECT $topic ~ _cb_stream_compile_topic($pattern)` for the match
+   cases; error cases assert IRD01 (`ErrInvalid`). Include: zero-token
+   tail (`a.#` matches `a`), bare `#`, mid-pattern `*`, rejected `#` not
+   final, rejected in-token wildcards, rejected empty segments. Condition
+   side, accept: `exists($.payload.a.b)`, `$.headers.k == "v"`,
+   numbers/true/false, mixed headers+payload conjuncts disassembled into
+   the right columns. Reject with IRD01: `$.topic` inside a condition,
+   bare paths, `||`, `!=`, `null`, array indexing, quoted segments, a
+   string containing `&&`, empty expression.
 2. **TestFilteredQueue** — the ORCID shape: publish mixed topics, a queue
-   with `Filter: "record.work.#"` and `StartPos: At(0)`; consumers see only
+   with `Topic: "record.work.#"` and `StartPos: At(0)`; consumers see only
    matches; `closed_pos` advances over non-matches; a failed match lands in
    `sr.*` and redelivers; **quarantine leaks nothing**: crash a claim whose
    range holds matching and non-matching messages, assert only matching
    copies appear in `sr.*`.
-3. **TestFilteredCursor** — filtered `Read` returns matches only, advances
-   over a batch with zero matches, and never returns NULL-topic messages;
-   an unfiltered cursor on the same stream sees everything (independence).
+3. **TestFilteredCursor** — a cursor with a topic pattern returns matches
+   only, advances over a batch with zero matches, and never returns
+   NULL-topic messages; an unfiltered cursor on the same stream sees
+   everything (independence). Condition side:
+   `Condition: "exists($.payload.made_public_at)"` selects only messages
+   carrying the field; `Topic` + `Condition` AND together; a
+   valid-but-absent key matches nothing and still advances; quarantine of
+   a mixed range republishes only condition-matching messages.
 4. **TestPublishMessages** — per-message topics land, headers/keys per
    element work, key dedup returns `existing`, `cb_` header rejected,
    element without payload rejected, refs come back in input order.
-5. **Replay** — late `EnsureQueue` with `StartPos: At(0)` + filter
+5. **Replay** — late `EnsureQueue` with `StartPos: At(0)` + topic pattern
    materializes retained history into handler calls (the regression
    incident's mechanical answer).
 
