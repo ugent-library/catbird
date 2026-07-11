@@ -24,24 +24,11 @@ Settled decisions:
 - Topic grammar unchanged: `*` one segment, `#` zero or more trailing
   segments, final position only. One matcher implementation, in SQL; the
   Go trie stays app-side (in-process dispatchers).
-- The condition MVP grammar is a whitelist — the parser is the validator,
-  so unsupported constructs fail loud at registration, and the emitted
-  jsonpath is generated, never user-authored:
-
-  ```
-  expr     := conjunct { "&&" conjunct }
-  conjunct := 'exists(' path ')'            -- nested-key existence
-            | path '==' scalar              -- nested-key scalar equality
-  path     := '$.' ("headers"|"payload") { "." ident }
-  scalar   := "string" | number | true | false
-  ```
-
-  Deliberately out of the MVP (start small and grow): quoted key segments
-  (`$."@type"` — LDN keys wait for this), array indexing, `null` equality
-  (`exists` covers presence), string escapes, and `&&` inside string
-  literals (it breaks the conjunct split, then fails the conjunct match —
-  loud, not silently wrong). `$.topic` is not part of this language at
-  all: the topic pattern is its own parameter.
+- The condition language is a whitelist, specified in full below ("The
+  condition language") — the parser is the validator, so unsupported
+  constructs fail loud at registration, and the emitted jsonpath is
+  generated, never user-authored. `$.topic` is not part of the language:
+  the topic pattern is its own parameter.
 - A `NULL` message topic never matches a topic pattern.
 - Retry queues never carry a topic or condition: `sr.*` holds only this
   queue's own failures, pre-filtered by construction.
@@ -59,6 +46,99 @@ Build order: (1) compilers + columns + ensure params, (2) read paths
 (`cb_stream_read`, new `cb_stream_read_claim`, quarantine predicate),
 (3) Go opts + fetch swap, (4) `cb_stream_publish_messages` + Go
 `PublishMessages`, (5) tests, (6) doc fixes.
+
+---
+
+## The condition language (ratified spec)
+
+One expression per queue or cursor, fixed at creation, parsed once. It
+prunes messages *after* the topic pattern; it never selects instead of
+one. It sees the message as stored — event-time headers and payload, never
+current application state.
+
+```
+condition := conjunct { "&&" conjunct }
+conjunct  := "exists(" path ")"            -- key presence
+           | path "==" scalar              -- scalar equality
+path      := "$." namespace "." key { "." key }
+namespace := "headers" | "payload"
+key       := [a-zA-Z_][a-zA-Z0-9_]*
+scalar    := string | number | "true" | "false"
+string    := '"' any chars except '"' and '\' '"'
+number    := ["-"] digits ["." digits]
+```
+
+Whitespace is free around `&&` and `==`; a path is one unbroken token.
+Two conjunct forms, one connective — that is the entire language.
+
+Semantics:
+
+1. **`exists(path)` tests presence, not non-nullness.** `{"a": null}`
+   satisfies `exists($.payload.a)`. There is no `== null` — presence
+   questions go to `exists`, value questions go to `==`.
+2. **Equality is strict across JSON's types and numeric within `number`.**
+   String, number and boolean never match each other — no coercion, no
+   truthiness. Within numbers, `3` matches `3.0`: JSON defines exactly one
+   number type and serializers disagree about its spelling (Go emits `3`
+   for `float64(3.0)`, Python emits `3.0`), so int-vs-float strictness
+   would make a condition's meaning depend on which client produced the
+   message. A field that carries an int-vs-float distinction must carry it
+   in the data (separate field or string tag).
+3. **Lax-mode array unwrapping is in, and is a feature.**
+   `$.payload.tags == "urgent"` matches `{"tags": ["urgent", "review"]}` —
+   equality over an array value holds if any element equals the scalar.
+   One rule, no exceptions: `{"type": ["work"]}` also matches
+   `$.payload.type == "work"`.
+4. **`&&` means all conjuncts hold.** No `||`, grouping or negation in the
+   MVP. Conjuncts may repeat and mix namespaces; order is irrelevant.
+5. **Evaluation cannot fail at read time.** Every construct is
+   deterministic (nothing timezone-, locale- or regex-shaped), and any
+   evaluation surprise is a non-match, never an error. `headers` and
+   `payload` are NOT NULL, so the targets always exist.
+6. **Filtering never touches accounting.** A scanned-but-not-matched row
+   advances cursors and closes claims exactly like a topic non-match.
+
+Accepted:
+
+| Condition | Matches | Doesn't match |
+|---|---|---|
+| `exists($.payload.made_public_at)` | `{"made_public_at": "2026-01-01"}`, `{"made_public_at": null}` | `{}` |
+| `$.payload.type == "work"` | `{"type": "work"}`, `{"type": ["work"]}` (unwrap) | `{"type": "Work"}` |
+| `$.payload.tags == "urgent"` | `{"tags": "urgent"}`, `{"tags": ["urgent","review"]}` | `{"tags": ["later"]}` |
+| `$.headers.attempt == 3` | `{"attempt": 3}`, `{"attempt": 3.0}` | `{"attempt": "3"}` |
+| `$.payload.public == true` | `{"public": true}` | `{"public": "true"}` |
+| `$.payload.access.status == "open" && exists($.headers.trace_id)` | both hold | either missing |
+
+Rejected at registration (IRD01, loud):
+
+| Expression | Why |
+|---|---|
+| `$.payload.a` | bare path, no operator (the `@?` footgun this whitelist prevents) |
+| `$.payload.n > 5`, `$.payload.a != 1` | comparisons are deferred growth |
+| `exists($.payload.a) \|\| exists($.payload.b)` | no OR — two consumers, or wait for growth |
+| `not exists($.payload.a)` | negation deferred |
+| `$.payload.a == null` | use `exists`; null-vs-absent stays unambiguous |
+| `$.payload.items[0] == "x"` | array indexing deferred |
+| `$.payload."@type" == "Announce"` | quoted segments deferred (LDN — first planned growth) |
+| `$.topic == "a.b"` | topic is its own parameter |
+| `$.payload.msg == "a && b"` | `&&` in a string breaks the conjunct split, then fails the shape match — loud, never misrouted |
+| `payload.a == 1` | missing `$.` |
+| `$.body.a == 1` | unknown namespace |
+| `` (empty), `a && && b` | empty expression / empty conjunct |
+
+Growth roadmap — a menu inherited from the old condition DSL's proven
+operator set, each landing as a parser addition plus a compilation rule
+(the whitelist only widens, so existing registrations never change
+meaning): `!=` · `>` `>=` `<` `<=` · `in [...]` · negation · `||` with
+grouping · quoted key segments · array indexing · `starts with`. Never
+entering: `like_regex` (one regex dialect in the system — the topic
+pattern's) and `datetime()` (session-timezone-dependent; conditions must
+mean the same thing on every connection of every client).
+
+Sharp edges, documented not fixed: a typo'd key is valid and matches
+nothing, silently, forever — same failure family as a typo'd topic
+pattern, larger namespace; the app's tests own it. Keys and string values
+are case-sensitive (JSON's rules).
 
 ---
 
@@ -526,11 +606,13 @@ element from `cb_stream_publish_messages($1, $2)`.
    cases; error cases assert IRD01 (`ErrInvalid`). Include: zero-token
    tail (`a.#` matches `a`), bare `#`, mid-pattern `*`, rejected `#` not
    final, rejected in-token wildcards, rejected empty segments. Condition
-   side, accept: `exists($.payload.a.b)`, `$.headers.k == "v"`,
-   numbers/true/false, mixed headers+payload conjuncts disassembled into
-   the right columns. Reject with IRD01: `$.topic` inside a condition,
-   bare paths, `||`, `!=`, `null`, array indexing, quoted segments, a
-   string containing `&&`, empty expression.
+   side: the accept/reject tables in "The condition language" above are
+   the seed rows — drive each accepted row's match/no-match columns
+   through a compiled condition against a probe message, and assert each
+   rejected row raises IRD01 (`ErrInvalid`). Also assert the disassembly:
+   mixed headers+payload conjuncts land in the right columns, and the
+   semantics rules hold (`exists` sees a null value, `3` matches `3.0`,
+   `"3"` does not match `3`, array unwrap matches any element).
 2. **TestFilteredQueue** — the ORCID shape: publish mixed topics, a queue
    with `Topic: "record.work.#"` and `StartPos: At(0)`; consumers see only
    matches; `closed_pos` advances over non-matches; a failed match lands in
