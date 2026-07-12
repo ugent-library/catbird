@@ -75,10 +75,10 @@ measured against the tick math.
 
 Create two `internal/` packages, `internal/ticker` and `internal/migrate`.
 First, a **ticker facility**: it
-registers periodic jobs, and the assigner, delivery, janitors, and relays all
-become registrations. There is **no leader election**. Every node runs every job,
+registers periodic jobs, and the assigner, delivery, and janitors all become
+registrations. There is **no leader election**. Every node runs every job,
 and each job's own locks decide who works: try-lock for the assigner, SKIP LOCKED
-for delivery, the cursor row for relays. Second, a per-module goose runner, keyed
+for delivery. Second, a per-module goose runner, keyed
 by version table + migration FS and advisory-locked.
 **Poll-only at this stage** (D17). Design the job interface with a second wake
 source in mind: a channel the M5 notifier can feed. Build no LISTEN machinery now;
@@ -125,26 +125,52 @@ schedules fire and re-arm honoring `catch_up_policy` (port scheduler tests'
 semantic core); throughput benchmark ≥ current `BenchmarkQueueThroughput`
 envelope.
 
-## M3 — spine: bindings and relays
+## M3 — filtered reads (was: spine — bindings and relays) — DONE 2026-07-12
 
-02: `bus` stream, `catbird.Publish` facade, binding rows, relay runner with the
-`stream` destination kind, the SQL-side `pg_notify` emission for wire (nothing
-listens until M5).
+The bindings/relays design was replaced before building (D29; journey in
+`spine-usage-sketch.md`). Shipped instead: queues and cursors take a topic
+pattern and a condition, parsed once at registration into precompiled
+artifacts and evaluated in SQL; the publish API collapsed to `Publish` +
+`PublishMessages` (batch envelopes with per-message topic, headers, key,
+delay); `publish_payloads` retired.
 
-*Exit:* publish-then-rollback delivers nothing (the LiveView property, as a test);
-relay crash mid-batch → no duplicates in destinations; late binding replays
-history; `bindings_test.go` semantics ported.
+*Exit (met):* compiler grammar tables ported from `bindings_test.go`
+(`TestCompileTopic`/`TestCompileCondition`); filtered cursor and queue through
+the real APIs; late binding replays pre-queue history via `StartPos`;
+quarantine republishes only matching messages; a live filtered worker end to
+end (delivers exactly the matches, a failed match returns through `sr.*`,
+closed position keeps up over undelivered ranges); the batch publish matrix.
+Suite green under `-race`.
 
-## M4 — flow engine (the big one)
+## M4 — tasks first, then flows
 
-03: event streams, projection tables + apply function, sharded projectors, ready
-dispatch, worker claim/execute/complete, the Plan DSL, signals, OnFail, dedup,
-retries via M2 machinery, `RunEvery` via the schedule table. Port from current code:
-reflection/type utilities (`task.go`, `util.go`), worker lifecycle (`worker.go`),
-backoff strategies (`backoff.go`).
+Sequencing (2026-07-12): tasks are the smaller customer of the same machinery
+— a task is a single-handler run, no DAG — so they land first, and the
+infrastructure flows need (run state, claim/execute/complete, terminal hooks)
+gets validated at task scale before the flow engine builds on it.
 
-*Exit:* semantic core of `flow_test.go` + `task_test.go` green against the new
-engine (deps, signals, cancel, OnFail with dependency inputs, dedup, outputs,
+**Tasks:** run rows and a durable run handle — status, output, cancel,
+queryable by id *and* by an application key (raven's job UI polls it; ingest's
+delivery correlation hand-rolled it via derived concurrency keys — both apps
+demanded exactly this lookup); run-with-dedup-key in the caller's transaction;
+scheduled runs via `cb_stream_schedules`; conditions in the M3 condition
+language; retries and dead letters via the M2 machinery. No topic-bound
+triggering: a task fed by events is a worker on a filtered queue.
+
+**Then flows:** 03 — event streams, projection tables + apply function,
+sharded projectors, ready dispatch, worker claim/execute/complete, the Plan
+DSL, signals, OnFail (which must also fire on hard worker death — ingest's
+`sweep_stuck_deliveries` exists because today's doesn't), dedup, `RunEvery`
+via the schedule table. Port from current code: reflection/type utilities
+(`task.go`, `util.go`), worker lifecycle (`worker.go`), backoff strategies
+(`backoff.go`).
+
+*Exit, tasks:* raven's on-demand job shape end to end — run in a transaction
+with a dedup key, poll status, read output, cancel; a scheduled task fires;
+semantic core of `task_test.go` green against the new engine.
+
+*Exit, flows:* semantic core of `flow_test.go` green against the new engine
+(deps, signals, cancel, OnFail with dependency inputs, dedup, outputs,
 map-as-pattern); new projection tests (03 §9); a step-to-step latency benchmark
 (03 §4 predicts ~2× publish→consume); a demo foreign worker claims and completes
 a dedicated step *slower than the claim TTL*, proving D11 and the claim-liveness
@@ -162,8 +188,10 @@ it land together. First, the **ticker wake accelerator** (D17). Assigner,
 consumers, and the periodic jobs attach the notifier to the wake seam built in
 M0. They wake on the notifications the SQL has emitted since M1. The poll
 interval is demoted to safety net. Second, **wire** (04): SSE onto the notifier,
-inbox `read_at`/`MarkRead`, retention tiers, `NotifyDurable`, the `inbox` relay
-kind.
+inbox `read_at`/`MarkRead`, retention tiers, `NotifyDurable`. Inbox rows are
+written explicitly by handlers holding the identity (D29 confirmed the old
+suspicion: interpolated identities were data all along) — no relay kind, no
+`identity_from`.
 
 *Exit:* ported `wire_test.go`/`notifications_test.go` green; new seen/read and
 retention tests; **the M1 latency gate re-measured with the accelerator — target
@@ -187,8 +215,8 @@ Then **empty the root package**. Everything with a shipped successor is deleted:
 `client.go` (retired — the subpackages are the API), the old
 `worker_notifier.go`/`notify.go` (ending the transition's duplication), and the
 old `migrations/` + `migrate.go` once nothing reads `cb_q_*`/`cb_t_*`. What
-remains is the thin umbrella: `Conn` and shared sentinels, the spine facade
-(`Publish`/`Bind`), and migration convenience. This is also where the facade
+remains is the thin umbrella: `Conn` and shared sentinels, the publish facade
+(`Publish`/`PublishMessages`), and migration convenience. This is also where the facade
 import cycle is resolved. Both options stay open. Option one: the facade wraps
 the SQL functions directly, with no Go import of `stream`. Option two: the
 shared types move out of `internal/` and the root imports `stream` freely.
@@ -206,7 +234,7 @@ nothing outside history.
 | Current | Fate |
 |---|---|
 | `worker_notifier.go` (the LISTEN machinery — `notifier.go` does not exist; CLAUDE.md is stale), `notify.go` (send helper), wire.go's embedded listener | copied/consolidated into a shared `internal/` notifier package (M5, D17); originals serve the old worker until deleted at M6 |
-| `topic_trie.go`, `topic.go` | kept verbatim, used by relays (M3) |
+| `topic_trie.go`, `topic.go` | trie kept for app-side in-process dispatchers (one event against many subscriber rows, webhook-style); the engine's matcher is SQL (D29, M3); `topic.go` retires with the old API (M6) |
 | `migrate.go` | parameterized per module (M0) |
 | `queue.go` + `cb_q_*` SQL | replaced by `stream` (M1–M2); `Send/Read/Hide/Delete` API retired |
 | `scheduler.go` | dissolved into `cb_stream_schedules` (M2) + builder sugar |

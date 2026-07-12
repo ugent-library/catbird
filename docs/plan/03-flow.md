@@ -26,7 +26,7 @@ hard dependency (D15). A task is a one-step flow: one model, not two.
 
 | Event | Emitted by | Payload core |
 |---|---|---|
-| `run_requested` | `RunFlow` / relay / cron | input, dedup_key |
+| `run_requested` | `RunFlow` / cron | input, dedup_key |
 | `step_spawned` | entry logic; step completion (D10) | step name, input, `after: [step_ids]`, `await_signal?`, idempotency_key |
 | `step_started` | worker on claim | step_id, worker, attempt |
 | `step_completed` | worker | step_id, output? |

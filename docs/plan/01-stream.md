@@ -220,7 +220,7 @@ Column discipline (settled while writing the first migration):
   to **3 segments, ≤ 44 bytes**. The arithmetic: worst composed name
   `sr.<20>.<20>` = 44 ≤ 44; partition (dots encoded as `__`) `cbm__` (5) + 46 + `__YYYYMMDD` (10) =
   61 ≤ 63; channel `public.cbs_` (11) + 44 = 55 ≤ 63. Consumer names never contain dots:
-  shards are `proj_0`, relays `relay_<dest>`.
+  shards are `proj_0`, an app cursor is `indexer`.
 - **Function visibility** (PostGIS's convention): `cb_*` is public — listed in
   `docs/sql-api.md`, stable, breaking changes are versioned events. `_cb_*` is
   internal — no stability promise, may change in any migration. Public by
@@ -274,7 +274,8 @@ func Consume(ctx context.Context, pool *pgxpool.Pool, stream, cursor string,
 			}
 			msgs, err := fetch(ctx, tx, stream, cursor, pos, batchSize)
 			// fetch: position > pos — no upper bound; assignment is atomic
-			//        [+ optional prefix/header filter]  ORDER BY position
+			//        [+ the cursor's precompiled topic/condition filter]
+			//        ORDER BY position
 			if err != nil || len(msgs) == 0 {
 				return err
 			}
@@ -295,13 +296,17 @@ func Consume(ctx context.Context, pool *pgxpool.Pool, stream, cursor string,
 }
 ```
 
-**The filtering contract (owned here; 02 and 03 refer back).** SQL evaluates only
-cheap predicates: an optional equality match on one header key (how flow shards
-route, 03 §4) and an optional topic *prefix*. Wildcard topic patterns (`?`/`*`)
-are matched **in Go only**, by the ported trie, after the batch read. The matcher
-exists once, never twice. Either way the cursor advances over skipped rows. There
-is no consumer-targeting predicate at all: retries live in per-queue retry
-streams (D21), so ownership is a place, not a filter.
+**The filtering contract (owned by 02 as shipped; D29).** A cursor or queue may
+carry a filter, fixed at registration — birth policy, because competing
+consumers of one queue must agree: a topic pattern (`*` one segment, `#`
+trailing zero-or-more) compiled to a regex at ensure, and a condition over
+headers and payload compiled into per-column jsonpath (02 §2). Both evaluate
+**in SQL** from the precompiled columns — one matcher implementation, identical
+for every client. The Go trie survives app-side only, for in-process
+dispatchers matching one event against many subscriber rows. Either way the
+cursor advances over skipped rows, and claims tile positions regardless of
+matches. There is no consumer-targeting predicate at all: retries live in
+per-queue retry streams (D21), so ownership is a place, not a filter.
 
 Freshness is also a per-consumer policy, not a message property. A handler that
 doesn't want old messages skips anything whose `created_at` is older than its own
@@ -538,6 +543,16 @@ message returns through quarantine with backoff (D28), not immediately. SKIP
 LOCKED survives only on the cold claim-adoption path.
 Today's queue semantics (`Send`/`Read` with hide) are *not* re-exposed; the
 stream queue API replaces them.
+
+**Filters and claims (D29).** A queue's topic pattern and condition never touch
+the claim machinery: claims are counter bumps over positions, tiling everything
+whether it matches or not, and `claim_batch_size` counts positions, not
+matches. The filter applies in exactly two places — the claimed-range fetch
+(`cb_stream_read_claim`, so no client needs to know the filter exists) and the
+quarantine loop (so non-matching messages never reach `sr.*`). Retry streams
+themselves are never filtered: they hold only their queue's own failures,
+pre-filtered by construction, and a table CHECK pins it. A sparse filter just
+means near-empty claims that close fast.
 
 ### The consume loop owns the clock (D27, adopted 2026-07-09)
 
@@ -919,6 +934,16 @@ consumer's own cadence (wake interval + the cursor as a free dirty-flag), and
 burst collapse is batch-dedupe in the handler — both zero-latency when the
 system is idle, which a publish-side window can never be. Patterns, not
 primitives.
+
+**Batch publish (D29).** `cb_stream_publish_messages(stream, messages jsonb)`
+is the batch form: one jsonb array of `{payload, topic?, headers?, key?,
+delay?, deliver_at?}` envelopes, one result row per element in input order —
+exactly N × `cb_stream_publish` in one call and one transaction. The parameter
+is a single jsonb array, not `jsonb[]`: one JSON text any client language
+produces natively, no PG-array-literal escaping. The Go API is `Publish` and
+`PublishMessages`, nothing else; the payloads-only batch function is retired.
+The shipped implementation loops over the single-publish path; the set-based
+fast path is a deferred optimization with a written design (05).
 
 **`cb_stream_publish`, sketched** — every write path in one function: immediate,
 waiting, keyed.

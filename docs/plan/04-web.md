@@ -4,9 +4,9 @@ One package, two storage stories (D12). The vision said wire and the inbox share
 no machinery. That was already false in the current code: they share Fragment
 rendering, token auth, and the poll transport (PR #41). The honest claim, and the
 design rule: **independent storage and delivery, shared presentation.** The
-package is `wire` and it depends on the kernel. Importing `stream` is optional
-and buys exactly one thing: registering the `inbox` relay kind with the spine
-(02 §3).
+package is `wire` and it depends on the kernel only. (It used to optionally
+import `stream` to register an `inbox` relay kind; relays died with routing —
+D29 — and inbox rows are written explicitly by handlers holding the identity.)
 
 ## 1. Shape
 
@@ -37,14 +37,17 @@ store rows on the substrate's log. The log's retention floor is the lowest curso
 and the log can only drop rows below that floor. Inbox cursors would be
 per-identity, and most users sit idle. One dormant account would pin partitions
 forever. The vision said "the inbox can ride on the substrate". That is amended
-(README #10): the inbox rides the **spine**. An `inbox` relay kind (02 §3) writes
-rows here, while storage and retention stay identity-local.
+(README #10): the inbox is its **own identity-keyed store** (D13). Handlers
+write rows directly via `wire.NotifyDurable` — the handler that finishes a job
+knows exactly which user asked for it, so identity is a value in its hand, not
+something extracted from a topic (D29). Storage and retention stay
+identity-local.
 
 **seen / read distinction** (your note). Three timestamps, two verbs:
 
 | State | Meaning | Set by |
 |---|---|---|
-| delivered | row exists (created_at) | relay or direct `wire.NotifyDurable` |
+| delivered | row exists (created_at) | `wire.NotifyDurable` |
 | **seen** | rendered in the client's list — clears the badge | `MarkSeenUntil(identity, watermark)` — the watermark API from PR #41, unchanged |
 | **read** | user opened/acted on this item | `MarkRead(identity, id)` / `MarkReadUntil` — per-item, **new** |
 
@@ -79,7 +82,7 @@ subsystem.
 1. Port `wire.go`/`wire_token.go` onto the kernel notifier; keep the public API.
 2. Inbox DDL (`cb_wire_*`, own goose table); port `notifications.go`; add
    `read_at` + `MarkRead`/`MarkReadUntil`; retention janitor on the kernel ticker.
-3. `NotifyDurable` helper; `inbox` relay kind registration (02 §3).
+3. `NotifyDurable` helper.
 4. Shared internals folder for Fragment/tokens/ServePoll — one implementation,
    both transports.
 5. Tests: port `wire_test.go` + `notifications_test.go`; new: seen vs read

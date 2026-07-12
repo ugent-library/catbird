@@ -39,7 +39,7 @@ There is no Makefile. Tests use a hardcoded DSN (`postgres://postgres:postgres@l
 
 **Two independent systems:**
 
-1. **Generic Message Queues** — `Send()`, `Publish()`, `Read()` operations (SQS-like). Topic routing via bindings with wildcard support (`?` single token, `*` multi-token tail).
+1. **Generic Message Queues** — `Send()`, `Publish()`, `Read()` operations (SQS-like). Topic routing via bindings with wildcard support (`*` single token, `#` multi-token tail). In the rewrite (`stream/`) routing is replaced by server-side read filters: queues and cursors take a topic pattern plus a condition (D29 in `docs/plan/README.md`).
 2. **Task & Flow Execution** — Tasks are single handlers; Flows are DAGs of steps with dependencies. `RunTask()`/`RunFlow()` create run entries; workers claim and execute handlers via NOTIFY-driven scheduling.
 
 **Key components:**
