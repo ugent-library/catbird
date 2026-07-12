@@ -3,14 +3,18 @@ package stream
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"maps"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -237,12 +241,14 @@ func TestPublishRefs(t *testing.T) {
 	}
 
 	// batch publish
-	ids, err := PublishPayloads(ctx, pool, "go_refs", "t", []any{1, 2, 3})
+	refs, err := PublishMessages(ctx, pool, "go_refs", []BatchMessage{
+		{Topic: "t", Payload: 1}, {Topic: "t", Payload: 2}, {Topic: "t", Payload: 3},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ids) != 3 {
-		t.Fatalf("published %d payloads, want 3", len(ids))
+	if len(refs) != 3 {
+		t.Fatalf("published %d messages, want 3", len(refs))
 	}
 }
 
@@ -1358,24 +1364,109 @@ func TestFailThenQuarantine(t *testing.T) {
 	}
 }
 
-func TestPublishPayloads(t *testing.T) {
+func TestPublishMessages(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
 	if err := Ensure(ctx, pool, "go_batch"); err != nil {
 		t.Fatal(err)
 	}
-	payloads := make([]any, 100)
-	for i := range payloads {
-		payloads[i] = i
-	}
-	ids, err := PublishPayloads(ctx, pool, "go_batch", "bulk", payloads)
+
+	// per-message topics, headers, keys and delay in one call; refs come
+	// back in input order
+	refs, err := PublishMessages(ctx, pool, "go_batch", []BatchMessage{
+		{Topic: "a.b", Payload: 1},
+		{Topic: "c", Payload: 2, Headers: map[string]any{"h": "v"}},
+		{Payload: 3, Key: "k1"},
+		{Payload: 4, Key: "k1"},        // duplicate key: keep-oldest
+		{Payload: 5, Delay: time.Hour}, // parked as pending
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ids) != 100 {
-		t.Fatalf("published %d payloads, want 100", len(ids))
+	if len(refs) != 5 {
+		t.Fatalf("got %d refs, want 5", len(refs))
 	}
+	for i, r := range refs[:3] {
+		if r.Kind != RefMessage || r.Existing {
+			t.Fatalf("refs[%d] = %+v, want a fresh message", i, r)
+		}
+	}
+	if !refs[3].Existing || refs[3].ID != refs[2].ID {
+		t.Fatalf("refs[3] = %+v, want the existing ref of refs[2] (%+v)", refs[3], refs[2])
+	}
+	if refs[4].Kind != RefPending || refs[4].Existing {
+		t.Fatalf("refs[4] = %+v, want a fresh pending", refs[4])
+	}
+
+	// topics landed per message; absent topic and headers stay NULL and {}
+	var topics []string
+	rows, err := pool.Query(ctx,
+		`SELECT coalesce(topic, '') FROM cb_stream_messages WHERE stream = 'go_batch' ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if topics, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"a.b", "c", ""}; !slices.Equal(topics, want) {
+		t.Fatalf("topics = %v, want %v", topics, want)
+	}
+	var headers, noHeaders string
+	if err := pool.QueryRow(ctx, `SELECT headers::text FROM cb_stream_messages
+		WHERE stream = 'go_batch' AND topic = 'c'`).Scan(&headers); err != nil {
+		t.Fatal(err)
+	}
+	if headers != `{"h": "v"}` {
+		t.Fatalf("headers = %s", headers)
+	}
+	if err := pool.QueryRow(ctx, `SELECT headers::text FROM cb_stream_messages
+		WHERE stream = 'go_batch' AND topic = 'a.b'`).Scan(&noHeaders); err != nil {
+		t.Fatal(err)
+	}
+	if noHeaders != `{}` {
+		t.Fatalf("nil Headers landed as %s, want {}", noHeaders)
+	}
+
+	// the delayed message is pending, not published
+	var pending int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM cb_stream_pending WHERE stream = 'go_batch'`).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 1 {
+		t.Fatalf("pending = %d, want 1", pending)
+	}
+
+	// delay and deliver_at on one element are mutually exclusive
+	if _, err := PublishMessages(ctx, pool, "go_batch", []BatchMessage{
+		{Payload: 1, Delay: time.Minute, DeliverAt: time.Now().Add(time.Minute)},
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("err = %v, want ErrInvalid", err)
+	}
+
+	// cb_ headers are reserved, same as single publish
+	if _, err := PublishMessages(ctx, pool, "go_batch", []BatchMessage{
+		{Payload: 1, Headers: map[string]any{"cb_sneaky": 1}},
+	}); err == nil {
+		t.Fatal("publish with cb_ header succeeded, want error")
+	}
+
+	// a nil or empty batch is a no-op
+	if refs, err := PublishMessages(ctx, pool, "go_batch", nil); err != nil || refs != nil {
+		t.Fatalf("nil batch: refs = %v, err = %v", refs, err)
+	}
+
+	// malformed envelopes are rejected at the SQL surface (unreachable
+	// from the Go client): non-array, non-object element, missing payload
+	for _, bad := range []string{`{"payload": 1}`, `[1]`, `[{"topic": "t"}]`} {
+		if _, err := pool.Exec(ctx,
+			`SELECT cb_stream_publish_messages('go_batch', $1::jsonb)`, bad); !errors.Is(wrapErr(err), ErrInvalid) {
+			t.Fatalf("messages = %s: err = %v, want ErrInvalid", bad, err)
+		}
+	}
+
+	// positions cover exactly the immediate messages
 	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_batch')"); err != nil {
 		t.Fatal(err)
 	}
@@ -1384,8 +1475,8 @@ func TestPublishPayloads(t *testing.T) {
 		`SELECT last_pos FROM cb_streams WHERE name = 'go_batch'`).Scan(&lastPos); err != nil {
 		t.Fatal(err)
 	}
-	if lastPos != 100 {
-		t.Fatalf("last_pos = %d, want 100", lastPos)
+	if lastPos != 3 {
+		t.Fatalf("last_pos = %d, want 3", lastPos)
 	}
 }
 
@@ -1907,11 +1998,11 @@ func TestConsumeQueueCompeting(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	payloads := make([]any, 50)
-	for i := range payloads {
-		payloads[i] = i + 1
+	msgs := make([]BatchMessage, 50)
+	for i := range msgs {
+		msgs[i] = BatchMessage{Topic: "t", Payload: i + 1}
 	}
-	if _, err := PublishPayloads(ctx, pool, "go_pool", "t", payloads); err != nil {
+	if _, err := PublishMessages(ctx, pool, "go_pool", msgs); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_pool')"); err != nil {
@@ -2124,5 +2215,433 @@ func TestRetryBackoffTiming(t *testing.T) {
 	}
 	if from, to, ok := claimRange(t, ctx, pool, "sr.go_wait.r", "r", "c1"); !ok || from != 1 || to != 1 {
 		t.Fatalf("retry claim = %d..%d, %v, want 1..1 after the backoff", from, to, ok)
+	}
+}
+
+// the topic-pattern compiler: match semantics and rejected grammar
+func TestCompileTopic(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	matches := []struct {
+		topic, pattern string
+		want           bool
+	}{
+		{"a.b", "a.b", true},
+		{"a.b", "a.c", false},
+		{"record.work.created", "record.*.created", true},
+		{"record.work.updated", "record.*.created", false},
+		{"record.a.b.created", "record.*.created", false}, // * is exactly one segment
+		{"a.b.c", "a.*.c", true},
+		{"a.b", "*.b", true},
+		{"record.work", "record.work.#", true}, // # matches the zero-segment tail
+		{"record.work.updated.minor", "record.work.#", true},
+		{"record.workx", "record.work.#", false},
+		{"record", "record.work.#", false},
+		{"a", "#", true},
+		{"a.b.c", "#", true},
+	}
+	for _, m := range matches {
+		var got bool
+		if err := pool.QueryRow(ctx,
+			`SELECT $1 ~ _cb_stream_compile_topic($2)`, m.topic, m.pattern).Scan(&got); err != nil {
+			t.Fatalf("%q ~ %q: %v", m.topic, m.pattern, err)
+		}
+		if got != m.want {
+			t.Errorf("%q ~ %q = %v, want %v", m.topic, m.pattern, got, m.want)
+		}
+	}
+
+	for _, bad := range []string{
+		"", "a..b", ".a", "a.", "a.#.b", "a*", "a#", "#a", "a b",
+	} {
+		_, err := pool.Exec(ctx, `SELECT _cb_stream_compile_topic($1)`, bad)
+		if !errors.Is(wrapErr(err), ErrInvalid) {
+			t.Errorf("pattern %q: err = %v, want ErrInvalid", bad, err)
+		}
+	}
+}
+
+// the condition compiler: match semantics, per-column disassembly and
+// rejected grammar
+func TestCompileCondition(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	// evaluate a compiled condition against probe headers and payload the
+	// way the read paths do: in WHERE, an unknown result (e.g. a
+	// type-mismatched comparison makes @@ return NULL) drops the row, so
+	// coalesce to false here
+	eval := func(condition, headers, payload string) bool {
+		t.Helper()
+		var got bool
+		if err := pool.QueryRow(ctx, `
+			SELECT coalesce(
+				(c.headers_condition IS NULL OR $2::jsonb @@ c.headers_condition)
+			AND (c.payload_condition IS NULL OR $3::jsonb @@ c.payload_condition), false)
+			FROM _cb_stream_compile_condition($1) c`,
+			condition, headers, payload).Scan(&got); err != nil {
+			t.Fatalf("%q: %v", condition, err)
+		}
+		return got
+	}
+
+	cases := []struct {
+		condition, headers, payload string
+		want                        bool
+	}{
+		// exists tests presence, not non-nullness
+		{`exists($.payload.made_public_at)`, `{}`, `{"made_public_at": "2026-01-01"}`, true},
+		{`exists($.payload.made_public_at)`, `{}`, `{"made_public_at": null}`, true},
+		{`exists($.payload.made_public_at)`, `{}`, `{}`, false},
+		// equality is strict across JSON types, numeric within number
+		{`$.payload.type == "work"`, `{}`, `{"type": "work"}`, true},
+		{`$.payload.type == "work"`, `{}`, `{"type": "Work"}`, false},
+		{`$.headers.attempt == 3`, `{"attempt": 3}`, `{}`, true},
+		{`$.headers.attempt == 3`, `{"attempt": 3.0}`, `{}`, true},
+		{`$.headers.attempt == 3`, `{"attempt": "3"}`, `{}`, false},
+		{`$.payload.public == true`, `{}`, `{"public": true}`, true},
+		{`$.payload.public == true`, `{}`, `{"public": "true"}`, false},
+		// lax array unwrapping: equality holds if any element equals
+		{`$.payload.tags == "urgent"`, `{}`, `{"tags": ["urgent", "review"]}`, true},
+		{`$.payload.tags == "urgent"`, `{}`, `{"tags": ["later"]}`, false},
+		{`$.payload.type == "work"`, `{}`, `{"type": ["work"]}`, true},
+		// conjuncts mix namespaces and all must hold
+		{`$.payload.access.status == "open" && exists($.headers.trace_id)`,
+			`{"trace_id": "t1"}`, `{"access": {"status": "open"}}`, true},
+		{`$.payload.access.status == "open" && exists($.headers.trace_id)`,
+			`{}`, `{"access": {"status": "open"}}`, false},
+	}
+	for _, c := range cases {
+		if got := eval(c.condition, c.headers, c.payload); got != c.want {
+			t.Errorf("%q on headers=%s payload=%s = %v, want %v",
+				c.condition, c.headers, c.payload, got, c.want)
+		}
+	}
+
+	// conjuncts land in their own columns; absent namespaces stay NULL
+	var headersNull, payloadNull bool
+	if err := pool.QueryRow(ctx, `
+		SELECT c.headers_condition IS NULL, c.payload_condition IS NULL
+		FROM _cb_stream_compile_condition('exists($.payload.a)') c`).Scan(&headersNull, &payloadNull); err != nil {
+		t.Fatal(err)
+	}
+	if !headersNull || payloadNull {
+		t.Fatalf("payload-only condition: headers IS NULL = %v, payload IS NULL = %v",
+			headersNull, payloadNull)
+	}
+
+	for _, bad := range []string{
+		"",
+		`$.payload.a`,     // bare path, no operator
+		`$.payload.n > 5`, // comparisons are deferred
+		`$.payload.a != 1`,
+		`exists($.payload.a) || exists($.payload.b)`,
+		`not exists($.payload.a)`,
+		`$.payload.a == null`,             // exists covers presence
+		`$.payload.items[0] == "x"`,       // arrays are deferred
+		`$.payload."@type" == "Announce"`, // quoted segments are deferred
+		`$.topic == "a.b"`,                // topic is its own parameter
+		`$.payload.msg == "a && b"`,       // && in a string fails loud
+		`payload.a == 1`,                  // missing $.
+		`$.body.a == 1`,                   // unknown namespace
+		`exists($.payload.a) && && exists($.payload.b)`,
+	} {
+		_, err := pool.Exec(ctx, `SELECT * FROM _cb_stream_compile_condition($1)`, bad)
+		if !errors.Is(wrapErr(err), ErrInvalid) {
+			t.Errorf("condition %q: err = %v, want ErrInvalid", bad, err)
+		}
+	}
+}
+
+// cursors with a topic pattern and a condition: matches only, NULL topics
+// excluded, scanned-range advancement, unfiltered independence
+func TestFilteredCursor(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	if err := Ensure(ctx, pool, "go_fcur"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PublishMessages(ctx, pool, "go_fcur", []BatchMessage{
+		{Topic: "a.b", Payload: map[string]any{"flag": true}},
+		{Topic: "a.c", Payload: map[string]any{}},
+		{Topic: "b.d", Payload: map[string]any{"flag": false}},
+		{Payload: map[string]any{"flag": true}}, // no topic
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_fcur')"); err != nil {
+		t.Fatal(err)
+	}
+
+	readTopics := func(cursor string, opts CursorOpts) []string {
+		t.Helper()
+		if err := EnsureCursor(ctx, pool, "go_fcur", cursor, opts); err != nil {
+			t.Fatal(err)
+		}
+		msgs, err := Read(ctx, pool, "go_fcur", cursor, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		topics := make([]string, len(msgs))
+		for i, m := range msgs {
+			topics[i] = m.Topic
+		}
+		return topics
+	}
+
+	// topic pattern: matches only, and a NULL topic never matches
+	if got := readTopics("bytopic", CursorOpts{StartPos: At(0), Topic: "a.#"}); !slices.Equal(got, []string{"a.b", "a.c"}) {
+		t.Fatalf("topic-filtered read = %v", got)
+	}
+	// condition: the event payload decides
+	if got := readTopics("bycond", CursorOpts{StartPos: At(0), Condition: `$.payload.flag == true`}); !slices.Equal(got, []string{"a.b", ""}) {
+		t.Fatalf("condition-filtered read = %v", got)
+	}
+	// topic and condition AND together
+	if got := readTopics("byboth", CursorOpts{StartPos: At(0), Topic: "a.#", Condition: `$.payload.flag == true`}); !slices.Equal(got, []string{"a.b"}) {
+		t.Fatalf("combined read = %v", got)
+	}
+	// an unfiltered cursor on the same stream sees everything
+	if got := readTopics("plain", CursorOpts{StartPos: At(0)}); len(got) != 4 {
+		t.Fatalf("unfiltered read = %v", got)
+	}
+
+	// a zero-match read still advances over the whole scanned range
+	if got := readTopics("bynone", CursorOpts{StartPos: At(0), Topic: "z.#"}); len(got) != 0 {
+		t.Fatalf("zero-match read = %v", got)
+	}
+	var pos, lastPos int64
+	if err := pool.QueryRow(ctx, `SELECT c.pos, s.last_pos FROM cb_stream_cursors c
+		JOIN cb_streams s ON s.name = c.stream
+		WHERE c.stream = 'go_fcur' AND c.name = 'bynone'`).Scan(&pos, &lastPos); err != nil {
+		t.Fatal(err)
+	}
+	if pos != lastPos {
+		t.Fatalf("cursor pos = %d, want %d: a zero-match read must advance", pos, lastPos)
+	}
+}
+
+// queues with a topic pattern: late binding replays history, claims cover
+// non-matches, retries keep the filter, and quarantine leaks nothing
+func TestFilteredQueue(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	if err := Ensure(ctx, pool, "go_fqt"); err != nil {
+		t.Fatal(err)
+	}
+	// history exists before the queue: binding late replays it
+	if _, err := PublishMessages(ctx, pool, "go_fqt", []BatchMessage{
+		{Topic: "record.work.created", Payload: 1},
+		{Topic: "record.person.created", Payload: 2},
+		{Topic: "record.work.updated", Payload: 3},
+		{Topic: "record.person.updated", Payload: 4},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_fqt')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureQueue(ctx, pool, "go_fqt", "orcid", QueueOpts{
+		StartPos:    At(0),
+		Topic:       "record.work.#",
+		BackoffKind: BackoffNone, // retries land immediately, visible below
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	from, to, ok := claimRange(t, ctx, pool, "go_fqt", "orcid", "w1")
+	if !ok {
+		t.Fatal("nothing to claim, want the replayed history")
+	}
+	type claimed struct {
+		Pos   int64
+		Topic string
+	}
+	rows, err := pool.Query(ctx, `SELECT m.pos, coalesce(m.topic, '')
+		FROM cb_stream_read_claim('go_fqt', 'orcid', $1, $2) m`, from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowToStructByPos[claimed])
+	if err != nil {
+		t.Fatal(err)
+	}
+	topics := make([]string, len(got))
+	for i, m := range got {
+		topics[i] = m.Topic
+	}
+	if want := []string{"record.work.created", "record.work.updated"}; !slices.Equal(topics, want) {
+		t.Fatalf("claimed messages = %v, want %v", topics, want)
+	}
+
+	// a failed match retries through sr.* with its topic intact
+	if _, err := pool.Exec(ctx,
+		`SELECT cb_stream_fail('go_fqt', 'orcid', 'w1', $1, 'boom')`, got[0].Pos); err != nil {
+		t.Fatal(err)
+	}
+	var retryTopic string
+	if err := pool.QueryRow(ctx, `SELECT topic FROM cb_stream_messages
+		WHERE stream = 'sr.go_fqt.orcid'`).Scan(&retryTopic); err != nil {
+		t.Fatal(err)
+	}
+	if retryTopic != "record.work.created" {
+		t.Fatalf("retry topic = %q", retryTopic)
+	}
+
+	// closing advances over the non-matching positions too
+	if _, err := pool.Exec(ctx,
+		`SELECT cb_stream_close_claim('go_fqt', 'orcid', 'w1', $1)`, from); err != nil {
+		t.Fatal(err)
+	}
+	var closedPos, lastPos int64
+	if err := pool.QueryRow(ctx, `SELECT q.closed_pos, s.last_pos
+		FROM cb_stream_queues q JOIN cb_streams s ON s.name = q.stream
+		WHERE q.stream = 'go_fqt' AND q.name = 'orcid'`).Scan(&closedPos, &lastPos); err != nil {
+		t.Fatal(err)
+	}
+	if closedPos != lastPos {
+		t.Fatalf("closed_pos = %d, want %d", closedPos, lastPos)
+	}
+
+	// quarantine republishes only the queue's own messages: crash a claim
+	// whose range holds matches and non-matches, then count what reaches sr.*
+	if err := EnsureQueue(ctx, pool, "go_fqt", "q2", QueueOpts{
+		StartPos:    At(0),
+		Topic:       "record.work.#",
+		BackoffKind: BackoffNone,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE cb_stream_queues
+		SET claim_ttl = interval '30 milliseconds', max_crashes = 1
+		WHERE stream = 'go_fqt' AND name = 'q2'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := claimRange(t, ctx, pool, "go_fqt", "q2", "c1"); !ok {
+		t.Fatal("nothing to claim")
+	}
+	time.Sleep(80 * time.Millisecond) // expire: first crash, handed out whole again
+	if _, _, ok := claimRange(t, ctx, pool, "go_fqt", "q2", "c2"); !ok {
+		t.Fatal("expired claim was not handed out again")
+	}
+	time.Sleep(80 * time.Millisecond) // expire at max_crashes: quarantined
+	if _, _, ok := claimRange(t, ctx, pool, "go_fqt", "q2", "c3"); ok {
+		t.Fatal("claim handed out again, want quarantine")
+	}
+	rows, err = pool.Query(ctx, `SELECT coalesce(topic, '') FROM cb_stream_messages
+		WHERE stream = 'sr.go_fqt.q2' ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantined, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"record.work.created", "record.work.updated"}; !slices.Equal(quarantined, want) {
+		t.Fatalf("quarantined = %v, want %v: non-matches must never reach sr.*", quarantined, want)
+	}
+}
+
+// a live worker on a filtered queue: the loop delivers exactly the matching
+// messages, keeps up over the positions it never delivers, and a failed
+// match comes back through the retry stream into the same loop
+func TestConsumeQueueFiltered(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	if err := Ensure(ctx, pool, "go_cqf"); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureQueue(ctx, pool, "go_cqf", "f", QueueOpts{
+		StartPos:    At(0),
+		Topic:       "job.#",
+		Condition:   `$.payload.run == true`,
+		BackoffKind: BackoffNone,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PublishMessages(ctx, pool, "go_cqf", []BatchMessage{
+		{Topic: "job.a", Payload: map[string]any{"run": true, "n": 1}},
+		{Topic: "job.b", Payload: map[string]any{"run": false, "n": 2}},   // condition drops it
+		{Topic: "other.x", Payload: map[string]any{"run": true, "n": 3}},  // topic drops it
+		{Topic: "job.fail", Payload: map[string]any{"run": true, "n": 4}}, // fails once
+		{Topic: "job.c", Payload: map[string]any{"run": true, "n": 5}},
+		{Payload: map[string]any{"run": true, "n": 6}}, // no topic: never matches
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	jctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobsDone := make(chan error, 1)
+	go func() {
+		jobsDone <- RunJobs(jctx, pool, JobsOpts{
+			AssignPositionsInterval: 20 * time.Millisecond,
+			DeliverInterval:         20 * time.Millisecond,
+		})
+	}()
+
+	var mu sync.Mutex
+	deliveries := map[int]int{}
+	var retryAttempt any
+	queueDone := make(chan error, 1)
+	go func() {
+		queueDone <- ConsumeQueue(jctx, pool, "go_cqf", "f", func(_ context.Context, m Message) error {
+			var p struct {
+				N int `json:"n"`
+			}
+			if err := json.Unmarshal(m.Payload, &p); err != nil {
+				return err
+			}
+			mu.Lock()
+			deliveries[p.N]++
+			seen := deliveries[p.N]
+			if seen == 2 {
+				retryAttempt = m.Headers["cb_attempt"]
+			}
+			mu.Unlock()
+			if p.N == 4 && seen == 1 {
+				return errors.New("first try fails")
+			}
+			return nil
+		}, ConsumeQueueOpts{PollInterval: 20 * time.Millisecond})
+	}()
+
+	// done when the base queue's closed position reaches the stream's tail
+	// and the failed match has come back around through sr.*
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var caughtUp bool
+		if err := pool.QueryRow(ctx, `SELECT q.closed_pos = s.last_pos
+			FROM cb_stream_queues q JOIN cb_streams s ON s.name = q.stream
+			WHERE q.stream = 'go_cqf' AND q.name = 'f'`).Scan(&caughtUp); err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		retried := deliveries[4] == 2
+		snapshot := maps.Clone(deliveries)
+		mu.Unlock()
+		if caughtUp && retried {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("worker never caught up: deliveries = %v, caught up = %v", snapshot, caughtUp)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	<-queueDone
+	<-jobsDone
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := map[int]int{1: 1, 4: 2, 5: 1}; !maps.Equal(deliveries, want) {
+		t.Fatalf("deliveries = %v, want %v: the loop must deliver exactly the matches", deliveries, want)
+	}
+	if retryAttempt != float64(1) {
+		t.Fatalf("redelivery cb_attempt = %v (%T), want 1", retryAttempt, retryAttempt)
 	}
 }

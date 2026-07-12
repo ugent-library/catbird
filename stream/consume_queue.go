@@ -133,10 +133,8 @@ func consumeClaim(ctx context.Context, pool *pgxpool.Pool, stream, queue, consum
 
 	rows, err := pool.Query(ctx, `
 		SELECT m.id, m.stream, m.pos, coalesce(m.topic, ''), m.payload, m.headers, m.created_at
-		FROM cb_stream_messages m
-		WHERE m.stream = $1 AND m.pos BETWEEN $2 AND $3
-		ORDER BY m.pos`,
-		stream, *fromPos, *toPos)
+		FROM cb_stream_read_claim($1, $2, $3, $4) m`,
+		stream, queue, *fromPos, *toPos)
 	if err != nil {
 		return true, err
 	}

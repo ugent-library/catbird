@@ -34,6 +34,18 @@ type QueueOpts struct {
 	BackoffBase    time.Duration // 5s
 	BackoffMax     time.Duration // 5m
 	OnFail         FailPolicy    // dead_letter
+	// Topic: which topics this queue reads, applied server-side. '*'
+	// matches one segment, '#' zero or more trailing segments. "" reads
+	// every topic. A claim covers every position in its range, matching
+	// or not, so it can hold fewer messages than claim_batch_size, or
+	// none.
+	Topic string
+	// Condition: AND-only expression over headers and payload, parsed once
+	// at creation and applied server-side after the topic pattern. MVP
+	// forms: exists($.payload.a.b), $.headers.a.b == <scalar>. Slower than
+	// topic matching: costs a per-row jsonb evaluation, never
+	// index-assisted.
+	Condition string
 }
 
 func EnsureQueue(ctx context.Context, conn Conn, stream, queue string, opts ...QueueOpts) error {
@@ -49,10 +61,19 @@ func EnsureQueue(ctx context.Context, conn Conn, stream, queue string, opts ...Q
 			backoff_base     => $6,
 			backoff_max      => $7,
 			on_fail          => $8,
-			claim_batch_size => $9)`,
-		stream, queue, o.StartPos,
+			claim_batch_size => $9,
+			topic            => $10,
+			condition        => $11)`,
+		stream, queue,
+		o.StartPos,
 		nullInt(o.MaxAttempts),
-		nullText(string(o.BackoffKind)), nullInterval(o.BackoffBase), nullInterval(o.BackoffMax),
-		nullText(string(o.OnFail)), nullInt(o.ClaimBatchSize))
+		nullText(string(o.BackoffKind)),
+		nullInterval(o.BackoffBase),
+		nullInterval(o.BackoffMax),
+		nullText(string(o.OnFail)),
+		nullInt(o.ClaimBatchSize),
+		nullText(o.Topic),
+		nullText(o.Condition),
+	)
 	return wrapErr(err)
 }

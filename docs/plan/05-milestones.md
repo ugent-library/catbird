@@ -216,6 +216,33 @@ nothing outside history.
 | `circuit_breaker.go` | stays client-side, unchanged |
 | `dashboard/`, `tui/`, `cmd/` | re-pointed at new tables, moved to `cb` module (M6) |
 
+## Deferred optimizations — after the feature set is complete
+
+- **`cb_stream_publish_messages` hybrid fast path.** The shipped function
+  loops over `cb_stream_publish` per element: semantically complete, ~6×
+  slower than set-based for plain bulk (measured 2026-07-12: 10k messages,
+  loop 319ms ≈ 31k msg/s vs raw set-based insert 51ms ≈ 196k msg/s; ~32µs
+  per message — invisible at Revise scale, real for imports and backfills).
+  Deliberate: complete the feature set, adjust, then optimize. The
+  ready-to-apply design, sketched and reviewed: split the batch at
+  validation — elements with `key`/`delay`/`deliver_at` keep the
+  per-message path (a key claim and a pending insert are row-at-a-time by
+  nature), everything else takes one `INSERT … SELECT` over
+  `jsonb_array_elements WITH ORDINALITY`, refs zipped back by input
+  position. Pairing invariant: an ordered CTE feeds the insert in input
+  order and the id column *default* draws the sequence per consumed row
+  (never `nextval` in a target list with `ORDER BY` — values draw before
+  the sort), so ords-by-ord zip with ids-by-id exactly. The `cb_` header
+  guard moves into the shared validation pass so the set-based branch
+  enforces it too. Notify is no reason to hurry: NOTIFY dedups identical
+  (channel, payload) pairs per transaction, so the loop's effective load
+  already equals one-per-distinct-topic. Trigger to un-defer: the first
+  bulk customer (raven import, LDN backfill, seeding pain) or the
+  pre-release benchmark pass. The temp-table full-set-based variant stays
+  rejected: session state breaks transaction-pooled connections, catalog
+  churn, and it accelerates bulk *keyed* publishes — a shape with no
+  customer.
+
 ## Standing risks to watch while building
 
 - **Assigner latency under load** (M1 gate). This is the one empirical bet in
