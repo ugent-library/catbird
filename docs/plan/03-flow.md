@@ -1,126 +1,147 @@
-# 03 — flow: the engine as a projection
+# 03 — flow: the engine on rows
 
-Dynamic tasks and flows are three uses of the substrate. **Append**: handlers
-emit events. **Project**: sharded consumers maintain state rows. **Dispatch**:
-ready steps go to work streams. Package `flow` depends on `stream`, an accepted
-hard dependency (D15). A task is a one-step flow: one model, not two.
+> Sections 4–9 below are being rewritten for D30–D32; until then they still
+> describe the dead projection design. Trust §1–3 and the README decision log.
 
-## 1. Streams and tables
+**One concept.** A run is a group of executions, and every execution may
+atomically enqueue follow-on steps when it completes — "a flow is a task that
+enqueues follow-ons" (D31). There is no separate task engine: a task is a run
+whose single execution enqueued nothing, and it survives only as sugar —
+`flow.NewTask(name, fn)` over a plain `func(ctx, In) (Out, error)`. Package
+`flow` depends on `stream` (D15, an accepted hard dependency) and installs its
+own migrations (version table `cb_flow_migrations`).
 
-- One event stream **per flow name**: `fe.<flow>`. Each gets its own LIST
-  partition, which gives isolation and per-flow retention for free. `run_id` is a
-  field, *not* a stream. A stream per run would explode the partition count.
-- One ready stream per flow: `fq.<flow>` (queue mode, 01 §5), plus `fq.<flow>.<queue>` per
-  dedicated step (§7).
-- Projection tables — **rows are the view, the log is the truth**:
-  `cb_flow_runs (run_id, flow, status, input, output, dedup_key — UNIQUE(flow,
-  dedup_key), the RunFlow dedup point (§3), created/finished)` ·
-  `cb_flow_steps (run_id, step_id, name, status, input, output, attempt,
-  idempotency_key UNIQUE)` · `cb_flow_deps (run_id, step_id, needs_step_id,
-  satisfied)` · `cb_flows (name, shards, …)` (per-flow config) ·
-  `cb_flow_step_claims (run_id, step_id, attempt, outcome — PK on the triple)`,
-  the per-attempt resolution claim (§7), deleted when the run turns terminal.
-  Lookups (`WaitForOutput`, status, dashboard) hit rows only.
+**Rows are the truth (D30).** There is no event log and no projection: the run
+and step rows are the engine's only state, and `cb_flow_complete` applies
+everything — the outcome, the spawned steps, dispatch, live accounting — in the
+completion transaction itself. The old event catalog has no successor: what
+used to be events are now function arguments and guarded row updates. History
+does not disappear, it changes grain — rows are event-grained, and
+`cb_flow_attempts` keeps one row per attempt (§8).
 
-## 2. Event catalog
+## 1. Streams
 
-| Event | Emitted by | Payload core |
-|---|---|---|
-| `run_requested` | `RunFlow` / cron | input, dedup_key |
-| `step_spawned` | entry logic; step completion (D10) | step name, input, `after: [step_ids]`, `await_signal?`, idempotency_key |
-| `step_started` | worker on claim | step_id, worker, attempt |
-| `step_completed` | worker | step_id, output? |
-| `step_failed` | worker | step_id, error, attempt |
-| `signal` | `SignalFlow` | run_id, step name, payload |
-| `run_output_set` | a handler via `p.SetRunOutput` | value |
-| `run_canceled` | `CancelFlow` | reason |
+- One **ready stream** per flow: `fq.<flow>` (queue mode, 01 §5), plus
+  `fq.<flow>.<q>` for each step that declares its own queue via `WithQueue`
+  (§7). A ready message is `{run_id, step_id}` with **topic = step name**, so a
+  worker that implements a subset of steps filters by topic (D29).
+- Every ready stream has a **retry twin** that mirrors its name: `fq.orders` →
+  `fr.orders`, `fq.orders.gpu` → `fr.orders.gpu`. There is exactly one queue
+  per ready stream, so the queue name never becomes an extra segment (unlike
+  `sr.<stream>.<queue>`, where many queues share one stream).
+- One **dead letter stream** per flow: `fd.<flow>` (D6). The worker runs a
+  cursor on it and calls `cb_flow_exhaust` per message — verdict exhaustion and
+  crash exhaustion converge there (§4), exactly-once by the headline guarantee
+  (cursor advance and row effects commit together).
+- **No `fe.<flow>`**: the flow event streams died with the projection (D30);
+  the `fe` code stays reserved (D22).
 
-`idempotency_key = hash(run_id, parent_step_id, step_name, spawn_index)`. The
-projection applies `ON CONFLICT DO NOTHING` on this key, so a duplicate handler
-execution (dispatch is at-least-once) spawns each child once. This is the
-engine's entire idempotency story. Handlers only need to make their *external*
-effects idempotent.
+**Prerequisite changes in the stream layer** (land with M4a, in
+`stream/migrations`): the fail path in 00001 is not family-aware — it builds
+`sr.<stream>.<queue>` by concatenation and derives the dead letter stream
+`sd.<base>` by `split_part`, so failing a message on `fq.orders.gpu` would mint
+`sr.fq.orders.gpu`, which breaks D22's arity rule. The fail path must pick the
+family from the stream's code (`fq.*` → `fr.*`/`fd.*`, plain → `sr.*`/`sd.*`).
+The `fr.*` queues need the same CHECK pins as `sr.*` (claim batch size 1, no
+filters), and the run-terminal notify channel joins D22's channel grammar.
 
-## 3. Run lifecycle semantics
+## 2. Tables
 
-- A run starts as its **entry step**. `run_requested` projects into a spawn of
-  step `start`, and the handler of `start` is the flow's entry handler.
-- **Completion**: a run completes when every step is terminal
-  (completed/failed-exhausted/canceled/skipped) and none is awaiting a signal.
-  Only handlers spawn, so a run that has gone quiet can never grow again.
-  Auto-completion is therefore safe, and no explicit "done" call is needed.
-- **Failure/OnFail**: when a step exhausts retries, the run fails. If the flow
-  declares an OnFail handler, the projection spawns it as a final step with the
-  failed step's name, error, and dependency inputs. This ports today's OnFail
-  semantics, including #43's failed-step dependency inputs.
-- **Run output**: an explicit `p.SetRunOutput(v)` wins. Otherwise it is the
-  output of the last step to complete, if that step set one. Otherwise it is
-  null. This changes today's semantics, where run output meant "output of the
-  final step" — in a dynamic DAG there is no well-defined final step.
-  `WaitForOutput` keeps its API.
-- **Cancel**: `run_canceled` projects into skipping all non-started steps and
-  marking the run. Running handlers see context cancellation via the worker's
-  NOTIFY wakeup. That is best-effort, as today.
-- **Dedup**: `RunFlow` mints the run id synchronously. It upserts the
-  `cb_flow_runs` row and appends `run_requested` in the same transaction. The
-  upsert is today's pattern, verbatim:
-  `ON CONFLICT (flow, dedup_key) … WHERE FALSE` + `UNION ALL`. An existing run
-  returns its id and appends nothing. The *stream* dedup table is the wrong tool
-  here. Mapping its row back to a run id would mean reading an event, and
-  retention may already have dropped that event.
-- **Signals are buffered**: a `signal` event projects into run state whether or
-  not the awaiting step exists yet. When a step with `AwaitSignal` spawns, or is
-  already waiting, the projection matches the two. Arrival order doesn't matter.
-  `SignalFlow` therefore errors only if the run is missing or terminal. The
-  synchronous `ErrSignalNotDelivered` is retired (README amendment 12). Steps
-  that await a signal must have names unique among the run's live steps, and
-  spawn time enforces this. That way a signal's target is never ambiguous.
+Five tables, no edges — there is no deps table (D31):
 
-**`cb_flow_run`, sketched** — the synchronous entry point:
+- `cb_flows (name PK, first_step, on_fail, retention NOT NULL)` — per-flow
+  config. The entry step is an ordinary step; `first_step` just names it.
+- `cb_flow_runs (run_id, flow, key, status, input, output, error, live)` —
+  status `running | completed | failed | canceled` (text + CHECK, D20);
+  `UNIQUE (flow, key)` (constraint `cb_flow_runs_flow_key_key`) — `key` is the
+  dedup point *and* the app-key lookup in one column (raven and ingest both
+  demanded a durable run handle by application key); `live` counts the
+  executions the run still owes (§3).
+- `cb_flow_steps (PK (run_id, step_id), name, status, input, output, error,
+  attempt, dispatch, idem_key UNIQUE)` — status `waiting | queued | started |
+  completed | failed | canceled`; `attempt` is bumped by `cb_flow_start` (§3);
+  `dispatch` is `immediate | all_done | signal` — the same three words in the
+  Go options, the spawns JSON and this column; `idem_key` (named constraint) =
+  `hash(run_id, parent step_id, name, ordinal)`, so a duplicate execution
+  replaying its spawn buffer inserts nothing.
+- `cb_flow_attempts (PK (run_id, step_id, attempt), consumer, outcome, error)`
+  — per-attempt history *and* the fence record; kept when the run turns
+  terminal. A NULL outcome is recorded silence: a start that never reported.
+- `cb_flow_signals` — the signal buffer, matched under the run lock (§3).
 
-```sql
-CREATE FUNCTION cb_flow_run(flow text, input jsonb, dedup_key text DEFAULT NULL)
-RETURNS TABLE (run_id bigint, existing boolean)
-LANGUAGE plpgsql AS $$
-#variable_conflict use_column   -- params flow/dedup_key vs columns in the
-                                -- ON CONFLICT target (see 01 §8's sketch)
-DECLARE _id bigint; _won bigint;
-BEGIN
-    _id := nextval(pg_get_serial_sequence('cb_flow_runs', 'run_id'));
+Lookups — `WaitForOutput`, status, lookup by app key, the dashboard — read
+these rows directly. There is nothing else to read.
 
-    -- today's dedup pattern, verbatim (WHERE FALSE + UNION ALL — do not simplify)
-    WITH won AS (
-        INSERT INTO cb_flow_runs AS r (run_id, flow, status, input, dedup_key)
-        VALUES (_id, flow, 'requested', input, dedup_key)
-        ON CONFLICT (flow, dedup_key) WHERE dedup_key IS NOT NULL
-        DO UPDATE SET status = r.status WHERE FALSE
-        RETURNING r.run_id
-    )
-    SELECT x.run_id INTO _won FROM (
-        SELECT w.run_id FROM won w
-        UNION ALL
-        SELECT r.run_id FROM cb_flow_runs r
-        WHERE r.flow = cb_flow_run.flow AND r.dedup_key = cb_flow_run.dedup_key
-        LIMIT 1
-    ) x;
+## 3. Lifecycle
 
-    IF _won <> _id THEN
-        RETURN QUERY VALUES (_won, true);  -- existing run: nothing appended
-        RETURN;
-    END IF;
+**The fence, stated once.** Every engine function follows the same two-step
+guard. First it locks the run row (`FOR UPDATE`) and requires status
+`running` — anything else is a silent no-op returning false. Then it checks
+the step guard: the step's status and attempt must still match what
+`cb_flow_start` handed out. Attempts are minted by `cb_flow_start` and never
+read from message headers: the step's `attempt` counts *starts*, the stream
+layer's `cb_attempt` header counts *verdicts*, and the two diverge on crashes
+deliberately — a crashed execution consumed a start but never produced a
+verdict. (This gets a comment and a test at implementation.)
 
-    -- same event shape as cb_flow_complete's appends, same shard header
-    INSERT INTO cb_stream_messages (stream, topic, payload, headers)
-    VALUES ('fe.' || flow, 'run_requested',
-            jsonb_build_object('run_id', _id, 'input', input),
-            jsonb_build_object('cb_run_id', _id,
-                'cb_shard', abs(hashint8(_id)) % (SELECT f.shards FROM cb_flows f
-                                               WHERE f.name = cb_flow_run.flow)));
-    PERFORM pg_notify(current_schema || '.cbs_fe.' || flow, '');
-    RETURN QUERY VALUES (_id, false);
-END;
-$$;
-```
+**Birth.** `cb_flow_run` inserts the run (`live` = 1) and its first step
+(`queued`), and makes one direct publish to `fq.<flow>` (delay supported) —
+nothing else. It is callable on a `Conn`, so an application can enqueue a run
+in the same transaction as its own writes — the blob-GC / ingest pattern,
+validated in production. Dedup is the run row itself: today's
+`ON CONFLICT … DO UPDATE … WHERE FALSE` + `UNION ALL` pattern (do not
+simplify), on constraint `cb_flow_runs_flow_key_key`; an existing run returns
+its id and publishes nothing. The stream layer's key table is the wrong tool
+here — the run row must exist anyway, and mapping a stream key back to a run
+id would be a second lookup against a table retention may have emptied.
+
+**Scheduled runs.** A schedule (01 §6) publishes its template to `fq.<flow>`
+with no `run_id`. `cb_flow_start` recognizes that shape and births the run and
+its first step right there, at claim time — schedule delivery stays pure
+stream machinery, and a scheduled fire is just a message until a worker
+starts it.
+
+**Dispatch and the live count.** `live` counts the executions the run still
+owes. A spawn with dispatch `immediate` inserts its step as `queued` and
+publishes its ready message in the same completion transaction — the parent is
+complete by construction, so a sequential edge needs no bookkeeping beyond the
+spawn itself. A barrier step (`OnAllDone`, dispatch `all_done`) inserts as
+`waiting` and stays **outside** the count. A signal step (`OnSignal`, dispatch
+`signal`) inserts as `waiting` and **counts as live** — barriers and the run's
+completion wait behind an unanswered signal. When a completion brings `live`
+to zero: if barriers are waiting, they dispatch together as the next set and
+become the new live executions; otherwise the run finalizes.
+
+**Completion and run output.** A run finalizes when `live` reaches zero and no
+barrier is left waiting. Only executions spawn, so such a run can never grow
+again — no explicit "done" call exists. Output resolution: an explicit
+`run_output` passed to `cb_flow_complete` wins; otherwise the output of the
+last execution to complete, if it set one; otherwise null. (Today's "output of
+the final step" has no meaning when steps are spawned dynamically.)
+`WaitForOutput` keeps its API, woken by the run-terminal notify (§1).
+
+**Failure.** A failed execution reports through `cb_flow_fail`: the verdict is
+recorded (attempt row, step back to `queued`) and the message is handed to the
+stream layer's retry machinery — backoff, `fr.*`, dead letters are M2's call,
+not the engine's (D21, D28). Exhaustion, whether by verdicts or by crashes,
+arrives on `fd.<flow>`, where the worker's cursor calls `cb_flow_exhaust`: the
+step turns `failed`; if the flow declares `on_fail`, it is spawned as a final
+step receiving the failed step's name, error and input; the run drains to
+`failed`. (`on_fail` itself lands in M4b, 05.)
+
+**Cancel.** `cb_flow_cancel` flips every non-started step and the run to
+`canceled`. Started handlers get best-effort context cancellation: the consume
+loop checks the run's status on its extend cadence (D27) — the same promise as
+today.
+
+**Signals are buffered.** `cb_flow_signal` satisfies a waiting signal step if
+one exists, otherwise it buffers the payload in `cb_flow_signals` — both under
+the run lock, so arrival order does not matter: a signal step that spawns
+later consumes its buffered signal as it is applied. The call errors only if
+the run is missing or terminal; the synchronous `ErrSignalNotDelivered` is
+retired (README amendment 12). A signal step's name must be unique among the
+run's live steps — enforced when the spawn is applied — so a signal's target
+is never ambiguous.
 
 ## 4. The projection — sharded, exactly-once (D9)
 
