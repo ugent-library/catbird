@@ -112,8 +112,14 @@ github.com/ugent-library/catbird          (module — the library)
   assignment machinery twice.
 - Table naming: static tables per module (`cb_stream_*`, `cb_flow_*`, `cb_wire_*`),
   one goose version table per module (`cb_stream_migrations`, …) so modules install
-  and upgrade independently. No collision with the current `cb_q_*`/`cb_t_*` dynamic
-  tables, so old and new can coexist in one database during the transition.
+  and upgrade independently. Old and new must coexist in one database during the
+  transition, which means no collision with the current schema's *static* tables
+  either, not just the `cb_q_*`/`cb_t_*` dynamic ones — the one hard clash found
+  (`cb_flows`, the old static flow registry) is dodged by naming the new config
+  table `cb_flow_defs` (03 §2). The old-vs-new function names never collide exactly
+  (old is verb-first, new module-first), but the near-anagram pairs
+  (`cb_run_flow`/`cb_flow_run`) coexist until the old schema drops — sql-api.md
+  carries an old-vs-new table during the transition.
 - `go.work` at the repo root ties the nested `cb` module in for development.
 - **This diagram is the end state (post-M6).** During the transition the root
   package remains the frozen old API and the shared machinery lives under

@@ -1,8 +1,5 @@
 # 03 — flow: the engine on rows
 
-> Sections 7–9 below are being rewritten for D30–D32; until then they still
-> describe the dead projection design. Trust §1–6 and the README decision log.
-
 **One concept.** A run is a group of executions, and every execution may
 atomically enqueue follow-on steps when it completes — "a flow is a task that
 enqueues follow-ons" (D31). There is no separate task engine: a task is a run
@@ -49,8 +46,13 @@ filters), and the run-terminal notify channel joins D22's channel grammar.
 
 Five tables, no edges — there is no deps table (D31):
 
-- `cb_flows (name PK, first_step, on_fail, retention NOT NULL)` — per-flow
-  config. The entry step is an ordinary step; `first_step` just names it.
+- `cb_flow_defs (name PK, first_step, on_fail, retention NOT NULL)` — the
+  flow definition, per-flow config. The entry step is an ordinary step;
+  `first_step` just names it. Not `cb_flows`: the old schema's static flow
+  registry has that exact name, it exists in every old-catbird database
+  (raven's included, flows or not), and old and new must coexist during the
+  transition — the one hard name collision between the two worlds, found and
+  dodged here.
 - `cb_flow_runs (run_id, flow, key, status, input, output, error,
   steps_remaining)` —
   status `running | completed | failed | canceled` (text + CHECK, D20);
@@ -251,7 +253,7 @@ with the spawn options `flow.OnAllDone()` and `flow.OnSignal()` ·
 reflection utilities; a multi-instance name yields a slice). The rule: **a
 spawn dispatches immediately unless an `On*` option defers it** (§3). The
 entry step is not special — `FirstStep` names an ordinary step, and
-`cb_flows.first_step` records it; there is no `Entry` method.
+`cb_flow_defs.first_step` records it; there is no `Entry` method.
 
 The naming rule behind the options: name the **dispatch condition from the
 step's own viewpoint**, never the engine's mechanics, and nothing may sound
@@ -314,199 +316,93 @@ changing it by raw UPDATE would silently break convictions. Queues and flows
 share one robustness mechanism, it executes in SQL, and every language sees
 it.
 
-## 7. Cross-language steps (D11) — your differentiator, scoped
+## 7. Cross-language workers (D11) — the differentiator, scoped
 
 Not a rabbit hole, **provided it stays at the SQL API level**. A foreign worker
-implements a contract of five functions. They are documented in `docs/sql-api.md`,
-which becomes the normative spec:
+is ~50 lines against a contract of seven functions — three from the stream
+layer, four from the engine — documented in `docs/sql-api.md`, which M4a makes
+the normative spec:
 
 ```
-cb_flow_claim(queue, worker, batch)          → ready steps (run_id, step_id, attempt, name, input jsonb)
-cb_flow_complete(run_id, step_id, attempt, output?, spawns jsonb, run_output?) → bool
-cb_flow_fail(run_id, step_id, attempt, error) → bool
-cb_flow_signal(flow, run_id, step, payload)
-cb_stream_extend_claim(queue, worker, from)  -- claim liveness; call between steps
+cb_stream_claim(stream, queue, consumer, ttl)   → claimed messages
+cb_stream_extend_claim(…)                       -- keep the claim alive (D23, D27)
+cb_stream_close_claim(…)                        -- after the batch
+cb_flow_start(…)        → (name, input, attempt) or nothing (fence failed,
+                        --  or the message was a conviction, D33)
+cb_flow_complete(run_id, step_id, attempt, output, spawns, run_output) → bool
+cb_flow_fail(…)         → bool                  -- verdict + retry hand-off, one call
+cb_flow_signal(…)
 ```
 
-`attempt` travels with the claim and back through complete/fail. It is the claim
-key's third column, so each attempt resolves exactly once. The boolean return
-surfaces a lost race for logging and metrics: false means the caller's execution
-was a duplicate and nothing was appended.
+The loop: claim `fq.<flow>` and its retry twin → per message `cb_flow_start` →
+run the handler → `cb_flow_complete` or `cb_flow_fail` → close the claim,
+extending between messages and while a handler runs (D27). A worker that never
+extends has its slow steps truthfully counted as crashes and quarantine slows
+it down — legal, at-least-once, just noisy; the M4b demo worker is
+deliberately slower than the claim TTL to prove that path end to end.
+`attempt` travels from start through complete/fail — the fence's third
+column — so each start resolves at most once, and a false return means the
+execution was a duplicate and nothing happened. (`cb_flow_run` and
+`cb_flow_cancel` are equally callable — any client with a Postgres connection
+starts and cancels runs; the *worker* contract is the seven above.)
 
-`spawns` carries the buffered Plan mutations, so even *dynamic* spawning is fully
-available to a Python worker. The DSL is sugar, not capability. `input` is the
-spawn input, verbatim (§5). Extending is not optional. Every claim expires after
-the queue's `claim_ttl` (D23). A foreign worker that doesn't call
-`cb_stream_extend_claim` between steps loses its claim mid-work. Then any step
-slower than the TTL is guaranteed a duplicate execution. The TTL and recommended
-extend cadence are part of the sql-api.md spec. `WithQueue("x")`
-routes a step to its own ready stream, so a foreign worker subscribes to exactly
-the steps it implements and never claims work it can't run. Range claims can't
-skip messages; dedicated streams make the filtering structural instead.
+`spawns` carries the buffered Plan as JSON — `[{name, input, dispatch}]`, the
+same three dispatch words as the column (§2) — so dynamic spawning is fully
+available to a Python worker. The DSL is sugar, not capability. `WithQueue`
+steps live on their own ready stream (`fq.<flow>.<q>`), so a foreign worker
+subscribes to exactly the steps it implements and never claims work it can't
+run. Conviction asks nothing of the worker: a marked corpse is just another
+claimed message whose `cb_flow_start` hands back no work (D33).
 
-**`cb_flow_complete`, sketched** — the worker's commit point. Handlers run outside
-any database transaction. This one call is where a step execution becomes real, or
-becomes a no-op, atomically:
+Explicitly out of scope, same line as before: cross-language flow
+*definition*, typed payload schemas or registries, SDK parity. The contract is
+step name in, JSON in, JSON out, plus the seven calls. Hold that line.
 
-```sql
-CREATE FUNCTION cb_flow_complete(
-    run_id     bigint,
-    step_id    bigint,
-    attempt    int,                 -- from cb_flow_claim
-    output     jsonb DEFAULT NULL,
-    spawns     jsonb DEFAULT '[]',  -- [{name, input, after: [{name}|{ref}], await_signal}]
-    run_output jsonb DEFAULT NULL
-) RETURNS boolean                   -- false: lost the race, nothing appended
-LANGUAGE plpgsql AS $$
-DECLARE
-    _flow   text;
-    _shards int;
-    _stream text;
-    _hdrs   jsonb;
-BEGIN
-    -- run → flow → event stream + projection shard (01 §4: header equality filter)
-    SELECT r.flow, f.shards INTO _flow, _shards
-    FROM cb_flow_runs r
-    JOIN cb_flows f ON f.name = r.flow
-    WHERE r.run_id = cb_flow_complete.run_id;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: run % not found', run_id;
-    END IF;
-    _stream := 'fe.' || _flow;
-    _hdrs   := jsonb_build_object(
-        'cb_run_id', run_id,
-        'cb_shard',  abs(hashint8(run_id)) % _shards);
+## 8. Retention, audit, history (D30)
 
-    -- Claim this attempt's resolution. Exactly one of complete/fail wins per
-    -- (run, step, attempt). The loser appends NOTHING. So a redelivered
-    -- execution produces no duplicate events, buffered spawns included, and
-    -- handlers need not spawn deterministically. cb_flow_fail claims the same
-    -- key with outcome = 'failed'.
-    INSERT INTO cb_flow_step_claims (run_id, step_id, attempt, outcome)
-    VALUES (run_id, step_id, attempt, 'completed')
-    ON CONFLICT (run_id, step_id, attempt) DO NOTHING;
-    IF NOT FOUND THEN
-        RETURN false;
-    END IF;
+Rows are the history. A step row per spawn, an attempt row per start —
+`cb_flow_attempts` is kept when the run turns terminal, and a NULL outcome is
+itself a record: a start that never reported, which is what a crash looks like
+(§3). The dashboard's run detail view reads what actually happened — who
+started what, which attempts failed with which errors, what convicted —
+without an event log. What died with the log is replay and
+state-as-of-time-T reconstruction, which was never a shipped feature.
 
-    -- One event batch, atomic with the claim. Spawns first, completion last.
-    -- Insert order = id order = position tie-break (01 §2). So the projection
-    -- sees the children before the completion that may satisfy their edges,
-    -- and resolves everything in a single apply pass.
-    INSERT INTO cb_stream_messages (stream, topic, payload, headers)
-    SELECT _stream, 'step_spawned',
-           jsonb_build_object(
-               'name',            s->>'name',
-               'input',           s->'input',
-               'after',           coalesce(s->'after', '[]'),
-               'await_signal',    coalesce((s->>'await_signal')::bool, false),
-               'parent',          step_id,
-               'idempotency_key', md5(run_id || ':' || step_id || ':' ||
-                                      (s->>'name') || ':' || (i - 1))),
-           _hdrs
-    FROM jsonb_array_elements(spawns) WITH ORDINALITY AS b(s, i);
-
-    INSERT INTO cb_stream_messages (stream, topic, payload, headers)
-    VALUES (_stream, 'step_completed',
-            jsonb_build_object('step_id', step_id, 'attempt', attempt,
-                               'output', output),
-            _hdrs);
-
-    IF run_output IS NOT NULL THEN
-        INSERT INTO cb_stream_messages (stream, topic, payload, headers)
-        VALUES (_stream, 'run_output_set',
-                jsonb_build_object('value', run_output, 'step_id', step_id),
-                _hdrs);
-    END IF;
-
-    -- The engine owns this stream, so it appends directly rather than through
-    -- cb_stream_publish: no dedup, no pending on this path. It still owes the
-    -- assigner its wake-up.
-    PERFORM pg_notify(current_schema || '.cbs_' || _stream, '');
-
-    RETURN true;
-END;
-$$;
-```
-
-Sketch-level notes. Real code prefixes parameters per the existing migration
-convention (`cb_send.queue`-style qualification) to dodge column ambiguity. The
-`{ref: idx}` edges resolve to sibling idempotency keys; the same hash makes them
-computable at append time. Claim accounting for the *ready-stream* message is
-the stream layer's job. The worker reports it there separately; this function is
-purely flow-level. Note the complete-vs-fail race is asymmetric by design. If a
-duplicated execution fails first and completes second, the fail wins, and the
-step retries despite having succeeded once. That is legal under at-least-once,
-and rarer than the reverse.
-
-The twins are smaller. `cb_flow_fail` is the same claim with the other outcome.
-It is deliberately dumb, because retry policy is the projection's job, not the
-worker's:
-
-```sql
-CREATE FUNCTION cb_flow_fail(run_id bigint, step_id bigint, attempt int, error text)
-RETURNS boolean LANGUAGE plpgsql AS $$
-BEGIN
-    INSERT INTO cb_flow_step_claims (run_id, step_id, attempt, outcome)
-    VALUES (run_id, step_id, attempt, 'failed')
-    ON CONFLICT (run_id, step_id, attempt) DO NOTHING;
-    IF NOT FOUND THEN RETURN false; END IF;
-
-    INSERT INTO cb_stream_messages (stream, topic, payload, headers)
-    VALUES (..., 'step_failed',
-            jsonb_build_object('step_id', step_id, 'attempt', attempt,
-                               'error', error),
-            ...same run→stream→shard resolution as complete...);
-    PERFORM pg_notify(current_schema || '.cbs_' || ..., '');
-    RETURN true;
-END;
-$$;
-```
-
-`cb_flow_claim` adds no new ideas. It runs `cb_stream_claim` on the ready stream
-(01 §5), then a PK fetch of each claimed `step_ready` message's `(run_id, step_id,
-attempt, name)` plus the step's `input` from `cb_flow_steps`. No joins, two
-indexed reads.
-`cb_flow_signal` is `cb_flow_run`'s little sibling: validate the run row exists
-and is not terminal, append one `signal` event, notify the assigner.
-
-This boundary keeps it from becoming a rabbit hole. Explicitly out of scope:
-cross-language flow *definition*, typed payload schemas/registries, SDK parity.
-The contract is: step name in, JSON in, JSON out, claim/complete/fail/signal.
-Hold that line.
-
-## 8. Retention, audit, history
-
-The event log **is** the audit trail. The current engine mutates rows in place
-and loses history. This one gets history for free, and the dashboard's run detail
-view can render the actual event sequence. A flow event partition drops when it
-is past the projection cursors, **and** every run with events in the partition is
-terminal, **and** it is older than the flow's audit window. A long-parked run (a
-signal step waiting weeks) pins its partition. A `max_run_age` policy cancels
-zombie runs before that pin grows old. Precedence, explicitly: the age cap of
-01 §10 sits above both and still wins on a truly stuck stream. Configure it well
-past `max_run_age`. Accept that when it fires, the audit trail has a hole,
-recorded by the `$sys.data_loss` event. Replay and time-travel claims hold
-*within retention*, not absolutely. Say so in user docs.
+Terminal runs are pruned past `cb_flow_defs.retention` (NOT NULL, per flow) — the
+run row and its step, attempt and signal rows together, in the stream layer's
+batched-DELETE shape (01 §10). A long-parked run (a signal step waiting weeks)
+now pins nothing but its own rows — the old design's partition-pinning problem
+died with the event log. Whether such runs should be canceled by age is a
+policy question deferred until a workload asks; the rows make it a one-line
+query. The flow's streams follow the stream layer's retention rules unchanged
+(D7); `fd.<flow>` holds convictions until triaged.
 
 ## 9. Build checklist
 
-1. Event types + append helpers; shard header at append time.
-2. Projection tables DDL; the apply function (one event batch → row deltas +
-   ready appends) — pure SQL, the heart of the engine.
-3. Sharded projection cursors; per-flow ensure (`flow.New(...).Ensure(pool)` creates
-   streams, policies, shards idempotently).
-4. Worker: claim ready → decode via reflection utils (port from `task.go`) → run
-   handler → complete/fail with buffered Plan. Port worker lifecycle/NOTIFY wiring
-   from `worker.go` (much of it survives).
-5. DSL surface (§5); `RunFlow`/`WaitForOutput`/`SignalFlow`/`CancelFlow` with
-   today's signatures where possible.
-6. OnFail, dedup, `RunEvery` via the schedule table.
-7. `docs/sql-api.md`: rewrite as the normative cross-language contract.
-8. Tests: port the semantic core of `flow_test.go` (deps, signals, OnFail, cancel,
-   dedup, map-as-pattern, output semantics); new: projection crash mid-batch (no
-   lost/duplicate ready dispatch), duplicate handler execution spawns once
-   (idempotency keys), shard parallelism (two runs progress while one shard is
-   artificially stalled), unhandled step parks and resumes, a signal arriving
-   before its awaiting step spawns is held and matched, a duplicate
-   `cb_flow_complete` for the same step appends nothing.
+Sequencing and exit criteria live in 05 (M4a = single-execution runs, M4b =
+spawns, barriers, signals, `on_fail`). The build items:
+
+1. Stream-layer prerequisite (§1): family-aware give-up path (`fq.*` → `fr.*`
+   / `fd.*`), the marked-final-delivery disposition (D33), `fr.*` CHECK pins,
+   run-terminal notify channel in D22's grammar.
+2. Migration `flow/migrations/00001`: the five tables (§2), text + CHECK
+   statuses, named constraints (`cb_flow_runs_flow_key_key`, the steps `key`),
+   version table `cb_flow_migrations`.
+3. Functions (§4), M4a scope: `run`, `start` with its two marked branches,
+   `complete` (raises on non-empty `spawns` until M4b), `fail`, `cancel`,
+   `signal`. M4b: the spawn/barrier/signal paths in `complete`, `on_fail` at
+   conviction.
+4. Go: `flow.New` / `flow.NewTask` builders + ensure (streams, queue rows,
+   `cb_flow_defs` row); worker = `ConsumeQueue` wrapping start → handler →
+   complete/fail (§5); the Plan buffer; reflection utilities ported from
+   `task.go`; run lookup by id and by app key; `WaitForOutput` on the
+   run-terminal notify.
+5. `docs/sql-api.md`: rewrite as the normative worker contract (§7).
+6. Tests, the semantic core: dedup + key lookup; duplicate complete/fail
+   no-ops; attempt-vs-`cb_attempt` divergence on crash (§3's deliberate pair);
+   conviction from both roads — verdict exhaustion and crash exhaustion — and
+   the fence states each arrives in; cancel during a retry gap; a scheduled
+   fire births exactly one run; a signal arriving before its step spawns is
+   buffered and matched; barrier dispatch at `steps_remaining` zero, including
+   a second phase; wide-map stress (M4b, the D30 watch item); the deliberately
+   slow Python demo worker (M4b).
