@@ -820,14 +820,19 @@ therefore invisible to non-Go workers and to SQL. Move the *policy* into columns
 max_attempts int · backoff_kind (enum: 'none'|'fixed'|'full_jitter', D20) ·
 backoff_base interval · backoff_max interval ·
 after_max_attempts (enum: 'dead_letter'|'drop' — the queue's single give-up
-policy, honored for crash exhaustion too, D28; 'reroute' + a reroute_stream
-column may join it later — appending to an enum is an ordinary migration, D20)
+policy, honored for crash exhaustion too, D28. A third disposition exists for
+flow queues (D33): the marked final delivery — at give-up, republish once more
+to the retry twin carrying the exhaustion stamp instead of archiving; the
+engine convicts on delivery. Value name settled at transcription. A general
+'reroute' to an arbitrary stream may still join later — appending to an enum
+is an ordinary migration, D20)
 ```
 
 `cb_stream_fail(stream, queue, consumer, position, error)` has no mechanism of
 its own (D21): it reads the failing message, then *publishes* — to the queue's
-retry stream with a backoff delay, or to the base stream's dead letters when
-attempts are exhausted. It acts only for the claim's current holder (the
+retry stream with a backoff delay, or, when attempts are exhausted, to the
+base stream's dead letters (flow queues instead make the marked final
+delivery, D33 — the sketch below shows only the plain-stream branch). It acts only for the claim's current holder (the
 ownership fence, D28 — covering claim, not closed, no expiry test: an
 expired-but-not-yet-adopted owner's verdict still lands, a superseded zombie's
 is a silent no-op). Idempotency under duplicate fails (a crashed-and-adopted
@@ -1091,7 +1096,11 @@ A dead letter stream is an ordinary stream named `sd.<stream>` (`fd.<flow>` for
 flows), created lazily on first use — its existence is policy-dependent, so it
 is the one object still born at its point of use. Exhausted messages are
 appended there with headers `{cb_queue, cb_error, cb_origin_position}` plus
-`cb_attempts` or `cb_crashes` — whichever exhausted the message (D28). Replay is
+`cb_attempts` or `cb_crashes` — whichever exhausted the message (D28). For flow
+streams the writer is the engine itself: exhaustion is one final marked
+delivery (D33), and `cb_flow_start` writes the `fd.<flow>` row at conviction,
+run and step context in the payload — the engine never reads dead letters;
+people and `Redrive` do. Replay is
 `stream.Redrive(deadLetters, n)` — republish to the origin stream (new position,
 counters reset by construction: the public publish path rejects `cb_` headers —
 plus a `cb_redriven_from` header). Because it is just a stream: it has

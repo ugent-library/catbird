@@ -142,41 +142,59 @@ end (delivers exactly the matches, a failed match returns through `sr.*`,
 closed position keeps up over undelivered ranges); the batch publish matrix.
 Suite green under `-race`.
 
-## M4 — tasks first, then flows
+## M4 — one engine: single-execution runs, then spawns (was: tasks, then flows)
 
-Sequencing (2026-07-12): tasks are the smaller customer of the same machinery
-— a task is a single-handler run, no DAG — so they land first, and the
-infrastructure flows need (run state, claim/execute/complete, terminal hooks)
-gets validated at task scale before the flow engine builds on it.
+There is no separate task engine to build (D31): a task is a run whose single
+execution enqueues nothing, kept as sugar (`flow.NewTask`). The 2026-07-12
+"tasks first" sequencing survives as **M4a / M4b** — the single-execution
+shape is the smaller customer of the same machinery, so the schema, the
+fences and the worker loop get validated at that scale before spawning exists
+at all.
 
-**Tasks:** run rows and a durable run handle — status, output, cancel,
-queryable by id *and* by an application key (raven's job UI polls it; ingest's
-delivery correlation hand-rolled it via derived concurrency keys — both apps
-demanded exactly this lookup); run-with-dedup-key in the caller's transaction;
-scheduled runs via `cb_stream_schedules`; conditions in the M3 condition
-language; retries and dead letters via the M2 machinery. No topic-bound
-triggering: a task fed by events is a worker on a filtered queue.
+**M4a — single-execution runs.** First the stream-layer prerequisite (03 §1):
+the family-aware give-up path (`fq.*` → `fr.*` / `fd.*`), the
+marked-final-delivery disposition (D33), `fr.*` CHECK pins, the run-terminal
+notify channel in D22's grammar. Then the full flow schema (03 §2 — all five
+tables, nothing deferred) and the M4a function set: `run`, `start` with both
+marked branches (scheduled fire, conviction), `complete` — which **raises** on
+non-empty `spawns` until M4b — `fail`, `cancel`. The worker is the existing
+`ConsumeQueue` machinery wrapping start → handler → complete/fail (03 §5).
+Durable run handle — status, output, error, cancel — queryable by id *and* by
+application key (raven's job UI polls it; ingest hand-rolled the lookup via
+derived concurrency keys — both apps demanded exactly this);
+run-with-dedup-key in the caller's transaction; scheduled runs via
+`cb_stream_schedules` templates; retries, quarantine and conviction via the M2
+machinery plus D33. No conditions on runs (D32), and no topic-bound
+triggering: a run fed by events is a worker on a filtered queue (D29).
 
-**Then flows:** 03 — event streams, projection tables + apply function,
-sharded projectors, ready dispatch, worker claim/execute/complete, the Plan
-DSL, signals, OnFail (which must also fire on hard worker death — ingest's
-`sweep_stuck_deliveries` exists because today's doesn't), dedup, `RunEvery`
-via the schedule table. Port from current code: reflection/type utilities
-(`task.go`, `util.go`), worker lifecycle (`worker.go`), backoff strategies
-(`backoff.go`).
+*Exit (M4a):* raven's on-demand job shape end to end — run in a transaction
+with a dedup key, poll status by app key, read output, cancel; a scheduled run
+fires; a poison run convicts through both roads (verdict exhaustion and crash
+exhaustion) and the run fails; semantic core of `task_test.go` green against
+the new engine.
 
-*Exit, tasks:* raven's on-demand job shape end to end — run in a transaction
-with a dedup key, poll status, read output, cancel; a scheduled task fires;
-semantic core of `task_test.go` green against the new engine.
+**M4b — spawns.** The `spawns` branch of `cb_flow_complete` (insert on the
+spawn `key`, batch publish, `steps_remaining` accounting), barriers
+(`OnAllDone`, including a second phase), signals (`OnSignal` +
+`cb_flow_signal`, buffered), `on_fail` at conviction — which thereby fires on
+hard worker death too (ingest's `sweep_stuck_deliveries` exists because
+today's OnFail doesn't) — the Plan buffer surface, `flow.NewTask` sugar. Port
+from current code: the reflection/type utilities (`task.go`, `util.go`); the
+worker loop and backoff already live in `stream` (M2).
 
-*Exit, flows:* semantic core of `flow_test.go` green against the new engine
-(deps, signals, cancel, OnFail with dependency inputs, dedup, outputs,
-map-as-pattern); new projection tests (03 §9); a step-to-step latency benchmark
-(03 §4 predicts ~2× publish→consume); a demo foreign worker claims and completes
-a dedicated step *slower than the claim TTL*, proving D11 and the claim-liveness
-contract for real. The foreign worker is a ~50-line Python script speaking the
-five SQL functions, extend included. `docs/sql-api.md` rewritten as the normative
-contract.
+*Exit (M4b):* semantic core of `flow_test.go` green against the new engine —
+sequential spawn chains, fan-out + barrier (map-as-pattern), signals including
+signal-before-step, cancel, `on_fail` receiving the failed step's name, error
+and input, dedup, output resolution — plus 03 §9's list (conviction fence
+states, attempt-vs-`cb_attempt` divergence, barrier phases); a step-to-step
+latency benchmark (03 §4 predicts ~1× publish→consume — the projection's
+second leg is gone); the **wide-map stress test** — hundreds of siblings
+completing into one run row, the D30 connection-occupancy watch item, deciding
+whether the mitigation ladder's first rung suffices; and the demo foreign
+worker: a ~50-line Python script speaking the seven-function contract (03 §7),
+extend included, deliberately *slower than the claim TTL* — proving D11, D27
+and the claim-liveness contract for real. `docs/sql-api.md` rewritten as the
+normative contract, with the old-vs-new name table for the transition.
 
 ## M5 — NOTIFY wake-up, wire + inbox
 
@@ -204,7 +222,7 @@ inbox row appears — the vision's §4 example, running.
 
 Migrate **raven**, the motivating workload, module-by-module. Its task/flow
 definitions, index worker, and scheduler usages are the acceptance suite. Port
-dashboard + TUI to the new tables; they gain the event-log run history (03 §8).
+dashboard + TUI to the new tables; they gain the attempt-grained run history (03 §8).
 Move them with the CLI to the nested `cb` module. Write migration notes for any
 external 0.x users.
 
@@ -239,7 +257,7 @@ nothing outside history.
 | `queue.go` + `cb_q_*` SQL | replaced by `stream` (M1–M2); `Send/Read/Hide/Delete` API retired |
 | `scheduler.go` | dissolved into `cb_stream_schedules` (M2) + builder sugar |
 | `task.go` reflection, `util.go`, `backoff.go` | ported into `flow` / `stream` (M4/M2) |
-| `flow.go`, `worker.go`, `cancel.go`, `complete_early.go` | semantics ported to event engine; code largely rewritten (M4) |
+| `flow.go`, `worker.go`, `cancel.go`, `complete_early.go` | semantics ported to the row engine (D30–D33); code largely rewritten (M4) |
 | `wire.go`, `wire_token.go`, `notifications.go` | ported, extended with read_at (M5) |
 | `circuit_breaker.go` | stays client-side, unchanged |
 | `dashboard/`, `tui/`, `cmd/` | re-pointed at new tables, moved to `cb` module (M6) |
@@ -277,8 +295,11 @@ nothing outside history.
   the design.
 - **Ordinal-update index churn** on high-volume streams: watch bloat on
   `(stream, position)` during M2 benchmarks; `fillfactor` tuning is the first lever.
-- **Projection lag** under 200-child spawn bursts (M4): the shard count is the
-  lever; measure before raising the default.
+- **Wide fan-in connection occupancy** (M4b): sibling completions serialize on
+  one run-row lock while each holds a pool connection (~1k completions/s per
+  run, D30). The wide-map stress test decides; the mitigation ladder — tiny
+  completion transaction → batched sibling completion → deferred drain
+  detection — is written down in D30 and 03 §4.
 - **Scope creep at the DSL** (M4): the cross-language boundary (03 §7) and the
   "patterns, not primitives" list are the two lines most likely to erode under
   porting pressure. The plan documents exist precisely so you notice when you're
