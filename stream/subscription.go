@@ -20,13 +20,13 @@ const (
 	FailDrop       FailPolicy = "drop"
 )
 
-// QueueOpts are initial values, applied only when this call creates the
-// queue: an existing queue is never modified. Zero fields mean the defaults.
+// SubscriptionOpts are initial values, applied only when this call creates the
+// subscription: an existing subscription is never modified. Zero fields mean the defaults.
 // The fields are workload policy: where to start, how many at a time, how
 // to retry, when to give up. The engine's failure-detection mechanics
-// (claim_ttl, max_crashes) have defaults on the queue row and are tuned
+// (claim_ttl, max_crashes) have defaults on the subscription row and are tuned
 // there, not here.
-type QueueOpts struct {
+type SubscriptionOpts struct {
 	StartPos       *int64        // claim from here; nil starts at the tail
 	ClaimBatchSize int           // 100: messages per claim
 	MaxAttempts    int           // 3
@@ -34,7 +34,7 @@ type QueueOpts struct {
 	BackoffBase    time.Duration // 5s
 	BackoffMax     time.Duration // 5m
 	OnFail         FailPolicy    // dead_letter
-	// Topic: which topics this queue reads, applied server-side. '*'
+	// Topic: which topics this subscription reads, applied server-side. '*'
 	// matches one segment, '#' zero or more trailing segments. "" reads
 	// every topic. A claim covers every position in its range, matching
 	// or not, so it can hold fewer messages than claim_batch_size, or
@@ -48,13 +48,13 @@ type QueueOpts struct {
 	Condition string
 }
 
-func EnsureQueue(ctx context.Context, conn Conn, stream, queue string, opts ...QueueOpts) error {
-	var o QueueOpts
+func EnsureSubscription(ctx context.Context, conn Conn, stream, subscription string, opts ...SubscriptionOpts) error {
+	var o SubscriptionOpts
 	if len(opts) > 0 {
 		o = opts[0]
 	}
 	_, err := conn.Exec(ctx,
-		`SELECT cb_stream_ensure_queue($1, $2,
+		`SELECT cb_stream_ensure_subscription($1, $2,
 			start_pos        => $3,
 			max_attempts     => $4,
 			backoff_kind     => $5,
@@ -64,7 +64,7 @@ func EnsureQueue(ctx context.Context, conn Conn, stream, queue string, opts ...Q
 			claim_batch_size => $9,
 			topic            => $10,
 			condition        => $11)`,
-		stream, queue,
+		stream, subscription,
 		o.StartPos,
 		nullInt(o.MaxAttempts),
 		nullText(string(o.BackoffKind)),

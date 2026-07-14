@@ -3,7 +3,7 @@
 -- Every error this API raises carries one of these SQLSTATE codes, so
 -- clients classify by code instead of parsing message text:
 --   IRD01  invalid argument  the call itself is malformed
---   IRD02  not defined       the stream, queue, cursor or schedule does not exist
+--   IRD02  not defined       the stream, subscription, cursor or schedule does not exist
 --   IRD03  not found         the message does not exist
 -- Why IRD: the natural prefix CB sits in the SQLSTATE class range the
 -- standard reserves for itself (0-4, A-H).
@@ -228,7 +228,7 @@ ALTER SEQUENCE cb_stream_messages_id_seq OWNED BY cb_stream_messages.id;
 
 CREATE INDEX ON cb_stream_messages (stream, pos);
 
-CREATE TABLE cb_stream_queues (
+CREATE TABLE cb_stream_subscriptions (
     stream text NOT NULL REFERENCES cb_streams(name) ON DELETE CASCADE,
     name text NOT NULL CHECK (cb_valid_name(name)),
     claimed_pos bigint NOT NULL DEFAULT 0, -- everything at or below this position is claimed
@@ -248,16 +248,16 @@ CREATE TABLE cb_stream_queues (
     payload_condition jsonpath,
     PRIMARY KEY (stream, name),
     CHECK (closed_pos <= claimed_pos),
-    CONSTRAINT cb_stream_queues_retry_batch_size
+    CONSTRAINT cb_stream_subscriptions_retry_batch_size
         CHECK (left(stream, 3) <> 'sr.' OR claim_batch_size = 1),
-    CONSTRAINT cb_stream_queues_retry_no_filters
+    CONSTRAINT cb_stream_subscriptions_retry_no_filters
         CHECK (left(stream, 3) <> 'sr.' OR (topic IS NULL AND condition IS NULL))
 
 );
 
 CREATE TABLE cb_stream_claims (
     stream text NOT NULL,
-    queue text NOT NULL,
+    subscription text NOT NULL,
     from_pos bigint NOT NULL,
     to_pos bigint NOT NULL,
     consumer text NOT NULL,
@@ -267,9 +267,9 @@ CREATE TABLE cb_stream_claims (
     crashes int NOT NULL DEFAULT 0,
     expires_at timestamptz NOT NULL, -- past this moment any consumer may claim again
     created_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (stream, queue, from_pos),
-    FOREIGN KEY (stream, queue)
-        REFERENCES cb_stream_queues(stream, name) ON DELETE CASCADE,
+    PRIMARY KEY (stream, subscription, from_pos),
+    FOREIGN KEY (stream, subscription)
+        REFERENCES cb_stream_subscriptions(stream, name) ON DELETE CASCADE,
     CHECK (from_pos <= to_pos)
 );
 
@@ -395,9 +395,9 @@ END; $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION cb_stream_ensure_queue(
+CREATE FUNCTION cb_stream_ensure_subscription(
     stream         text,
-    queue          text,
+    subscription          text,
     start_pos bigint DEFAULT NULL,
     claim_ttl      interval DEFAULT NULL,
     max_attempts   int      DEFAULT NULL,
@@ -417,72 +417,72 @@ DECLARE
     _headers_cond jsonpath;
     _payload_cond jsonpath;
 BEGIN
-    IF NOT cb_valid_name(cb_stream_ensure_queue.queue) THEN
-        RAISE EXCEPTION 'catbird: invalid queue name %; use [a-z][a-z0-9_]*, max 20 bytes',
-            cb_stream_ensure_queue.queue USING ERRCODE = 'IRD01';
+    IF NOT cb_valid_name(cb_stream_ensure_subscription.subscription) THEN
+        RAISE EXCEPTION 'catbird: invalid subscription name %; use [a-z][a-z0-9_]*, max 20 bytes',
+            cb_stream_ensure_subscription.subscription USING ERRCODE = 'IRD01';
     END IF;
 
-    IF cb_stream_ensure_queue.stream LIKE '%.%' THEN
-        RAISE EXCEPTION 'catbird: % is an internal stream; queues can only be created on a user stream',
-            cb_stream_ensure_queue.stream USING ERRCODE = 'IRD01';
+    IF cb_stream_ensure_subscription.stream LIKE '%.%' THEN
+        RAISE EXCEPTION 'catbird: % is an internal stream; subscriptions can only be created on a user stream',
+            cb_stream_ensure_subscription.stream USING ERRCODE = 'IRD01';
     END IF;
 
-    SELECT coalesce(cb_stream_ensure_queue.start_pos, s.last_pos)
+    SELECT coalesce(cb_stream_ensure_subscription.start_pos, s.last_pos)
     INTO _start
     FROM cb_streams s
-    WHERE s.name = cb_stream_ensure_queue.stream;
+    WHERE s.name = cb_stream_ensure_subscription.stream;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_ensure_queue.stream USING ERRCODE = 'IRD02';
+        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_ensure_subscription.stream USING ERRCODE = 'IRD02';
     END IF;
 
-    IF cb_stream_ensure_queue.topic IS NOT NULL THEN
-        _topic_re := _cb_stream_compile_topic(cb_stream_ensure_queue.topic);
+    IF cb_stream_ensure_subscription.topic IS NOT NULL THEN
+        _topic_re := _cb_stream_compile_topic(cb_stream_ensure_subscription.topic);
     END IF;
-    IF cb_stream_ensure_queue.condition IS NOT NULL THEN
+    IF cb_stream_ensure_subscription.condition IS NOT NULL THEN
         SELECT c.headers_condition, c.payload_condition INTO _headers_cond, _payload_cond
-        FROM _cb_stream_compile_condition(cb_stream_ensure_queue.condition) c;
+        FROM _cb_stream_compile_condition(cb_stream_ensure_subscription.condition) c;
     END IF;
 
-    INSERT INTO cb_stream_queues
+    INSERT INTO cb_stream_subscriptions
         (stream, name, claimed_pos, closed_pos,
          claim_ttl, claim_batch_size, max_attempts, max_crashes,
          backoff_kind, backoff_base, backoff_max, on_fail,
          topic, topic_regex, condition, headers_condition, payload_condition)
     VALUES (
-        cb_stream_ensure_queue.stream,
-        cb_stream_ensure_queue.queue,
+        cb_stream_ensure_subscription.stream,
+        cb_stream_ensure_subscription.subscription,
         _start, _start,
-        coalesce(cb_stream_ensure_queue.claim_ttl,        interval '30 seconds'),
-        coalesce(cb_stream_ensure_queue.claim_batch_size, 100),
-        coalesce(cb_stream_ensure_queue.max_attempts, 3),
-        coalesce(cb_stream_ensure_queue.max_crashes,  3),
-        coalesce(cb_stream_ensure_queue.backoff_kind, 'full_jitter'),
-        coalesce(cb_stream_ensure_queue.backoff_base, interval '5 seconds'),
-        coalesce(cb_stream_ensure_queue.backoff_max,  interval '5 minutes'),
-        coalesce(cb_stream_ensure_queue.on_fail,      'dead_letter'),
-        cb_stream_ensure_queue.topic,
+        coalesce(cb_stream_ensure_subscription.claim_ttl,        interval '30 seconds'),
+        coalesce(cb_stream_ensure_subscription.claim_batch_size, 100),
+        coalesce(cb_stream_ensure_subscription.max_attempts, 3),
+        coalesce(cb_stream_ensure_subscription.max_crashes,  3),
+        coalesce(cb_stream_ensure_subscription.backoff_kind, 'full_jitter'),
+        coalesce(cb_stream_ensure_subscription.backoff_base, interval '5 seconds'),
+        coalesce(cb_stream_ensure_subscription.backoff_max,  interval '5 minutes'),
+        coalesce(cb_stream_ensure_subscription.on_fail,      'dead_letter'),
+        cb_stream_ensure_subscription.topic,
         _topic_re,
-        cb_stream_ensure_queue.condition,
+        cb_stream_ensure_subscription.condition,
         _headers_cond,
         _payload_cond
     )
-    ON CONFLICT ON CONSTRAINT cb_stream_queues_pkey DO NOTHING;
+    ON CONFLICT ON CONSTRAINT cb_stream_subscriptions_pkey DO NOTHING;
 
-    -- The retry stream for this queue.
+    -- The retry stream for this subscription.
     PERFORM _cb_stream_ensure(
-        'sr.' || cb_stream_ensure_queue.stream || '.' || cb_stream_ensure_queue.queue,
+        'sr.' || cb_stream_ensure_subscription.stream || '.' || cb_stream_ensure_subscription.subscription,
         interval '7 days');
 
-    INSERT INTO cb_stream_queues
+    INSERT INTO cb_stream_subscriptions
         (stream, name, claimed_pos, closed_pos,
          claim_ttl, claim_batch_size, max_attempts, max_crashes,
          backoff_kind, backoff_base, backoff_max, on_fail)
     SELECT 'sr.' || q.stream || '.' || q.name, q.name, 0, 0,
         q.claim_ttl, 1, q.max_attempts, q.max_crashes,
         q.backoff_kind, q.backoff_base, q.backoff_max, q.on_fail
-    FROM cb_stream_queues q
-    WHERE q.stream = cb_stream_ensure_queue.stream AND q.name = cb_stream_ensure_queue.queue
-    ON CONFLICT ON CONSTRAINT cb_stream_queues_pkey DO NOTHING;
+    FROM cb_stream_subscriptions q
+    WHERE q.stream = cb_stream_ensure_subscription.stream AND q.name = cb_stream_ensure_subscription.subscription
+    ON CONFLICT ON CONSTRAINT cb_stream_subscriptions_pkey DO NOTHING;
 END; $$;
 -- +goose statementend
 
@@ -1030,21 +1030,21 @@ END; $$;
 -- +goose statementbegin
 -- Move the closed position forward over adjacent closed claims until an
 -- open claim stops it.
-CREATE FUNCTION _cb_stream_advance_closed_position(stream text, queue text)
+CREATE FUNCTION _cb_stream_advance_closed_position(stream text, subscription text)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
     _closed_pos bigint;
     _to_pos bigint;
 BEGIN
-    SELECT q.closed_pos INTO _closed_pos FROM cb_stream_queues q
+    SELECT q.closed_pos INTO _closed_pos FROM cb_stream_subscriptions q
     WHERE q.stream = _cb_stream_advance_closed_position.stream
-      AND q.name = _cb_stream_advance_closed_position.queue
+      AND q.name = _cb_stream_advance_closed_position.subscription
     FOR UPDATE;
 
     LOOP
         DELETE FROM cb_stream_claims c
         WHERE c.stream   = _cb_stream_advance_closed_position.stream
-          AND c.queue    = _cb_stream_advance_closed_position.queue
+          AND c.subscription    = _cb_stream_advance_closed_position.subscription
           AND c.from_pos = _closed_pos + 1
           AND c.closed
         RETURNING c.to_pos INTO _to_pos;
@@ -1052,9 +1052,9 @@ BEGIN
         _closed_pos := _to_pos;
     END LOOP;
 
-    UPDATE cb_stream_queues q SET closed_pos = _closed_pos
+    UPDATE cb_stream_subscriptions q SET closed_pos = _closed_pos
     WHERE q.stream = _cb_stream_advance_closed_position.stream
-      AND q.name = _cb_stream_advance_closed_position.queue
+      AND q.name = _cb_stream_advance_closed_position.subscription
       AND q.closed_pos < _closed_pos;
 END; $$;
 -- +goose statementend
@@ -1065,27 +1065,27 @@ END; $$;
 -- retry copy instead of gaining a second one.
 -- A message that has exceeded max_crashes is moved to the dead letter stream or
 -- dropped. A message that retention already pruned is skipped.
--- max_crashes, backoff and on_fail come from the base queue row, even when
+-- max_crashes, backoff and on_fail come from the base subscription row, even when
 -- the crashing claim is on the retry stream itself.
 CREATE FUNCTION _cb_stream_quarantine(claim cb_stream_claims)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
     _stream text := _cb_stream_quarantine.claim.stream;
-    _queue text := _cb_stream_quarantine.claim.queue;
+    _subscription text := _cb_stream_quarantine.claim.subscription;
     _from_pos bigint := _cb_stream_quarantine.claim.from_pos;
     _to_pos bigint := _cb_stream_quarantine.claim.to_pos;
     _base_name text;
     _retry_stream text;
-    _q cb_stream_queues;
+    _q cb_stream_subscriptions;
     _m cb_stream_messages;
     _origin_pos bigint;
     _crash int;
 BEGIN
     _base_name := CASE WHEN _stream LIKE '%.%' THEN split_part(_stream, '.', 2) ELSE _stream END;
-    _retry_stream := 'sr.' || _base_name || '.' || _queue;
+    _retry_stream := 'sr.' || _base_name || '.' || _subscription;
 
-    SELECT q.* INTO _q FROM cb_stream_queues q
-    WHERE q.stream = _base_name AND q.name = _queue;
+    SELECT q.* INTO _q FROM cb_stream_subscriptions q
+    WHERE q.stream = _base_name AND q.name = _subscription;
 
     FOR _m IN
         SELECT m.* FROM cb_stream_messages m
@@ -1102,14 +1102,14 @@ BEGIN
         -- retry copy it made carries the message from here
         IF EXISTS (SELECT 1 FROM cb_stream_keys k
                    WHERE k.stream = _retry_stream
-                     AND k.key = _queue || ':' || _origin_pos || ':a'
+                     AND k.key = _subscription || ':' || _origin_pos || ':a'
                          || (coalesce((_m.headers->>'cb_attempt')::int, 0) + 1)) THEN
             CONTINUE;
         END IF;
 
         IF _crash > _q.max_crashes THEN
             IF _q.on_fail = 'dead_letter' THEN
-                PERFORM _cb_stream_dead_letter(_stream, _queue, _m.pos,
+                PERFORM _cb_stream_dead_letter(_stream, _subscription, _m.pos,
                     NULL, _crash, 'crash limit reached');
             END IF;
             CONTINUE;
@@ -1119,7 +1119,7 @@ BEGIN
             _retry_stream,
             _m.topic,
             _m.payload,
-            key => _queue || ':' || _origin_pos || ':c' || _crash,
+            key => _subscription || ':' || _origin_pos || ':c' || _crash,
             headers => _m.headers || jsonb_build_object(
                 'cb_crash', _crash,
                 'cb_origin_pos', _origin_pos),
@@ -1142,9 +1142,9 @@ $$;
 --      on purpose and says nothing about its messages.
 CREATE FUNCTION cb_stream_claim(
     stream     text,
-    queue      text,
+    subscription      text,
     consumer   text,
-    ttl        interval DEFAULT NULL, -- the queue's claim_ttl is used if NULL
+    ttl        interval DEFAULT NULL, -- the subscription's claim_ttl is used if NULL
 
     OUT from_pos   bigint, -- NULL when there is nothing to claim
     OUT to_pos     bigint,
@@ -1152,16 +1152,16 @@ CREATE FUNCTION cb_stream_claim(
 )
 LANGUAGE plpgsql AS $$
 DECLARE
-    _q cb_stream_queues;
+    _q cb_stream_subscriptions;
     _ttl interval;
     _c cb_stream_claims;
     _claimed_pos bigint;
     _last_pos bigint;
 BEGIN
-    SELECT q.* INTO _q FROM cb_stream_queues q
-    WHERE q.stream = cb_stream_claim.stream AND q.name = cb_stream_claim.queue;
+    SELECT q.* INTO _q FROM cb_stream_subscriptions q
+    WHERE q.stream = cb_stream_claim.stream AND q.name = cb_stream_claim.subscription;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: queue %.% not defined', cb_stream_claim.stream, cb_stream_claim.queue USING ERRCODE = 'IRD02';
+        RAISE EXCEPTION 'catbird: subscription %.% not defined', cb_stream_claim.stream, cb_stream_claim.subscription USING ERRCODE = 'IRD02';
     END IF;
     _ttl := coalesce(cb_stream_claim.ttl, _q.claim_ttl);
 
@@ -1179,7 +1179,7 @@ BEGIN
         SELECT r.* INTO _c
         FROM cb_stream_claims r
         WHERE r.stream = cb_stream_claim.stream
-          AND r.queue  = cb_stream_claim.queue
+          AND r.subscription  = cb_stream_claim.subscription
           AND NOT r.closed
           AND r.expires_at <= clock_timestamp()
         ORDER BY r.from_pos
@@ -1193,10 +1193,10 @@ BEGIN
 
             UPDATE cb_stream_claims c
             SET closed = true
-            WHERE (c.stream, c.queue, c.from_pos)
-                = (_c.stream, _c.queue, _c.from_pos);
+            WHERE (c.stream, c.subscription, c.from_pos)
+                = (_c.stream, _c.subscription, _c.from_pos);
 
-            PERFORM _cb_stream_advance_closed_position(cb_stream_claim.stream, cb_stream_claim.queue);
+            PERFORM _cb_stream_advance_closed_position(cb_stream_claim.stream, cb_stream_claim.subscription);
             CONTINUE;
         END IF;
 
@@ -1207,8 +1207,8 @@ BEGIN
             expires_at = clock_timestamp() + coalesce(cb_stream_claim.ttl, c.ttl),
             crashes    = c.crashes + CASE WHEN c.released THEN 0 ELSE 1 END,
             released   = false
-        WHERE (c.stream, c.queue, c.from_pos)
-            = (_c.stream, _c.queue, _c.from_pos)
+        WHERE (c.stream, c.subscription, c.from_pos)
+            = (_c.stream, _c.subscription, _c.from_pos)
         RETURNING c.from_pos, c.to_pos, c.expires_at
         INTO from_pos, to_pos, expires_at;
         RETURN;
@@ -1216,8 +1216,8 @@ BEGIN
 
     ---- Claim a fresh range. ----
     SELECT q.claimed_pos INTO _claimed_pos
-    FROM cb_stream_queues q
-    WHERE q.stream = cb_stream_claim.stream AND q.name = cb_stream_claim.queue
+    FROM cb_stream_subscriptions q
+    WHERE q.stream = cb_stream_claim.stream AND q.name = cb_stream_claim.subscription
     FOR UPDATE;
 
     -- No lock needed on the streams row. last_position only grows,
@@ -1233,16 +1233,16 @@ BEGIN
     to_pos := least(_claimed_pos + _q.claim_batch_size, _last_pos);
     expires_at := clock_timestamp() + _ttl;
 
-    UPDATE cb_stream_queues q
+    UPDATE cb_stream_subscriptions q
     SET claimed_pos = cb_stream_claim.to_pos
     WHERE q.stream = cb_stream_claim.stream
-      AND q.name = cb_stream_claim.queue;
+      AND q.name = cb_stream_claim.subscription;
 
     INSERT INTO cb_stream_claims
-        (stream, queue, from_pos, to_pos, consumer, ttl, expires_at, crashes)
+        (stream, subscription, from_pos, to_pos, consumer, ttl, expires_at, crashes)
     VALUES (
         cb_stream_claim.stream,
-        cb_stream_claim.queue,
+        cb_stream_claim.subscription,
         cb_stream_claim.from_pos,
         cb_stream_claim.to_pos,
         cb_stream_claim.consumer,
@@ -1255,16 +1255,16 @@ $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- The messages of a claimed range, in order, honoring the queue's topic
+-- The messages of a claimed range, in order, honoring the subscription's topic
 -- and condition.
-CREATE FUNCTION cb_stream_read_claim(stream text, queue text, from_pos bigint, to_pos bigint)
+CREATE FUNCTION cb_stream_read_claim(stream text, subscription text, from_pos bigint, to_pos bigint)
 RETURNS SETOF cb_stream_messages
 LANGUAGE sql AS $$
     SELECT m.*
     FROM cb_stream_messages m
-    JOIN cb_stream_queues q
+    JOIN cb_stream_subscriptions q
       ON q.stream = cb_stream_read_claim.stream
-     AND q.name   = cb_stream_read_claim.queue
+     AND q.name   = cb_stream_read_claim.subscription
     WHERE m.stream = cb_stream_read_claim.stream
       AND m.pos BETWEEN cb_stream_read_claim.from_pos AND cb_stream_read_claim.to_pos
       AND (q.topic_regex IS NULL OR m.topic ~ q.topic_regex)
@@ -1277,7 +1277,7 @@ $$;
 -- +goose statementbegin
 -- If ttl is NULL, the claim's existing ttl is used. Returns the new expires_at timestamp.
 CREATE FUNCTION cb_stream_extend_claim(
-    stream text, queue text,
+    stream text, subscription text,
     consumer text,
     from_pos bigint,
     ttl interval DEFAULT NULL
@@ -1293,7 +1293,7 @@ BEGIN
     UPDATE cb_stream_claims c
     SET expires_at = clock_timestamp() + coalesce(cb_stream_extend_claim.ttl, c.ttl)
     WHERE c.stream   = cb_stream_extend_claim.stream
-      AND c.queue    = cb_stream_extend_claim.queue
+      AND c.subscription    = cb_stream_extend_claim.subscription
       AND c.consumer      = cb_stream_extend_claim.consumer
       AND c.from_pos = cb_stream_extend_claim.from_pos
       AND NOT c.closed
@@ -1307,7 +1307,7 @@ END; $$;
 -- cb_stream_claim call may adopt it.
 CREATE FUNCTION cb_stream_release_claim(
     stream text,
-    queue text,
+    subscription text,
     consumer text,
     from_pos bigint
 )
@@ -1317,7 +1317,7 @@ BEGIN
     SET expires_at = clock_timestamp(),
         released   = true
     WHERE c.stream   = cb_stream_release_claim.stream
-      AND c.queue    = cb_stream_release_claim.queue
+      AND c.subscription    = cb_stream_release_claim.subscription
       AND c.consumer      = cb_stream_release_claim.consumer
       AND c.from_pos = cb_stream_release_claim.from_pos
       AND NOT c.closed;
@@ -1327,7 +1327,7 @@ END; $$;
 -- +goose statementbegin
 CREATE FUNCTION cb_stream_close_claim(
     stream text,
-    queue text,
+    subscription text,
     consumer text,
     from_pos bigint
 )
@@ -1336,7 +1336,7 @@ BEGIN
     -- Only the current owner may close.
     UPDATE cb_stream_claims c SET closed = true
     WHERE c.stream   = cb_stream_close_claim.stream
-      AND c.queue    = cb_stream_close_claim.queue
+      AND c.subscription    = cb_stream_close_claim.subscription
       AND c.consumer = cb_stream_close_claim.consumer
       AND c.from_pos = cb_stream_close_claim.from_pos
       AND NOT c.closed;
@@ -1344,7 +1344,7 @@ BEGIN
         RETURN;
     END IF;
 
-    PERFORM _cb_stream_advance_closed_position(cb_stream_close_claim.stream, cb_stream_close_claim.queue);
+    PERFORM _cb_stream_advance_closed_position(cb_stream_close_claim.stream, cb_stream_close_claim.subscription);
 END; $$;
 -- +goose statementend
 
@@ -1377,7 +1377,7 @@ END; $$;
 -- reports of the same failure.
 CREATE FUNCTION _cb_stream_dead_letter(
     stream text,
-    queue text,
+    subscription text,
     pos bigint, -- 'position' is a keyword: legal for columns, not parameters
     attempts int,
     crashes int,
@@ -1410,28 +1410,28 @@ BEGIN
         _m.payload,
         headers => _m.headers || jsonb_build_object(
             'cb_origin_pos', _origin_pos,
-            'cb_queue',    _cb_stream_dead_letter.queue,
+            'cb_queue',    _cb_stream_dead_letter.subscription,
             'cb_error',    _cb_stream_dead_letter.error)
             || CASE WHEN _cb_stream_dead_letter.attempts IS NOT NULL
                     THEN jsonb_build_object('cb_attempts', _cb_stream_dead_letter.attempts)
                     ELSE jsonb_build_object('cb_crashes', _cb_stream_dead_letter.crashes) END,
-        key => _cb_stream_dead_letter.queue || ':' || _origin_pos || ':dead_letter');
+        key => _cb_stream_dead_letter.subscription || ':' || _origin_pos || ':dead_letter');
 END; $$;
 -- +goose statementend
 
 -- +goose statementbegin
 -- Reports that a handler could not process a message. Called once per
 -- failed message. While attempts remain the message is republished to the
--- queue's retry stream with a backoff delay; at max_attempts it is moved to
+-- subscription's retry stream with a backoff delay; at max_attempts it is moved to
 -- the dead letter stream or dropped. A call from a consumer that no longer
 -- holds the covering claim does nothing: the new holder runs the message
 -- again and reports for itself. Failing a message does not change the
 -- claim: it still closes through cb_stream_close_claim.
-CREATE FUNCTION cb_stream_fail(stream text, queue text, consumer text, pos bigint, error text)
+CREATE FUNCTION cb_stream_fail(stream text, subscription text, consumer text, pos bigint, error text)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
     _m cb_stream_messages;
-    _q cb_stream_queues;
+    _q cb_stream_subscriptions;
     _base_name text;
     _retry_stream text;
     _attempt int;
@@ -1439,7 +1439,7 @@ DECLARE
 BEGIN
     PERFORM 1 FROM cb_stream_claims c
     WHERE c.stream   = cb_stream_fail.stream
-      AND c.queue    = cb_stream_fail.queue
+      AND c.subscription    = cb_stream_fail.subscription
       AND c.consumer = cb_stream_fail.consumer
       AND NOT c.closed
       AND cb_stream_fail.pos BETWEEN c.from_pos AND c.to_pos;
@@ -1458,10 +1458,10 @@ BEGIN
                   THEN split_part(cb_stream_fail.stream, '.', 2)
                   ELSE cb_stream_fail.stream END;
 
-    SELECT q.* INTO _q FROM cb_stream_queues q
-    WHERE q.stream = _base_name AND q.name = cb_stream_fail.queue;
+    SELECT q.* INTO _q FROM cb_stream_subscriptions q
+    WHERE q.stream = _base_name AND q.name = cb_stream_fail.subscription;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: queue %.% not defined', _base_name, cb_stream_fail.queue USING ERRCODE = 'IRD02';
+        RAISE EXCEPTION 'catbird: subscription %.% not defined', _base_name, cb_stream_fail.subscription USING ERRCODE = 'IRD02';
     END IF;
 
     _attempt := coalesce((_m.headers->>'cb_attempt')::int, 0) + 1;
@@ -1469,20 +1469,20 @@ BEGIN
 
     IF _attempt >= _q.max_attempts THEN
         IF _q.on_fail = 'dead_letter' THEN
-            PERFORM _cb_stream_dead_letter(cb_stream_fail.stream, cb_stream_fail.queue,
+            PERFORM _cb_stream_dead_letter(cb_stream_fail.stream, cb_stream_fail.subscription,
                 cb_stream_fail.pos, _attempt, NULL, cb_stream_fail.error);
         END IF;
         RETURN;
     END IF;
 
-    _retry_stream := 'sr.' || _base_name || '.' || cb_stream_fail.queue;
+    _retry_stream := 'sr.' || _base_name || '.' || cb_stream_fail.subscription;
 
-    -- the retry stream exists by declaration: cb_stream_ensure_queue birthed it
+    -- the retry stream exists by declaration: cb_stream_ensure_subscription birthed it
     PERFORM _cb_stream_publish(
         _retry_stream,
         _m.topic,
         _m.payload,
-        key => cb_stream_fail.queue || ':' || _origin_pos || ':a' || _attempt,
+        key => cb_stream_fail.subscription || ':' || _origin_pos || ':a' || _attempt,
         headers => _m.headers || jsonb_build_object(
             'cb_attempt',         _attempt,
             'cb_origin_pos', _origin_pos,
@@ -1511,12 +1511,12 @@ DROP FUNCTION cb_stream_release_claim(text, text, text, bigint);
 DROP FUNCTION cb_stream_extend_claim(text, text, text, bigint, interval);
 DROP FUNCTION cb_stream_claim(text, text, text, interval);
 DROP FUNCTION _cb_stream_quarantine(cb_stream_claims);
-DROP FUNCTION cb_stream_ensure_queue(text, text, bigint, interval, int, cb_backoff_kind, interval, interval, cb_fail_policy, int, int, text, text);
+DROP FUNCTION cb_stream_ensure_subscription(text, text, bigint, interval, int, cb_backoff_kind, interval, interval, cb_fail_policy, int, int, text, text);
 DROP FUNCTION cb_stream_ensure_cursor(text, text, bigint, text, text);
 DROP FUNCTION cb_stream_read_claim(text, text, bigint, bigint);
 DROP FUNCTION cb_stream_read(text, text, int);
 DROP TABLE cb_stream_claims;
-DROP TABLE cb_stream_queues;
+DROP TABLE cb_stream_subscriptions;
 DROP FUNCTION cb_stream_publish_messages(text, jsonb);
 DROP FUNCTION cb_stream_publish(text, text, jsonb, jsonb, text, interval, timestamptz);
 DROP FUNCTION _cb_stream_publish(text, text, jsonb, jsonb, text, interval, timestamptz);

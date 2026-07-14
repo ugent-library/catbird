@@ -14,8 +14,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// ConsumeQueueOpts tunes the queue consume loop. Zero fields mean the defaults.
-type ConsumeQueueOpts struct {
+// ConsumeSubscriptionOpts tunes the subscription consume loop. Zero fields mean the defaults.
+type ConsumeSubscriptionOpts struct {
 	PollInterval time.Duration // 250ms: how often to look for new messages when caught up
 }
 
@@ -35,15 +35,15 @@ func newConsumerName() string {
 	return fmt.Sprintf("%s_%d_%x", host, os.Getpid(), r)
 }
 
-// ConsumeQueue processes a queue's messages: unordered, at-least-once,
+// ConsumeSubscription processes a subscription's messages: unordered, at-least-once,
 // parallel across consumers. The claim is kept alive for as long as
-// a handler runs. Handler errors are retried with the queue's backoff policy
+// a handler runs. Handler errors are retried with the subscription's backoff policy
 // and dead-lettered or dropped when attempts run out.
-func ConsumeQueue(ctx context.Context, pool *pgxpool.Pool, stream, queue string,
+func ConsumeSubscription(ctx context.Context, pool *pgxpool.Pool, stream, subscription string,
 	handler func(ctx context.Context, msg Message) error,
-	opts ...ConsumeQueueOpts,
+	opts ...ConsumeSubscriptionOpts,
 ) error {
-	var o ConsumeQueueOpts
+	var o ConsumeSubscriptionOpts
 	if len(opts) > 0 {
 		o = opts[0]
 	}
@@ -54,7 +54,7 @@ func ConsumeQueue(ctx context.Context, pool *pgxpool.Pool, stream, queue string,
 
 	consumer := newConsumerName()
 	// Failed and crashed messages come back through the retry stream.
-	streams := []string{stream, "sr." + stream + "." + queue}
+	streams := []string{stream, "sr." + stream + "." + subscription}
 
 	timer := time.NewTimer(poll)
 	defer timer.Stop()
@@ -77,7 +77,7 @@ func ConsumeQueue(ctx context.Context, pool *pgxpool.Pool, stream, queue string,
 		var loopErr error
 		worked := false
 		for _, s := range streams {
-			n, err := consumeClaim(ctx, pool, s, queue, consumer, handler)
+			n, err := consumeClaim(ctx, pool, s, subscription, consumer, handler)
 			if err != nil {
 				loopErr = err
 				break
@@ -108,14 +108,14 @@ func ConsumeQueue(ctx context.Context, pool *pgxpool.Pool, stream, queue string,
 
 // consumeClaim runs one claim cycle: claim a range, handle its messages,
 // close it. It reports whether there was anything to claim.
-func consumeClaim(ctx context.Context, pool *pgxpool.Pool, stream, queue, consumer string,
+func consumeClaim(ctx context.Context, pool *pgxpool.Pool, stream, subscription, consumer string,
 	handler func(ctx context.Context, msg Message) error,
 ) (bool, error) {
 	var fromPos, toPos *int64
 	var expiresAt *time.Time
 	if err := pool.QueryRow(ctx,
 		`SELECT c.from_pos, c.to_pos, c.expires_at FROM cb_stream_claim($1, $2, $3) c`,
-		stream, queue, consumer,
+		stream, subscription, consumer,
 	).Scan(&fromPos, &toPos, &expiresAt); err != nil {
 		return false, wrapErr(err)
 	}
@@ -128,13 +128,13 @@ func consumeClaim(ctx context.Context, pool *pgxpool.Pool, stream, queue, consum
 	release := func() {
 		_, _ = pool.Exec(context.WithoutCancel(ctx),
 			`SELECT cb_stream_release_claim($1, $2, $3, $4)`,
-			stream, queue, consumer, *fromPos)
+			stream, subscription, consumer, *fromPos)
 	}
 
 	rows, err := pool.Query(ctx, `
 		SELECT m.id, m.stream, m.pos, coalesce(m.topic, ''), m.payload, m.headers, m.created_at
 		FROM cb_stream_read_claim($1, $2, $3, $4) m`,
-		stream, queue, *fromPos, *toPos)
+		stream, subscription, *fromPos, *toPos)
 	if err != nil {
 		return true, err
 	}
@@ -153,7 +153,7 @@ func consumeClaim(ctx context.Context, pool *pgxpool.Pool, stream, queue, consum
 		var newExp *time.Time
 		if err := pool.QueryRow(ctx,
 			`SELECT cb_stream_extend_claim($1, $2, $3, $4)`,
-			stream, queue, consumer, *fromPos).Scan(&newExp); err != nil {
+			stream, subscription, consumer, *fromPos).Scan(&newExp); err != nil {
 			return false, wrapErr(err)
 		}
 		if newExp == nil {
@@ -179,7 +179,7 @@ func consumeClaim(ctx context.Context, pool *pgxpool.Pool, stream, queue, consum
 			}
 		}
 
-		verdict, err := runHandler(ctx, stream, queue, ttl, m, extend, handler)
+		verdict, err := runHandler(ctx, stream, subscription, ttl, m, extend, handler)
 		switch {
 		case errors.Is(err, errClaimLost):
 			return true, nil
@@ -192,7 +192,7 @@ func consumeClaim(ctx context.Context, pool *pgxpool.Pool, stream, queue, consum
 		default:
 			if _, err := pool.Exec(ctx,
 				`SELECT cb_stream_fail($1, $2, $3, $4, $5)`,
-				stream, queue, consumer, m.Pos, verdict.Error()); err != nil {
+				stream, subscription, consumer, m.Pos, verdict.Error()); err != nil {
 				return true, wrapErr(err)
 			}
 		}
@@ -200,7 +200,7 @@ func consumeClaim(ctx context.Context, pool *pgxpool.Pool, stream, queue, consum
 
 	if _, err := pool.Exec(ctx,
 		`SELECT cb_stream_close_claim($1, $2, $3, $4)`,
-		stream, queue, consumer, *fromPos); err != nil {
+		stream, subscription, consumer, *fromPos); err != nil {
 		return true, wrapErr(err)
 	}
 	return true, nil
@@ -212,7 +212,7 @@ func consumeClaim(ctx context.Context, pool *pgxpool.Pool, stream, queue, consum
 // expired anyway and another consumer took it, or the failed extend. On a
 // non-nil err the handler is canceled and awaited first, so one consumer
 // never runs two handlers at once, and the verdict is meaningless.
-func runHandler(ctx context.Context, stream, queue string, ttl time.Duration, m Message,
+func runHandler(ctx context.Context, stream, subscription string, ttl time.Duration, m Message,
 	extend func() (bool, error),
 	handler func(ctx context.Context, msg Message) error,
 ) (verdict error, err error) {
@@ -244,7 +244,7 @@ func runHandler(ctx context.Context, stream, queue string, ttl time.Duration, m 
 			ok, err := extend()
 			if err == nil && ok {
 				slog.Info("catbird: handler still running",
-					"stream", stream, "queue", queue, "pos", m.Pos,
+					"stream", stream, "subscription", subscription, "pos", m.Pos,
 					"elapsed", time.Since(started))
 				continue
 			}

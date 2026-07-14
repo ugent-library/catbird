@@ -63,14 +63,14 @@ func setupTest(t *testing.T) *pgxpool.Pool {
 // claimRange claims the next batch for a consumer; ok reports whether there
 // was anything to claim.
 func claimRange(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
-	stream, queue, consumer string,
+	stream, subscription, consumer string,
 ) (fromPos, toPos int64, ok bool) {
 	t.Helper()
 	var from, to *int64
 	var expiresAt *time.Time
 	if err := pool.QueryRow(ctx,
 		`SELECT c.from_pos, c.to_pos, c.expires_at FROM cb_stream_claim($1, $2, $3) c`,
-		stream, queue, consumer).Scan(&from, &to, &expiresAt); err != nil {
+		stream, subscription, consumer).Scan(&from, &to, &expiresAt); err != nil {
 		t.Fatal(err)
 	}
 	if from == nil {
@@ -83,12 +83,12 @@ func claimRange(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 // open and closed claims exactly tile the region (closed_pos, claimed_pos] —
 // no gaps, no overlaps, the first claim right after closed_pos, the last one
 // ending at claimed_pos.
-func checkClaims(t *testing.T, ctx context.Context, pool *pgxpool.Pool, stream, queue string) {
+func checkClaims(t *testing.T, ctx context.Context, pool *pgxpool.Pool, stream, subscription string) {
 	t.Helper()
 	var closedPos, claimedPos int64
 	if err := pool.QueryRow(ctx,
-		`SELECT closed_pos, claimed_pos FROM cb_stream_queues WHERE stream = $1 AND name = $2`,
-		stream, queue).Scan(&closedPos, &claimedPos); err != nil {
+		`SELECT closed_pos, claimed_pos FROM cb_stream_subscriptions WHERE stream = $1 AND name = $2`,
+		stream, subscription).Scan(&closedPos, &claimedPos); err != nil {
 		t.Fatal(err)
 	}
 	if closedPos > claimedPos {
@@ -97,8 +97,8 @@ func checkClaims(t *testing.T, ctx context.Context, pool *pgxpool.Pool, stream, 
 
 	rows, err := pool.Query(ctx,
 		`SELECT from_pos, to_pos, crashes FROM cb_stream_claims
-		 WHERE stream = $1 AND queue = $2 ORDER BY from_pos`,
-		stream, queue)
+		 WHERE stream = $1 AND subscription = $2 ORDER BY from_pos`,
+		stream, subscription)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,7 +433,7 @@ func TestRunJobs(t *testing.T) {
 	}
 }
 
-func TestConsumeQueue(t *testing.T) {
+func TestConsumeSubscription(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
@@ -441,7 +441,7 @@ func TestConsumeQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	// no backoff so the failed message retries immediately
-	if err := EnsureQueue(ctx, pool, "go_cq", "m", QueueOpts{
+	if err := EnsureSubscription(ctx, pool, "go_cq", "m", SubscriptionOpts{
 		StartPos:    At(0),
 		BackoffKind: BackoffNone,
 	}); err != nil {
@@ -467,9 +467,9 @@ func TestConsumeQueue(t *testing.T) {
 	counts := map[string]int{}
 	handled := make(chan struct{}, 32)
 	failedOnce := false
-	queueDone := make(chan error, 1)
+	subDone := make(chan error, 1)
 	go func() {
-		queueDone <- ConsumeQueue(jctx, pool, "go_cq", "m", func(_ context.Context, m Message) error {
+		subDone <- ConsumeSubscription(jctx, pool, "go_cq", "m", func(_ context.Context, m Message) error {
 			mu.Lock()
 			defer mu.Unlock()
 			if string(m.Payload) == "3" && !failedOnce {
@@ -479,7 +479,7 @@ func TestConsumeQueue(t *testing.T) {
 			counts[string(m.Payload)]++
 			handled <- struct{}{}
 			return nil
-		}, ConsumeQueueOpts{PollInterval: 20 * time.Millisecond})
+		}, ConsumeSubscriptionOpts{PollInterval: 20 * time.Millisecond})
 	}()
 
 	// all five process; the failed one comes back through the retry stream
@@ -507,12 +507,12 @@ func TestConsumeQueue(t *testing.T) {
 		t.Fatalf("retry stream holds %d messages, want 1", retried)
 	}
 
-	// the base queue drains: closed_pos reaches the tail
+	// the base subscription drains: closed_pos reaches the tail
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		var closed int64
 		if err := pool.QueryRow(ctx,
-			`SELECT closed_pos FROM cb_stream_queues WHERE stream = 'go_cq' AND name = 'm'`).Scan(&closed); err != nil {
+			`SELECT closed_pos FROM cb_stream_subscriptions WHERE stream = 'go_cq' AND name = 'm'`).Scan(&closed); err != nil {
 			t.Fatal(err)
 		}
 		if closed == 5 {
@@ -525,19 +525,19 @@ func TestConsumeQueue(t *testing.T) {
 	}
 
 	cancel()
-	if err := <-queueDone; !errors.Is(err, context.Canceled) {
-		t.Fatalf("queue consume returned %v, want context.Canceled", err)
+	if err := <-subDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("subscription consume returned %v, want context.Canceled", err)
 	}
 	if err := <-jobsDone; !errors.Is(err, context.Canceled) {
 		t.Fatalf("jobs returned %v, want context.Canceled", err)
 	}
 
 	// adoption: a dead consumer's claim expires and another consumer takes it
-	if err := EnsureQueue(ctx, pool, "go_cq", "adopt", QueueOpts{StartPos: At(0)}); err != nil {
+	if err := EnsureSubscription(ctx, pool, "go_cq", "adopt", SubscriptionOpts{StartPos: At(0)}); err != nil {
 		t.Fatal(err)
 	}
 	// crash detection latency is engine mechanics, tuned on the row
-	if _, err := pool.Exec(ctx, `UPDATE cb_stream_queues SET claim_ttl = interval '50 milliseconds'
+	if _, err := pool.Exec(ctx, `UPDATE cb_stream_subscriptions SET claim_ttl = interval '50 milliseconds'
 		WHERE stream = 'go_cq' AND name = 'adopt'`); err != nil {
 		t.Fatal(err)
 	}
@@ -550,10 +550,10 @@ func TestConsumeQueue(t *testing.T) {
 	actx, acancel := context.WithCancel(ctx)
 	adoptDone := make(chan error, 1)
 	go func() {
-		adoptDone <- ConsumeQueue(actx, pool, "go_cq", "adopt", func(_ context.Context, m Message) error {
+		adoptDone <- ConsumeSubscription(actx, pool, "go_cq", "adopt", func(_ context.Context, m Message) error {
 			adopted <- m
 			return nil
-		}, ConsumeQueueOpts{PollInterval: 20 * time.Millisecond})
+		}, ConsumeSubscriptionOpts{PollInterval: 20 * time.Millisecond})
 	}()
 	for range 5 {
 		select {
@@ -683,14 +683,14 @@ func TestDefineSchedule(t *testing.T) {
 	}
 }
 
-func TestEnsureQueue(t *testing.T) {
+func TestEnsureSubscription(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
 	if err := Ensure(ctx, pool, "go_q"); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsureQueue(ctx, pool, "go_q", "mailer", QueueOpts{
+	if err := EnsureSubscription(ctx, pool, "go_q", "mailer", SubscriptionOpts{
 		StartPos:    At(0),
 		MaxAttempts: 5,
 		BackoffKind: BackoffFixed,
@@ -705,7 +705,7 @@ func TestEnsureQueue(t *testing.T) {
 		t.Helper()
 		if err := pool.QueryRow(ctx, `
 			SELECT claim_ttl::text, max_attempts, max_crashes, backoff_kind::text, on_fail::text
-			FROM cb_stream_queues WHERE stream = 'go_q' AND name = 'mailer'`,
+			FROM cb_stream_subscriptions WHERE stream = 'go_q' AND name = 'mailer'`,
 		).Scan(&claimTTL, &maxAttempts, &maxCrashes, &backoffKind, &onFail); err != nil {
 			t.Fatal(err)
 		}
@@ -713,55 +713,55 @@ func TestEnsureQueue(t *testing.T) {
 
 	row()
 	if claimTTL != "00:00:30" || maxAttempts != 5 || backoffKind != "fixed" || onFail != "drop" {
-		t.Fatalf("queue = %s %d %s %s", claimTTL, maxAttempts, backoffKind, onFail)
+		t.Fatalf("subscription = %s %d %s %s", claimTTL, maxAttempts, backoffKind, onFail)
 	}
 	if maxCrashes != 3 { // engine mechanics: always the default at birth
 		t.Fatalf("max_crashes = %d, want the default 3", maxCrashes)
 	}
 
-	// ensure is birth-only: an existing queue is never modified
-	if err := EnsureQueue(ctx, pool, "go_q", "mailer", QueueOpts{MaxAttempts: 9}); err != nil {
+	// ensure is birth-only: an existing subscription is never modified
+	if err := EnsureSubscription(ctx, pool, "go_q", "mailer", SubscriptionOpts{MaxAttempts: 9}); err != nil {
 		t.Fatal(err)
 	}
 	row()
 	if maxCrashes != 3 || maxAttempts != 5 || backoffKind != "fixed" {
-		t.Fatalf("queue after re-ensure = %d %d %s, want unchanged", maxCrashes, maxAttempts, backoffKind)
+		t.Fatalf("subscription after re-ensure = %d %d %s, want unchanged", maxCrashes, maxAttempts, backoffKind)
 	}
 
-	// declaring the queue declared its retry route: bounded history, the
-	// queue's stored terms copied, one message per claim
+	// declaring the subscription declared its retry route: bounded history, the
+	// subscription's stored terms copied, one message per claim
 	var retryBounded bool
 	if err := pool.QueryRow(ctx,
 		`SELECT retention = interval '7 days' FROM cb_streams WHERE name = 'sr.go_q.mailer'`).Scan(&retryBounded); err != nil {
 		t.Fatal(err)
 	}
 	if !retryBounded {
-		t.Fatal("retry stream not born with the queue, or with the wrong retention")
+		t.Fatal("retry stream not born with the subscription, or with the wrong retention")
 	}
 	var retryBatch int
 	var retryTTL, retryOnFail string
 	if err := pool.QueryRow(ctx, `SELECT claim_batch_size, claim_ttl::text, on_fail::text
-		FROM cb_stream_queues WHERE stream = 'sr.go_q.mailer' AND name = 'mailer'`,
+		FROM cb_stream_subscriptions WHERE stream = 'sr.go_q.mailer' AND name = 'mailer'`,
 	).Scan(&retryBatch, &retryTTL, &retryOnFail); err != nil {
 		t.Fatal(err)
 	}
 	if retryBatch != 1 || retryTTL != "00:00:30" || retryOnFail != "drop" {
-		t.Fatalf("retry queue row = batch %d, ttl %s, on_fail %s; want 1, the parent's ttl and policy",
+		t.Fatalf("retry subscription row = batch %d, ttl %s, on_fail %s; want 1, the parent's ttl and policy",
 			retryBatch, retryTTL, retryOnFail)
 	}
 
 	// solo attribution is a constraint, not a convention
 	if _, err := pool.Exec(ctx,
-		`UPDATE cb_stream_queues SET claim_batch_size = 5 WHERE stream = 'sr.go_q.mailer'`); err == nil {
-		t.Fatal("a retry queue accepted a claim batch above 1")
+		`UPDATE cb_stream_subscriptions SET claim_batch_size = 5 WHERE stream = 'sr.go_q.mailer'`); err == nil {
+		t.Fatal("a retry subscription accepted a claim batch above 1")
 	}
 
-	// batch size is queue policy, born at ensure
-	if err := EnsureQueue(ctx, pool, "go_q", "sized", QueueOpts{StartPos: At(0), ClaimBatchSize: 7}); err != nil {
+	// batch size is subscription policy, born at ensure
+	if err := EnsureSubscription(ctx, pool, "go_q", "sized", SubscriptionOpts{StartPos: At(0), ClaimBatchSize: 7}); err != nil {
 		t.Fatal(err)
 	}
 	var batch int
-	if err := pool.QueryRow(ctx, `SELECT claim_batch_size FROM cb_stream_queues
+	if err := pool.QueryRow(ctx, `SELECT claim_batch_size FROM cb_stream_subscriptions
 		WHERE stream = 'go_q' AND name = 'sized'`).Scan(&batch); err != nil {
 		t.Fatal(err)
 	}
@@ -769,26 +769,26 @@ func TestEnsureQueue(t *testing.T) {
 		t.Fatalf("claim_batch_size = %d, want 7", batch)
 	}
 
-	// queues live on plain streams; engine-made streams are read with cursors
-	if err := EnsureQueue(ctx, pool, "sd.go_q", "triage"); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("queue on a dotted stream returned %v, want ErrInvalid", err)
+	// subscriptions live on plain streams; engine-made streams are read with cursors
+	if err := EnsureSubscription(ctx, pool, "sd.go_q", "triage"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("subscription on a dotted stream returned %v, want ErrInvalid", err)
 	}
 }
 
 // the loop owns the clock: a handler slower than the claim ttl keeps its
 // claim through extension — processed once, nothing quarantined
-func TestConsumeQueueSlowHandler(t *testing.T) {
+func TestConsumeSubscriptionSlowHandler(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
 	if err := Ensure(ctx, pool, "go_slow"); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsureQueue(ctx, pool, "go_slow", "s", QueueOpts{StartPos: At(0)}); err != nil {
+	if err := EnsureSubscription(ctx, pool, "go_slow", "s", SubscriptionOpts{StartPos: At(0)}); err != nil {
 		t.Fatal(err)
 	}
 	// a short crash-detection window, so the handler outlives it three times
-	if _, err := pool.Exec(ctx, `UPDATE cb_stream_queues SET claim_ttl = interval '300 milliseconds'
+	if _, err := pool.Exec(ctx, `UPDATE cb_stream_subscriptions SET claim_ttl = interval '300 milliseconds'
 		WHERE stream = 'go_slow' AND name = 's'`); err != nil {
 		t.Fatal(err)
 	}
@@ -803,7 +803,7 @@ func TestConsumeQueueSlowHandler(t *testing.T) {
 	cctx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() {
-		done <- ConsumeQueue(cctx, pool, "go_slow", "s", func(hctx context.Context, m Message) error {
+		done <- ConsumeSubscription(cctx, pool, "go_slow", "s", func(hctx context.Context, m Message) error {
 			select {
 			case <-time.After(900 * time.Millisecond): // three claim ttls
 			case <-hctx.Done():
@@ -811,7 +811,7 @@ func TestConsumeQueueSlowHandler(t *testing.T) {
 			}
 			handled <- struct{}{}
 			return nil
-		}, ConsumeQueueOpts{PollInterval: 20 * time.Millisecond})
+		}, ConsumeSubscriptionOpts{PollInterval: 20 * time.Millisecond})
 	}()
 
 	select {
@@ -825,7 +825,7 @@ func TestConsumeQueueSlowHandler(t *testing.T) {
 	for {
 		var closed int64
 		if err := pool.QueryRow(ctx,
-			`SELECT closed_pos FROM cb_stream_queues WHERE stream = 'go_slow' AND name = 's'`).Scan(&closed); err != nil {
+			`SELECT closed_pos FROM cb_stream_subscriptions WHERE stream = 'go_slow' AND name = 's'`).Scan(&closed); err != nil {
 			t.Fatal(err)
 		}
 		if closed == 1 {
@@ -869,8 +869,8 @@ func TestClaims(t *testing.T) {
 	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_b')"); err != nil {
 		t.Fatal(err)
 	}
-	// batch size is queue policy: three per claim
-	if err := EnsureQueue(ctx, pool, "go_b", "mailer", QueueOpts{
+	// batch size is subscription policy: three per claim
+	if err := EnsureSubscription(ctx, pool, "go_b", "mailer", SubscriptionOpts{
 		StartPos:       At(0),
 		ClaimBatchSize: 3,
 	}); err != nil {
@@ -921,7 +921,7 @@ func TestClaims(t *testing.T) {
 	closedPos := func() (pos int64) {
 		t.Helper()
 		if err := pool.QueryRow(ctx,
-			`SELECT closed_pos FROM cb_stream_queues WHERE stream = 'go_b' AND name = 'mailer'`).Scan(&pos); err != nil {
+			`SELECT closed_pos FROM cb_stream_subscriptions WHERE stream = 'go_b' AND name = 'mailer'`).Scan(&pos); err != nil {
 			t.Fatal(err)
 		}
 		return pos
@@ -979,10 +979,10 @@ func TestClaims(t *testing.T) {
 	}
 	checkClaims(t, ctx, pool, "go_b", "mailer")
 
-	// an undefined queue fails fast; a non-positive ttl is rejected
+	// an undefined subscription fails fast; a non-positive ttl is rejected
 	if _, err := pool.Exec(ctx,
 		`SELECT cb_stream_claim('go_b', 'nope', 'c1')`); !errors.Is(wrapErr(err), ErrNotDefined) {
-		t.Fatalf("claim on undefined queue returned %v, want ErrNotDefined", err)
+		t.Fatalf("claim on undefined subscription returned %v, want ErrNotDefined", err)
 	}
 	if _, err := pool.Exec(ctx,
 		`SELECT cb_stream_extend_claim('go_b', 'mailer', 'c1', 1, interval '0')`); !errors.Is(wrapErr(err), ErrInvalid) {
@@ -999,7 +999,7 @@ func TestFail(t *testing.T) {
 	if err := Ensure(ctx, pool, "go_fail"); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsureQueue(ctx, pool, "go_fail", "payer", QueueOpts{
+	if err := EnsureSubscription(ctx, pool, "go_fail", "payer", SubscriptionOpts{
 		StartPos:    At(0),
 		MaxAttempts: 2,
 		BackoffKind: BackoffFixed,
@@ -1108,7 +1108,7 @@ func TestFail(t *testing.T) {
 	if err := Ensure(ctx, pool, "go_drop"); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsureQueue(ctx, pool, "go_drop", "binman", QueueOpts{
+	if err := EnsureSubscription(ctx, pool, "go_drop", "binman", SubscriptionOpts{
 		StartPos:    At(0),
 		MaxAttempts: 1,
 		OnFail:      FailDrop,
@@ -1127,7 +1127,7 @@ func TestFail(t *testing.T) {
 	if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('go_drop', 'binman', 'c1', 1, 'nope')`); err != nil {
 		t.Fatal(err)
 	}
-	// the queue and its declared retry route exist; drop archived nothing
+	// the subscription and its declared retry route exist; drop archived nothing
 	var streams, deadStreams int
 	if err := pool.QueryRow(ctx,
 		`SELECT count(*) FROM cb_streams WHERE name LIKE '%go\_drop%'`).Scan(&streams); err != nil {
@@ -1168,14 +1168,14 @@ func TestQuarantine(t *testing.T) {
 		t.Fatal(err)
 	}
 	// no backoff, so quarantined copies are deliverable immediately
-	if err := EnsureQueue(ctx, pool, "go_ladder", "runner", QueueOpts{
+	if err := EnsureSubscription(ctx, pool, "go_ladder", "runner", SubscriptionOpts{
 		StartPos:    At(0),
 		BackoffKind: BackoffNone,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	// one whole redelivery before quarantine, tuned on the row
-	if _, err := pool.Exec(ctx, `UPDATE cb_stream_queues SET max_crashes = 1
+	if _, err := pool.Exec(ctx, `UPDATE cb_stream_subscriptions SET max_crashes = 1
 		WHERE stream = 'go_ladder' AND name = 'runner'`); err != nil {
 		t.Fatal(err)
 	}
@@ -1214,7 +1214,7 @@ func TestQuarantine(t *testing.T) {
 	}
 	var closedPos int64
 	if err := pool.QueryRow(ctx,
-		`SELECT closed_pos FROM cb_stream_queues WHERE stream = 'go_ladder' AND name = 'runner'`).Scan(&closedPos); err != nil {
+		`SELECT closed_pos FROM cb_stream_subscriptions WHERE stream = 'go_ladder' AND name = 'runner'`).Scan(&closedPos); err != nil {
 		t.Fatal(err)
 	}
 	if closedPos != 3 {
@@ -1292,14 +1292,14 @@ func TestFailThenQuarantine(t *testing.T) {
 	if err := Ensure(ctx, pool, "go_fq"); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsureQueue(ctx, pool, "go_fq", "q", QueueOpts{
+	if err := EnsureSubscription(ctx, pool, "go_fq", "q", SubscriptionOpts{
 		StartPos:    At(0),
 		MaxAttempts: 3,
 		BackoffKind: BackoffNone,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE cb_stream_queues SET max_crashes = 1
+	if _, err := pool.Exec(ctx, `UPDATE cb_stream_subscriptions SET max_crashes = 1
 		WHERE stream = 'go_fq' AND name = 'q'`); err != nil {
 		t.Fatal(err)
 	}
@@ -1904,14 +1904,14 @@ func TestDeliverSchedules(t *testing.T) {
 
 // a poison handler: panics become failed attempts, and attempts exhaust to
 // the dead letter stream through the real loop
-func TestConsumeQueuePoisonHandler(t *testing.T) {
+func TestConsumeSubscriptionPoisonHandler(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
 	if err := Ensure(ctx, pool, "go_poison"); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsureQueue(ctx, pool, "go_poison", "p", QueueOpts{
+	if err := EnsureSubscription(ctx, pool, "go_poison", "p", SubscriptionOpts{
 		StartPos:    At(0),
 		MaxAttempts: 2,
 		BackoffKind: BackoffNone,
@@ -1933,14 +1933,14 @@ func TestConsumeQueuePoisonHandler(t *testing.T) {
 
 	var mu sync.Mutex
 	calls := 0
-	queueDone := make(chan error, 1)
+	subDone := make(chan error, 1)
 	go func() {
-		queueDone <- ConsumeQueue(jctx, pool, "go_poison", "p", func(context.Context, Message) error {
+		subDone <- ConsumeSubscription(jctx, pool, "go_poison", "p", func(context.Context, Message) error {
 			mu.Lock()
 			calls++
 			mu.Unlock()
 			panic("boom")
-		}, ConsumeQueueOpts{PollInterval: 20 * time.Millisecond})
+		}, ConsumeSubscriptionOpts{PollInterval: 20 * time.Millisecond})
 	}()
 
 	deadline := time.Now().Add(10 * time.Second)
@@ -1976,8 +1976,8 @@ func TestConsumeQueuePoisonHandler(t *testing.T) {
 	mu.Unlock()
 
 	cancel()
-	if err := <-queueDone; !errors.Is(err, context.Canceled) {
-		t.Fatalf("queue consume returned %v, want context.Canceled", err)
+	if err := <-subDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("subscription consume returned %v, want context.Canceled", err)
 	}
 	if err := <-jobsDone; !errors.Is(err, context.Canceled) {
 		t.Fatalf("jobs returned %v, want context.Canceled", err)
@@ -1985,14 +1985,14 @@ func TestConsumeQueuePoisonHandler(t *testing.T) {
 }
 
 // worker pools: competing consumers split the stream and nothing is lost
-func TestConsumeQueueCompeting(t *testing.T) {
+func TestConsumeSubscriptionCompeting(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
 	if err := Ensure(ctx, pool, "go_pool"); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsureQueue(ctx, pool, "go_pool", "w", QueueOpts{
+	if err := EnsureSubscription(ctx, pool, "go_pool", "w", SubscriptionOpts{
 		StartPos:       At(0),
 		ClaimBatchSize: 7,
 	}); err != nil {
@@ -2015,12 +2015,12 @@ func TestConsumeQueueCompeting(t *testing.T) {
 	done := make(chan error, 3)
 	for range 3 {
 		go func() {
-			done <- ConsumeQueue(cctx, pool, "go_pool", "w", func(_ context.Context, m Message) error {
+			done <- ConsumeSubscription(cctx, pool, "go_pool", "w", func(_ context.Context, m Message) error {
 				mu.Lock()
 				counts[string(m.Payload)]++
 				mu.Unlock()
 				return nil
-			}, ConsumeQueueOpts{PollInterval: 20 * time.Millisecond})
+			}, ConsumeSubscriptionOpts{PollInterval: 20 * time.Millisecond})
 		}()
 	}
 
@@ -2028,7 +2028,7 @@ func TestConsumeQueueCompeting(t *testing.T) {
 	for {
 		var closed int64
 		if err := pool.QueryRow(ctx,
-			`SELECT closed_pos FROM cb_stream_queues WHERE stream = 'go_pool' AND name = 'w'`).Scan(&closed); err != nil {
+			`SELECT closed_pos FROM cb_stream_subscriptions WHERE stream = 'go_pool' AND name = 'w'`).Scan(&closed); err != nil {
 			t.Fatal(err)
 		}
 		if closed == 50 {
@@ -2060,18 +2060,18 @@ func TestConsumeQueueCompeting(t *testing.T) {
 
 // a frozen consumer discovers it lost its claim and stands down without
 // spending an attempt
-func TestConsumeQueueClaimLost(t *testing.T) {
+func TestConsumeSubscriptionClaimLost(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
 	if err := Ensure(ctx, pool, "go_zombie"); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsureQueue(ctx, pool, "go_zombie", "z", QueueOpts{StartPos: At(0)}); err != nil {
+	if err := EnsureSubscription(ctx, pool, "go_zombie", "z", SubscriptionOpts{StartPos: At(0)}); err != nil {
 		t.Fatal(err)
 	}
 	// a tiny claim window, so the freeze outlives it quickly
-	if _, err := pool.Exec(ctx, `UPDATE cb_stream_queues SET claim_ttl = interval '60 milliseconds'
+	if _, err := pool.Exec(ctx, `UPDATE cb_stream_subscriptions SET claim_ttl = interval '60 milliseconds'
 		WHERE stream = 'go_zombie' AND name = 'z'`); err != nil {
 		t.Fatal(err)
 	}
@@ -2087,12 +2087,12 @@ func TestConsumeQueueClaimLost(t *testing.T) {
 	cctx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() {
-		done <- ConsumeQueue(cctx, pool, "go_zombie", "z", func(hctx context.Context, m Message) error {
+		done <- ConsumeSubscription(cctx, pool, "go_zombie", "z", func(hctx context.Context, m Message) error {
 			started <- struct{}{}
 			<-hctx.Done() // frozen: never finishes on its own
 			canceled <- struct{}{}
 			return hctx.Err()
-		}, ConsumeQueueOpts{PollInterval: 20 * time.Millisecond})
+		}, ConsumeSubscriptionOpts{PollInterval: 20 * time.Millisecond})
 	}()
 
 	select {
@@ -2161,7 +2161,7 @@ func TestRetryBackoffTiming(t *testing.T) {
 	if err := Ensure(ctx, pool, "go_wait"); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsureQueue(ctx, pool, "go_wait", "r", QueueOpts{
+	if err := EnsureSubscription(ctx, pool, "go_wait", "r", SubscriptionOpts{
 		StartPos:    At(0),
 		MaxAttempts: 3,
 		BackoffKind: BackoffFixed,
@@ -2423,16 +2423,16 @@ func TestFilteredCursor(t *testing.T) {
 	}
 }
 
-// queues with a topic pattern: late binding replays history, claims cover
+// subscriptions with a topic pattern: late binding replays history, claims cover
 // non-matches, retries keep the filter, and quarantine leaks nothing
-func TestFilteredQueue(t *testing.T) {
+func TestFilteredSubscription(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
 	if err := Ensure(ctx, pool, "go_fqt"); err != nil {
 		t.Fatal(err)
 	}
-	// history exists before the queue: binding late replays it
+	// history exists before the subscription: binding late replays it
 	if _, err := PublishMessages(ctx, pool, "go_fqt", []BatchMessage{
 		{Topic: "record.work.created", Payload: 1},
 		{Topic: "record.person.created", Payload: 2},
@@ -2444,7 +2444,7 @@ func TestFilteredQueue(t *testing.T) {
 	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_fqt')"); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsureQueue(ctx, pool, "go_fqt", "orcid", QueueOpts{
+	if err := EnsureSubscription(ctx, pool, "go_fqt", "orcid", SubscriptionOpts{
 		StartPos:    At(0),
 		Topic:       "record.work.#",
 		BackoffKind: BackoffNone, // retries land immediately, visible below
@@ -2498,7 +2498,7 @@ func TestFilteredQueue(t *testing.T) {
 	}
 	var closedPos, lastPos int64
 	if err := pool.QueryRow(ctx, `SELECT q.closed_pos, s.last_pos
-		FROM cb_stream_queues q JOIN cb_streams s ON s.name = q.stream
+		FROM cb_stream_subscriptions q JOIN cb_streams s ON s.name = q.stream
 		WHERE q.stream = 'go_fqt' AND q.name = 'orcid'`).Scan(&closedPos, &lastPos); err != nil {
 		t.Fatal(err)
 	}
@@ -2506,16 +2506,16 @@ func TestFilteredQueue(t *testing.T) {
 		t.Fatalf("closed_pos = %d, want %d", closedPos, lastPos)
 	}
 
-	// quarantine republishes only the queue's own messages: crash a claim
+	// quarantine republishes only the subscription's own messages: crash a claim
 	// whose range holds matches and non-matches, then count what reaches sr.*
-	if err := EnsureQueue(ctx, pool, "go_fqt", "q2", QueueOpts{
+	if err := EnsureSubscription(ctx, pool, "go_fqt", "q2", SubscriptionOpts{
 		StartPos:    At(0),
 		Topic:       "record.work.#",
 		BackoffKind: BackoffNone,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE cb_stream_queues
+	if _, err := pool.Exec(ctx, `UPDATE cb_stream_subscriptions
 		SET claim_ttl = interval '30 milliseconds', max_crashes = 1
 		WHERE stream = 'go_fqt' AND name = 'q2'`); err != nil {
 		t.Fatal(err)
@@ -2545,17 +2545,17 @@ func TestFilteredQueue(t *testing.T) {
 	}
 }
 
-// a live worker on a filtered queue: the loop delivers exactly the matching
+// a live worker on a filtered subscription: the loop delivers exactly the matching
 // messages, keeps up over the positions it never delivers, and a failed
 // match comes back through the retry stream into the same loop
-func TestConsumeQueueFiltered(t *testing.T) {
+func TestConsumeSubscriptionFiltered(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
 	if err := Ensure(ctx, pool, "go_cqf"); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsureQueue(ctx, pool, "go_cqf", "f", QueueOpts{
+	if err := EnsureSubscription(ctx, pool, "go_cqf", "f", SubscriptionOpts{
 		StartPos:    At(0),
 		Topic:       "job.#",
 		Condition:   `$.payload.run == true`,
@@ -2587,9 +2587,9 @@ func TestConsumeQueueFiltered(t *testing.T) {
 	var mu sync.Mutex
 	deliveries := map[int]int{}
 	var retryAttempt any
-	queueDone := make(chan error, 1)
+	subDone := make(chan error, 1)
 	go func() {
-		queueDone <- ConsumeQueue(jctx, pool, "go_cqf", "f", func(_ context.Context, m Message) error {
+		subDone <- ConsumeSubscription(jctx, pool, "go_cqf", "f", func(_ context.Context, m Message) error {
 			var p struct {
 				N int `json:"n"`
 			}
@@ -2607,16 +2607,16 @@ func TestConsumeQueueFiltered(t *testing.T) {
 				return errors.New("first try fails")
 			}
 			return nil
-		}, ConsumeQueueOpts{PollInterval: 20 * time.Millisecond})
+		}, ConsumeSubscriptionOpts{PollInterval: 20 * time.Millisecond})
 	}()
 
-	// done when the base queue's closed position reaches the stream's tail
+	// done when the base subscription's closed position reaches the stream's tail
 	// and the failed match has come back around through sr.*
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		var caughtUp bool
 		if err := pool.QueryRow(ctx, `SELECT q.closed_pos = s.last_pos
-			FROM cb_stream_queues q JOIN cb_streams s ON s.name = q.stream
+			FROM cb_stream_subscriptions q JOIN cb_streams s ON s.name = q.stream
 			WHERE q.stream = 'go_cqf' AND q.name = 'f'`).Scan(&caughtUp); err != nil {
 			t.Fatal(err)
 		}
@@ -2633,7 +2633,7 @@ func TestConsumeQueueFiltered(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	cancel()
-	<-queueDone
+	<-subDone
 	<-jobsDone
 
 	mu.Lock()
