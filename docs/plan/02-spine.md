@@ -6,6 +6,10 @@
 > replaced by server-side read filters before anything was built (D29). The
 > journey and the grounding evidence are in `spine-usage-sketch.md`; this
 > chapter describes what shipped.
+>
+> Vocabulary updated 2026-07-14 (branch experiment): queue → **subscription**
+> (D37), retry and dead-letter state are rows (D35, D36), and dispatched work
+> is a run (D34) — the consumer-shape table below reflects it.
 
 ## 1. There is no routing (supersedes D8's framing)
 
@@ -19,11 +23,11 @@ consumers.
 What remains is one mental model: **a consumer is a filter plus a position over
 a log.** Three durability flavors of the same idea — no position (wire,
 ephemeral, in-process match), an ordered position (cursor), claimed ranges with
-retries (queue).
+retries (subscription).
 
 The usage sketch's evidence, compressed: every live enqueue in both apps is
-producer-knows-consumer (same-transaction publish to a named stream); the
-consumers that want a *subset* of a feed want queue retry semantics on that
+producer-knows-consumer (same-transaction enqueue — a one-step run since D37);
+the consumers that want a *subset* of a feed want retry semantics on that
 subset, which filters give them in place, with no copy; and every topic-routing
 path ever wired in either app died — one by silent regression, one deleted after
 a day. Late binding and replay survive untouched: they were always cursor-start
@@ -31,8 +35,8 @@ semantics (`StartPos`), never copy semantics.
 
 ## 2. The filter: two small languages
 
-A filter is birth policy on a queue or cursor — like `claim_batch_size`,
-competing consumers of one queue must agree, so it is never a read argument. It
+A filter is birth policy on a subscription or cursor — like `claim_batch_size`,
+competing consumers of one subscription must agree, so it is never a read argument. It
 is parsed **once at registration**; reads evaluate precompiled artifacts only.
 Two parts, AND-ed, each doing one job:
 
@@ -61,9 +65,10 @@ The shared rules:
 - Claims cover every position in their range, matching or not:
   `claim_batch_size` counts positions, and a sparse filter just closes
   near-empty claims fast. The filter applies in the claimed-range fetch
-  (`cb_stream_read_claim`) and in quarantine — non-matches never reach `sr.*`.
-- Retry streams are never filtered: `sr.*` holds only its queue's own
-  failures, pre-filtered by construction (a table CHECK pins it).
+  (`cb_stream_read_claim`) and in quarantine — non-matches never become
+  retry rows.
+- Retry rows are never filtered: `cb_stream_retries` holds only its
+  subscription's own failures, pre-filtered by construction (D35).
 - **Topics select, conditions prune.** Any condition costs a per-row jsonb
   evaluation and is never index-assisted. The engine creates no content
   indexes and correctness never depends on one; a deep sparse replay can add
@@ -103,15 +108,17 @@ directly:
 | Need | Shape |
 |---|---|
 | Projection over the whole feed (search index, representations) | plain cursor |
-| Subset with retry/dead-letter semantics (ORCID push, per-target deletes) | **filtered queue on the feed** |
-| Producer knows the consumer (blob GC, flow runs, LDN outbox) | same-tx `Publish` to a work stream |
-| Many dynamic user-defined subscribers (webhooks) | one dispatcher cursor + the Go trie over app rows + a delivery work queue |
+| Subset with retry/dead-row semantics (ORCID push, per-target deletes) | **filtered subscription on the feed** |
+| Producer knows the consumer (blob GC, LDN outbox) | same-tx `cb_flow_run` — a one-step run with a dedup key (D37); a stream-only install composes `Publish` to an own stream + a subscription instead |
+| Many dynamic user-defined subscribers (webhooks) | one dispatcher cursor + the Go trie over app rows + one run per delivery (D37) |
 | User-facing notification inbox | explicit writes by handlers (04) — identity is data in the handler's hand |
 
 The exactly-once guarantee moves with the shapes: any filtered cursor consumer
 whose effects are rows in the same Postgres commits effects and cursor advance
 in one transaction — the guarantee the relay row in the README table used to
-claim, now without the relay.
+claim, now without the relay. And a handler that calls `cb_flow_run` creates
+work from events under the same guarantee — the composition rule (README,
+"Two shapes, one discipline").
 
 The Go trie (`topic_trie.go`) is not dead code: it is the app-side matcher for
 the dispatcher shape — one event against many subscriber patterns, in process,
@@ -143,6 +150,6 @@ its source's retention. None exists in either app or their roadmaps.
 
 Shipped and tested (M3 exit, 2026-07-12): compilers with grammar tables,
 filtered cursors and queues through the real APIs, a live filtered worker end
-to end (delivers exactly the matches, failed match returns through `sr.*`,
-closed position keeps up over undelivered ranges), and batch publish with the
-full envelope matrix.
+to end (delivers exactly the matches, failed match returns through `sr.*` —
+retry rows after M3r, closed position keeps up over undelivered ranges), and
+batch publish with the full envelope matrix.
