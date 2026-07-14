@@ -10,7 +10,7 @@
 
 CREATE TYPE cb_ref_kind AS ENUM ('message', 'pending');
 CREATE TYPE cb_backoff_kind AS ENUM ('none', 'fixed', 'full_jitter');
-CREATE TYPE cb_fail_policy AS ENUM ('dead_letter', 'drop');
+CREATE TYPE cb_fail_policy AS ENUM ('keep', 'delete');
 CREATE TYPE cb_catch_up_policy AS ENUM ('skip', 'all');
 
 -- +goose statementbegin
@@ -236,7 +236,6 @@ CREATE TABLE cb_stream_subscriptions (
     claim_ttl interval NOT NULL,
     claim_batch_size int NOT NULL DEFAULT 100 CHECK (claim_batch_size > 0),
     max_attempts int NOT NULL CHECK (max_attempts > 0),
-    max_crashes int NOT NULL CHECK (max_crashes > 0),
     backoff_kind cb_backoff_kind NOT NULL,
     backoff_base interval NOT NULL,
     backoff_max interval NOT NULL,
@@ -247,12 +246,7 @@ CREATE TABLE cb_stream_subscriptions (
     headers_condition jsonpath, -- disassembled by _cb_stream_compile_condition at ensure
     payload_condition jsonpath,
     PRIMARY KEY (stream, name),
-    CHECK (closed_pos <= claimed_pos),
-    CONSTRAINT cb_stream_subscriptions_retry_batch_size
-        CHECK (left(stream, 3) <> 'sr.' OR claim_batch_size = 1),
-    CONSTRAINT cb_stream_subscriptions_retry_no_filters
-        CHECK (left(stream, 3) <> 'sr.' OR (topic IS NULL AND condition IS NULL))
-
+    CHECK (closed_pos <= claimed_pos)
 );
 
 CREATE TABLE cb_stream_claims (
@@ -262,9 +256,8 @@ CREATE TABLE cb_stream_claims (
     to_pos bigint NOT NULL,
     consumer text NOT NULL,
     closed boolean NOT NULL DEFAULT false,
-    released boolean NOT NULL DEFAULT false, -- never a crash
+    released boolean NOT NULL DEFAULT false, -- a claim handed back on purpose, never a crash
     ttl interval NOT NULL,
-    crashes int NOT NULL DEFAULT 0,
     expires_at timestamptz NOT NULL, -- past this moment any consumer may claim again
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (stream, subscription, from_pos),
@@ -272,6 +265,36 @@ CREATE TABLE cb_stream_claims (
         REFERENCES cb_stream_subscriptions(stream, name) ON DELETE CASCADE,
     CHECK (from_pos <= to_pos)
 );
+
+-- One row per base-stream position that a subscription could not process.
+-- Replaces the old sr.* retry and sd.* streams: a failed or
+-- crashed message becomes a row here, retried on its own with a backoff,
+-- and marked failed when its attempts run out. origin_pos is the position on
+-- the base stream that failed, and the row's identity. claimable_at carries
+-- three jobs at once: a live lease holds it in the future, expiry brings it
+-- back, and a backoff pushes it out. attempt counts delivery tries consumed;
+-- one budget, max_attempts, covers both verdicts and crashes.
+-- The headers are the original message's, untouched: a handler retried from
+-- here sees exactly what it saw the first time.
+CREATE TABLE cb_stream_retries (
+    stream       text NOT NULL,
+    subscription text NOT NULL,
+    origin_pos   bigint NOT NULL,
+    topic        text,
+    payload      jsonb NOT NULL,
+    headers      jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(headers) = 'object'),
+    attempt      int NOT NULL,
+    last_error   text,                 -- 'silence' for a crash, the handler's text for a verdict
+    failed       boolean NOT NULL DEFAULT false,
+    claimable_at timestamptz NOT NULL, -- visibility, backoff and lease in one: due when <= now
+    claimed_by   text,                 -- the consumer holding the lease; NULL when free
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (stream, subscription, origin_pos),
+    FOREIGN KEY (stream, subscription)
+        REFERENCES cb_stream_subscriptions(stream, name) ON DELETE CASCADE
+);
+
+CREATE INDEX ON cb_stream_retries (stream, subscription, claimable_at);
 
 CREATE TABLE cb_stream_schedules (
     stream   text NOT NULL REFERENCES cb_streams(name) ON DELETE CASCADE,
@@ -293,8 +316,7 @@ CREATE TABLE cb_stream_schedules (
 CREATE INDEX ON cb_stream_schedules (next_at);
 
 -- +goose statementbegin
--- Create the stream's physical partition. Shared by cb_stream_ensure
--- and _cb_stream_ensure.
+-- Create the stream's physical partition.
 -- Partition names encode dots as '__'.
 CREATE FUNCTION _cb_stream_ensure_partition(stream text)
 RETURNS void LANGUAGE plpgsql AS $$
@@ -305,24 +327,6 @@ BEGIN
     EXECUTE format(
         'CREATE TABLE IF NOT EXISTS %I PARTITION OF cb_stream_messages FOR VALUES IN (%L)',
         _partition, _cb_stream_ensure_partition.stream);
-END; $$;
--- +goose statementend
-
--- +goose statementbegin
--- The internal version accepts the dotted names used by retry and dead letter
--- streams.
-CREATE FUNCTION _cb_stream_ensure(stream text, retention interval DEFAULT NULL)
-RETURNS void LANGUAGE plpgsql AS $$
-BEGIN
-    IF NOT _cb_valid_stream_name(_cb_stream_ensure.stream) THEN
-        RAISE EXCEPTION 'catbird: invalid stream name %', _cb_stream_ensure.stream USING ERRCODE = 'IRD01';
-    END IF;
-
-    INSERT INTO cb_streams (name, retention)
-    VALUES (_cb_stream_ensure.stream, coalesce(_cb_stream_ensure.retention, cb_forever()))
-    ON CONFLICT DO NOTHING;
-
-    PERFORM _cb_stream_ensure_partition(_cb_stream_ensure.stream);
 END; $$;
 -- +goose statementend
 
@@ -405,7 +409,6 @@ CREATE FUNCTION cb_stream_ensure_subscription(
     backoff_base   interval DEFAULT NULL,
     backoff_max    interval DEFAULT NULL,
     on_fail        cb_fail_policy DEFAULT NULL,
-    max_crashes    int      DEFAULT NULL,
     claim_batch_size int    DEFAULT NULL,
     topic text DEFAULT NULL,
     condition text DEFAULT NULL
@@ -445,7 +448,7 @@ BEGIN
 
     INSERT INTO cb_stream_subscriptions
         (stream, name, claimed_pos, closed_pos,
-         claim_ttl, claim_batch_size, max_attempts, max_crashes,
+         claim_ttl, claim_batch_size, max_attempts,
          backoff_kind, backoff_base, backoff_max, on_fail,
          topic, topic_regex, condition, headers_condition, payload_condition)
     VALUES (
@@ -455,33 +458,16 @@ BEGIN
         coalesce(cb_stream_ensure_subscription.claim_ttl,        interval '30 seconds'),
         coalesce(cb_stream_ensure_subscription.claim_batch_size, 100),
         coalesce(cb_stream_ensure_subscription.max_attempts, 3),
-        coalesce(cb_stream_ensure_subscription.max_crashes,  3),
         coalesce(cb_stream_ensure_subscription.backoff_kind, 'full_jitter'),
         coalesce(cb_stream_ensure_subscription.backoff_base, interval '5 seconds'),
         coalesce(cb_stream_ensure_subscription.backoff_max,  interval '5 minutes'),
-        coalesce(cb_stream_ensure_subscription.on_fail,      'dead_letter'),
+        coalesce(cb_stream_ensure_subscription.on_fail,      'keep'),
         cb_stream_ensure_subscription.topic,
         _topic_re,
         cb_stream_ensure_subscription.condition,
         _headers_cond,
         _payload_cond
     )
-    ON CONFLICT ON CONSTRAINT cb_stream_subscriptions_pkey DO NOTHING;
-
-    -- The retry stream for this subscription.
-    PERFORM _cb_stream_ensure(
-        'sr.' || cb_stream_ensure_subscription.stream || '.' || cb_stream_ensure_subscription.subscription,
-        interval '7 days');
-
-    INSERT INTO cb_stream_subscriptions
-        (stream, name, claimed_pos, closed_pos,
-         claim_ttl, claim_batch_size, max_attempts, max_crashes,
-         backoff_kind, backoff_base, backoff_max, on_fail)
-    SELECT 'sr.' || q.stream || '.' || q.name, q.name, 0, 0,
-        q.claim_ttl, 1, q.max_attempts, q.max_crashes,
-        q.backoff_kind, q.backoff_base, q.backoff_max, q.on_fail
-    FROM cb_stream_subscriptions q
-    WHERE q.stream = cb_stream_ensure_subscription.stream AND q.name = cb_stream_ensure_subscription.subscription
     ON CONFLICT ON CONSTRAINT cb_stream_subscriptions_pkey DO NOTHING;
 END; $$;
 -- +goose statementend
@@ -592,37 +578,6 @@ CREATE FUNCTION cb_stream_publish(
     topic      text,
     payload    jsonb,
     headers    jsonb       DEFAULT '{}',
-    key        text        DEFAULT NULL,
-    delay      interval    DEFAULT NULL,
-    deliver_at timestamptz DEFAULT NULL,
-
-    OUT ref_kind cb_ref_kind,
-    OUT ref_id   bigint,
-    OUT existing boolean
-)
-LANGUAGE plpgsql AS $$
-BEGIN
-    -- Header keys starting with cb_ are for catbird's own use.
-    IF EXISTS (SELECT 1 FROM jsonb_object_keys(cb_stream_publish.headers) AS k
-               WHERE left(k, 3) = 'cb_') THEN
-        RAISE EXCEPTION 'catbird: header keys starting with cb_ are reserved' USING ERRCODE = 'IRD01';
-    END IF;
-
-    SELECT p.ref_kind, p.ref_id, p.existing INTO ref_kind, ref_id, existing
-    FROM _cb_stream_publish(cb_stream_publish.stream, cb_stream_publish.topic,
-        cb_stream_publish.payload, cb_stream_publish.headers, cb_stream_publish.key,
-        cb_stream_publish.delay, cb_stream_publish.deliver_at) p;
-END; $$;
--- +goose statementend
-
--- +goose statementbegin
--- The internal version allows reserved header keys prefixed with cb_ for use by retry
--- and dead letter streams.
-CREATE FUNCTION _cb_stream_publish(
-    stream     text,
-    topic      text,
-    payload    jsonb,
-    headers    jsonb       DEFAULT '{}',
     key        text        DEFAULT NULL, -- deduplication key (keep oldest)
     delay      interval    DEFAULT NULL, -- relative delayed delivery
     deliver_at timestamptz DEFAULT NULL, -- absolute delayed delivery
@@ -637,24 +592,30 @@ DECLARE
     _deliver_at timestamptz;
     _future boolean;
 BEGIN
+    -- Header keys starting with cb_ are for catbird's own use.
+    IF EXISTS (SELECT 1 FROM jsonb_object_keys(cb_stream_publish.headers) AS k
+               WHERE left(k, 3) = 'cb_') THEN
+        RAISE EXCEPTION 'catbird: header keys starting with cb_ are reserved' USING ERRCODE = 'IRD01';
+    END IF;
+
     existing := false;
 
     -- Validate arguments.
-    IF delay IS NOT NULL AND _cb_stream_publish.deliver_at IS NOT NULL THEN
+    IF delay IS NOT NULL AND cb_stream_publish.deliver_at IS NOT NULL THEN
         RAISE EXCEPTION 'catbird: cannot specify both delay and deliver_at' USING ERRCODE = 'IRD01';
     END IF;
 
-    _deliver_at := coalesce(_cb_stream_publish.deliver_at, clock_timestamp() + _cb_stream_publish.delay);
+    _deliver_at := coalesce(cb_stream_publish.deliver_at, clock_timestamp() + cb_stream_publish.delay);
     _future := _deliver_at IS NOT NULL AND _deliver_at > clock_timestamp();
 
     -- Check the stream exists.
-    PERFORM 1 FROM cb_streams s WHERE s.name = _cb_stream_publish.stream;
+    PERFORM 1 FROM cb_streams s WHERE s.name = cb_stream_publish.stream;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: stream % not defined', _cb_stream_publish.stream USING ERRCODE = 'IRD02';
+        RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_publish.stream USING ERRCODE = 'IRD02';
     END IF;
 
     ---- Deduplication by key. ----
-    IF _cb_stream_publish.key IS NOT NULL THEN
+    IF cb_stream_publish.key IS NOT NULL THEN
         _id := CASE WHEN _future
             THEN nextval(pg_get_serial_sequence('cb_stream_pending', 'id'))
             ELSE nextval(pg_get_serial_sequence('cb_stream_messages', 'id')) END;
@@ -673,8 +634,8 @@ BEGIN
         -- back empty. The retry SELECT runs as a new statement and handles that race.
         WITH won AS (
             INSERT INTO cb_stream_keys AS k (stream, key, ref_kind, ref_id)
-            VALUES (_cb_stream_publish.stream,
-                    _cb_stream_publish.key,
+            VALUES (cb_stream_publish.stream,
+                    cb_stream_publish.key,
                     CASE WHEN _future THEN 'pending' ELSE 'message' END::cb_ref_kind, _id)
             ON CONFLICT ON CONSTRAINT cb_stream_keys_pkey
             DO UPDATE SET ref_id = k.ref_id WHERE FALSE
@@ -684,16 +645,16 @@ BEGIN
             SELECT w.ref_kind, w.ref_id FROM won w
             UNION ALL
             SELECT k.ref_kind, k.ref_id FROM cb_stream_keys k
-            WHERE k.stream = _cb_stream_publish.stream
-              AND k.key         = _cb_stream_publish.key
+            WHERE k.stream = cb_stream_publish.stream
+              AND k.key         = cb_stream_publish.key
             LIMIT 1
         ) ref;
         -- Handle race edge case.
         IF ref_id IS NULL THEN
             SELECT k.ref_kind, k.ref_id INTO ref_kind, ref_id
             FROM cb_stream_keys k
-            WHERE k.stream = _cb_stream_publish.stream
-              AND k.key         = _cb_stream_publish.key;
+            WHERE k.stream = cb_stream_publish.stream
+              AND k.key         = cb_stream_publish.key;
         END IF;
 
         -- It's a duplicate. Return the existing id.
@@ -712,12 +673,12 @@ BEGIN
             (id, stream, topic, payload, headers, deliver_at, key)
         VALUES (
             ref_id,
-            _cb_stream_publish.stream,
-            _cb_stream_publish.topic,
-            _cb_stream_publish.payload,
-            _cb_stream_publish.headers,
+            cb_stream_publish.stream,
+            cb_stream_publish.topic,
+            cb_stream_publish.payload,
+            cb_stream_publish.headers,
             _deliver_at,
-            _cb_stream_publish.key
+            cb_stream_publish.key
         );
 
         PERFORM pg_notify(current_schema || '.cb_tick',
@@ -734,14 +695,14 @@ BEGIN
     INSERT INTO cb_stream_messages (id, stream, topic, payload, headers)
     VALUES (
         ref_id,
-        _cb_stream_publish.stream,
-        _cb_stream_publish.topic,
-        _cb_stream_publish.payload,
-        _cb_stream_publish.headers
+        cb_stream_publish.stream,
+        cb_stream_publish.topic,
+        cb_stream_publish.payload,
+        cb_stream_publish.headers
     );
 
     -- Notify the position assigner.
-    PERFORM _cb_stream_notify(_cb_stream_publish.stream, _cb_stream_publish.topic);
+    PERFORM _cb_stream_notify(cb_stream_publish.stream, cb_stream_publish.topic);
 END;
 $$;
 -- +goose statementend
@@ -1060,71 +1021,33 @@ END; $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- Copies a crashing claim's messages to the retry stream.
--- A message the crashed consumer already failed via cb_stream_fail keeps that
--- retry copy instead of gaining a second one.
--- A message that has exceeded max_crashes is moved to the dead letter stream or
--- dropped. A message that retention already pruned is skipped.
--- max_crashes, backoff and on_fail come from the base subscription row, even when
--- the crashing claim is on the retry stream itself.
-CREATE FUNCTION _cb_stream_quarantine(claim cb_stream_claims)
+-- Turns a crashed base range into retry rows, one per message the
+-- subscription would have delivered (topic and condition). A crash is
+-- silence, so each row starts at attempt 0 with no verdict, due now. A
+-- position that already has a retry row keeps it: the primary key plus
+-- ON CONFLICT DO NOTHING is the keep-existing-copy rule, so a verdict the
+-- consumer reported before it died is not overwritten by a later silence.
+CREATE FUNCTION _cb_stream_retry(claim cb_stream_claims)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
-    _stream text := _cb_stream_quarantine.claim.stream;
-    _subscription text := _cb_stream_quarantine.claim.subscription;
-    _from_pos bigint := _cb_stream_quarantine.claim.from_pos;
-    _to_pos bigint := _cb_stream_quarantine.claim.to_pos;
-    _base_name text;
-    _retry_stream text;
+    _stream text := _cb_stream_retry.claim.stream;
+    _subscription text := _cb_stream_retry.claim.subscription;
+    _from_pos bigint := _cb_stream_retry.claim.from_pos;
+    _to_pos bigint := _cb_stream_retry.claim.to_pos;
     _q cb_stream_subscriptions;
-    _m cb_stream_messages;
-    _origin_pos bigint;
-    _crash int;
 BEGIN
-    _base_name := CASE WHEN _stream LIKE '%.%' THEN split_part(_stream, '.', 2) ELSE _stream END;
-    _retry_stream := 'sr.' || _base_name || '.' || _subscription;
-
     SELECT q.* INTO _q FROM cb_stream_subscriptions q
-    WHERE q.stream = _base_name AND q.name = _subscription;
+    WHERE q.stream = _stream AND q.name = _subscription;
 
-    FOR _m IN
-        SELECT m.* FROM cb_stream_messages m
-        WHERE m.stream = _stream AND m.pos BETWEEN _from_pos AND _to_pos
-          AND (_q.topic_regex IS NULL OR m.topic ~ _q.topic_regex)
-          AND (_q.headers_condition IS NULL OR m.headers @@ _q.headers_condition)
-          AND (_q.payload_condition IS NULL OR m.payload @@ _q.payload_condition)
-        ORDER BY m.pos
-    LOOP
-        _origin_pos := coalesce((_m.headers->>'cb_origin_pos')::bigint, _m.pos);
-        _crash := coalesce((_m.headers->>'cb_crash')::int, 0) + 1;
-
-        -- the dead consumer reported this one failed before it died: the
-        -- retry copy it made carries the message from here
-        IF EXISTS (SELECT 1 FROM cb_stream_keys k
-                   WHERE k.stream = _retry_stream
-                     AND k.key = _subscription || ':' || _origin_pos || ':a'
-                         || (coalesce((_m.headers->>'cb_attempt')::int, 0) + 1)) THEN
-            CONTINUE;
-        END IF;
-
-        IF _crash > _q.max_crashes THEN
-            IF _q.on_fail = 'dead_letter' THEN
-                PERFORM _cb_stream_dead_letter(_stream, _subscription, _m.pos,
-                    NULL, _crash, 'crash limit reached');
-            END IF;
-            CONTINUE;
-        END IF;
-
-        PERFORM _cb_stream_publish(
-            _retry_stream,
-            _m.topic,
-            _m.payload,
-            key => _subscription || ':' || _origin_pos || ':c' || _crash,
-            headers => _m.headers || jsonb_build_object(
-                'cb_crash', _crash,
-                'cb_origin_pos', _origin_pos),
-            delay => _cb_backoff(_q.backoff_kind, _q.backoff_base, _q.backoff_max, _crash));
-    END LOOP;
+    INSERT INTO cb_stream_retries
+        (stream, subscription, origin_pos, topic, payload, headers, attempt, last_error, claimable_at)
+    SELECT m.stream, _subscription, m.pos, m.topic, m.payload, m.headers, 0, 'silence', clock_timestamp()
+    FROM cb_stream_messages m
+    WHERE m.stream = _stream AND m.pos BETWEEN _from_pos AND _to_pos
+      AND (_q.topic_regex IS NULL OR m.topic ~ _q.topic_regex)
+      AND (_q.headers_condition IS NULL OR m.headers @@ _q.headers_condition)
+      AND (_q.payload_condition IS NULL OR m.payload @@ _q.payload_condition)
+    ON CONFLICT ON CONSTRAINT cb_stream_retries_pkey DO NOTHING;
 END;
 $$;
 -- +goose statementend
@@ -1138,8 +1061,14 @@ $$;
 --      chain intact, or the closed position stalls and messages are lost
 --      to retention.
 --   2. claimed_pos and closed_pos only ever grow.
---   3. Crashes count only true expiries. A released claim was handed back
---      on purpose and says nothing about its messages.
+--
+-- Due retry rows are served first, each as a solo pseudo-claim
+-- (from_pos = to_pos = origin_pos), so a failed message is retried on its
+-- own before fresh work. A retry row still marked claimed but past due lost
+-- its holder to a crash: that try was already counted at hand-out, so it is
+-- recorded as silence and either backed off or given up on. Then expired base
+-- claims are adopted: a released one is handed back out whole and uncharged,
+-- any other expiry is a crash and is recorded as retry rows and closed.
 CREATE FUNCTION cb_stream_claim(
     stream     text,
     subscription      text,
@@ -1154,6 +1083,7 @@ LANGUAGE plpgsql AS $$
 DECLARE
     _q cb_stream_subscriptions;
     _ttl interval;
+    _r cb_stream_retries;
     _c cb_stream_claims;
     _claimed_pos bigint;
     _last_pos bigint;
@@ -1165,16 +1095,48 @@ BEGIN
     END IF;
     _ttl := coalesce(cb_stream_claim.ttl, _q.claim_ttl);
 
-    ---- Try to adopt an expired claim. ----
-    -- A released claim was handed back on purpose: it is handed out again
-    -- and nothing is counted. Every other expiry is a crash.
-    -- A range below max_crashes is handed out again whole, its crashes
-    -- count one higher. A range that reached max_crashes is quarantined:
-    -- handing it out whole again is pointless, some message in it keeps
-    -- killing consumers. A claim holding one message is quarantined on its
-    -- first crash: that crash points at its message alone, so there is
-    -- nothing left to narrow down. A quarantined claim closes here; from
-    -- then on the count travels on the messages themselves (cb_crash).
+    ---- Serve a due retry row. ----
+    LOOP
+        SELECT r.* INTO _r
+        FROM cb_stream_retries r
+        WHERE r.stream = cb_stream_claim.stream
+          AND r.subscription = cb_stream_claim.subscription
+          AND NOT r.failed
+          AND r.claimable_at <= clock_timestamp()
+        ORDER BY r.claimable_at, r.origin_pos
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED;
+        EXIT WHEN NOT FOUND;
+
+        -- A due row still claimed lost its holder to a crash.
+        IF _r.claimed_by IS NOT NULL THEN
+            IF _r.attempt >= _q.max_attempts THEN
+                PERFORM _cb_stream_give_up(_r, _q.on_fail, 'silence');
+            ELSE
+                UPDATE cb_stream_retries t
+                SET last_error   = 'silence',
+                    claimed_by   = NULL,
+                    claimable_at = clock_timestamp()
+                        + _cb_backoff(_q.backoff_kind, _q.backoff_base, _q.backoff_max, _r.attempt)
+                WHERE (t.stream, t.subscription, t.origin_pos)
+                    = (_r.stream, _r.subscription, _r.origin_pos);
+            END IF;
+            CONTINUE;
+        END IF;
+
+        -- Hand it out as a solo pseudo-claim, minting one try.
+        UPDATE cb_stream_retries t
+        SET attempt      = t.attempt + 1,
+            claimed_by   = cb_stream_claim.consumer,
+            claimable_at = clock_timestamp() + _ttl
+        WHERE (t.stream, t.subscription, t.origin_pos)
+            = (_r.stream, _r.subscription, _r.origin_pos)
+        RETURNING t.origin_pos, t.origin_pos, t.claimable_at
+        INTO from_pos, to_pos, expires_at;
+        RETURN;
+    END LOOP;
+
+    ---- Adopt an expired base claim. ----
     LOOP
         SELECT r.* INTO _c
         FROM cb_stream_claims r
@@ -1187,31 +1149,28 @@ BEGIN
         FOR UPDATE SKIP LOCKED;
         EXIT WHEN NOT FOUND; -- nothing expired, claim a fresh range
 
-        IF NOT _c.released
-           AND (_c.from_pos = _c.to_pos OR _c.crashes >= _q.max_crashes) THEN
-            PERFORM _cb_stream_quarantine(_c);
-
+        IF _c.released THEN
+            -- handed back on purpose: hand the whole range out again, uncharged
             UPDATE cb_stream_claims c
-            SET closed = true
+            SET consumer   = cb_stream_claim.consumer,
+                ttl        = coalesce(cb_stream_claim.ttl, c.ttl),
+                expires_at = clock_timestamp() + coalesce(cb_stream_claim.ttl, c.ttl),
+                released   = false
             WHERE (c.stream, c.subscription, c.from_pos)
-                = (_c.stream, _c.subscription, _c.from_pos);
-
-            PERFORM _cb_stream_advance_closed_position(cb_stream_claim.stream, cb_stream_claim.subscription);
-            CONTINUE;
+                = (_c.stream, _c.subscription, _c.from_pos)
+            RETURNING c.from_pos, c.to_pos, c.expires_at
+            INTO from_pos, to_pos, expires_at;
+            RETURN;
         END IF;
 
-        -- Hand out the whole range with a fresh deadline.
+        -- a crash: turn the range into retry rows and close it
+        PERFORM _cb_stream_retry(_c);
         UPDATE cb_stream_claims c
-        SET consumer   = cb_stream_claim.consumer,
-            ttl        = coalesce(cb_stream_claim.ttl, c.ttl),
-            expires_at = clock_timestamp() + coalesce(cb_stream_claim.ttl, c.ttl),
-            crashes    = c.crashes + CASE WHEN c.released THEN 0 ELSE 1 END,
-            released   = false
+        SET closed = true
         WHERE (c.stream, c.subscription, c.from_pos)
-            = (_c.stream, _c.subscription, _c.from_pos)
-        RETURNING c.from_pos, c.to_pos, c.expires_at
-        INTO from_pos, to_pos, expires_at;
-        RETURN;
+            = (_c.stream, _c.subscription, _c.from_pos);
+        PERFORM _cb_stream_advance_closed_position(cb_stream_claim.stream, cb_stream_claim.subscription);
+        CONTINUE;
     END LOOP;
 
     ---- Claim a fresh range. ----
@@ -1239,7 +1198,7 @@ BEGIN
       AND q.name = cb_stream_claim.subscription;
 
     INSERT INTO cb_stream_claims
-        (stream, subscription, from_pos, to_pos, consumer, ttl, expires_at, crashes)
+        (stream, subscription, from_pos, to_pos, consumer, ttl, expires_at)
     VALUES (
         cb_stream_claim.stream,
         cb_stream_claim.subscription,
@@ -1247,31 +1206,50 @@ BEGIN
         cb_stream_claim.to_pos,
         cb_stream_claim.consumer,
         _ttl,
-        cb_stream_claim.expires_at,
-        0
+        cb_stream_claim.expires_at
     );
 END;
 $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- The messages of a claimed range, in order, honoring the subscription's topic
--- and condition.
+-- The messages of a claim, in order. A base range returns the log's messages
+-- honoring the subscription's topic and condition. A solo retry claim returns
+-- the retry row's own stored copy as one message (id 0, pos = origin_pos); it
+-- must never read the log, because the original message may already be pruned.
+-- A base claim is told apart by an existing claim row at from_pos: a served
+-- retry row never shares a from_pos with a live base claim, since its
+-- origin_pos was claimed and closed well before this claim was handed out.
 CREATE FUNCTION cb_stream_read_claim(stream text, subscription text, from_pos bigint, to_pos bigint)
 RETURNS SETOF cb_stream_messages
-LANGUAGE sql AS $$
-    SELECT m.*
-    FROM cb_stream_messages m
-    JOIN cb_stream_subscriptions q
-      ON q.stream = cb_stream_read_claim.stream
-     AND q.name   = cb_stream_read_claim.subscription
-    WHERE m.stream = cb_stream_read_claim.stream
-      AND m.pos BETWEEN cb_stream_read_claim.from_pos AND cb_stream_read_claim.to_pos
-      AND (q.topic_regex IS NULL OR m.topic ~ q.topic_regex)
-      AND (q.headers_condition IS NULL OR m.headers @@ q.headers_condition)
-      AND (q.payload_condition IS NULL OR m.payload @@ q.payload_condition)
-    ORDER BY m.pos;
-$$;
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cb_stream_claims c
+               WHERE c.stream = cb_stream_read_claim.stream
+                 AND c.subscription = cb_stream_read_claim.subscription
+                 AND c.from_pos = cb_stream_read_claim.from_pos) THEN
+        RETURN QUERY
+        SELECT m.*
+        FROM cb_stream_messages m
+        JOIN cb_stream_subscriptions q
+          ON q.stream = cb_stream_read_claim.stream
+         AND q.name   = cb_stream_read_claim.subscription
+        WHERE m.stream = cb_stream_read_claim.stream
+          AND m.pos BETWEEN cb_stream_read_claim.from_pos AND cb_stream_read_claim.to_pos
+          AND (q.topic_regex IS NULL OR m.topic ~ q.topic_regex)
+          AND (q.headers_condition IS NULL OR m.headers @@ q.headers_condition)
+          AND (q.payload_condition IS NULL OR m.payload @@ q.payload_condition)
+        ORDER BY m.pos;
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    SELECT 0::bigint, r.stream, r.origin_pos, r.topic, r.payload, r.headers, r.created_at
+    FROM cb_stream_retries r
+    WHERE r.stream = cb_stream_read_claim.stream
+      AND r.subscription = cb_stream_read_claim.subscription
+      AND r.origin_pos = cb_stream_read_claim.from_pos;
+END; $$;
 -- +goose statementend
 
 -- +goose statementbegin
@@ -1298,13 +1276,33 @@ BEGIN
       AND c.from_pos = cb_stream_extend_claim.from_pos
       AND NOT c.closed
     RETURNING c.expires_at INTO _expires_at;
+    IF _expires_at IS NOT NULL THEN
+        RETURN _expires_at;
+    END IF;
+
+    -- A solo retry claim: push its lease out. The row carries no ttl of its
+    -- own, so fall back to the subscription's claim_ttl when none is given.
+    UPDATE cb_stream_retries r
+    SET claimable_at = clock_timestamp()
+        + coalesce(cb_stream_extend_claim.ttl,
+                   (SELECT q.claim_ttl FROM cb_stream_subscriptions q
+                    WHERE q.stream = cb_stream_extend_claim.stream
+                      AND q.name   = cb_stream_extend_claim.subscription))
+    WHERE r.stream   = cb_stream_extend_claim.stream
+      AND r.subscription = cb_stream_extend_claim.subscription
+      AND r.origin_pos = cb_stream_extend_claim.from_pos
+      AND r.claimed_by = cb_stream_extend_claim.consumer
+      AND NOT r.failed
+    RETURNING r.claimable_at INTO _expires_at;
     RETURN _expires_at;
 END; $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- The claim expires immediately and is marked released, so the next
--- cb_stream_claim call may adopt it.
+-- Hands a claim back so the next cb_stream_claim may take it. A base claim
+-- expires now and is marked released, so its adoption counts nothing. A solo
+-- retry claim becomes due again and refunds the try minted at hand-out: a
+-- clean handback costs the message nothing.
 CREATE FUNCTION cb_stream_release_claim(
     stream text,
     subscription text,
@@ -1321,6 +1319,19 @@ BEGIN
       AND c.consumer      = cb_stream_release_claim.consumer
       AND c.from_pos = cb_stream_release_claim.from_pos
       AND NOT c.closed;
+    IF FOUND THEN
+        RETURN;
+    END IF;
+
+    UPDATE cb_stream_retries r
+    SET claimed_by   = NULL,
+        claimable_at = clock_timestamp(),
+        attempt      = r.attempt - 1
+    WHERE r.stream   = cb_stream_release_claim.stream
+      AND r.subscription = cb_stream_release_claim.subscription
+      AND r.origin_pos = cb_stream_release_claim.from_pos
+      AND r.claimed_by = cb_stream_release_claim.consumer
+      AND NOT r.failed;
 END; $$;
 -- +goose statementend
 
@@ -1333,18 +1344,26 @@ CREATE FUNCTION cb_stream_close_claim(
 )
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
-    -- Only the current owner may close.
+    -- Only the current owner may close. A base claim closes and lets the
+    -- closed position advance; a solo retry claim is resolved by deleting
+    -- its row, the message finally handled.
     UPDATE cb_stream_claims c SET closed = true
     WHERE c.stream   = cb_stream_close_claim.stream
       AND c.subscription    = cb_stream_close_claim.subscription
       AND c.consumer = cb_stream_close_claim.consumer
       AND c.from_pos = cb_stream_close_claim.from_pos
       AND NOT c.closed;
-    IF NOT FOUND THEN
+    IF FOUND THEN
+        PERFORM _cb_stream_advance_closed_position(cb_stream_close_claim.stream, cb_stream_close_claim.subscription);
         RETURN;
     END IF;
 
-    PERFORM _cb_stream_advance_closed_position(cb_stream_close_claim.stream, cb_stream_close_claim.subscription);
+    DELETE FROM cb_stream_retries r
+    WHERE r.stream   = cb_stream_close_claim.stream
+      AND r.subscription = cb_stream_close_claim.subscription
+      AND r.origin_pos = cb_stream_close_claim.from_pos
+      AND r.claimed_by = cb_stream_close_claim.consumer
+      AND NOT r.failed;
 END; $$;
 -- +goose statementend
 
@@ -1370,76 +1389,95 @@ END; $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- Publish a message to the stream's dead letter stream (sd.<base>).
--- Exactly one of attempts/crashes is set: the report says which kind of
--- failure exhausted the message. Silently does nothing when retention
--- already dropped the message. The deduplication key collapses duplicate
--- reports of the same failure.
-CREATE FUNCTION _cb_stream_dead_letter(
-    stream text,
-    subscription text,
-    pos bigint, -- 'position' is a keyword: legal for columns, not parameters
-    attempts int,
-    crashes int,
-    error text
-)
+-- Gives up on a retry row whose attempts are spent. Under the 'keep' policy
+-- the row is kept as a failed row and the cb_failed channel is rung; under 'delete'
+-- the row is deleted and nothing is kept.
+CREATE FUNCTION _cb_stream_give_up(r cb_stream_retries, on_fail cb_fail_policy, last_error text)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
-    _m cb_stream_messages;
-    _base_name text;
-    _origin_pos bigint;
+    _stream text := _cb_stream_give_up.r.stream;
+    _subscription text := _cb_stream_give_up.r.subscription;
+    _origin_pos bigint := _cb_stream_give_up.r.origin_pos;
 BEGIN
-    SELECT m.* INTO _m FROM cb_stream_messages m
-    WHERE m.stream = _cb_stream_dead_letter.stream
-      AND m.pos    = _cb_stream_dead_letter.pos;
-    IF NOT FOUND THEN
+    IF _cb_stream_give_up.on_fail = 'delete' THEN
+        DELETE FROM cb_stream_retries t
+        WHERE t.stream = _stream AND t.subscription = _subscription AND t.origin_pos = _origin_pos;
         RETURN;
     END IF;
 
-    _base_name := CASE WHEN _cb_stream_dead_letter.stream LIKE '%.%'
-                  THEN split_part(_cb_stream_dead_letter.stream, '.', 2)
-                  ELSE _cb_stream_dead_letter.stream END;
+    UPDATE cb_stream_retries t
+    SET failed       = true,
+        last_error = _cb_stream_give_up.last_error,
+        claimed_by = NULL
+    WHERE t.stream = _stream AND t.subscription = _subscription AND t.origin_pos = _origin_pos;
 
-    _origin_pos := coalesce((_m.headers->>'cb_origin_pos')::bigint,
-        _cb_stream_dead_letter.pos);
-
-    PERFORM _cb_stream_ensure('sd.' || _base_name);
-    PERFORM _cb_stream_publish(
-        'sd.' || _base_name,
-        _m.topic,
-        _m.payload,
-        headers => _m.headers || jsonb_build_object(
-            'cb_origin_pos', _origin_pos,
-            'cb_queue',    _cb_stream_dead_letter.subscription,
-            'cb_error',    _cb_stream_dead_letter.error)
-            || CASE WHEN _cb_stream_dead_letter.attempts IS NOT NULL
-                    THEN jsonb_build_object('cb_attempts', _cb_stream_dead_letter.attempts)
-                    ELSE jsonb_build_object('cb_crashes', _cb_stream_dead_letter.crashes) END,
-        key => _cb_stream_dead_letter.subscription || ':' || _origin_pos || ':dead_letter');
+    PERFORM pg_notify(current_schema || '.cb_failed', _stream || '.' || _subscription);
 END; $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- Reports that a handler could not process a message. Called once per
--- failed message. While attempts remain the message is republished to the
--- subscription's retry stream with a backoff delay; at max_attempts it is moved to
--- the dead letter stream or dropped. A call from a consumer that no longer
--- holds the covering claim does nothing: the new holder runs the message
--- again and reports for itself. Failing a message does not change the
--- claim: it still closes through cb_stream_close_claim.
+-- Reports that a handler could not process a message. Called once per failed
+-- message. The failure becomes, or updates, a retry row: retried with a
+-- backoff while attempts remain, marked failed (or deleted) once they run out.
+-- Three shapes:
+--   * a retry row this consumer holds -> record the verdict, back off or give up
+--   * no retry row -> a base message's first failure: seed a row from it
+--   * a retry row this consumer does not hold -> a zombie's late report, no-op
+-- A base failure whose message is already gone (pruned mid-claim) is a silent
+-- no-op, as is a call from a consumer that no longer holds the covering claim.
+-- Failing does not change the claim: it still closes through cb_stream_close_claim.
 CREATE FUNCTION cb_stream_fail(stream text, subscription text, consumer text, pos bigint, error text)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
-    _m cb_stream_messages;
     _q cb_stream_subscriptions;
-    _base_name text;
-    _retry_stream text;
-    _attempt int;
-    _origin_pos bigint;
+    _r cb_stream_retries;
+    _m cb_stream_messages;
+    _failed boolean;
+    _inserted boolean;
 BEGIN
+    SELECT q.* INTO _q FROM cb_stream_subscriptions q
+    WHERE q.stream = cb_stream_fail.stream AND q.name = cb_stream_fail.subscription;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'catbird: subscription %.% not defined',
+            cb_stream_fail.stream, cb_stream_fail.subscription USING ERRCODE = 'IRD02';
+    END IF;
+
+    ---- A retry row already at this position? ----
+    SELECT r.* INTO _r FROM cb_stream_retries r
+    WHERE r.stream = cb_stream_fail.stream
+      AND r.subscription = cb_stream_fail.subscription
+      AND r.origin_pos = cb_stream_fail.pos
+    FOR UPDATE;
+
+    IF FOUND THEN
+        -- not ours, or already failed: leave it for its real holder
+        IF _r.claimed_by IS DISTINCT FROM cb_stream_fail.consumer OR _r.failed THEN
+            RETURN;
+        END IF;
+
+        IF _r.attempt >= _q.max_attempts THEN
+            PERFORM _cb_stream_give_up(_r, _q.on_fail, cb_stream_fail.error);
+        ELSE
+            UPDATE cb_stream_retries t
+            SET last_error   = cb_stream_fail.error,
+                claimed_by   = NULL,
+                claimable_at = clock_timestamp()
+                    + _cb_backoff(_q.backoff_kind, _q.backoff_base, _q.backoff_max, _r.attempt)
+            WHERE (t.stream, t.subscription, t.origin_pos)
+                = (_r.stream, _r.subscription, _r.origin_pos);
+        END IF;
+        RETURN;
+    END IF;
+
+    ---- No retry row: a base message's first failure. ----
+    -- The caller must still hold the covering claim; once that claim has been
+    -- adopted and closed, a late report finds it closed and no-ops.
+    -- Accepted residue: a consumer whose claim has expired but is not yet
+    -- adopted can still record its verdict here, so a range already recorded as
+    -- retries and resolved elsewhere may gain one late row and be delivered once more.
     PERFORM 1 FROM cb_stream_claims c
     WHERE c.stream   = cb_stream_fail.stream
-      AND c.subscription    = cb_stream_fail.subscription
+      AND c.subscription = cb_stream_fail.subscription
       AND c.consumer = cb_stream_fail.consumer
       AND NOT c.closed
       AND cb_stream_fail.pos BETWEEN c.from_pos AND c.to_pos;
@@ -1450,46 +1488,58 @@ BEGIN
     SELECT m.* INTO _m FROM cb_stream_messages m
     WHERE m.stream = cb_stream_fail.stream AND m.pos = cb_stream_fail.pos;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: message %.% not found',
-            cb_stream_fail.stream, cb_stream_fail.pos USING ERRCODE = 'IRD03';
+        RETURN; -- pruned mid-claim: nothing left to retry
     END IF;
 
-    _base_name := CASE WHEN cb_stream_fail.stream LIKE '%.%'
-                  THEN split_part(cb_stream_fail.stream, '.', 2)
-                  ELSE cb_stream_fail.stream END;
-
-    SELECT q.* INTO _q FROM cb_stream_subscriptions q
-    WHERE q.stream = _base_name AND q.name = cb_stream_fail.subscription;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'catbird: subscription %.% not defined', _base_name, cb_stream_fail.subscription USING ERRCODE = 'IRD02';
-    END IF;
-
-    _attempt := coalesce((_m.headers->>'cb_attempt')::int, 0) + 1;
-    _origin_pos := coalesce((_m.headers->>'cb_origin_pos')::bigint, cb_stream_fail.pos);
-
-    IF _attempt >= _q.max_attempts THEN
-        IF _q.on_fail = 'dead_letter' THEN
-            PERFORM _cb_stream_dead_letter(cb_stream_fail.stream, cb_stream_fail.subscription,
-                cb_stream_fail.pos, _attempt, NULL, cb_stream_fail.error);
-        END IF;
+    -- The base delivery was attempt 1. One-strike (max_attempts = 1) exhausts
+    -- it now: the 'keep' policy keeps a failed row, 'delete' keeps nothing.
+    _failed := _q.max_attempts <= 1;
+    IF _failed AND _q.on_fail = 'delete' THEN
         RETURN;
     END IF;
 
-    _retry_stream := 'sr.' || _base_name || '.' || cb_stream_fail.subscription;
+    INSERT INTO cb_stream_retries
+        (stream, subscription, origin_pos, topic, payload, headers,
+         attempt, last_error, failed, claimable_at)
+    VALUES (
+        cb_stream_fail.stream, cb_stream_fail.subscription, cb_stream_fail.pos,
+        _m.topic, _m.payload, _m.headers,
+        1, cb_stream_fail.error, _failed,
+        CASE WHEN _failed THEN clock_timestamp()
+             ELSE clock_timestamp() + _cb_backoff(_q.backoff_kind, _q.backoff_base, _q.backoff_max, 1) END
+    )
+    -- a concurrent crash may have recorded a silence row first: keep it
+    ON CONFLICT ON CONSTRAINT cb_stream_retries_pkey DO NOTHING
+    RETURNING true INTO _inserted;
 
-    -- the retry stream exists by declaration: cb_stream_ensure_subscription birthed it
-    PERFORM _cb_stream_publish(
-        _retry_stream,
-        _m.topic,
-        _m.payload,
-        key => cb_stream_fail.subscription || ':' || _origin_pos || ':a' || _attempt,
-        headers => _m.headers || jsonb_build_object(
-            'cb_attempt',         _attempt,
-            'cb_origin_pos', _origin_pos,
-            'cb_error',           cb_stream_fail.error),
-        delay => _cb_backoff(_q.backoff_kind, _q.backoff_base, _q.backoff_max, _attempt));
+    IF _failed AND coalesce(_inserted, false) THEN
+        PERFORM pg_notify(current_schema || '.cb_failed',
+            cb_stream_fail.stream || '.' || cb_stream_fail.subscription);
+    END IF;
 END;
 $$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- Retry every failed row of a subscription: reset each to a fresh, due retry
+-- with its full attempt budget. Returns how many rows were revived.
+CREATE FUNCTION cb_stream_retry_failed(stream text, subscription text)
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+    _n bigint;
+BEGIN
+    UPDATE cb_stream_retries r
+    SET failed         = false,
+        attempt      = 0,
+        last_error   = NULL,
+        claimed_by   = NULL,
+        claimable_at = clock_timestamp()
+    WHERE r.stream = cb_stream_retry_failed.stream
+      AND r.subscription = cb_stream_retry_failed.subscription
+      AND r.failed;
+    GET DIAGNOSTICS _n = ROW_COUNT;
+    RETURN _n;
+END; $$;
 -- +goose statementend
 
 -- +goose down
@@ -1502,26 +1552,26 @@ DROP FUNCTION cb_stream_define_schedule(text, text, interval, text, jsonb, jsonb
 DROP TABLE cb_stream_schedules;
 DROP TYPE cb_catch_up_policy;
 
+DROP FUNCTION cb_stream_retry_failed(text, text);
 DROP FUNCTION cb_stream_fail(text, text, text, bigint, text);
-DROP FUNCTION _cb_stream_dead_letter(text, text, bigint, int, int, text);
+DROP FUNCTION _cb_stream_give_up(cb_stream_retries, cb_fail_policy, text);
 DROP FUNCTION _cb_backoff(cb_backoff_kind, interval, interval, int);
 DROP FUNCTION cb_stream_close_claim(text, text, text, bigint);
 DROP FUNCTION _cb_stream_advance_closed_position(text, text);
 DROP FUNCTION cb_stream_release_claim(text, text, text, bigint);
 DROP FUNCTION cb_stream_extend_claim(text, text, text, bigint, interval);
 DROP FUNCTION cb_stream_claim(text, text, text, interval);
-DROP FUNCTION _cb_stream_quarantine(cb_stream_claims);
-DROP FUNCTION cb_stream_ensure_subscription(text, text, bigint, interval, int, cb_backoff_kind, interval, interval, cb_fail_policy, int, int, text, text);
+DROP FUNCTION _cb_stream_retry(cb_stream_claims);
+DROP FUNCTION cb_stream_ensure_subscription(text, text, bigint, interval, int, cb_backoff_kind, interval, interval, cb_fail_policy, int, text, text);
 DROP FUNCTION cb_stream_ensure_cursor(text, text, bigint, text, text);
 DROP FUNCTION cb_stream_read_claim(text, text, bigint, bigint);
 DROP FUNCTION cb_stream_read(text, text, int);
+DROP TABLE cb_stream_retries;
 DROP TABLE cb_stream_claims;
 DROP TABLE cb_stream_subscriptions;
 DROP FUNCTION cb_stream_publish_messages(text, jsonb);
 DROP FUNCTION cb_stream_publish(text, text, jsonb, jsonb, text, interval, timestamptz);
-DROP FUNCTION _cb_stream_publish(text, text, jsonb, jsonb, text, interval, timestamptz);
 DROP FUNCTION cb_stream_ensure(text, interval);
-DROP FUNCTION _cb_stream_ensure(text, interval);
 DROP FUNCTION _cb_stream_ensure_partition(text);
 DROP FUNCTION _cb_stream_deliver_pending(int);
 DROP FUNCTION _cb_stream_assign_positions(text, int);

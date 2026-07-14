@@ -50,10 +50,9 @@ func setupTest(t *testing.T) *pgxpool.Pool {
 			panic(err)
 		}
 		// test.sh recreates cb_tst per run, but bare go test reuses it:
-		// drop this suite's streams — including the retry and dead letter
-		// streams failures spawn from them — so positions start from scratch.
-		if _, err := testPool.Exec(ctx, `DELETE FROM cb_streams
-			WHERE name LIKE 'go\_%' OR name LIKE 'sr.go\_%' OR name LIKE 'sd.go\_%'`); err != nil {
+		// drop this suite's streams (their subscriptions, claims and retry
+		// rows cascade) so positions start from scratch.
+		if _, err := testPool.Exec(ctx, `DELETE FROM cb_streams WHERE name LIKE 'go\_%'`); err != nil {
 			panic(err)
 		}
 	})
@@ -96,7 +95,7 @@ func checkClaims(t *testing.T, ctx context.Context, pool *pgxpool.Pool, stream, 
 	}
 
 	rows, err := pool.Query(ctx,
-		`SELECT from_pos, to_pos, crashes FROM cb_stream_claims
+		`SELECT from_pos, to_pos FROM cb_stream_claims
 		 WHERE stream = $1 AND subscription = $2 ORDER BY from_pos`,
 		stream, subscription)
 	if err != nil {
@@ -106,15 +105,11 @@ func checkClaims(t *testing.T, ctx context.Context, pool *pgxpool.Pool, stream, 
 	expected := closedPos + 1
 	for rows.Next() {
 		var fromPos, toPos int64
-		var crashes int
-		if err := rows.Scan(&fromPos, &toPos, &crashes); err != nil {
+		if err := rows.Scan(&fromPos, &toPos); err != nil {
 			t.Fatal(err)
 		}
 		if fromPos != expected {
 			t.Fatalf("tiling broken: claim starts at %d, expected %d", fromPos, expected)
-		}
-		if crashes < 0 {
-			t.Fatal("negative crash count")
 		}
 		expected = toPos + 1
 	}
@@ -498,13 +493,23 @@ func TestConsumeSubscription(t *testing.T) {
 	}
 	mu.Unlock()
 
-	var retried int
-	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM cb_stream_messages WHERE stream = 'sr.go_cq.m'`).Scan(&retried); err != nil {
-		t.Fatal(err)
+	// "3" failed first and succeeded on retry (the counts prove it): its retry
+	// row is resolved and gone once the handler that re-ran it closed its claim
+	retryRows := func(stream, subscription string) (n int) {
+		t.Helper()
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM cb_stream_retries WHERE stream = $1 AND subscription = $2`,
+			stream, subscription).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
 	}
-	if retried != 1 {
-		t.Fatalf("retry stream holds %d messages, want 1", retried)
+	retryDeadline := time.Now().Add(5 * time.Second)
+	for retryRows("go_cq", "m") != 0 {
+		if time.Now().After(retryDeadline) {
+			t.Fatalf("retry rows = %d after draining, want 0", retryRows("go_cq", "m"))
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 
 	// the base subscription drains: closed_pos reaches the tail
@@ -532,7 +537,7 @@ func TestConsumeSubscription(t *testing.T) {
 		t.Fatalf("jobs returned %v, want context.Canceled", err)
 	}
 
-	// adoption: a dead consumer's claim expires and another consumer takes it
+	// adoption: a failed consumer's claim expires and another consumer takes it
 	if err := EnsureSubscription(ctx, pool, "go_cq", "adopt", SubscriptionOpts{StartPos: At(0)}); err != nil {
 		t.Fatal(err)
 	}
@@ -542,7 +547,7 @@ func TestConsumeSubscription(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx,
-		`SELECT cb_stream_claim('go_cq', 'adopt', 'dead')`); err != nil {
+		`SELECT cb_stream_claim('go_cq', 'adopt', 'failed')`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -694,29 +699,26 @@ func TestEnsureSubscription(t *testing.T) {
 		StartPos:    At(0),
 		MaxAttempts: 5,
 		BackoffKind: BackoffFixed,
-		OnFail:      FailDrop,
+		OnFail:      FailDelete,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	var claimTTL, backoffKind, onFail string
-	var maxAttempts, maxCrashes int
+	var maxAttempts int
 	row := func() {
 		t.Helper()
 		if err := pool.QueryRow(ctx, `
-			SELECT claim_ttl::text, max_attempts, max_crashes, backoff_kind::text, on_fail::text
+			SELECT claim_ttl::text, max_attempts, backoff_kind::text, on_fail::text
 			FROM cb_stream_subscriptions WHERE stream = 'go_q' AND name = 'mailer'`,
-		).Scan(&claimTTL, &maxAttempts, &maxCrashes, &backoffKind, &onFail); err != nil {
+		).Scan(&claimTTL, &maxAttempts, &backoffKind, &onFail); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	row()
-	if claimTTL != "00:00:30" || maxAttempts != 5 || backoffKind != "fixed" || onFail != "drop" {
+	if claimTTL != "00:00:30" || maxAttempts != 5 || backoffKind != "fixed" || onFail != "delete" {
 		t.Fatalf("subscription = %s %d %s %s", claimTTL, maxAttempts, backoffKind, onFail)
-	}
-	if maxCrashes != 3 { // engine mechanics: always the default at birth
-		t.Fatalf("max_crashes = %d, want the default 3", maxCrashes)
 	}
 
 	// ensure is birth-only: an existing subscription is never modified
@@ -724,36 +726,8 @@ func TestEnsureSubscription(t *testing.T) {
 		t.Fatal(err)
 	}
 	row()
-	if maxCrashes != 3 || maxAttempts != 5 || backoffKind != "fixed" {
-		t.Fatalf("subscription after re-ensure = %d %d %s, want unchanged", maxCrashes, maxAttempts, backoffKind)
-	}
-
-	// declaring the subscription declared its retry route: bounded history, the
-	// subscription's stored terms copied, one message per claim
-	var retryBounded bool
-	if err := pool.QueryRow(ctx,
-		`SELECT retention = interval '7 days' FROM cb_streams WHERE name = 'sr.go_q.mailer'`).Scan(&retryBounded); err != nil {
-		t.Fatal(err)
-	}
-	if !retryBounded {
-		t.Fatal("retry stream not born with the subscription, or with the wrong retention")
-	}
-	var retryBatch int
-	var retryTTL, retryOnFail string
-	if err := pool.QueryRow(ctx, `SELECT claim_batch_size, claim_ttl::text, on_fail::text
-		FROM cb_stream_subscriptions WHERE stream = 'sr.go_q.mailer' AND name = 'mailer'`,
-	).Scan(&retryBatch, &retryTTL, &retryOnFail); err != nil {
-		t.Fatal(err)
-	}
-	if retryBatch != 1 || retryTTL != "00:00:30" || retryOnFail != "drop" {
-		t.Fatalf("retry subscription row = batch %d, ttl %s, on_fail %s; want 1, the parent's ttl and policy",
-			retryBatch, retryTTL, retryOnFail)
-	}
-
-	// solo attribution is a constraint, not a convention
-	if _, err := pool.Exec(ctx,
-		`UPDATE cb_stream_subscriptions SET claim_batch_size = 5 WHERE stream = 'sr.go_q.mailer'`); err == nil {
-		t.Fatal("a retry subscription accepted a claim batch above 1")
+	if maxAttempts != 5 || backoffKind != "fixed" {
+		t.Fatalf("subscription after re-ensure = %d %s, want unchanged", maxAttempts, backoffKind)
 	}
 
 	// batch size is subscription policy, born at ensure
@@ -776,7 +750,7 @@ func TestEnsureSubscription(t *testing.T) {
 }
 
 // the loop owns the clock: a handler slower than the claim ttl keeps its
-// claim through extension — processed once, nothing quarantined
+// claim through extension — processed once, nothing retried
 func TestConsumeSubscriptionSlowHandler(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
@@ -836,15 +810,14 @@ func TestConsumeSubscriptionSlowHandler(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	var quarantined int
-	if err := pool.QueryRow(ctx, `SELECT
-		(SELECT count(*) FROM cb_stream_pending WHERE stream = 'sr.go_slow.s')
-		+ (SELECT count(*) FROM cb_stream_messages WHERE stream = 'sr.go_slow.s')`,
-	).Scan(&quarantined); err != nil {
+	var retried int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM cb_stream_retries WHERE stream = 'go_slow' AND subscription = 's'`,
+	).Scan(&retried); err != nil {
 		t.Fatal(err)
 	}
-	if quarantined != 0 {
-		t.Fatalf("%d copies reached the retry stream, want none", quarantined)
+	if retried != 0 {
+		t.Fatalf("%d retry rows appeared, want none", retried)
 	}
 
 	cancel()
@@ -990,8 +963,8 @@ func TestClaims(t *testing.T) {
 	}
 }
 
-// fail: retry stream, duplicate fail, exhaustion to the dead letter stream,
-// drop policy
+// fail: a base failure seeds one retry row, a duplicate collapses into it,
+// exhaustion gives up on it as a failed row, delete keeps nothing, a zombie is a no-op
 func TestFail(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
@@ -1014,104 +987,85 @@ func TestFail(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	retryRow := func(stream, subscription string, originPos int64) (attempt int, lastError string, failed, found bool) {
+		t.Helper()
+		err := pool.QueryRow(ctx,
+			`SELECT attempt, coalesce(last_error, ''), failed FROM cb_stream_retries
+			 WHERE stream = $1 AND subscription = $2 AND origin_pos = $3`,
+			stream, subscription, originPos).Scan(&attempt, &lastError, &failed)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, "", false, false
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return attempt, lastError, failed, true
+	}
+	rowCount := func(stream string) (n int) {
+		t.Helper()
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM cb_stream_retries WHERE stream = $1`, stream).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
 	if from, to, ok := claimRange(t, ctx, pool, "go_fail", "payer", "c1"); !ok || from != 1 || to != 1 {
 		t.Fatalf("claim = %d..%d, %v, want 1..1", from, to, ok)
 	}
-	// a duplicate fail for the same message collapses into one retry
+	// a base message's first failure seeds one retry row (attempt 1); a
+	// duplicate fail by the same base holder collapses into it
 	for range 2 {
 		if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('go_fail', 'payer', 'c1', 1, 'boom')`); err != nil {
 			t.Fatal(err)
 		}
 	}
-	var pending int
-	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM cb_stream_pending WHERE stream = 'sr.go_fail.payer'`).Scan(&pending); err != nil {
-		t.Fatal(err)
+	if a, e, failed, ok := retryRow("go_fail", "payer", 1); !ok || a != 1 || e != "boom" || failed {
+		t.Fatalf("retry row = attempt %d, err %q, failed %v, found %v; want 1, boom, false", a, e, failed, ok)
 	}
-	if pending != 1 {
-		t.Fatalf("retry stream holds %d pending messages, want 1", pending)
+	if n := rowCount("go_fail"); n != 1 {
+		t.Fatalf("a duplicate fail made %d rows, want 1", n)
 	}
 	if _, err := pool.Exec(ctx, `SELECT cb_stream_close_claim('go_fail', 'payer', 'c1', 1)`); err != nil {
 		t.Fatal(err)
 	}
 
-	// the backoff delay passes and the retry counts its attempt
-	time.Sleep(50 * time.Millisecond)
-	if _, err := pool.Exec(ctx, `SELECT _cb_stream_deliver_pending()`); err != nil {
-		t.Fatal(err)
+	// after the backoff the row is handed out solo, minting its second try
+	time.Sleep(20 * time.Millisecond)
+	if from, to, ok := claimRange(t, ctx, pool, "go_fail", "payer", "c2"); !ok || from != 1 || to != 1 {
+		t.Fatalf("retry claim = %d..%d, %v, want the solo 1..1", from, to, ok)
 	}
-	if _, err := pool.Exec(ctx, `SELECT _cb_stream_assign_positions('sr.go_fail.payer')`); err != nil {
-		t.Fatal(err)
-	}
-	var attempt string
-	if err := pool.QueryRow(ctx,
-		`SELECT headers->>'cb_attempt' FROM cb_stream_messages WHERE stream = 'sr.go_fail.payer'`).Scan(&attempt); err != nil {
-		t.Fatal(err)
-	}
-	if attempt != "1" {
-		t.Fatalf("cb_attempt = %s, want 1", attempt)
+	if a, _, _, _ := retryRow("go_fail", "payer", 1); a != 2 {
+		t.Fatalf("attempt = %d after hand-out, want 2", a)
 	}
 
-	// the second failure exhausts max_attempts: the message is archived with
-	// its origin, not retried again
-	if from, to, ok := claimRange(t, ctx, pool, "sr.go_fail.payer", "payer", "c1"); !ok || from != 1 || to != 1 {
-		t.Fatalf("retry claim = %d..%d, %v, want 1..1", from, to, ok)
-	}
-	if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('sr.go_fail.payer', 'payer', 'c1', 1, 'boom again')`); err != nil {
+	// failing at max_attempts gives up: the row is marked failed with its last verdict
+	if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('go_fail', 'payer', 'c2', 1, 'boom again')`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `SELECT cb_stream_close_claim('sr.go_fail.payer', 'payer', 'c1', 1)`); err != nil {
-		t.Fatal(err)
+	if a, e, failed, ok := retryRow("go_fail", "payer", 1); !ok || !failed || e != "boom again" {
+		t.Fatalf("retry row = attempt %d, err %q, failed %v; want a failed row with the last verdict", a, e, failed)
 	}
-	var dead int
-	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM cb_stream_messages WHERE stream = 'sd.go_fail'`).Scan(&dead); err != nil {
-		t.Fatal(err)
-	}
-	if dead != 1 {
-		t.Fatalf("dead letter stream holds %d messages, want 1", dead)
-	}
-	var originPos, attempts string
-	if err := pool.QueryRow(ctx,
-		`SELECT headers->>'cb_origin_pos', headers->>'cb_attempts'
-		 FROM cb_stream_messages WHERE stream = 'sd.go_fail'`).Scan(&originPos, &attempts); err != nil {
-		t.Fatal(err)
-	}
-	if originPos != "1" {
-		t.Fatalf("cb_origin_pos = %s, want 1", originPos)
-	}
-	// the report names the kind of failure that exhausted the message
-	if attempts != "2" {
-		t.Fatalf("cb_attempts = %s, want 2", attempts)
+	if n := rowCount("go_fail"); n != 1 {
+		t.Fatalf("go_fail holds %d retry rows, want 1", n)
 	}
 
-	// auto-created stream retention: retries are handled history and kept a
-	// bounded while, dead letters have not been handled and stay forever
-	var retryBounded bool
-	if err := pool.QueryRow(ctx,
-		`SELECT retention = interval '7 days' FROM cb_streams WHERE name = 'sr.go_fail.payer'`).Scan(&retryBounded); err != nil {
+	// a superseded consumer's late report on the failed row is a silent no-op
+	if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('go_fail', 'payer', 'zombie', 1, 'late')`); err != nil {
 		t.Fatal(err)
 	}
-	if !retryBounded {
-		t.Fatal("retry stream retention should default to 7 days")
-	}
-	var forever bool
-	if err := pool.QueryRow(ctx,
-		`SELECT retention = cb_forever() FROM cb_streams WHERE name = 'sd.go_fail'`).Scan(&forever); err != nil {
-		t.Fatal(err)
-	}
-	if !forever {
-		t.Fatal("dead letter stream should keep forever")
+	if _, e, failed, _ := retryRow("go_fail", "payer", 1); !failed || e != "boom again" {
+		t.Fatalf("failed row changed after a zombie report: err %q, failed %v", e, failed)
 	}
 
-	// on_fail = 'drop': retries stop and nothing is archived
+	// on_fail = 'delete' with a one-strike budget: the failure keeps nothing
 	if err := Ensure(ctx, pool, "go_drop"); err != nil {
 		t.Fatal(err)
 	}
 	if err := EnsureSubscription(ctx, pool, "go_drop", "binman", SubscriptionOpts{
 		StartPos:    At(0),
 		MaxAttempts: 1,
-		OnFail:      FailDrop,
+		OnFail:      FailDelete,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1127,39 +1081,14 @@ func TestFail(t *testing.T) {
 	if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('go_drop', 'binman', 'c1', 1, 'nope')`); err != nil {
 		t.Fatal(err)
 	}
-	// the subscription and its declared retry route exist; drop archived nothing
-	var streams, deadStreams int
-	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM cb_streams WHERE name LIKE '%go\_drop%'`).Scan(&streams); err != nil {
-		t.Fatal(err)
-	}
-	if streams != 2 {
-		t.Fatalf("found %d go_drop streams, want the base and its retry stream", streams)
-	}
-	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM cb_streams WHERE name = 'sd.go_drop'`).Scan(&deadStreams); err != nil {
-		t.Fatal(err)
-	}
-	if deadStreams != 0 {
-		t.Fatal("drop policy created a dead letter stream")
-	}
-
-	// a superseded consumer's report is a silent no-op
-	if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('go_fail', 'payer', 'zombie', 1, 'late')`); err != nil {
-		t.Fatal(err)
-	}
-	var pendingAfter int
-	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM cb_stream_pending WHERE stream = 'sr.go_fail.payer'`).Scan(&pendingAfter); err != nil {
-		t.Fatal(err)
-	}
-	if pendingAfter != 0 {
-		t.Fatalf("a fenced fail published %d retries, want none", pendingAfter)
+	if n := rowCount("go_drop"); n != 0 {
+		t.Fatalf("drop kept %d retry rows, want none", n)
 	}
 }
 
-// the quarantine: whole-range redelivery below the crash limit, republish
-// to the retry stream at it, releases never count, solo crashers convict
+// crash handling: a crashed range becomes silence retry rows (attempt 0), a
+// release refunds the try a hand-out minted, and repeated crashes give up on the
+// row to a failed silence row at max_attempts
 func TestQuarantine(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
@@ -1167,16 +1096,12 @@ func TestQuarantine(t *testing.T) {
 	if err := Ensure(ctx, pool, "go_ladder"); err != nil {
 		t.Fatal(err)
 	}
-	// no backoff, so quarantined copies are deliverable immediately
+	// no backoff, so a repaired retry row is due again at once
 	if err := EnsureSubscription(ctx, pool, "go_ladder", "runner", SubscriptionOpts{
 		StartPos:    At(0),
+		MaxAttempts: 2,
 		BackoffKind: BackoffNone,
 	}); err != nil {
-		t.Fatal(err)
-	}
-	// one whole redelivery before quarantine, tuned on the row
-	if _, err := pool.Exec(ctx, `UPDATE cb_stream_subscriptions SET max_crashes = 1
-		WHERE stream = 'go_ladder' AND name = 'runner'`); err != nil {
 		t.Fatal(err)
 	}
 	for i := 1; i <= 3; i++ {
@@ -1189,29 +1114,39 @@ func TestQuarantine(t *testing.T) {
 	}
 
 	// a crashed consumer leaves its claim to run out; force that instantly
-	expire := func(stream string, fromPos int64) {
+	expireClaim := func(fromPos int64) {
 		t.Helper()
 		if _, err := pool.Exec(ctx, `UPDATE cb_stream_claims SET expires_at = clock_timestamp()
-			WHERE stream = $1 AND from_pos = $2`, stream, fromPos); err != nil {
+			WHERE stream = 'go_ladder' AND from_pos = $1`, fromPos); err != nil {
 			t.Fatal(err)
 		}
 	}
+	// a crashed solo retry claim: its lease (claimable_at) lapses
+	expireLease := func(originPos int64) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `UPDATE cb_stream_retries SET claimable_at = clock_timestamp()
+			WHERE stream = 'go_ladder' AND origin_pos = $1`, originPos); err != nil {
+			t.Fatal(err)
+		}
+	}
+	attemptOf := func(originPos int64) (a int) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `SELECT attempt FROM cb_stream_retries
+			WHERE stream = 'go_ladder' AND origin_pos = $1`, originPos).Scan(&a); err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
 
-	// fresh claim, then one whole-range redelivery (crash 1 = the limit)
+	// c1 claims the whole range, then crashes: the next claim records it as retries
 	if from, to, ok := claimRange(t, ctx, pool, "go_ladder", "runner", "c1"); !ok || from != 1 || to != 3 {
 		t.Fatalf("claim = %d..%d, %v, want 1..3", from, to, ok)
 	}
-	expire("go_ladder", 1)
-	if from, to, ok := claimRange(t, ctx, pool, "go_ladder", "runner", "c2"); !ok || from != 1 || to != 3 {
-		t.Fatalf("claim = %d..%d, %v, want the whole 1..3 redelivered", from, to, ok)
+	expireClaim(1)
+	if _, _, ok := claimRange(t, ctx, pool, "go_ladder", "runner", "c2"); ok {
+		t.Fatal("expected nothing on the call that records the crashed range as retries")
 	}
 	checkClaims(t, ctx, pool, "go_ladder", "runner")
-
-	// at the limit the range moves to the retry stream, one copy per message
-	expire("go_ladder", 1)
-	if from, to, ok := claimRange(t, ctx, pool, "go_ladder", "runner", "c3"); ok {
-		t.Fatalf("claim = %d..%d, want nothing: the range was quarantined", from, to)
-	}
 	var closedPos int64
 	if err := pool.QueryRow(ctx,
 		`SELECT closed_pos FROM cb_stream_subscriptions WHERE stream = 'go_ladder' AND name = 'runner'`).Scan(&closedPos); err != nil {
@@ -1220,71 +1155,66 @@ func TestQuarantine(t *testing.T) {
 	if closedPos != 3 {
 		t.Fatalf("closed_pos = %d, want 3", closedPos)
 	}
-	checkClaims(t, ctx, pool, "go_ladder", "runner")
 
-	// the copies carry their crash count and become claimable
-	if _, err := pool.Exec(ctx, `SELECT _cb_stream_deliver_pending()`); err != nil {
+	// three silence rows, one per message, attempt 0 and due
+	var silence int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM cb_stream_retries
+		WHERE stream = 'go_ladder' AND attempt = 0 AND last_error = 'silence' AND NOT failed`).Scan(&silence); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `SELECT _cb_stream_assign_positions('sr.go_ladder.runner')`); err != nil {
-		t.Fatal(err)
-	}
-	var quarantined int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM cb_stream_messages
-		WHERE stream = 'sr.go_ladder.runner' AND headers->>'cb_crash' = '1'`).Scan(&quarantined); err != nil {
-		t.Fatal(err)
-	}
-	if quarantined != 3 {
-		t.Fatalf("%d quarantined copies with cb_crash 1, want 3", quarantined)
+	if silence != 3 {
+		t.Fatalf("%d silence rows, want 3", silence)
 	}
 
-	// a release is a handback, never a crash: the count stays put
-	if from, to, ok := claimRange(t, ctx, pool, "sr.go_ladder.runner", "runner", "c4"); !ok || from != 1 || to != 1 {
+	// isolate row 1 for the lifecycle below; park the others out of the way
+	if _, err := pool.Exec(ctx, `UPDATE cb_stream_retries SET claimable_at = clock_timestamp() + interval '1 hour'
+		WHERE stream = 'go_ladder' AND origin_pos <> 1`); err != nil {
+		t.Fatal(err)
+	}
+
+	// a release hands the solo claim back uncharged: the minted try is refunded
+	if from, to, ok := claimRange(t, ctx, pool, "go_ladder", "runner", "c3"); !ok || from != 1 || to != 1 {
 		t.Fatalf("claim = %d..%d, %v, want the solo 1..1", from, to, ok)
 	}
-	if _, err := pool.Exec(ctx,
-		`SELECT cb_stream_release_claim('sr.go_ladder.runner', 'runner', 'c4', 1)`); err != nil {
+	if a := attemptOf(1); a != 1 {
+		t.Fatalf("attempt = %d after hand-out, want 1", a)
+	}
+	if _, err := pool.Exec(ctx, `SELECT cb_stream_release_claim('go_ladder', 'runner', 'c3', 1)`); err != nil {
 		t.Fatal(err)
 	}
-	if from, to, ok := claimRange(t, ctx, pool, "sr.go_ladder.runner", "runner", "c5"); !ok || from != 1 || to != 1 {
-		t.Fatalf("claim = %d..%d, %v, want the released 1..1 back", from, to, ok)
-	}
-	var crashes int
-	if err := pool.QueryRow(ctx, `SELECT crashes FROM cb_stream_claims
-		WHERE stream = 'sr.go_ladder.runner' AND from_pos = 1`).Scan(&crashes); err != nil {
-		t.Fatal(err)
-	}
-	if crashes != 0 {
-		t.Fatalf("crashes = %d after a release, want 0", crashes)
+	if a := attemptOf(1); a != 0 {
+		t.Fatalf("attempt = %d after release, want the try refunded to 0", a)
 	}
 
-	// a solo claim's true expiry convicts: past the allowance the message is
-	// archived with a crash report
-	expire("sr.go_ladder.runner", 1)
-	if from, to, ok := claimRange(t, ctx, pool, "sr.go_ladder.runner", "runner", "c6"); !ok || from != 2 || to != 2 {
-		t.Fatalf("claim = %d..%d, %v, want the next solo 2..2", from, to, ok)
+	// hand it out again (try 1), crash it, and let the next claim repair and
+	// re-hand it (try 2 = max_attempts)
+	if from, to, ok := claimRange(t, ctx, pool, "go_ladder", "runner", "c4"); !ok || from != 1 || to != 1 {
+		t.Fatalf("claim = %d..%d, %v, want 1..1 again", from, to, ok)
 	}
-	checkClaims(t, ctx, pool, "sr.go_ladder.runner", "runner")
-	var deadCount int
-	var crashesHeader, errHeader string
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM cb_stream_messages
-		WHERE stream = 'sd.go_ladder'`).Scan(&deadCount); err != nil {
+	expireLease(1)
+	if from, to, ok := claimRange(t, ctx, pool, "go_ladder", "runner", "c5"); !ok || from != 1 || to != 1 {
+		t.Fatalf("claim = %d..%d, %v, want the repaired 1..1", from, to, ok)
+	}
+	if a := attemptOf(1); a != 2 {
+		t.Fatalf("attempt = %d, want 2", a)
+	}
+
+	// crash once more: at attempt 2 = max_attempts the next claim gives up
+	expireLease(1)
+	claimRange(t, ctx, pool, "go_ladder", "runner", "c6") // gives up on row 1 while repairing
+	var failed bool
+	var lastErr string
+	if err := pool.QueryRow(ctx, `SELECT failed, coalesce(last_error, '') FROM cb_stream_retries
+		WHERE stream = 'go_ladder' AND origin_pos = 1`).Scan(&failed, &lastErr); err != nil {
 		t.Fatal(err)
 	}
-	if deadCount != 1 {
-		t.Fatalf("dead letter stream holds %d messages, want the solo crasher", deadCount)
-	}
-	if err := pool.QueryRow(ctx, `SELECT headers->>'cb_crashes', headers->>'cb_error'
-		FROM cb_stream_messages WHERE stream = 'sd.go_ladder'`).Scan(&crashesHeader, &errHeader); err != nil {
-		t.Fatal(err)
-	}
-	if crashesHeader != "2" || errHeader != "crash limit reached" {
-		t.Fatalf("dead letter report = cb_crashes %s, cb_error %q", crashesHeader, errHeader)
+	if !failed || lastErr != "silence" {
+		t.Fatalf("row 1 = failed %v, last_error %q; want a failed silence row", failed, lastErr)
 	}
 }
 
-// a failure the dead consumer already reported is not quarantined twice:
-// its retry copy carries the message from there
+// a message the consumer already failed keeps its verdict row when the range
+// is later recorded as retries: the crash's silence does not overwrite the verdict
 func TestFailThenQuarantine(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
@@ -1292,15 +1222,14 @@ func TestFailThenQuarantine(t *testing.T) {
 	if err := Ensure(ctx, pool, "go_fq"); err != nil {
 		t.Fatal(err)
 	}
+	// a long backoff keeps the verdict row out of the way (not due), so the
+	// next claim reaches the crash-recording stage instead of serving that row
 	if err := EnsureSubscription(ctx, pool, "go_fq", "q", SubscriptionOpts{
 		StartPos:    At(0),
 		MaxAttempts: 3,
-		BackoffKind: BackoffNone,
+		BackoffKind: BackoffFixed,
+		BackoffBase: time.Hour,
 	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE cb_stream_subscriptions SET max_crashes = 1
-		WHERE stream = 'go_fq' AND name = 'q'`); err != nil {
 		t.Fatal(err)
 	}
 	for i := 1; i <= 2; i++ {
@@ -1315,52 +1244,38 @@ func TestFailThenQuarantine(t *testing.T) {
 	if from, to, ok := claimRange(t, ctx, pool, "go_fq", "q", "c1"); !ok || from != 1 || to != 2 {
 		t.Fatalf("claim = %d..%d, %v, want 1..2", from, to, ok)
 	}
+	// message 1 gets a verdict; message 2 is left to crash with the range
 	if _, err := pool.Exec(ctx, `SELECT cb_stream_fail('go_fq', 'q', 'c1', 1, 'boom')`); err != nil {
 		t.Fatal(err)
 	}
-
-	expire := func() {
-		t.Helper()
-		if _, err := pool.Exec(ctx, `UPDATE cb_stream_claims SET expires_at = clock_timestamp()
-			WHERE stream = 'go_fq'`); err != nil {
-			t.Fatal(err)
-		}
-	}
-	expire()
-	if from, to, ok := claimRange(t, ctx, pool, "go_fq", "q", "c2"); !ok || from != 1 || to != 2 {
-		t.Fatalf("claim = %d..%d, %v, want the whole 1..2 redelivered", from, to, ok)
-	}
-	expire()
-	if from, to, ok := claimRange(t, ctx, pool, "go_fq", "q", "c3"); ok {
-		t.Fatalf("claim = %d..%d, want nothing: the range was quarantined", from, to)
-	}
-
-	// message 1 kept its reported-failure copy; message 2 got a crash copy
-	keyCount := func(key string) (n int) {
-		t.Helper()
-		if err := pool.QueryRow(ctx, `SELECT count(*) FROM cb_stream_keys
-			WHERE stream = 'sr.go_fq.q' AND key = $1`, key).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		return n
-	}
-	if n := keyCount("q:1:a1"); n != 1 {
-		t.Fatal("the reported failure's retry copy is gone")
-	}
-	if n := keyCount("q:1:c1"); n != 0 {
-		t.Fatal("quarantine minted a second copy for a reported failure")
-	}
-	if n := keyCount("q:2:c1"); n != 1 {
-		t.Fatal("the crashed message got no quarantine copy")
-	}
-	// no backoff means both copies appended immediately, skipping pending
-	var copies int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM cb_stream_messages
-		WHERE stream = 'sr.go_fq.q'`).Scan(&copies); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE cb_stream_claims SET expires_at = clock_timestamp() WHERE stream = 'go_fq'`); err != nil {
 		t.Fatal(err)
 	}
-	if copies != 2 {
-		t.Fatalf("retry stream holds %d copies, want 2", copies)
+	if _, _, ok := claimRange(t, ctx, pool, "go_fq", "q", "c2"); ok {
+		t.Fatal("expected nothing on the call that records the crashed range as retries")
+	}
+
+	// message 1 kept its verdict row; message 2 got a silence row
+	kind := func(originPos int64) (attempt int, lastError string) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `SELECT attempt, coalesce(last_error, '') FROM cb_stream_retries
+			WHERE stream = 'go_fq' AND origin_pos = $1`, originPos).Scan(&attempt, &lastError); err != nil {
+			t.Fatal(err)
+		}
+		return attempt, lastError
+	}
+	if a, e := kind(1); a != 1 || e != "boom" {
+		t.Fatalf("row 1 = attempt %d, err %q; want the kept verdict (1, boom)", a, e)
+	}
+	if a, e := kind(2); a != 0 || e != "silence" {
+		t.Fatalf("row 2 = attempt %d, err %q; want a silence row (0, silence)", a, e)
+	}
+	var rows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM cb_stream_retries WHERE stream = 'go_fq'`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Fatalf("go_fq holds %d retry rows, want 2", rows)
 	}
 }
 
@@ -1903,7 +1818,7 @@ func TestDeliverSchedules(t *testing.T) {
 }
 
 // a poison handler: panics become failed attempts, and attempts exhaust to
-// the dead letter stream through the real loop
+// a failed retry row through the real loop
 func TestConsumeSubscriptionPoisonHandler(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
@@ -1945,29 +1860,31 @@ func TestConsumeSubscriptionPoisonHandler(t *testing.T) {
 
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		var dead int
+		var failed int
 		if err := pool.QueryRow(ctx,
-			`SELECT count(*) FROM cb_stream_messages WHERE stream = 'sd.go_poison'`).Scan(&dead); err != nil {
+			`SELECT count(*) FROM cb_stream_retries WHERE stream = 'go_poison' AND subscription = 'p' AND failed`).Scan(&failed); err != nil {
 			t.Fatal(err)
 		}
-		if dead == 1 {
+		if failed == 1 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("poison message never reached the dead letter stream")
+			t.Fatal("poison message never went to a failed row")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	var attempts, errText, origin string
-	if err := pool.QueryRow(ctx, `SELECT headers->>'cb_attempts', headers->>'cb_error', headers->>'cb_origin_pos'
-		FROM cb_stream_messages WHERE stream = 'sd.go_poison'`).Scan(&attempts, &errText, &origin); err != nil {
+	var attempt int
+	var origin int64
+	var errText string
+	if err := pool.QueryRow(ctx, `SELECT attempt, origin_pos, coalesce(last_error, '')
+		FROM cb_stream_retries WHERE stream = 'go_poison' AND subscription = 'p' AND failed`).Scan(&attempt, &origin, &errText); err != nil {
 		t.Fatal(err)
 	}
-	if attempts != "2" || origin != "1" {
-		t.Fatalf("dead letter report = attempts %s, origin %s; want 2 and 1", attempts, origin)
+	if attempt != 2 || origin != 1 {
+		t.Fatalf("failed row = attempt %d, origin %d; want 2 and 1", attempt, origin)
 	}
 	if !strings.HasPrefix(errText, "catbird: handler panic") {
-		t.Fatalf("cb_error = %q, want the recovered panic", errText)
+		t.Fatalf("last_error = %q, want the recovered panic", errText)
 	}
 	mu.Lock()
 	if calls != 2 {
@@ -2103,7 +2020,7 @@ func TestConsumeSubscriptionClaimLost(t *testing.T) {
 
 	// the extend cadence keeps reviving the claim; force the loss in the gap
 	// between two extends: expire it, then let a competitor act on it — a
-	// solo expired claim is quarantined by the competitor's claim call
+	// solo expired claim is recorded as retries by the competitor's claim call
 	stolen := false
 	for range 200 {
 		if _, err := pool.Exec(ctx, `UPDATE cb_stream_claims SET expires_at = clock_timestamp()
@@ -2112,10 +2029,8 @@ func TestConsumeSubscriptionClaimLost(t *testing.T) {
 		}
 		claimRange(t, ctx, pool, "go_zombie", "z", "thief")
 		var copies int
-		if err := pool.QueryRow(ctx, `SELECT
-			(SELECT count(*) FROM cb_stream_pending WHERE stream = 'sr.go_zombie.z')
-			+ (SELECT count(*) FROM cb_stream_messages WHERE stream = 'sr.go_zombie.z')`,
-		).Scan(&copies); err != nil {
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM cb_stream_retries WHERE stream = 'go_zombie' AND subscription = 'z'`).Scan(&copies); err != nil {
 			t.Fatal(err)
 		}
 		if copies == 1 {
@@ -2135,16 +2050,19 @@ func TestConsumeSubscriptionClaimLost(t *testing.T) {
 		t.Fatal("the frozen handler was never canceled")
 	}
 
-	// the zombie spent no attempt: the only copy is the crash copy
-	var failKeys, crashKeys int
-	if err := pool.QueryRow(ctx, `SELECT
-		count(*) FILTER (WHERE key = 'z:1:a1'),
-		count(*) FILTER (WHERE key = 'z:1:c1')
-		FROM cb_stream_keys WHERE stream = 'sr.go_zombie.z'`).Scan(&failKeys, &crashKeys); err != nil {
+	// the zombie recorded no verdict: its range became one silence retry row.
+	// another consumer may re-hand that due row (its attempt then climbs) —
+	// ordinary retrying, not the zombie's charge — so assert on the verdict, not
+	// the count of tries.
+	var n int
+	var lastErr string
+	var failed bool
+	if err := pool.QueryRow(ctx, `SELECT count(*), coalesce(max(last_error), ''), coalesce(bool_or(failed), false)
+		FROM cb_stream_retries WHERE stream = 'go_zombie' AND subscription = 'z'`).Scan(&n, &lastErr, &failed); err != nil {
 		t.Fatal(err)
 	}
-	if failKeys != 0 || crashKeys != 1 {
-		t.Fatalf("keys = %d fail, %d crash; want 0 and 1", failKeys, crashKeys)
+	if n != 1 || lastErr != "silence" || failed {
+		t.Fatalf("retry rows = %d, last_error %q, failed %v; want one silence row the zombie never charged", n, lastErr, failed)
 	}
 
 	cancel()
@@ -2182,38 +2100,24 @@ func TestRetryBackoffTiming(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// the copy is parked with the full fixed delay ahead of it
+	// the retry row is parked with the full fixed delay ahead of it
 	var wait float64
-	if err := pool.QueryRow(ctx, `SELECT extract(epoch FROM (deliver_at - clock_timestamp()))
-		FROM cb_stream_pending WHERE stream = 'sr.go_wait.r'`).Scan(&wait); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT extract(epoch FROM (claimable_at - clock_timestamp()))
+		FROM cb_stream_retries WHERE stream = 'go_wait' AND subscription = 'r' AND origin_pos = 1`).Scan(&wait); err != nil {
 		t.Fatal(err)
 	}
 	if wait < 0.2 || wait > 0.31 {
 		t.Fatalf("retry scheduled %.3fs out, want about 0.3s", wait)
 	}
 
-	// not due yet: a delivery pass leaves it parked
-	if _, err := pool.Exec(ctx, `SELECT _cb_stream_deliver_pending()`); err != nil {
-		t.Fatal(err)
-	}
-	var parked int
-	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM cb_stream_pending WHERE stream = 'sr.go_wait.r'`).Scan(&parked); err != nil {
-		t.Fatal(err)
-	}
-	if parked != 1 {
-		t.Fatal("the retry was delivered before its backoff passed")
+	// not due yet: a claim finds nothing
+	if _, _, ok := claimRange(t, ctx, pool, "go_wait", "r", "c2"); ok {
+		t.Fatal("the retry was claimable before its backoff passed")
 	}
 
-	// after the wait it delivers and is claimable
+	// after the wait it is due and handed out solo
 	time.Sleep(350 * time.Millisecond)
-	if _, err := pool.Exec(ctx, `SELECT _cb_stream_deliver_pending()`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `SELECT _cb_stream_assign_positions('sr.go_wait.r')`); err != nil {
-		t.Fatal(err)
-	}
-	if from, to, ok := claimRange(t, ctx, pool, "sr.go_wait.r", "r", "c1"); !ok || from != 1 || to != 1 {
+	if from, to, ok := claimRange(t, ctx, pool, "go_wait", "r", "c3"); !ok || from != 1 || to != 1 {
 		t.Fatalf("retry claim = %d..%d, %v, want 1..1 after the backoff", from, to, ok)
 	}
 }
@@ -2424,7 +2328,7 @@ func TestFilteredCursor(t *testing.T) {
 }
 
 // subscriptions with a topic pattern: late binding replays history, claims cover
-// non-matches, retries keep the filter, and quarantine leaks nothing
+// non-matches, retries keep the filter, and crash recording leaks nothing
 func TestFilteredSubscription(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
@@ -2477,14 +2381,14 @@ func TestFilteredSubscription(t *testing.T) {
 		t.Fatalf("claimed messages = %v, want %v", topics, want)
 	}
 
-	// a failed match retries through sr.* with its topic intact
+	// a failed match becomes a retry row carrying its topic intact
 	if _, err := pool.Exec(ctx,
 		`SELECT cb_stream_fail('go_fqt', 'orcid', 'w1', $1, 'boom')`, got[0].Pos); err != nil {
 		t.Fatal(err)
 	}
 	var retryTopic string
-	if err := pool.QueryRow(ctx, `SELECT topic FROM cb_stream_messages
-		WHERE stream = 'sr.go_fqt.orcid'`).Scan(&retryTopic); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT topic FROM cb_stream_retries
+		WHERE stream = 'go_fqt' AND subscription = 'orcid' AND origin_pos = $1`, got[0].Pos).Scan(&retryTopic); err != nil {
 		t.Fatal(err)
 	}
 	if retryTopic != "record.work.created" {
@@ -2506,8 +2410,9 @@ func TestFilteredSubscription(t *testing.T) {
 		t.Fatalf("closed_pos = %d, want %d", closedPos, lastPos)
 	}
 
-	// quarantine republishes only the subscription's own messages: crash a claim
-	// whose range holds matches and non-matches, then count what reaches sr.*
+	// a crash materializes retry rows only for the subscription's own
+	// messages: crash a claim whose range holds matches and non-matches, then
+	// count which become rows
 	if err := EnsureSubscription(ctx, pool, "go_fqt", "q2", SubscriptionOpts{
 		StartPos:    At(0),
 		Topic:       "record.work.#",
@@ -2516,32 +2421,28 @@ func TestFilteredSubscription(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE cb_stream_subscriptions
-		SET claim_ttl = interval '30 milliseconds', max_crashes = 1
+		SET claim_ttl = interval '30 milliseconds'
 		WHERE stream = 'go_fqt' AND name = 'q2'`); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, ok := claimRange(t, ctx, pool, "go_fqt", "q2", "c1"); !ok {
 		t.Fatal("nothing to claim")
 	}
-	time.Sleep(80 * time.Millisecond) // expire: first crash, handed out whole again
-	if _, _, ok := claimRange(t, ctx, pool, "go_fqt", "q2", "c2"); !ok {
-		t.Fatal("expired claim was not handed out again")
+	time.Sleep(80 * time.Millisecond) // expire: the crashed range is recorded as retries
+	if _, _, ok := claimRange(t, ctx, pool, "go_fqt", "q2", "c2"); ok {
+		t.Fatal("claim handed out again, want the crashed range recorded as retries")
 	}
-	time.Sleep(80 * time.Millisecond) // expire at max_crashes: quarantined
-	if _, _, ok := claimRange(t, ctx, pool, "go_fqt", "q2", "c3"); ok {
-		t.Fatal("claim handed out again, want quarantine")
-	}
-	rows, err = pool.Query(ctx, `SELECT coalesce(topic, '') FROM cb_stream_messages
-		WHERE stream = 'sr.go_fqt.q2' ORDER BY id`)
+	rows, err = pool.Query(ctx, `SELECT coalesce(topic, '') FROM cb_stream_retries
+		WHERE stream = 'go_fqt' AND subscription = 'q2' ORDER BY origin_pos`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	quarantined, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	retried, err := pgx.CollectRows(rows, pgx.RowTo[string])
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"record.work.created", "record.work.updated"}; !slices.Equal(quarantined, want) {
-		t.Fatalf("quarantined = %v, want %v: non-matches must never reach sr.*", quarantined, want)
+	if want := []string{"record.work.created", "record.work.updated"}; !slices.Equal(retried, want) {
+		t.Fatalf("retried = %v, want %v: non-matches must never become rows", retried, want)
 	}
 }
 
@@ -2586,7 +2487,6 @@ func TestConsumeSubscriptionFiltered(t *testing.T) {
 
 	var mu sync.Mutex
 	deliveries := map[int]int{}
-	var retryAttempt any
 	subDone := make(chan error, 1)
 	go func() {
 		subDone <- ConsumeSubscription(jctx, pool, "go_cqf", "f", func(_ context.Context, m Message) error {
@@ -2599,9 +2499,6 @@ func TestConsumeSubscriptionFiltered(t *testing.T) {
 			mu.Lock()
 			deliveries[p.N]++
 			seen := deliveries[p.N]
-			if seen == 2 {
-				retryAttempt = m.Headers["cb_attempt"]
-			}
 			mu.Unlock()
 			if p.N == 4 && seen == 1 {
 				return errors.New("first try fails")
@@ -2611,7 +2508,7 @@ func TestConsumeSubscriptionFiltered(t *testing.T) {
 	}()
 
 	// done when the base subscription's closed position reaches the stream's tail
-	// and the failed match has come back around through sr.*
+	// and the failed match has come back around as a retry row
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		var caughtUp bool
@@ -2640,8 +2537,5 @@ func TestConsumeSubscriptionFiltered(t *testing.T) {
 	defer mu.Unlock()
 	if want := map[int]int{1: 1, 4: 2, 5: 1}; !maps.Equal(deliveries, want) {
 		t.Fatalf("deliveries = %v, want %v: the loop must deliver exactly the matches", deliveries, want)
-	}
-	if retryAttempt != float64(1) {
-		t.Fatalf("redelivery cb_attempt = %v (%T), want 1", retryAttempt, retryAttempt)
 	}
 }

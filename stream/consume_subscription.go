@@ -38,7 +38,8 @@ func newConsumerName() string {
 // ConsumeSubscription processes a subscription's messages: unordered, at-least-once,
 // parallel across consumers. The claim is kept alive for as long as
 // a handler runs. Handler errors are retried with the subscription's backoff policy
-// and dead-lettered or dropped when attempts run out.
+// and kept or deleted when attempts run out. Failed and crashed
+// messages come back as due retry rows, served by the same claim call.
 func ConsumeSubscription(ctx context.Context, pool *pgxpool.Pool, stream, subscription string,
 	handler func(ctx context.Context, msg Message) error,
 	opts ...ConsumeSubscriptionOpts,
@@ -53,8 +54,6 @@ func ConsumeSubscription(ctx context.Context, pool *pgxpool.Pool, stream, subscr
 	}
 
 	consumer := newConsumerName()
-	// Failed and crashed messages come back through the retry stream.
-	streams := []string{stream, "sr." + stream + "." + subscription}
 
 	timer := time.NewTimer(poll)
 	defer timer.Stop()
@@ -74,16 +73,7 @@ func ConsumeSubscription(ctx context.Context, pool *pgxpool.Pool, stream, subscr
 			return ctx.Err()
 		}
 
-		var loopErr error
-		worked := false
-		for _, s := range streams {
-			n, err := consumeClaim(ctx, pool, s, subscription, consumer, handler)
-			if err != nil {
-				loopErr = err
-				break
-			}
-			worked = worked || n
-		}
+		worked, loopErr := consumeClaim(ctx, pool, stream, subscription, consumer, handler)
 
 		switch {
 		case ctx.Err() != nil:

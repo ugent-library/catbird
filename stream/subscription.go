@@ -16,16 +16,15 @@ const (
 type FailPolicy string
 
 const (
-	FailDeadLetter FailPolicy = "dead_letter"
-	FailDrop       FailPolicy = "drop"
+	FailKeep   FailPolicy = "keep"
+	FailDelete FailPolicy = "delete"
 )
 
 // SubscriptionOpts are initial values, applied only when this call creates the
 // subscription: an existing subscription is never modified. Zero fields mean the defaults.
 // The fields are workload policy: where to start, how many at a time, how
-// to retry, when to give up. The engine's failure-detection mechanics
-// (claim_ttl, max_crashes) have defaults on the subscription row and are tuned
-// there, not here.
+// to retry, when to give up. The crash-detection window (claim_ttl) has a
+// default on the subscription row and is tuned there, not here.
 type SubscriptionOpts struct {
 	StartPos       *int64        // claim from here; nil starts at the tail
 	ClaimBatchSize int           // 100: messages per claim
@@ -33,7 +32,7 @@ type SubscriptionOpts struct {
 	BackoffKind    BackoffKind   // full_jitter
 	BackoffBase    time.Duration // 5s
 	BackoffMax     time.Duration // 5m
-	OnFail         FailPolicy    // dead_letter
+	OnFail         FailPolicy    // keep
 	// Topic: which topics this subscription reads, applied server-side. '*'
 	// matches one segment, '#' zero or more trailing segments. "" reads
 	// every topic. A claim covers every position in its range, matching
@@ -76,4 +75,14 @@ func EnsureSubscription(ctx context.Context, conn Conn, stream, subscription str
 		nullText(o.Condition),
 	)
 	return wrapErr(err)
+}
+
+// RetryFailed resets every failed row of a subscription to a fresh, due retry with
+// its full attempt budget, and reports how many were revived. The messages
+// go back to this subscription only; cursors never saw them.
+func RetryFailed(ctx context.Context, conn Conn, stream, subscription string) (int64, error) {
+	var n int64
+	err := conn.QueryRow(ctx,
+		`SELECT cb_stream_retry_failed($1, $2)`, stream, subscription).Scan(&n)
+	return n, wrapErr(err)
 }
