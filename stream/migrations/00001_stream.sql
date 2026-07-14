@@ -18,19 +18,8 @@ CREATE FUNCTION cb_valid_name(name text)
 RETURNS boolean
 LANGUAGE sql IMMUTABLE AS $$
     SELECT name IS NOT NULL
-       AND name !~ '__'   -- '__' is reserved, it encodes dots in partition names
        AND name ~ '^[a-z][a-z0-9_]*$'
        AND octet_length(name) <= 20
-$$;
--- +goose statementend
-
--- +goose statementbegin
-CREATE FUNCTION _cb_valid_stream_name(name text)
-RETURNS boolean
-LANGUAGE sql IMMUTABLE AS $$
-    SELECT name IS NOT NULL
-       AND name ~ '^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){0,2}$'
-       AND octet_length(name) <= 44
 $$;
 -- +goose statementend
 
@@ -165,7 +154,7 @@ END; $$;
 -- +goose statementend
 
 CREATE TABLE cb_streams (
-    name text PRIMARY KEY CHECK (_cb_valid_stream_name(name)),
+    name text PRIMARY KEY CHECK (cb_valid_name(name)),
     last_pos bigint NOT NULL DEFAULT 0,
     retention interval NOT NULL DEFAULT cb_forever()
         CHECK (retention = cb_forever() OR retention > interval '0')
@@ -173,7 +162,7 @@ CREATE TABLE cb_streams (
 
 CREATE TABLE cb_stream_cursors (
     stream text NOT NULL REFERENCES cb_streams(name) ON DELETE CASCADE,
-    name text NOT NULL CHECK (cb_valid_name(name)), -- single segment: dots are streams-only
+    name text NOT NULL CHECK (cb_valid_name(name)),
     pos bigint NOT NULL DEFAULT 0, -- how far this cursor has read: everything at or below this position is acked
     topic text,                 -- topic pattern; NULL reads every topic
     topic_regex text,           -- compiled by _cb_stream_compile_topic at ensure
@@ -317,11 +306,10 @@ CREATE INDEX ON cb_stream_schedules (next_at);
 
 -- +goose statementbegin
 -- Create the stream's physical partition.
--- Partition names encode dots as '__'.
 CREATE FUNCTION _cb_stream_ensure_partition(stream text)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
-    _partition text := 'cbm__' || replace(_cb_stream_ensure_partition.stream, '.', '__');
+    _partition text := 'cbm_' || _cb_stream_ensure_partition.stream;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('cb_stream_ensure'));
     EXECUTE format(
@@ -372,6 +360,10 @@ BEGIN
     IF NOT cb_valid_name(cb_stream_ensure_cursor.cursor) THEN
         RAISE EXCEPTION 'catbird: invalid cursor name %; use [a-z][a-z0-9_]*, max 20 bytes',
             cb_stream_ensure_cursor.cursor USING ERRCODE = 'IRD01';
+    END IF;
+    IF NOT cb_valid_name(cb_stream_ensure_cursor.stream) THEN
+        RAISE EXCEPTION 'catbird: invalid stream name %; use [a-z][a-z0-9_]*, max 20 bytes',
+            cb_stream_ensure_cursor.stream USING ERRCODE = 'IRD01';
     END IF;
 
     -- NULL start = tail: skip everything already in the stream.
@@ -425,8 +417,8 @@ BEGIN
             cb_stream_ensure_subscription.subscription USING ERRCODE = 'IRD01';
     END IF;
 
-    IF cb_stream_ensure_subscription.stream LIKE '%.%' THEN
-        RAISE EXCEPTION 'catbird: % is an internal stream; subscriptions can only be created on a user stream',
+    IF NOT cb_valid_name(cb_stream_ensure_subscription.stream) THEN
+        RAISE EXCEPTION 'catbird: invalid stream name %; use [a-z][a-z0-9_]*, max 20 bytes',
             cb_stream_ensure_subscription.stream USING ERRCODE = 'IRD01';
     END IF;
 
@@ -1584,7 +1576,6 @@ DROP TABLE cb_streams;
 DROP FUNCTION cb_forever();
 DROP FUNCTION _cb_stream_compile_condition(text);
 DROP FUNCTION _cb_stream_compile_topic(text);
-DROP FUNCTION _cb_valid_stream_name(text);
 DROP FUNCTION cb_valid_name(text);
 DROP TYPE cb_ref_kind;
 DROP TYPE cb_backoff_kind;

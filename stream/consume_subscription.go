@@ -29,7 +29,7 @@ func newConsumerName() string {
 	if err != nil || host == "" {
 		host = "consumer"
 	}
-	host = strings.ReplaceAll(host, ".", "_") // internal stream names use dots
+	host = strings.ReplaceAll(host, ".", "_") // keep the generated consumer name dot-free
 	var r [8]byte
 	rand.Read(r[:])
 	return fmt.Sprintf("%s_%d_%x", host, os.Getpid(), r)

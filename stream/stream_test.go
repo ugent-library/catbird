@@ -743,7 +743,7 @@ func TestEnsureSubscription(t *testing.T) {
 		t.Fatalf("claim_batch_size = %d, want 7", batch)
 	}
 
-	// subscriptions live on plain streams; engine-made streams are read with cursors
+	// dotted names are not valid stream names
 	if err := EnsureSubscription(ctx, pool, "sd.go_q", "triage"); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("subscription on a dotted stream returned %v, want ErrInvalid", err)
 	}
