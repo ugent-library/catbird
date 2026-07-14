@@ -156,11 +156,13 @@ github.com/ugent-library/catbird          (module — the library)
   installs independently.
 - Table naming: static tables per module (`cb_stream_*`, `cb_flow_*`, `cb_wire_*`),
   one goose version table per module (`cb_stream_migrations`, …) so modules install
-  and upgrade independently. Old and new must coexist in one database during the
-  transition, which means no collision with the current schema's *static* tables
-  either, not just the `cb_q_*`/`cb_t_*` dynamic ones — the one hard clash found
-  (`cb_flows`, the old static flow registry) is dodged by naming the new config
-  table `cb_flow_defs` (03 §2). The old-vs-new function names never collide exactly
+  and upgrade independently. Stream's new names never clash with the current
+  schema — not the `cb_q_*`/`cb_t_*` dynamic tables nor the static ones — so
+  stream and the old code share one database through the transition. Flow is
+  deliberately different: it reclaims the old flow table names (`cb_flows`,
+  `cb_flow_schedules`) rather than dodge them, because raven and biblio have
+  zero flows (D31) — the old flow tables are empty, dropped at raven's cutover,
+  and the flow test suite runs on its own database (05, 03 §2). The old-vs-new function names never collide exactly
   (old is verb-first, new module-first), but the near-anagram pairs
   (`cb_run_flow`/`cb_flow_run`) coexist until the old schema drops — sql-api.md
   carries an old-vs-new table during the transition.

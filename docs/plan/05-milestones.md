@@ -51,16 +51,21 @@ the one breaking release, at M6. Ground rules:
   once, at M6 (see there).
 - **Tests ride the existing rails.** `./scripts/test.sh` already runs
   `go test ./...`. New subpackages are picked up automatically, and the
-  drop-and-recreate of `cb_tst` covers them. Each new package gets its own
+  drop-and-recreate of `cb_tst` covers them. Flow is the one exception: it
+  reuses old flow table names (below), so its suite runs on its own database
+  rather than the shared `cb_tst`. Each new package gets its own
   `TestMain` + `sync.Once` setup running its own migrations (the
   `catbird_test.go` pattern). `go test ./...` runs packages in parallel
   processes, so the `internal/migrate` runner takes an advisory lock. That is
   already this codebase's setup convention.
 - **Migrations are per module and additive.** Each subpackage embeds its own
   `migrations/` FS with its own goose table (`cb_stream_migrations`, …). The
-  existing `migrate.go` and `migrations/` are untouched until M6. New names
-  (`cb_stream_*`, `cb_stream_publish`) cannot collide with the old ones, so old
-  and new suites share one database.
+  existing `migrate.go` and `migrations/` are untouched until M6. Stream's new
+  names (`cb_stream_*`, `cb_stream_publish`) cannot collide with the old ones,
+  so the stream and old suites share one database. Flow instead reclaims the
+  old flow names (`cb_flows`, `cb_flow_schedules`): raven and biblio have zero
+  flows (D31), so the old flow tables are empty, dropped at raven's cutover,
+  and the two flow schemas are never needed side by side.
 - **The migrations are the naming authority.** Plan sketches convey semantics and
   may abbreviate identifiers (e.g. `stream` for the DDL's `stream_name`). When
   code and plan disagree on a *name*, the migration wins and no doc edit is
