@@ -276,7 +276,7 @@ CREATE TABLE cb_stream_retries (
     last_error   text,                 -- 'silence' for a crash, the handler's text for a verdict
     failed       boolean NOT NULL DEFAULT false,
     claimable_at timestamptz NOT NULL, -- visibility, backoff and lease in one: due when <= now
-    claimed_by   text,                 -- the consumer holding the lease; NULL when free
+    consumer     text,                 -- the consumer holding the lease; NULL when free
     created_at   timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (stream, subscription, origin_pos),
     FOREIGN KEY (stream, subscription)
@@ -1101,13 +1101,13 @@ BEGIN
         EXIT WHEN NOT FOUND;
 
         -- A due row still claimed lost its holder to a crash.
-        IF _r.claimed_by IS NOT NULL THEN
+        IF _r.consumer IS NOT NULL THEN
             IF _r.attempt >= _q.max_attempts THEN
                 PERFORM _cb_stream_give_up(_r, _q.on_fail, 'silence');
             ELSE
                 UPDATE cb_stream_retries t
                 SET last_error   = 'silence',
-                    claimed_by   = NULL,
+                    consumer     = NULL,
                     claimable_at = clock_timestamp()
                         + _cb_backoff(_q.backoff_kind, _q.backoff_base, _q.backoff_max, _r.attempt)
                 WHERE (t.stream, t.subscription, t.origin_pos)
@@ -1119,7 +1119,7 @@ BEGIN
         -- Hand it out as a solo pseudo-claim, minting one try.
         UPDATE cb_stream_retries t
         SET attempt      = t.attempt + 1,
-            claimed_by   = cb_stream_claim.consumer,
+            consumer     = cb_stream_claim.consumer,
             claimable_at = clock_timestamp() + _ttl
         WHERE (t.stream, t.subscription, t.origin_pos)
             = (_r.stream, _r.subscription, _r.origin_pos)
@@ -1283,7 +1283,7 @@ BEGIN
     WHERE r.stream   = cb_stream_extend_claim.stream
       AND r.subscription = cb_stream_extend_claim.subscription
       AND r.origin_pos = cb_stream_extend_claim.from_pos
-      AND r.claimed_by = cb_stream_extend_claim.consumer
+      AND r.consumer = cb_stream_extend_claim.consumer
       AND NOT r.failed
     RETURNING r.claimable_at INTO _expires_at;
     RETURN _expires_at;
@@ -1316,13 +1316,13 @@ BEGIN
     END IF;
 
     UPDATE cb_stream_retries r
-    SET claimed_by   = NULL,
+    SET consumer     = NULL,
         claimable_at = clock_timestamp(),
         attempt      = r.attempt - 1
     WHERE r.stream   = cb_stream_release_claim.stream
       AND r.subscription = cb_stream_release_claim.subscription
       AND r.origin_pos = cb_stream_release_claim.from_pos
-      AND r.claimed_by = cb_stream_release_claim.consumer
+      AND r.consumer = cb_stream_release_claim.consumer
       AND NOT r.failed;
 END; $$;
 -- +goose statementend
@@ -1354,7 +1354,7 @@ BEGIN
     WHERE r.stream   = cb_stream_close_claim.stream
       AND r.subscription = cb_stream_close_claim.subscription
       AND r.origin_pos = cb_stream_close_claim.from_pos
-      AND r.claimed_by = cb_stream_close_claim.consumer
+      AND r.consumer = cb_stream_close_claim.consumer
       AND NOT r.failed;
 END; $$;
 -- +goose statementend
@@ -1400,7 +1400,7 @@ BEGIN
     UPDATE cb_stream_retries t
     SET failed       = true,
         last_error = _cb_stream_give_up.last_error,
-        claimed_by = NULL
+        consumer   = NULL
     WHERE t.stream = _stream AND t.subscription = _subscription AND t.origin_pos = _origin_pos;
 
     PERFORM pg_notify(current_schema || '.cb_failed', _stream || '.' || _subscription);
@@ -1443,7 +1443,7 @@ BEGIN
 
     IF FOUND THEN
         -- not ours, or already failed: leave it for its real holder
-        IF _r.claimed_by IS DISTINCT FROM cb_stream_fail.consumer OR _r.failed THEN
+        IF _r.consumer IS DISTINCT FROM cb_stream_fail.consumer OR _r.failed THEN
             RETURN;
         END IF;
 
@@ -1452,7 +1452,7 @@ BEGIN
         ELSE
             UPDATE cb_stream_retries t
             SET last_error   = cb_stream_fail.error,
-                claimed_by   = NULL,
+                consumer     = NULL,
                 claimable_at = clock_timestamp()
                     + _cb_backoff(_q.backoff_kind, _q.backoff_base, _q.backoff_max, _r.attempt)
             WHERE (t.stream, t.subscription, t.origin_pos)
@@ -1524,7 +1524,7 @@ BEGIN
     SET failed         = false,
         attempt      = 0,
         last_error   = NULL,
-        claimed_by   = NULL,
+        consumer     = NULL,
         claimable_at = clock_timestamp()
     WHERE r.stream = cb_stream_retry_failed.stream
       AND r.subscription = cb_stream_retry_failed.subscription
