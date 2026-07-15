@@ -82,6 +82,11 @@ CREATE TABLE cb_job_runs (
     CONSTRAINT cb_job_runs_job_key_key UNIQUE (job, key)
 );
 
+-- _cb_job_prune_runs reads terminal runs oldest first; finished_at is set
+-- exactly when a run turns terminal, so live runs stay out of the index.
+CREATE INDEX cb_job_runs_finished_idx ON cb_job_runs (finished_at)
+    WHERE finished_at IS NOT NULL;
+
 -- The work table: one timestamp column, claimable_at, carries visibility,
 -- lease and backoff. Replay identity is the plain tuple (run_id,
 -- parent_step_id, name, ordinal), where ordinal is the spawn's zero-based
@@ -961,8 +966,103 @@ BEGIN
 END; $$;
 -- +goose statementend
 
+-- The module's tick calls the two functions below on an interval. Running
+-- the tick from several processes is safe: FOR UPDATE SKIP LOCKED decides
+-- who does the work. Without a tick, on-demand runs keep working; only
+-- scheduled runs and pruning pause.
+
+-- +goose statementbegin
+-- Fires due schedules: each due row creates runs via cb_job_run and
+-- re-arms, in this one transaction — so a slot fires exactly once no
+-- matter how many processes tick. catch_up decides what a backlog (the
+-- tick was down past one or more slots) gets: 'all' fires a run per
+-- missed slot, 'skip' drops the backlog and fires only an on-time slot.
+-- Runs are created without a key: every fired slot is its own run.
+-- Returns the number of runs created.
+CREATE FUNCTION _cb_job_run_scheduled(batch_size int DEFAULT 500)
+RETURNS int LANGUAGE plpgsql AS $$
+DECLARE
+    _schedule cb_job_schedules;
+    _due_slots int;  -- slots due from next_at through now, inclusive (always >= 1)
+    _fire_slots int; -- how many of those slots this policy actually fires
+    _slot int;
+    _n int := 0;
+BEGIN
+    FOR _schedule IN
+        SELECT * FROM cb_job_schedules
+        WHERE next_at <= clock_timestamp()
+        ORDER BY next_at LIMIT _cb_job_run_scheduled.batch_size
+        FOR UPDATE SKIP LOCKED
+    LOOP
+        _due_slots := floor(extract(epoch FROM clock_timestamp() - _schedule.next_at)
+            / extract(epoch FROM _schedule.every))::int + 1;
+
+        _fire_slots := CASE WHEN _schedule.catch_up = 'all' THEN _due_slots
+                            WHEN _due_slots = 1             THEN 1
+                            ELSE 0 END;
+
+        FOR _slot IN 1.._fire_slots LOOP
+            PERFORM cb_job_run(_schedule.job, _schedule.input);
+            _n := _n + 1;
+        END LOOP;
+
+        -- Re-arm to the first slot after now, in one step. Same expression
+        -- for both policies: 'all' has just caught up to it, 'skip' jumps
+        -- its backlog past it. Anchored on the old next_at, so the firing
+        -- phase holds.
+        UPDATE cb_job_schedules sc
+        SET next_at = _schedule.next_at + _schedule.every * _due_slots
+        WHERE sc.name = _schedule.name;
+    END LOOP;
+
+    RETURN _n;
+END; $$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- Deletes terminal runs older than their birth job's retention, together
+-- with their step, attempt and signal rows — oldest first, up to
+-- batch_size runs per call. Children are deleted before their run, the
+-- order the FKs require. Runs of a job whose retention is cb_forever()
+-- are kept; that filter also guards the age comparison, which would match
+-- every finished run when the retention is negative. Locked runs are
+-- skipped: a run an engine call holds right now is not old, it can wait
+-- for the next tick. Returns the number of runs deleted.
+CREATE FUNCTION _cb_job_prune_runs(batch_size int DEFAULT 1000)
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+    _run_ids bigint[];
+    _n bigint;
+BEGIN
+    SELECT array_agg(old_run.id) INTO _run_ids
+    FROM (
+        SELECT r.id FROM cb_job_runs r
+        JOIN cb_jobs j ON j.name = r.job
+        WHERE j.retention <> cb_forever()
+          AND r.finished_at < clock_timestamp() - j.retention
+        ORDER BY r.finished_at
+        LIMIT _cb_job_prune_runs.batch_size
+        FOR UPDATE OF r SKIP LOCKED
+    ) old_run;
+
+    IF _run_ids IS NULL THEN
+        RETURN 0;
+    END IF;
+
+    DELETE FROM cb_job_signals sg WHERE sg.run_id = ANY (_run_ids);
+    DELETE FROM cb_job_attempts a WHERE a.run_id = ANY (_run_ids);
+    DELETE FROM cb_job_steps s WHERE s.run_id = ANY (_run_ids);
+    DELETE FROM cb_job_runs r WHERE r.id = ANY (_run_ids);
+
+    GET DIAGNOSTICS _n = ROW_COUNT;
+    RETURN _n;
+END; $$;
+-- +goose statementend
+
 -- +goose down
 
+DROP FUNCTION _cb_job_prune_runs(int);
+DROP FUNCTION _cb_job_run_scheduled(int);
 DROP FUNCTION cb_job_cancel(bigint, text);
 DROP FUNCTION cb_job_fail(bigint, bigint, int, text);
 DROP FUNCTION cb_job_complete(bigint, bigint, int, jsonb, jsonb, jsonb);
