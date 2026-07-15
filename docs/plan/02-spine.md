@@ -109,7 +109,7 @@ directly:
 |---|---|
 | Projection over the whole feed (search index, representations) | plain cursor |
 | Subset with retry/dead-row semantics (ORCID push, per-target deletes) | **filtered subscription on the feed** |
-| Producer knows the consumer (blob GC, LDN outbox) | same-tx `cb_job_run` — a one-job run with a dedup key (D37, D39); a stream-only install composes `Publish` to an own stream + a subscription instead |
+| Producer knows the consumer (blob GC, LDN outbox) | same-tx `cb_job_run` — a one-step run with a dedup key (D37, D39); a stream-only install composes `Publish` to an own stream + a subscription instead |
 | Many dynamic user-defined subscribers (webhooks) | one dispatcher cursor + the Go trie over app rows + one run per delivery (D37) |
 | User-facing notification inbox | explicit writes by handlers (04) — identity is data in the handler's hand |
 

@@ -30,25 +30,25 @@ func TestMigrate(t *testing.T) {
 	}
 
 	// Down leaves no module objects behind — no tables, partitions,
-	// sequences, functions or enum types. Only goose's version tables and
-	// the kernel's SQL unit (shared with the other modules) stay.
+	// sequences, functions or enum types. Only goose's version table and
+	// the kernel's SQL unit stay. The query is scoped to this module's
+	// namespace: the jobs suite runs against the same database in parallel.
 	if err := MigrateDownTo(t.Context(), db, 0); err != nil {
 		t.Fatalf("migrate down: %v", err)
 	}
 	var leftover int
 	if err := db.QueryRowContext(t.Context(), `SELECT count(*) FROM (
 		SELECT relname FROM pg_class
-		WHERE relname LIKE 'cb%' AND relname NOT LIKE 'cb\_stream\_migrations%'
-		  AND relname NOT LIKE 'cb\_kernel\_migrations%'
+		WHERE (relname LIKE 'cb\_stream%' OR relname = 'cb_streams' OR relname LIKE 'cbm\_%')
+		  AND relname NOT LIKE 'cb\_stream\_migrations%'
 		  AND relkind IN ('r', 'p', 'S')
 		UNION ALL
 		SELECT proname FROM pg_proc
-		WHERE proname LIKE '%cb\_%' AND pronamespace = 'public'::regnamespace
-		  AND proname NOT IN ('cb_valid_name', 'cb_forever', 'cb_backoff')
+		WHERE proname LIKE '%cb\_stream\_%' AND pronamespace = 'public'::regnamespace
 		UNION ALL
 		SELECT typname FROM pg_type
-		WHERE typname LIKE 'cb\_%' AND typtype = 'e'
-		  AND typname <> 'cb_backoff_kind') x`).Scan(&leftover); err != nil {
+		WHERE typname IN ('cb_ref_kind', 'cb_fail_policy', 'cb_catch_up_policy')
+		  AND typtype = 'e') x`).Scan(&leftover); err != nil {
 		t.Fatal(err)
 	}
 	if leftover != 0 {

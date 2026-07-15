@@ -5,8 +5,9 @@
 > retry rows, dead rows) reopens M2's failure half in row terms, and **M4** is
 > restated for the engine on its own rows — no stream prerequisite, kernel
 > dependency only. M3r and M4 touch disjoint modules and may run in either
-> order or in parallel. Re-revised 2026-07-15 (D39–D41): the engine's
-> vocabulary converges on **job** (package `jobs`, tables `cb_job_*`); **M4c**
+> order or in parallel. Re-revised 2026-07-15 (D39–D44): the engine's
+> vocabulary settles on **job / run / step / attempt** (package `jobs`,
+> tables `cb_jobs` + `cb_job_*`, D44); **M4c**
 > adds triggers — events become jobs declaratively, a feature of `jobs/`, not
 > a module (D41); and the kernel gains a SQL unit of shared pure functions,
 > auto-applied by the migration runner (D41).
@@ -215,7 +216,7 @@ adds triggers (D40) — a feature of `jobs/`, not a module (D41) — once M1 and
 M4a stand.
 
 **M4a — single-execution runs.** The full job schema (03 §2 — all seven
-tables, nothing deferred, `main` seeded) and the M4a function set: `define`,
+tables, nothing deferred, `default` seeded) and the M4a function set: `define`,
 `run`, `claim` (lease repair, queue array), `start` (give-up check
 included), `extend`, `release`, `complete` — which **raises** on non-empty
 `spawns` until M4b — `fail`, `cancel`, `_cb_job_give_up`;
@@ -234,7 +235,9 @@ exactly this); run-with-dedup-key in the caller's transaction; scheduled
 runs via `cb_job_schedules`, delivered exactly-once per slot in the re-arm
 transaction; retries and give-up via the one counter (D38). No conditions
 on runs (D32) — a run fed by events is a trigger (M4c) or a filtered
-subscription whose handler calls `cb_job_run` (README).
+subscription whose handler calls `cb_job_run` (README). Vocabulary per
+D44: job / run / step / attempt — the work table is `cb_job_steps`, the
+declared jobs are `cb_jobs`.
 
 *Exit (M4a):* raven's on-demand job shape end to end — run in a transaction
 with a dedup key, poll status by app key, read output, cancel; a scheduled
@@ -242,11 +245,11 @@ run fires and re-arms; a poison run is given up on through both roads — verdic
 fail, silence at start — and the run fails; a graceful shutdown mid-handler
 spends a start while a never-started lease lapses free (D38's stated
 properties); semantic core of `task_test.go` green against the new engine;
-job-to-job latency measured — notify + claim, no assigner leg in the path
+step-to-step latency measured — notify + claim, no assigner leg in the path
 (03 §4); throughput ≥ the old `BenchmarkTaskThroughput` envelope.
 
 **M4b — spawns.** The `spawns` branch of `cb_job_complete` (insert on the
-identity tuple, queue stamped from the defs, `jobs_remaining`
+identity tuple, queue stamped from the definitions, `steps_remaining`
 accounting), barriers (`OnAllDone`, including a second phase), signals
 (`OnSignal` + `cb_job_signal`, one buffered slot per name), combined gates
 (`all_done_signal`, D42), `on_fail` at
@@ -265,7 +268,7 @@ lifecycle, lease-repair idempotence under racing claims, the remaining
 formula's barrier phases); the **wide-map stress test** — hundreds of siblings
 completing into one run row, the D30 connection-occupancy watch item, deciding
 whether the mitigation ladder's first rung suffices, and watching
-`cb_jobs` autovacuum (the D34 churn note, 03 §4); and the demo foreign
+`cb_job_steps` autovacuum (the D34 churn note, 03 §4); and the demo foreign
 worker: a ~40-line Python script speaking the worker contract (03 §7),
 extend included (release is optional politeness it may skip), deliberately
 *slower than the claim TTL* — proving D11, D27
@@ -300,7 +303,7 @@ of it land together. First, the **ticker wake accelerator** (D17). Assigner,
 cursors and subscriptions, and the periodic jobs attach the notifier to the wake
 seam built in M0. They wake on the notifications the SQL has emitted since M1.
 The poll interval is demoted to safety net. Second, **job workers and
-`WaitForOutput`** attach to the `cbj_*`/`cbjr_*` channels — whose
+`WaitForOutput`** attach to the `cbq_*`/`cbj_*` channels — whose
 earliest-due payload contract is exactly the one `worker_notifier.go`
 already speaks (03 §1; the channel is the pool, so no payload prefix),
 emitted since M4. The trigger tick (M4c) attaches to its streams' channels
@@ -312,7 +315,7 @@ suspicion: interpolated identities were data all along) — no relay kind, no
 
 *Exit:* ported `wire_test.go`/`notifications_test.go` green; new seen/read and
 retention tests; **the M1 latency gate re-measured with the accelerator — target
-~30–80ms publish→consume — and job-to-job re-measured (notify + claim)**;
+~30–80ms publish→consume — and step-to-step re-measured (notify + claim)**;
 the fallback test: kill the LISTEN connection mid-run
 and verify delivery degrades to tick latency with zero loss; an end-to-end demo:
 one `Publish` in a transaction → worker consumes, a trigger births a job
@@ -328,7 +331,7 @@ Move them with the CLI to the nested `cb` module. Write migration notes for any
 external 0.x users.
 
 Then **empty the root package**. Everything with a shipped successor is deleted:
-`queue.go` (→ subscriptions + one-job runs, M1–M4, D37), `task.go`/`flow.go`/
+`queue.go` (→ subscriptions + one-step runs, M1–M4, D37), `task.go`/`flow.go`/
 `worker.go`/`cancel.go`/`complete_early.go`/`handler_opts.go`/`backoff.go`
 (→ job, M4), `scheduler.go` (→ the schedule tables, M2/M4a),
 `wire.go`/`wire_token.go`/`notifications.go` (→ wire, M5),
@@ -356,7 +359,7 @@ nothing outside history.
 | `worker_notifier.go` (the LISTEN machinery — `notifier.go` does not exist; CLAUDE.md is stale), `notify.go` (send helper), wire.go's embedded listener | copied/consolidated into a shared `internal/` notifier package (M5, D17); originals serve the old worker until deleted at M6 |
 | `topic_trie.go`, `topic.go` | trie kept for app-side in-process dispatchers (one event against many subscriber rows, webhook-style); the engine's matcher is SQL (D29, M3); `topic.go` retires with the old API (M6) |
 | `migrate.go` | parameterized per module (M0) |
-| `queue.go` + `cb_q_*` SQL | replaced by subscriptions (feed half, M1–M2) and one-job runs (work half, M4 — D37); `Send/Read/Hide/Delete` API retired |
+| `queue.go` + `cb_q_*` SQL | replaced by subscriptions (feed half, M1–M2) and one-step runs (work half, M4 — D37); `Send/Read/Hide/Delete` API retired |
 | `scheduler.go` | dissolved into `cb_stream_schedules` (M2) + `cb_job_schedules` (M4a) + builder sugar |
 | `task.go` reflection, `util.go` | ported into `job` (M4); `backoff.go`'s semantics move to the kernel SQL unit, one implementation for both modules (M4a, D41) |
 | `flow.go`, `worker.go`, `cancel.go`, `complete_early.go` | semantics ported to the row engine (D30–D39); code largely rewritten (M4) — the claim-loop shape and the NOTIFY wake contract are the parts that carry over most directly |
@@ -391,7 +394,7 @@ nothing outside history.
   churn, and it accelerates bulk *keyed* publishes — a shape with no
   customer.
 
-- **One-job-run row collapse.** A one-job run writes run + job + attempt
+- **One-step-run row collapse.** A one-step run writes run + step + attempt
   rows where a bare queue would write one; invisible at the stated scale,
   and the run row *is* the feature (handle, dedup, status). If a high-volume
   fire-and-forget workload ever makes the weight measurable, fold the
@@ -411,8 +414,8 @@ nothing outside history.
 
 - **Assigner latency under load** (M1 gate). This is the one empirical bet in
   the design — feed layer only: job edges no longer ride it (D34).
-- **Jobs-table churn** (M4): claim, start and complete each update the job
-  row; watch `cb_jobs` autovacuum and index bloat during the wide-map
+- **Steps-table churn** (M4): claim, start and complete each update the step
+  row; watch `cb_job_steps` autovacuum and index bloat during the wide-map
   stress. LIST partitioning by queue is the documented escape hatch (03 §4).
 - **Ordinal-update index churn** on high-volume streams: watch bloat on
   `(stream, position)` during M2 benchmarks; `fillfactor` tuning is the first lever.
