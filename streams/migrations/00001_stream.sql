@@ -8,31 +8,17 @@
 -- Why IRD: the natural prefix CB sits in the SQLSTATE class range the
 -- standard reserves for itself (0-4, A-H).
 
+-- cb_valid_name, cb_forever, cb_backoff and cb_backoff_kind live in the
+-- kernel's SQL unit (internal/migrate/migrations), applied before this file.
+
 CREATE TYPE cb_ref_kind AS ENUM ('message', 'pending');
-CREATE TYPE cb_backoff_kind AS ENUM ('none', 'fixed', 'full_jitter');
 CREATE TYPE cb_fail_policy AS ENUM ('keep', 'delete');
 CREATE TYPE cb_catch_up_policy AS ENUM ('skip', 'all');
-
--- +goose statementbegin
-CREATE FUNCTION cb_valid_name(name text)
-RETURNS boolean
-LANGUAGE sql IMMUTABLE AS $$
-    SELECT name IS NOT NULL
-       AND name ~ '^[a-z][a-z0-9_]*$'
-       AND octet_length(name) <= 20
-$$;
--- +goose statementend
 
 -- +goose statementbegin
 CREATE FUNCTION _cb_stream_notify(stream text, payload text)
 RETURNS void LANGUAGE sql AS $$
     SELECT pg_notify(current_schema || '.cbs_' || stream, payload);
-$$;
--- +goose statementend
-
--- +goose statementbegin
-CREATE FUNCTION cb_forever() RETURNS interval LANGUAGE sql IMMUTABLE AS $$
-    SELECT interval '-1 second'
 $$;
 -- +goose statementend
 
@@ -1109,7 +1095,7 @@ BEGIN
                 SET last_error   = 'silence',
                     consumer     = NULL,
                     claimable_at = clock_timestamp()
-                        + _cb_backoff(_q.backoff_kind, _q.backoff_base, _q.backoff_max, _r.attempt)
+                        + cb_backoff(_q.backoff_kind, _q.backoff_base, _q.backoff_max, _r.attempt)
                 WHERE (t.stream, t.subscription, t.origin_pos)
                     = (_r.stream, _r.subscription, _r.origin_pos);
             END IF;
@@ -1360,27 +1346,6 @@ END; $$;
 -- +goose statementend
 
 -- +goose statementbegin
-CREATE FUNCTION _cb_backoff(kind cb_backoff_kind, base_delay interval, max_delay interval, attempt int)
-RETURNS interval LANGUAGE plpgsql AS $$
-DECLARE
-    _cap interval;
-BEGIN
-    CASE _cb_backoff.kind
-    WHEN 'none' THEN
-        RETURN '0';
-    WHEN 'fixed' THEN
-        RETURN least(_cb_backoff.base_delay, _cb_backoff.max_delay);
-    WHEN 'full_jitter' THEN
-        _cap := least(_cb_backoff.base_delay * (2 ^ least(_cb_backoff.attempt - 1, 20)),
-                      _cb_backoff.max_delay);
-        RETURN _cap * random();
-    ELSE
-        RAISE EXCEPTION 'catbird: unknown backoff kind %', _cb_backoff.kind USING ERRCODE = 'IRD01';
-    END CASE;
-END; $$;
--- +goose statementend
-
--- +goose statementbegin
 -- Gives up on a retry row whose attempts are spent. Under the 'keep' policy
 -- the row is kept as a failed row and the cb_failed channel is rung; under 'delete'
 -- the row is deleted and nothing is kept.
@@ -1454,7 +1419,7 @@ BEGIN
             SET last_error   = cb_stream_fail.error,
                 consumer     = NULL,
                 claimable_at = clock_timestamp()
-                    + _cb_backoff(_q.backoff_kind, _q.backoff_base, _q.backoff_max, _r.attempt)
+                    + cb_backoff(_q.backoff_kind, _q.backoff_base, _q.backoff_max, _r.attempt)
             WHERE (t.stream, t.subscription, t.origin_pos)
                 = (_r.stream, _r.subscription, _r.origin_pos);
         END IF;
@@ -1498,7 +1463,7 @@ BEGIN
         _m.topic, _m.payload, _m.headers,
         1, cb_stream_fail.error, _failed,
         CASE WHEN _failed THEN clock_timestamp()
-             ELSE clock_timestamp() + _cb_backoff(_q.backoff_kind, _q.backoff_base, _q.backoff_max, 1) END
+             ELSE clock_timestamp() + cb_backoff(_q.backoff_kind, _q.backoff_base, _q.backoff_max, 1) END
     )
     -- a concurrent crash may have recorded a silence row first: keep it
     ON CONFLICT ON CONSTRAINT cb_stream_retries_pkey DO NOTHING
@@ -1547,7 +1512,6 @@ DROP TYPE cb_catch_up_policy;
 DROP FUNCTION cb_stream_retry_failed(text, text);
 DROP FUNCTION cb_stream_fail(text, text, text, bigint, text);
 DROP FUNCTION _cb_stream_give_up(cb_stream_retries, cb_fail_policy, text);
-DROP FUNCTION _cb_backoff(cb_backoff_kind, interval, interval, int);
 DROP FUNCTION cb_stream_close_claim(text, text, text, bigint);
 DROP FUNCTION _cb_stream_advance_closed_position(text, text);
 DROP FUNCTION cb_stream_release_claim(text, text, text, bigint);
@@ -1573,10 +1537,7 @@ DROP TABLE cb_stream_cursors;
 DROP TABLE cb_stream_keys;
 DROP TABLE cb_stream_pending;
 DROP TABLE cb_streams;
-DROP FUNCTION cb_forever();
 DROP FUNCTION _cb_stream_compile_condition(text);
 DROP FUNCTION _cb_stream_compile_topic(text);
-DROP FUNCTION cb_valid_name(text);
 DROP TYPE cb_ref_kind;
-DROP TYPE cb_backoff_kind;
 DROP TYPE cb_fail_policy;

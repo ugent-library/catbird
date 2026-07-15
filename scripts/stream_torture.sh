@@ -17,8 +17,10 @@ DURATION="${1:-8}"   # seconds of pgbench load; pass a bigger number for a longe
 
 docker exec catbird-postgres psql -U postgres -q \
   -c "DROP DATABASE IF EXISTS $DB;" -c "CREATE DATABASE $DB;"
-sed -n '/+goose up/,/+goose down/p' stream/migrations/00001_stream.sql \
-  | grep -v '\-\- +goose down' | "${PSQL[@]}"
+for sql in internal/migrate/migrations/00001_kernel.sql streams/migrations/00001_stream.sql; do
+  sed -n '/+goose up/,/+goose down/p' "$sql" \
+    | grep -v '\-\- +goose down' | "${PSQL[@]}"
+done
 "${PSQL[@]}" -c "SELECT cb_stream_ensure('torture');"
 
 # pgbench script: publish once per transaction; ~5% of transactions stay open

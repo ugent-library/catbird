@@ -1,4 +1,4 @@
-package stream
+package streams
 
 import (
 	"context"
@@ -323,7 +323,7 @@ func TestConsume(t *testing.T) {
 	}
 }
 
-func TestRunJobs(t *testing.T) {
+func TestRunTicks(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
@@ -336,9 +336,9 @@ func TestRunJobs(t *testing.T) {
 	}
 
 	jctx, cancel := context.WithCancel(ctx)
-	jobsDone := make(chan error, 1)
+	ticksDone := make(chan error, 1)
 	go func() {
-		jobsDone <- RunJobs(jctx, pool, JobsOpts{
+		ticksDone <- RunTicks(jctx, pool, TickOpts{
 			AssignPositionsInterval: 20 * time.Millisecond,
 			DeliverInterval:         20 * time.Millisecond,
 			PruneInterval:           50 * time.Millisecond,
@@ -420,7 +420,7 @@ func TestRunJobs(t *testing.T) {
 	}
 
 	cancel()
-	if err := <-jobsDone; !errors.Is(err, context.Canceled) {
+	if err := <-ticksDone; !errors.Is(err, context.Canceled) {
 		t.Fatalf("jobs returned %v, want context.Canceled", err)
 	}
 	if err := <-consumeDone; !errors.Is(err, context.Canceled) {
@@ -444,9 +444,9 @@ func TestConsumeSubscription(t *testing.T) {
 	}
 
 	jctx, cancel := context.WithCancel(ctx)
-	jobsDone := make(chan error, 1)
+	ticksDone := make(chan error, 1)
 	go func() {
-		jobsDone <- RunJobs(jctx, pool, JobsOpts{
+		ticksDone <- RunTicks(jctx, pool, TickOpts{
 			AssignPositionsInterval: 20 * time.Millisecond,
 			DeliverInterval:         20 * time.Millisecond,
 		})
@@ -533,7 +533,7 @@ func TestConsumeSubscription(t *testing.T) {
 	if err := <-subDone; !errors.Is(err, context.Canceled) {
 		t.Fatalf("subscription consume returned %v, want context.Canceled", err)
 	}
-	if err := <-jobsDone; !errors.Is(err, context.Canceled) {
+	if err := <-ticksDone; !errors.Is(err, context.Canceled) {
 		t.Fatalf("jobs returned %v, want context.Canceled", err)
 	}
 
@@ -1838,9 +1838,9 @@ func TestConsumeSubscriptionPoisonHandler(t *testing.T) {
 	}
 
 	jctx, cancel := context.WithCancel(ctx)
-	jobsDone := make(chan error, 1)
+	ticksDone := make(chan error, 1)
 	go func() {
-		jobsDone <- RunJobs(jctx, pool, JobsOpts{
+		ticksDone <- RunTicks(jctx, pool, TickOpts{
 			AssignPositionsInterval: 20 * time.Millisecond,
 			DeliverInterval:         20 * time.Millisecond,
 		})
@@ -1896,7 +1896,7 @@ func TestConsumeSubscriptionPoisonHandler(t *testing.T) {
 	if err := <-subDone; !errors.Is(err, context.Canceled) {
 		t.Fatalf("subscription consume returned %v, want context.Canceled", err)
 	}
-	if err := <-jobsDone; !errors.Is(err, context.Canceled) {
+	if err := <-ticksDone; !errors.Is(err, context.Canceled) {
 		t.Fatalf("jobs returned %v, want context.Canceled", err)
 	}
 }
@@ -2477,9 +2477,9 @@ func TestConsumeSubscriptionFiltered(t *testing.T) {
 
 	jctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	jobsDone := make(chan error, 1)
+	ticksDone := make(chan error, 1)
 	go func() {
-		jobsDone <- RunJobs(jctx, pool, JobsOpts{
+		ticksDone <- RunTicks(jctx, pool, TickOpts{
 			AssignPositionsInterval: 20 * time.Millisecond,
 			DeliverInterval:         20 * time.Millisecond,
 		})
@@ -2531,7 +2531,7 @@ func TestConsumeSubscriptionFiltered(t *testing.T) {
 	}
 	cancel()
 	<-subDone
-	<-jobsDone
+	<-ticksDone
 
 	mu.Lock()
 	defer mu.Unlock()

@@ -1,4 +1,4 @@
-package stream
+package streams
 
 import (
 	"context"
@@ -10,22 +10,22 @@ import (
 	"github.com/ugent-library/catbird/internal/ticker"
 )
 
-// JobsOpts tunes the background jobs. Zero fields mean the defaults.
-type JobsOpts struct {
+// TickOpts tunes the background ticks. Zero fields mean the defaults.
+type TickOpts struct {
 	AssignPositionsInterval time.Duration // 100ms: publish consume latency
 	DeliverInterval         time.Duration // 500ms: delayed message and schedule accuracy
 	PruneInterval           time.Duration // 60s
 	Logger                  *slog.Logger  // slog.Default()
 }
 
-// RunJobs runs the stream engine's background work: assigning positions,
+// RunTicks runs the stream engine's background work: assigning positions,
 // delivering due pending messages and schedules, and pruning expired
 // messages and keys.
 // Running this from multiple processes is safe, the SQL locks decide who
 // does the work. If none are running, delivery pauses but publishing keeps
 // working.
-func RunJobs(ctx context.Context, pool *pgxpool.Pool, opts ...JobsOpts) error {
-	var o JobsOpts
+func RunTicks(ctx context.Context, pool *pgxpool.Pool, opts ...TickOpts) error {
+	var o TickOpts
 	if len(opts) > 0 {
 		o = opts[0]
 	}
@@ -43,11 +43,11 @@ func RunJobs(ctx context.Context, pool *pgxpool.Pool, opts ...JobsOpts) error {
 	}
 
 	t := ticker.New(o.Logger)
-	t.Add(ticker.Job{Name: "stream.assign", Every: o.AssignPositionsInterval,
+	t.Add(ticker.Tick{Name: "stream.assign", Every: o.AssignPositionsInterval,
 		Run: func(ctx context.Context) (int, error) { return assignPositions(ctx, pool) }})
-	t.Add(ticker.Job{Name: "stream.deliver", Every: o.DeliverInterval,
+	t.Add(ticker.Tick{Name: "stream.deliver", Every: o.DeliverInterval,
 		Run: func(ctx context.Context) (int, error) { return deliver(ctx, pool) }})
-	t.Add(ticker.Job{Name: "stream.prune", Every: o.PruneInterval,
+	t.Add(ticker.Tick{Name: "stream.prune", Every: o.PruneInterval,
 		Run: func(ctx context.Context) (int, error) { return prune(ctx, pool) }})
 	return t.Start(ctx)
 }

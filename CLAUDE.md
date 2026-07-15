@@ -8,7 +8,7 @@ Catbird is a PostgreSQL-backed message queue with task and workflow (DAG) execut
 
 ## Rewrite in progress
 
-New code lives in `stream/`, `internal/ticker/`, and `internal/migrate/` (later `jobs/` and `wire/`) per `docs/plan/`. The top-level API is **frozen**: bugfixes only, no improvements — everything here is scheduled for replacement. The new stream schema is goose-managed in `stream/migrations/` with its own version table (`cb_stream_migrations`), separate from the old `migrations/`. Its scenario tests live in the Go suite (`stream/stream_test.go`); `scripts/stream_torture.sh` stress-tests the assigner separately.
+New code lives in `streams/`, `internal/ticker/`, and `internal/migrate/` (later `jobs/` and `wire/`) per `docs/plan/`. The top-level API is **frozen**: bugfixes only, no improvements — everything here is scheduled for replacement. The new stream schema is goose-managed in `streams/migrations/` with its own version table (`cb_stream_migrations`), separate from the old `migrations/`. Shared pure SQL (`cb_backoff`, `cb_valid_name`, `cb_forever`) lives in the kernel unit `internal/migrate/migrations/`, applied automatically before any module's migrations. Scenario tests live in the Go suite (`streams/stream_test.go`); `scripts/stream_torture.sh` stress-tests the assigner separately.
 
 ## Development Commands
 
@@ -39,7 +39,7 @@ There is no Makefile. Tests use a hardcoded DSN (`postgres://postgres:postgres@l
 
 **Two independent systems:**
 
-1. **Generic Message Queues** — `Send()`, `Publish()`, `Read()` operations (SQS-like). Topic routing via bindings with wildcard support (`*` single token, `#` multi-token tail). In the rewrite (`stream/`) routing is replaced by server-side read filters: queues and cursors take a topic pattern plus a condition (D29 in `docs/plan/README.md`).
+1. **Generic Message Queues** — `Send()`, `Publish()`, `Read()` operations (SQS-like). Topic routing via bindings with wildcard support (`*` single token, `#` multi-token tail). In the rewrite (`streams/`) routing is replaced by server-side read filters: queues and cursors take a topic pattern plus a condition (D29 in `docs/plan/README.md`).
 2. **Task & Flow Execution** — Tasks are single handlers; Flows are DAGs of steps with dependencies. `RunTask()`/`RunFlow()` create run entries; workers claim and execute handlers via NOTIFY-driven scheduling.
 
 **Key components:**
