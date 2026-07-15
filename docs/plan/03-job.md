@@ -129,8 +129,8 @@ like every other module (05).
   ('signal', 'all_done_signal') AND status NOT IN ('completed', 'failed',
   'canceled')` enforces §3's signal-name rule race-free.
 - `cb_job_attempts (PK (run_id, step_id, attempt), worker, started_at,
-  finished_at, outcome, error)` — per-attempt history *and* the fence
-  record; kept when the run turns terminal. `outcome` is `completed | failed
+  finished_at, status, error)` — per-attempt history *and* the fence
+  record; kept when the run turns terminal. `status` is `completed | failed
   | NULL`, and NULL is recorded silence: a start that never reported — a
   crash, or a restart that superseded it.
 - `cb_job_signals (PK (run_id, name), payload, created_at)` — the signal
@@ -250,7 +250,7 @@ row until M5, then wakes on the notify with the poll demoted to safety net.
 
 **Failure, retries, giving up — one counter (D38).** A failed execution
 reports through `cb_job_fail`: the fence admits it, the attempt row records
-the verdict (`outcome = 'failed'`, the error), and one comparison decides:
+the verdict (attempt-row `status = 'failed'`, the error), and one comparison decides:
 
 - `attempt < max_attempts` — the step goes back to `queued`, `claimable_at =
   now() + backoff(attempt)`, worker cleared. The retry is nothing but the
@@ -415,7 +415,7 @@ contract each sketch must meet.
   until a new worker arrives. False means the step already moved on.
 - **`cb_job_complete(run_id, step_id, attempt, output, spawns, run_output)
   → boolean`** — the heart, one transaction, in this order: fence → resolve
-  the attempt (outcome, finished_at; step → `completed`, output stored) →
+  the attempt (status, finished_at; step → `completed`, output stored) →
   validate and insert the spawned steps (names against `cb_jobs`, queue
   stamped from the definition, dispatch words;
   identity `ON CONFLICT DO NOTHING` as defense in depth) → consume signal
@@ -745,7 +745,7 @@ for the composition rule.
 ## 9. Retention, audit, history (D30)
 
 Rows are the history. A step row per spawn, an attempt row per start —
-`cb_job_attempts` is kept when the run turns terminal, and a NULL outcome is
+`cb_job_attempts` is kept when the run turns terminal, and a NULL status is
 itself a record: a start that never reported (§3). The dashboard's run detail
 view reads what actually happened — who started what, which attempts failed
 with which errors, what was given up on — without an event log; give-ups are a

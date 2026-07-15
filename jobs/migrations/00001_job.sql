@@ -128,7 +128,7 @@ CREATE UNIQUE INDEX cb_job_steps_signal_name_idx ON cb_job_steps (run_id, name)
       AND status NOT IN ('completed', 'failed', 'canceled');
 
 -- Per-attempt history and the fence record, kept when the run turns
--- terminal. A NULL outcome is recorded silence: a start that never
+-- terminal. A NULL status is recorded silence: a start that never
 -- reported — a crash, or a restart that superseded it.
 CREATE TABLE cb_job_attempts (
     run_id bigint NOT NULL,
@@ -137,7 +137,7 @@ CREATE TABLE cb_job_attempts (
     worker text NOT NULL,
     started_at timestamptz NOT NULL DEFAULT now(),
     finished_at timestamptz,
-    outcome text CHECK (outcome IN ('completed', 'failed')),
+    status text CHECK (status IN ('completed', 'failed')),
     error text,
     PRIMARY KEY (run_id, step_id, attempt),
     FOREIGN KEY (run_id, step_id) REFERENCES cb_job_steps (run_id, id)
