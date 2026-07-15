@@ -19,9 +19,10 @@
 An ordered, partitioned, append-only log with two read modes — the layer that
 answers *what happened*. Consumers are cursors (ordered, exactly-once same-DB)
 and subscriptions (at-least-once, filtered, with retries). Work dispatch —
-*what must still be done* — is the flow engine's row-shaped job (03, D34);
-events become work through a consumer that calls `cb_flow_run` in its handler
-transaction. Package `stream`; tables `cb_stream_*`.
+*what must still be done* — is the job engine's work row (03, D34, D39);
+events become jobs through a trigger (D40), or any consumer that calls
+`cb_job_run` in its handler transaction. Package `streams`; tables
+`cb_stream_*`.
 
 ## 1. The model in five sentences
 
@@ -195,7 +196,7 @@ cb_stream_retries   stream · consumer name · origin_pos PK(stream,consumer,
                    and backoff in one column) · claim consumer · created_at
                    The whole unhappy path of §7 and §9: a message's failure
                    state from first verdict or quarantine to resolution
-                   (deleted), conviction (dead = true, parked for triage and
+                   (deleted), give-up (dead = true, parked for triage and
                    redrive) or drop. Serves subscriptions (retry + dead) and
                    cursors (dead only, via failure_policy).
 cb_stream_pending  id PK · stream · topic · payload · headers · deliver_at ·
@@ -239,11 +240,13 @@ Column discipline (settled while writing the first migration):
   sketches abbreviate to `stream`. Semantics here, identifiers there.
   Convention: table names are **plural** (`cb_stream_messages`,
   `cb_stream_keys`) except collectives (`cb_stream_pending`); function names
-  stay singular verbs (`cb_stream_publish`). Bonus: the `cb_flow_runs` table
-  no longer collides with the `cb_flow_run()` function.
+  stay singular verbs (`cb_stream_publish`). Bonus: the `cb_job_runs` table
+  no longer collides with the `cb_job_run()` function.
 - **Name validation, one tier** (D36 collapsed the grammar): every stream is
   user-made and single-segment — `cb_valid_name` (`^[a-z][a-z0-9_]*$`, ≤ 20
   bytes; relaxable to ~40 now that nothing composes names, if anyone asks).
+  `cb_valid_name` and `cb_forever` move to the kernel's shared SQL unit at
+  M4a, names unchanged (D41).
   The D22 code grammar (`fe` `fq` `fr` `fd` `sr` `sd`, arity rules, the
   44-byte budget, `__` partition encoding and its injectivity argument, the
   `split_part` base derivations in the failure paths) is retired whole: the
@@ -525,7 +528,7 @@ LOCKED` on the tiny claim table — cold path, fine): a released claim is
 re-handed whole, an expired one is **quarantined** into retry rows (D28 as
 amended by D35/D38, below). Due retry rows are served by the same claim call as
 solo pseudo-claims, before ranges (§7). Then per message in the range: run the
-handler; on failure, `cb_stream_fail` records a retry row or convicts per
+handler; on failure, `cb_stream_fail` records a retry row or gives up per
 policy (§7, D35).
 A claim closes when every message *fetched for it* is handled (succeeded, retried,
 or dead-lettered) — defined over what was fetched, not the position range, so a
@@ -704,7 +707,7 @@ assigner numbering positions nobody ordered by), the escalation key grammar
 pending-table hop inside every backoff, and the covering-claim ownership
 fence on `cb_stream_fail` — the row's own lease is the fence (§7). The
 outage-runway property survives with one budget: a fleet that dies
-continuously convicts a cycling message after `max_attempts` solo rounds,
+continuously gives up on a cycling message after `max_attempts` solo rounds,
 each backoff-separated — minutes at the defaults, a policy number operators
 should know, not a surprise. Solo drain is deliberately slower than ranges
 and that is fine — backoff rate-limits the unhappy path by design; if
@@ -856,7 +859,7 @@ due row is handed out as a **solo pseudo-claim** — `from_pos = to_pos =
 origin_pos`, its `attempt` minted at hand-out, its lease on the row.
 `read_claim` returns the row's copied envelope; `extend` renews the row's
 lease; `close` resolves what the caller still holds — a row that was failed
-(parked) or convicted (dead) survives it, a row that succeeded is deleted;
+(parked) or given up (dead) survives it, a row that succeeded is deleted;
 `release` clears the lease. **The worker contract does not change shape**:
 claim / read / extend / release / close / fail, one stream, no second claim
 loop — the old design's retry-stream leg (`streams := [stream, sr.…]`)
@@ -1225,9 +1228,9 @@ not an omission.
    - No evidence, no charge: crash a range of N with one poison message →
      bystanders quarantine at `attempt = 0`, complete on their first solo
      delivery, and end with `attempt = 1`; only the poison row climbs.
-   - Outage runway: continuous consumer death convicts a cycling message only
+   - Outage runway: continuous consumer death gives up on a cycling message only
      after `max_attempts` solo rounds, each backoff-separated — assert the
-     conviction latency matches policy, not luck.
+     give-up latency matches policy, not luck.
    - Dead rows: exhaustion parks the row (`drop` deletes it); redrive resets
      it and only the owning subscription re-delivers — cursors on the origin
      stream see nothing.

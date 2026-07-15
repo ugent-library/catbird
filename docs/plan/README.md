@@ -16,7 +16,7 @@ should be able to defend after implementing it.
 |---|---|
 | [01-stream.md](01-stream.md) | The feed layer: assigned append-only log, cursors + subscriptions, dedup, pending (delay), schedules (cron), retry rows + dead rows (D35, D36), retention |
 | [02-spine.md](02-spine.md) | Filters: topic patterns and conditions on subscriptions and cursors, the publish API, the end of routing (D29) |
-| [03-flow.md](03-flow.md) | The engine: unified runs (D31), rows as truth *and transport* (D30, D34), the one-counter failure algebra (D38), barriers and signals, Plan DSL, cross-language step contract |
+| [03-job.md](03-job.md) | The engine: jobs and runs (D31, D39), rows as truth *and transport* (D30, D34), the one-counter failure algebra (D38), barriers and signals, Plan DSL, cross-language job contract, triggers (D40) |
 | [04-web.md](04-web.md) | wire: SSE + durable inbox, seen/read semantics, durable push |
 | [05-milestones.md](05-milestones.md) | Build order, exit criteria, test checklists, reuse map from current code |
 
@@ -27,13 +27,13 @@ Async work asks exactly two questions, and each gets its native shape (D34):
 - **The log** answers *what happened* — immutable, shared, ordered,
   replayable, retained by policy. Its consumers are **cursors** (order and
   exactly-once are the product) and **subscriptions** (at-least-once
-  consumption of a feed subset, with retries). Package `stream`.
+  consumption of a feed subset, with retries). Package `streams`.
 - **The work row** answers *what is still owed* — mutable, owned, unordered,
-  gone when done. Flow steps and subscription retries are the same shape
-  (`cb_flow_steps`, `cb_stream_retries`): one timestamp column carrying
+  gone when done. Jobs and subscription retries are the same shape
+  (`cb_jobs`, `cb_stream_retries`): one timestamp column carrying
   visibility, lease and backoff; counters as columns; leases extended by the
-  loop that owns the clock (D27). Package `flow` for work; the retry table
-  inside `stream` for the feed's failure state.
+  loop that owns the clock (D27). Package `jobs` for work; the retry table
+  inside `streams` for the feed's failure state.
 
 Neither shape wears the other's costume — that rule deleted the projection
 (D30), the routing spine (D29), the flow-on-streams transport (D34), the
@@ -44,17 +44,19 @@ and one law for counting it — **no evidence, no charge; solo evidence, one
 charge; one budget** (D38) — one lease protocol (D23/D27), one config
 convention (ensure births, define converges, policy in DB columns, D26), one
 kernel (ticker, notifier, migrations, backoff, the dedup pattern), and one
-composition rule: **events become work through a consumer that calls
-`cb_flow_run` in its handler transaction** — which makes event→job creation
-exactly-once with dedup, the same-database superpower applied at the
-boundary.
+composition rule: **events become jobs through a trigger — a declared
+filter→job binding delivered in the cursor's transaction (D40) — or through
+any consumer that calls `cb_job_run` in its handler transaction** — either
+way event→job creation is exactly-once with dedup, the same-database
+superpower applied at the boundary.
 
-The developer-facing toolbox is five nouns: **stream** (publish, keys,
-delay) · **cursor** · **subscription** · **run** (tasks and flows — also the
-work queue: a one-step run *is* "just a queue", with a handle, D37) ·
-**schedule**, plus **wire** for the browser. There is deliberately no
-standalone queue primitive: both meanings of the word already have a truer
-home (D37).
+The developer-facing toolbox is six nouns: **stream** (publish, keys,
+delay) · **cursor** · **subscription** · **job** (declared work; a **run**
+is its instance, and a flow is implicit — a job that enqueues more jobs,
+D31/D39 — also the work queue: a one-job run *is* "just a queue", with a
+handle, D37) · **schedule** · **trigger** (events become jobs, D40), plus
+**wire** for the browser. There is deliberately no standalone queue
+primitive: both meanings of the word already have a truer home (D37).
 
 ## Delivery guarantees (the headline)
 
@@ -66,7 +68,8 @@ These are the guarantees the whole design is arranged around. Every mechanism in
 | Ordered consumer, effects in the same Postgres | **Exactly-once processing** | Handler runs inside a transaction that also advances the cursor; commit applies effects and ack atomically |
 | Ordered consumer, external effects | At-least-once, in order | Cursor advances only on success; idempotency is the handler's job |
 | Subscription (at-least-once feed consumption) | At-least-once, unordered | Range claims with TTL expiry (D23), extended by the consume loop while work is in progress (D27); retries and crash quarantine as solo retry rows, one budget (D35, D38); dead rows on exhaustion (D36) |
-| Flow & task runs (work rows — no log in the path) | At-least-once execution, **exactly-once row effects** | The attempt-fenced completion transaction (D30, D34); one starts-counter bounds total executions (D38) |
+| Job runs (work rows — no log in the path) | At-least-once execution, **exactly-once row effects** | The attempt-fenced completion transaction (D30, D34); one starts-counter bounds total executions (D38) |
+| Trigger (event → job creation) | **Exactly-once creation** | Cursor advance and `cb_job_run` in one transaction, dedup key as belt and braces (D40) |
 | wire (ephemeral browser push) | At-most-once | `pg_notify`, fires on commit, no storage |
 
 All rows hold for filtered consumers too: a topic pattern or condition
@@ -76,9 +79,9 @@ Exactly-once **external** delivery does not exist in any system; we do not claim
 What we do claim — and it is a real differentiator of the same-database design — is
 that any consumer whose side effects are rows in the same Postgres gets exactly-once
 processing with no idempotency reasoning at all. Every same-DB cursor consumer uses
-this path; the flow engine gets the same property from its attempt-fenced completion
-transaction (D30); and the composition of the two — a cursor handler calling
-`cb_flow_run` — creates work from events exactly-once as well.
+this path; the job engine gets the same property from its attempt-fenced completion
+transaction (D30); and the composition of the two — a trigger, or any cursor
+handler calling `cb_job_run` — creates jobs from events exactly-once as well (D40).
 
 ## Decision log
 
@@ -118,7 +121,7 @@ evidence.
 | D28 | **Claims are atoms; quarantine replaces the crash ladder.** Claims are created whole, re-owned whole, closed whole — boundaries never mutate, so the tiling invariant is structural rather than a proof obligation per branch (the ladder's split shipped with a broken proof: releases counted as crashes, so a rolling deploy could dead-letter a never-attempted message). Adoption has two branches: re-hand whole below `max_crashes` (the `released` flag marks voluntary handback — never a crash; only true expiry bumps the count), or **quarantine** — republish the range's messages individually to the retry stream (`cb_crash`+1 in headers, backoff delay, key `queue:origin:c<crash>`; a message whose failure was already reported keeps its existing retry copy; rows already pruned are simply gone), dead-letter past the limit with `cb_crashes` stamped, `on_fail` honored (one give-up policy; on flow queues that disposition is D33's marked final delivery). A solo claim's first true expiry quarantines immediately — crashed messages return with backoff. `max_crashes` is a granularity threshold, not an execution threshold: wrong trips cost a deferred retry, not an archive; terminal verdicts rest on solo, per-message evidence (conviction runway ~a quarter hour of continuous fleet death at defaults — a documented policy number). `claim_batch_size` is queue policy, no per-call override (retry queues CHECK-pinned to 1). Queues exist on plain streams only; dotted streams are cursor-read. `cb_stream_fail` gains `consumer` third + an ownership fence (covering claim, not closed, no expiry test, silent no-op). Failure vocabulary: **verdict** (error, panic, future timeout) · **silence** (death) · **handback** (release) — each counted once, in one place. Rejected: pure per-message in-flight claims (per-message write amplification and vacuum churn on the happy path; the hybrid degrades to per-message exactly where trouble lives). *Bookkeeping amended by D35/D38: quarantine materializes solo retry rows — no threshold, no claim crash count, no `max_crashes`; claims-as-atoms, released-is-uncharged and adoption-at-contention stand* | 01 §5 |
 | D29 | **Read filters replace routing** (supersedes D8's framing: there is no fan-out at all). Topics are metadata consumers select on, never addresses messages are sent to; a consumer is a filter plus a position over a log (ephemeral/cursor/queue are its three durability flavors). The filter is two small languages, AND-ed, **birth policy** on queues and cursors (competing consumers must agree — the `claim_batch_size` reasoning): a bare topic pattern (`*` one segment, `#` trailing zero-or-more; compiled to a regex at ensure; the fast path) and a `condition` over `$.headers`/`$.payload` (AND-only; MVP = nested-key `exists` + scalar equality; strict across JSON types, numeric within `number`; lax array unwrap; whitelist parser = validator, unsupported fails loud at registration; disassembled into per-column generated jsonpath; grows by whitelist only — `like_regex` and `datetime()` never enter). One matcher implementation, in SQL, identical for every client; the Go trie stays app-side for in-process dispatchers. Cursors advance over the whole scanned range; claims tile positions regardless of matches; quarantine honors the filter; retry streams are never filtered (CHECK-pinned). Filters never require indexes (evaluation-only; deep sparse replay may add an app-owned topic index). Bindings, relays, destination kinds, the kind registry, `identity_from` and the `bus` stream were deleted before being built; autocopy revives only for fan-in, transformation, or a copy outliving its source's retention. Publish collapses to two functions: `Publish` and `PublishMessages` (≡ N × Publish, atomic, full envelope incl. delay; single `jsonb` array parameter; `publish_payloads` retired; set-based fast path deferred with a written design, 05). Grounded in the raven/ingest usage survey (`spine-usage-sketch.md`) | 02 |
 | D30 | **Rows are the truth: the projection is deleted before being built** (supersedes D9 — same fate as bindings and relays, D29). Run and step rows are the engine's only state; there are no `fe.*` event streams (the `fe` code stays reserved, D22), no shards, no apply loop. The ordered-log requirement existed only while the log was the truth — dependency satisfaction is a commutative counter and a status flip is a guarded update, and neither cares about replay order. Exactly-once comes from the **attempt-fenced completion transaction**: every engine function takes the run-row lock first (`FOR UPDATE`, run must be `running`, else silent no-op), then the step guard (status and attempt must match what `cb_flow_start` handed out). Attempts are minted by start, never read from headers — the step's `attempt` counts starts, the stream's `cb_attempt` counts verdicts; they diverge on crashes, deliberately. History changes grain rather than dying: rows are event-grained and `cb_flow_attempts` is kept at terminal (a NULL outcome is recorded silence); only replay/state-at-T is lost, and it was never a feature. Cost: strictly cheaper than the projection (no event write + re-read + apply + cursor advance; one assigned leg per edge instead of two); serialization moved to the run-row lock queue, not removed — serial-per-run was required in both designs. Watch item: connection occupancy on wide fan-in (sibling completions serialize on the run-row lock, ~1k completions/s per run); mitigation ladder = keep the completion transaction tiny → batched complete (an array of siblings, the `PublishMessages` precedent) → deferred drain detection. Wide-map stress test lands in M4b | 03 |
-| D31 | **A run is a group of executions; every execution may atomically enqueue follow-ons at completion** ("a flow is a task that enqueues follow-ons", taken literally). The separate task concept is eliminated: a task is a run whose single execution enqueued nothing, surviving only as sugar — `flow.NewTask(name, fn)` over `func(ctx, In) (Out, error)`. One package `flow/`, its own migration table. **No deps table**: a sequential edge is a spawn at completion — the parent is complete by construction, so there is nothing to check; fan-in is a barrier over the run's `steps_remaining` counter — barrier steps (`OnAllDone()`) wait outside the count, and when `steps_remaining` reaches zero, waiting barriers dispatch as the next set, otherwise the run finalizes. Signal-waiting steps (`OnSignal()`) count as remaining, so barriers and run completion wait behind them. Deletes `After`/`SpawnRef`/unmet tracking and cycle validation. Evidence: raven and biblio contain zero flows — declared DAG edges have no production customer; ingest's flows are fan-out + join, which the barrier covers. Partial joins (start C after A and B while D still runs) are deferred with a written design and arrive additively as an `OnAllDone("a","b")` overload when the first real workload asks. Vocabulary (ratified): builder = `flow.New(name).FirstStep("split").Step(name, fn, opts...)` — the entry step is an ordinary step designated by `first_step`; one Plan verb, `p.Spawn`; the rule is "a spawn dispatches immediately unless an `On*` option defers it"; every Plan method buffers, nothing blocks, the buffer commits with the completion (D10). Dispatch words are the same in Go, the JSON contract and the column: `immediate` \| `all_done` \| `signal` | 03 |
+| D31 | **A run is a group of executions; every execution may atomically enqueue follow-ons at completion** ("a flow is a task that enqueues follow-ons", taken literally). The separate task concept is eliminated: a task is a run whose single execution enqueued nothing, surviving only as sugar — `flow.NewTask(name, fn)` over `func(ctx, In) (Out, error)`. One package `flow/`, its own migration table. **No deps table**: a sequential edge is a spawn at completion — the parent is complete by construction, so there is nothing to check; fan-in is a barrier over the run's `steps_remaining` counter — barrier steps (`OnAllDone()`) wait outside the count, and when `steps_remaining` reaches zero, waiting barriers dispatch as the next set, otherwise the run finalizes. Signal-waiting steps (`OnSignal()`) count as remaining, so barriers and run completion wait behind them. Deletes `After`/`SpawnRef`/unmet tracking and cycle validation. Evidence: raven and biblio contain zero flows — declared DAG edges have no production customer; ingest's flows are fan-out + join, which the barrier covers. Partial joins (start C after A and B while D still runs) are deferred with a written design and arrive additively as an `OnAllDone("a","b")` overload when the first real workload asks. Vocabulary (ratified): builder = `flow.New(name).FirstStep("split").Step(name, fn, opts...)` — the entry step is an ordinary step designated by `first_step`; one Plan verb, `p.Spawn`; the rule is "a spawn dispatches immediately unless an `On*` option defers it"; every Plan method buffers, nothing blocks, the buffer commits with the completion (D10). Dispatch words are the same in Go, the JSON contract and the column: `immediate` \| `all_done` \| `signal`. *Vocabulary superseded by D39: everything converges on **job**, `FirstStep` retires (any job is an entry point), and the flow builder dissolves into individual declarations* | 03 |
 | D32 | **The engine never guards: conditions are eliminated from the engine.** Guards live at enqueue points — queue and cursor filters (D29), a plain `if` before `Spawn`/`Run`; a condition on a scheduled run is the degenerate case of the same rule. Raven's one production `WithCondition` (plus its three `BindTask`s) becomes a filtered queue: more capable, and non-matching messages no longer churn run rows. No condition column on runs or steps, no skipped status — `ErrRunSkipped` retires; what used to be a skip is either never enqueued (the guard lives upstream) or canceled by the cascade. The M3 condition language lives on queues and cursors (D29), not on runs | 03 |
 | D33 | **Exhaustion is one final marked delivery; conviction happens in `cb_flow_start`** (deletes `cb_flow_exhaust` before it was built). At give-up the stream layer does not archive a flow message: it republishes it once more to the retry twin carrying the exhaustion stamp (`cb_attempts` or `cb_crashes`), and the corpse arrives through the normal claim path; `cb_flow_start` sees the stamp and convicts instead of starting — step `failed`, `on_fail` spawned if declared, the run drains, and the engine writes the `fd.<flow>` archive row itself, all in that one transaction. This removes the failure path's projection-shaped detour (stream tx → `fd` → cursor → second tx) and with it the worker's `fd` cursor, the window where run state lies, and the load-bearing archive: `fd.<flow>` becomes a pure archive with one writer (the engine) and no reader the engine depends on. Verdict and crash exhaustion still converge at one conviction site, and foreign workers convict for free — they call `cb_flow_start` on every claimed message anyway (under the cursor design a Python-only fleet never convicted anything). The mechanism spends the give-up disposition the log had parked as deferred (`reroute`; value name provisional until transcription), implemented generically: the substrate keeps owning and enforcing `max_attempts`/`max_crashes` (D28's one policy home intact) and never learns flows exist. Accepted costs: a verdict conviction waits one claim cycle instead of an `fd` cursor tick (still sooner); the marked corpse sits on `fr.*` under its retention, so a workerless week loses the conviction — the same hazard class the dead `fd` cursor had, and `max_run_age`'s problem either way. Rejected en route: `cb_flow_fail` returning the stream layer's disposition + start convicting only crashes (two conviction sites, and flow queues would need a lying crash column with the real limit homed elsewhere); engine-owned retries with no `fr.*` (duplicates M2's backoff/exhaustion arithmetic and breaks the shared robustness mechanism). *Superseded whole by D34/D38: flows left the log — no marked delivery, no corpse; conviction is one comparison against the step's start count, and "shared robustness" became a shared law over two shapes rather than one mechanism* | 03 |
 | D34 | **Flows leave the log: the step row is the work unit** (supersedes D33 whole; amends D9/D30's framing — rows are the truth *and the transport* — and D15's dependency rule). The engine claims `cb_flow_steps` directly (`FOR UPDATE SKIP LOCKED` over a partial working-set index); one `claimable_at` column carries visibility, lease and backoff; spawn = insert + notify, retry = an UPDATE, scheduled runs = a flow-side schedule table delivering `cb_flow_run` in the re-arm transaction. Deletes: the `fq.*`/`fr.*`/`fd.*` families before birth, the ready-message copy and its assigned position (three writes per edge → one), the header contract (`cb_run_id`…), the corpse protocol, the scheduled-template translation, the parked-run pruned-message hazard (a step can't be pruned apart from its run), and the entire stream-layer prerequisite — the stream layer is untouched by flows. Step-to-step latency drops below the assigner floor to notify + claim: the engine was paying per edge for ordering no flow ever consumed. D2's no-SKIP-LOCKED rule is scoped to the log, where it remains right: a mutable owned working set is the canonical SKIP LOCKED case, and it is the shape the old engine already ran in production. `flow → kernel` only; either module ships without the other | 03 |
@@ -126,6 +129,11 @@ evidence.
 | D36 | **Dead letters are dead rows** (supersedes D6). A dead letter is a retry row that exhausted: `dead = true`, parked until a human acts — redrive is a reset (`dead = false, attempt = 0`), dismiss is a delete. Fixes an inherited leak: stream-shaped redrive *republished* to the origin stream, re-delivering to every cursor and subscription that had already processed the message; a reset re-delivers only to the owner. Deletes `sd.*`, the one lazily-born object, and the per-family retention defaults ("drop what's handled, keep what hasn't" became structure: resolved rows delete, dead rows sit). With D34/D35 this leaves **no engine-made streams at all** — D22's grammar collapses to `cb_valid_name`, partition names need no encoding, and "the log holds only what was published" becomes literal. Cursors' `dead_letter` failure policy writes the same row. Cost accepted: no failure-events-as-a-feed out of the box (notify + dashboard instead; publishable by policy later if a workload asks) | 01 §9 |
 | D37 | **The queue is renamed subscription, and there is no standalone queue primitive** (extends D24). "Queue" named two needs. Consuming a subset of a shared feed at-least-once → **subscription**: the only need that requires the log (shared immutable rows, replay, independent consumer groups), and the reason range claims + filters exist. Dispatching owned work → **a run**: `flow.NewTask` + `cb_flow_run` *is* the work queue, with dedup key, durable handle, attempt history, same-transaction enqueue, `on_fail` — every property the apps' actual queue-shaped code wants; fire-and-forget sets a short flow retention. A pure queue's invariants are a strict subset of the task's — subsets are usage patterns, not primitives (the D31/D32 ruling). Stream-only installations still compose a work path (own stream + subscription), so the toolbox is complete at every module subset | 01 §5, 03 §5 |
 | D38 | **One failure law over both shapes: no evidence, no charge; solo evidence, one charge; one budget** (amends D28's bookkeeping; keeps its vocabulary). `max_attempts` is the only budget; `max_crashes`, the claim-level crash count, `cb_crash`/`cb_attempt` headers and the granularity-threshold doctrine are retired. Evidence: flow mints the count at `start` (per-step call); subscriptions mint it at solo row hand-out (a retry row is claimed alone); the range phase mints nothing — a range crash quarantines bystanders at `attempt = 0`, uncharged, and a verdict creates the row at `attempt = 1` (the verdict is the evidence). One comparison — `attempt ≥ max_attempts` — decides terminal wherever fate is discovered: fail-time for verdicts, hand-out/start-time for silent killers; lapsed leases are repaired at the next claim with `backoff(attempt)` — detection at the point of contention, as everywhere. Verdict / silence / handback survive as record words (`last_error` = error text or `'silence'`; released = uncharged), not as arithmetic: vocabulary for humans, one number for the machine. Accepted imprecision, stated: a graceful restart of a *running* handler spends a start (the fence cannot tell a zombie from a corpse), and a claimed-then-released retry row keeps its charge — both bounded at one per event. The principled asymmetry: flow leases in batches and mints at start (runs are precious — conviction cascades); subscription rows claim solo and mint at hand-out (messages are cheap, and solo restores attribution D28 bought with pins) | 01 §5, §7; 03 §3 |
+| D39 | **Task, flow and step converge on one word: job** (extends D31/D37; renames D34's tables). The claimable work row is a **job**; a flow is implicit — a job that enqueues more jobs; the run is the group and the record. Jobs are declared individually and globally named (`cb_job_defs`, the spawn-validation and routing authority in one); any job is an entry point — `FirstStep` retires, `RunJob` names the job you mean; the run inherits `on_fail` and retention from its **birth job**; the dedup key scopes per birth job (`UNIQUE (job, key)`). Queues are **global pools**, each with its own terms (`WithRetry` is a queue option, never a job option); the migration seeds `main`; a grouped `jobs.Define` restores shared-pool declarations as pure sugar; claim and extend take a queue array so many small pools cost one round trip; a per-pool `max_inflight` cap is deferred with a written note (03 §6). `flow.NewTask` dies: one registration shape, the Plan parameter optional. The `cb_job_*` names collide with nothing in the old schema, so the job suite runs on the shared test database — the old-flow-name reuse and its own-database exception are deleted. The kernel ticker's registrations stop being called "jobs" (they are ticks and janitors) so the word means one thing | 03 |
+| D40 | **Triggers: events become jobs declaratively** (the spine's surviving descendant; completes what D29/D32 left to hand-written consumers). A trigger is a declared binding — a filter (topic pattern + condition, the D29 languages, same compiler) over a stream → a named job — delivered entirely in SQL by a kernel tick: read the trigger's cursor, `cb_job_run(job, envelope, key)` per match, advance the cursor, one transaction — **exactly-once event→job creation** with no deployed consumer code, cross-language by construction. Input = the message envelope whole (the engine-supplies-it rule); key defaults to `<trigger>:<position>` (idempotent across cursor resets), message-key coalescing opt-in. Deterministic failures roll back the batch and stall the trigger at its cursor — visible, loud; execution failures belong to the job's retry/`on_fail` story, and backpressure is the pool's (03 §6). Hand-written subscription consumers remain for bridges needing app logic. *Packaging amended by D41: no `trigger/` module — the trigger is a feature of `jobs/`, requiring the stream schema at use, loudly. The coalescing option is named `deduplicate` per D43 ("coalesce" already means keep-newest pending, D5)* | 03 §8 |
+| D41 | **Seams are congruent across layers, and the kernel exists in SQL too** (amends D40's packaging and D34's copy-per-module rule; a schema merge of stream and job was considered and **rejected**). Go packages, SQL families and migration units carry the same splits — `stream`/`job`/`wire` ↔ `cb_stream_*`/`cb_job_*`/`cb_wire_*` — because the SQL API is the stable contract (D14) and its structure must mirror the product's; "web layer vs backend" stays the *deliverable* framing, not a packaging merge. The merge's gains proved achievable without it. The **trigger becomes a feature of `job/`**: `cb_triggers` and its functions live in job's migrations (PL/pgSQL bodies are late-bound, so the job schema installs cleanly without the stream schema), and `cb_trigger_define` + the delivery tick raise `catbird: stream schema required` at use — no third module, no install check, one recorded one-directional composition (job's SQL → stream's public SQL API, never the reverse; the run-lifecycle feed D36 parked will use the same pattern when a workload asks). Shared machinery moves to the kernel on both layers: the D27 claim-loop skeleton to `internal/` (the stream consumer rebases on it at M4a), and a **kernel SQL migration unit** — own version table, auto-applied by the `internal/migrate` runner before any module's migrations, so no install step changes — holding the module-independent pure functions: backoff, `cb_valid_name`, `cb_forever`, and `cb_cron_next` when cron lands (the first shared SQL too heavy to copy: date math, DST, one torture-tested implementation serving both schedule tables). The per-module-copy rule dies with the gap that justified it. What the rejected merge would have cost, the split keeps: the two-shapes boundary stays structurally enforced — the discipline that deleted D29/D30/D34's wrong designs | 03 §8, §10; 05 |
+| D42 | **Dispatch is two orthogonal gates, not an enum** (amends D31's dispatch vocabulary). `all_done` (wait for the phase to drain) and `signal` (wait for a payload) compose: `immediate | all_done | signal | all_done_signal`, one word in Go (the `On*` options combine), the spawns JSON and the column. A job with an unsatisfied `all_done` gate stays outside the remaining count; at phase dispatch the gate clears and a still-unsignaled job waits on, now counting; a signal arriving while the barrier gate is pending buffers in the run's slot and is consumed at dispatch. Covers the old engine's dependencies-AND-signal shape (the approval gate after fan-out) natively — the sequential half was already free via spawn-at-completion, and two composable-looking `On*` options that panicked when combined would have been a lie in the API | 03 §3 |
+| D43 | **API consolidation: plural packages, declaration nouns, one defs slice, worker vocabulary, give-up** (amends D24's argument naming for the engine and D40's option naming; details D39's surface). Go packages are plural — `jobs`, `streams` — because `job` and `stream` are exactly the identifiers users bind (the `strings`/`bytes`/`errors` rationale); the shipped `stream/` renames mechanically at M4a. Declarations are nouns, `New*` dropped: `jobs.Job`, `jobs.Queue`, `jobs.Schedule`, `jobs.Trigger`, and `jobs.External` — a def row with no handler; which fleet holds a handler is deployment knowledge, deliberately not schema, and coverage validation is the fleet-symmetric enforcement. One defs slice is the single source read by both `jobs.Define` (deploy: converge whole, one advisory-locked transaction) and `jobs.NewWorker` (runtime: register handlers, validate coverage). The engine's SQL says **worker**, not consumer — `cb_job_claim(queues, worker)`, a `worker` column — the substrate keeps consumer (D24: the engine names what things do). `_cb_job_convict` becomes `_cb_job_give_up`, prose to match — one failure vocabulary with the stream layer. Signal payloads are additive (amends D42's detail): a signal-gated spawn carries a normal input; the payload is stamped into a `signal` column at satisfaction and returned by `cb_job_start` — the input rule loses its signal exception. Run retention adopts D7's convention (`cb_forever()` sentinel; default 30 days, deliberately not forever). Child FKs added where the run lock already pays for them (`cb_jobs → cb_job_runs`, attempts, signals); the two hot config references stay FK-free with a justifying comment in the migration. `main` is seeded with stated terms and redeclarable from app code like any pool | 03 |
 
 ## Naming and repo structure
 
@@ -137,9 +145,12 @@ dependencies live in a nested module.
 ```
 github.com/ugent-library/catbird          (module — the library)
 ├── catbird.go, conn.go, …                 kernel: Conn, topic matching, NOTIFY relay,
-│                                          ticker facility, migration runner
-├── stream/                                feed layer (01) — depends on kernel only
-├── flow/                                  engine (03) — depends on kernel only (D34)
+│                                          ticker facility, migration runner, claim-loop
+│                                          skeleton, and a SQL unit of shared pure
+│                                          functions (D41)
+├── streams/                               feed layer (01) — depends on kernel only
+├── jobs/                                  engine (03) — depends on kernel only (D34,
+│                                          D39); includes triggers (03 §8, D40, D41)
 ├── wire/                                  SSE + inbox (04) — depends on kernel only
 └── cb/                                    (nested module) CLI, TUI, dashboard
 ```
@@ -148,24 +159,27 @@ github.com/ugent-library/catbird          (module — the library)
   and `catbird.PublishMessages` are the five-minute API; they delegate to
   `stream`. (`catbird.Bind` died with routing, D29 — consumers declare filters
   on their own queues and cursors instead.)
-- Dependency rule: `flow → kernel`, `stream → kernel`, `wire → kernel` (D34).
-  Vision open decision 3 dissolves rather than being accepted: the engine
-  needs no log, so there is no "second embedded log" to fear — a work table
-  duplicates none of the correctness-critical assignment machinery. The
-  ten-line `backoff()` function is deliberately copied per module so each
-  installs independently.
-- Table naming: static tables per module (`cb_stream_*`, `cb_flow_*`, `cb_wire_*`),
-  one goose version table per module (`cb_stream_migrations`, …) so modules install
-  and upgrade independently. Stream's new names never clash with the current
-  schema — not the `cb_q_*`/`cb_t_*` dynamic tables nor the static ones — so
-  stream and the old code share one database through the transition. Flow is
-  deliberately different: it reclaims the old flow table names (`cb_flows`,
-  `cb_flow_schedules`) rather than dodge them, because raven and biblio have
-  zero flows (D31) — the old flow tables are empty, dropped at raven's cutover,
-  and the flow test suite runs on its own database (05, 03 §2). The old-vs-new function names never collide exactly
-  (old is verb-first, new module-first), but the near-anagram pairs
-  (`cb_run_flow`/`cb_flow_run`) coexist until the old schema drops — sql-api.md
-  carries an old-vs-new table during the transition.
+- Dependency rule: `jobs → kernel`, `streams → kernel`, `wire → kernel`
+  (D34); the trigger, inside `jobs`, composes with stream's public SQL API
+  one-directionally at runtime and raises loudly when that schema is absent
+  (D40, D41). Vision open decision 3 dissolves rather than being accepted:
+  the engine needs no log, so there is no "second embedded log" to fear — a
+  work table duplicates none of the correctness-critical assignment
+  machinery. Shared pure functions (backoff, `cb_valid_name`, `cb_forever`,
+  cron-next when it lands) live in the kernel's SQL unit, auto-applied by
+  the migration runner before any module's migrations (D41) — the
+  per-module-copy rule is retired.
+- Table naming: static tables per module (`cb_stream_*`, `cb_job_*` +
+  `cb_jobs`, `cb_triggers`, `cb_wire_*`), one goose version table per module
+  (`cb_stream_migrations`, …) so modules install and upgrade independently.
+  None of the new names clash with the current schema — not the
+  `cb_q_*`/`cb_t_*` dynamic tables nor the static ones (the old flow tables
+  are `cb_flows`/`cb_flow_*`, which the new schema no longer uses, D39) — so
+  every new module shares one database with the old code through the
+  transition, and every suite runs on the shared test database. The
+  old-vs-new function names never collide (old is verb-first, new
+  module-first) — sql-api.md carries an old-vs-new table during the
+  transition.
 - `go.work` at the repo root ties the nested `cb` module in for development.
 - **This diagram is the end state (post-M6).** During the transition the root
   package remains the frozen old API and the shared machinery lives under
@@ -182,18 +196,19 @@ never a migration.
 
 | Thing | Predefined? | How |
 |---|---|---|
-| Stream | ensured | config row + `LIST` partition; `stream.Ensure(name, opts)` |
+| Stream | ensured | config row + `LIST` partition; `streams.Ensure(name, opts)` |
 | Cursor | ensured (or late-bound) | cursor row with an explicit start position (`tail` \| `begin` \| position) |
 | Subscription | ensured | subscription row + policy columns (D37) |
 | Filter (topic pattern + condition) | born with its subscription/cursor | policy columns, compiled once at ensure (D29); changing one later is a deliberate op |
-| Retry/backoff policy | ensured / defined | columns on the subscription row (ensure) and `cb_flow_queues` (define — converges on deploy) (D4, D26) |
-| Flow | **defined** | `flow.Define`: defs row + steps map + queue terms + schedules, whole declarations that converge on deploy (D26, D34) |
-| Steps of a run | **dynamic** | spawned by handlers at runtime (D10, D31) — the spawned row *is* the claimable work unit (D34) |
+| Retry/backoff policy | ensured / defined | columns on the subscription row (ensure) and `cb_job_queues` (define — converges on deploy) (D4, D26) |
+| Job | **defined** | `jobs.Define`: def rows + queue terms + schedules, whole declarations that converge on deploy (D26, D34, D39) |
+| Jobs of a run | **dynamic** | spawned by handlers at runtime (D10, D31) — the spawned row *is* the claimable work unit (D34) |
 | Signals | **dynamic** | buffered per run, no declaration |
-| Cron schedule | defined | `cb_stream_schedules` (publish templates) and `cb_flow_schedules` (run templates), each delivered by its module's tick (D3, D34) |
-| Pools per priority class | defined | just flow queues — priority is composition, as in the vision |
+| Trigger | defined | `cb_triggers` row + its filtered cursor, delivered by job's trigger tick (D40, D41) |
+| Cron schedule | defined | `cb_stream_schedules` (publish templates) and `cb_job_schedules` (run templates), each delivered by its module's tick (D3, D34) |
+| Pools per priority class | defined | just job queues — priority is composition, as in the vision |
 
-Nothing at runtime performs DDL except `stream.Ensure` (partition creation) — same
+Nothing at runtime performs DDL except `streams.Ensure` (partition creation) — same
 cost profile as today's `CreateQueue`, but one table family instead of four.
 
 ## Amendments to the vision
@@ -243,3 +258,11 @@ Fold these into vision.md by hand; the plan documents assume them.
     `cb_stream_retries`, dead letters are its `dead` rows, redrive is a row
     reset, and one budget (`max_attempts`) replaces the attempt/crash counter
     pair everywhere.
+16. **Task, flow and step converge on "job"** (D39): the vision's
+    task/workflow vocabulary becomes job + run — a flow is implicit, a job
+    that enqueues more jobs; there is no flow object, no task engine, no
+    entry-step declaration.
+17. **Events trigger jobs declaratively** (D40): the vision's
+    "everything is a consumer" gains machinery for its most important case —
+    a trigger binds a filter to a job and delivers exactly-once in the
+    cursor's transaction; the outbox pattern needs zero glue code.

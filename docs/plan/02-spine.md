@@ -109,16 +109,16 @@ directly:
 |---|---|
 | Projection over the whole feed (search index, representations) | plain cursor |
 | Subset with retry/dead-row semantics (ORCID push, per-target deletes) | **filtered subscription on the feed** |
-| Producer knows the consumer (blob GC, LDN outbox) | same-tx `cb_flow_run` — a one-step run with a dedup key (D37); a stream-only install composes `Publish` to an own stream + a subscription instead |
+| Producer knows the consumer (blob GC, LDN outbox) | same-tx `cb_job_run` — a one-job run with a dedup key (D37, D39); a stream-only install composes `Publish` to an own stream + a subscription instead |
 | Many dynamic user-defined subscribers (webhooks) | one dispatcher cursor + the Go trie over app rows + one run per delivery (D37) |
 | User-facing notification inbox | explicit writes by handlers (04) — identity is data in the handler's hand |
 
 The exactly-once guarantee moves with the shapes: any filtered cursor consumer
 whose effects are rows in the same Postgres commits effects and cursor advance
 in one transaction — the guarantee the relay row in the README table used to
-claim, now without the relay. And a handler that calls `cb_flow_run` creates
-work from events under the same guarantee — the composition rule (README,
-"Two shapes, one discipline").
+claim, now without the relay. And a trigger — or any handler that calls
+`cb_job_run` — creates jobs from events under the same guarantee (D40; the
+composition rule, README "Two shapes, one discipline").
 
 The Go trie (`topic_trie.go`) is not dead code: it is the app-side matcher for
 the dispatcher shape — one event against many subscriber patterns, in process,
@@ -147,6 +147,12 @@ job, destination kinds, the kind registry, `identity_from`, the well-known
 stream — comes back only if a real customer needs what filters cannot do:
 fan-in from several streams, transformation in flight, or a copy that outlives
 its source's retention. None exists in either app or their roadmaps.
+
+One descendant of the spine survives, elsewhere: the **trigger** (03 §8,
+D40) — a declared filter→job binding delivered in the cursor's transaction,
+so events create jobs exactly-once with no consumer code. It is not routing
+(nothing is sent anywhere; a filter and a position read a log), and it lives
+with the engine, not here.
 
 Shipped and tested (M3 exit, 2026-07-12): compilers with grammar tables,
 filtered cursors and queues through the real APIs, a live filtered worker end
