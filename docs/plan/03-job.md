@@ -38,7 +38,7 @@ time `cb_job_start` hands the step to a handler, whatever later becomes of
 that execution. A verdict, a crash, a graceful restart of a running handler:
 each consumed a start. That one number is the whole retry budget, checked
 wherever an execution's fate is decided. There is no crash counter, no header
-bookkeeping, and no second exhaustion road: silence is just a lease that
+bookkeeping, and no second exhaustion road: a crash is just a lease that
 lapsed, and the lapsed row carries its own count.
 
 ## 1. The work table — steps are the messages
@@ -50,17 +50,19 @@ lapsed, and the lapsed row carries its own count.
   `now() + claim_ttl` (the lease deadline); extend pushes it; fail sets it to
   `now() + backoff(attempt)`; a crash simply lets it lapse.
 - **Wakeups** ride the old engine's proven contract: the engine fires
-  `pg_notify` on the queue's channel (`cbq_<queue>`) with the earliest
-  `claimable_at` in the payload; the notifier (M5) parses it and wakes or
-  arms a timer — this is `worker_notifier.go`'s existing protocol, pointed
-  at new tables, and the channel being the pool means a `payments` worker
-  never wakes for `default` spawns. Until M5, workers poll (D17). A second
+  `pg_notify` on the queue's channel (`cbq_<queue>`) with the step's
+  `claimable_at` in the payload; the worker's notifier parses it and wakes
+  the claim loop at once or arms a timer for the earliest future time —
+  `worker_notifier.go`'s existing protocol, pointed at new tables — and the
+  channel being the pool means a `payments` worker never wakes for
+  `default` spawns. Fallback polling stays as the safety net (D17). A second
   channel per birth job (`cbj_<job>`) carries run-terminal events (payload
-  `<run_id>:<status>`) for `WaitForOutput` and the dashboard.
+  `<run_id>:<status>`) for `WaitForOutput` (which polls until M5) and the
+  dashboard.
 - **Queues are global pools.** A job's `queue` (NULL means `default`)
   partitions claiming and carries retry terms (§6). Pools are deliberately
-  cheap: one line declares one, jobs opt in with `WithQueue`, a grouped
-  declaration gives a family a shared pool as sugar (§5), and claim and
+  cheap: one call declares one, a job opts in with one field
+  (`JobOpts.Queue`), and claim and
   extend take an **array of queues**, so a worker serving many small pools
   pays one round trip. No streams, no filters, no topics — the claim
   predicate is the routing.
@@ -88,8 +90,8 @@ like every other module (05).
   spawned mid-run they are inert config.
 - `cb_job_queues (name PK, claim_ttl, claim_batch_size, max_attempts,
   backoff_kind, backoff_base, backoff_max)` — the retry and claim terms per
-  pool, written whole by `jobs.Define` (D26: config deploys with code and
-  must converge). The migration seeds the `default` row, so a bare install
+  pool, written whole by `jobs.DefineQueue` (D26: config deploys with code
+  and must converge). The migration seeds the `default` row, so a bare install
   works; every other pool is declared, and `default` itself is redeclarable
   like any pool (§6).
 - `cb_job_schedules (name PK, job, every, catch_up, input, next_at)` —
@@ -108,7 +110,7 @@ like every other module (05).
   key)` (constraint `cb_job_runs_job_key_key`) — `key` is the dedup point
   *and* the app-key lookup in one column, scoped per birth job; NULLs are
   distinct. `steps_remaining` counts the steps the run still owes (§3).
-  `next_step_id` mints per-run step ids — the run row is locked in every
+  `next_step_id` hands out per-run step ids — the run row is locked in every
   engine call anyway, so the counter is free, and it gives dense ids and a
   clean `0` sentinel for "spawned at birth".
 - `cb_job_steps (PK (run_id, id), queue, name, parent_step_id NOT NULL,
@@ -129,10 +131,10 @@ like every other module (05).
   ('signal', 'all_done_signal') AND status NOT IN ('completed', 'failed',
   'canceled')` enforces §3's signal-name rule race-free.
 - `cb_job_attempts (PK (run_id, step_id, attempt), worker, started_at,
-  finished_at, status, error)` — per-attempt history *and* the fence
-  record; kept when the run turns terminal. `status` is `completed | failed
-  | NULL`, and NULL is recorded silence: a start that never reported — a
-  crash, or a restart that superseded it.
+  finished_at, status, error)` — per-attempt history, kept when the run
+  turns terminal. `status` is `completed | failed | NULL`, and NULL means
+  the attempt never reported a result: the worker crashed, or the step was
+  handed to another worker and this start no longer counts.
 - `cb_job_signals (PK (run_id, name), payload, created_at)` — the signal
   buffer, one slot per name: a second signal for a name nobody consumed yet
   overwrites the slot (last signal wins); matching consumes it — deletes the
@@ -157,16 +159,17 @@ no message copy, no position, no stream.
 
 ## 3. Lifecycle
 
-**The fence, stated once.** Every engine function follows the same two-step
-guard. First it locks the run row (`FOR UPDATE`) and checks the run's status:
+**The checks.** Every engine function follows the same two-step guard.
+First it locks the run row (`FOR UPDATE`) and checks the run's status:
 `running` or `failing` for start / complete / fail / signal (`failing` admits
 the `on_fail` chain — the give-up canceled everything else, so no per-step
 marking is needed) and for cancel (in a `failing` run, cancel stops the
 cleanup, not the verdict — below). Anything else is a silent
 no-op returning false (signal raises instead, below). Then the step guard:
 complete and fail require `(status = 'started', attempt = $attempt)`; a
-mismatch means the caller was superseded, and nothing happens. Attempts are
-minted by `cb_job_start` only. One lock ordering — run row first, then step
+mismatch means the caller is acting on outdated information — the step was
+finished or handed to another worker — and nothing happens. Only
+`cb_job_start` increments `attempt`. One lock ordering — run row first, then step
 rows — means no deadlocks between engine calls; it is also why giving up happens
 in start and fail, never in claim (claim locks step rows without the
 run lock, §4).
@@ -249,7 +252,7 @@ payload `<run_id>:<status>`). `WaitForOutput` keeps its API: it polls the run
 row until M5, then wakes on the notify with the poll demoted to safety net.
 
 **Failure, retries, giving up — one counter (D38).** A failed execution
-reports through `cb_job_fail`: the fence admits it, the attempt row records
+reports through `cb_job_fail`: the checks admit it, the attempt row records
 the verdict (attempt-row `status = 'failed'`, the error), and one comparison decides:
 
 - `attempt < max_attempts` — the step goes back to `queued`, `claimable_at =
@@ -257,52 +260,56 @@ the verdict (attempt-row `status = 'failed'`, the error), and one comparison dec
   row becoming claimable later; no copy, no republish, no second object.
 - `attempt ≥ max_attempts` — the engine **gives up**, in the same transaction.
 
-Crashes are silence — the handler never reports. A crashed execution's lease
-just lapses, and the next claim call repairs it (§4): a `started` row whose
-lease has lapsed is rescheduled to `claimable_at = now() + backoff(attempt)`
-with its worker stamp cleared — backoff paced by the same counter, since the
-lapsed start *was* attempt N. A row already at `attempt ≥ max_attempts` is
-repaired to `now()` instead: its only future is the give-up, and pacing a
-give-up helps nobody, and `on_fail` fires one claim sooner. When the
-repaired row next reaches a worker,
-`cb_job_start` checks the same comparison: starting would mint `attempt +
+A crash means the handler never reports. The crashed execution's lease
+just lapses, and the next claim call clears the row (§4): a `started` row
+whose lease has lapsed gets its worker stamp cleared and `claimable_at`
+moved to `now() + backoff(attempt)` — the same pacing a reported failure
+gets, since the lapsed start *was* attempt N. A row already at `attempt ≥
+max_attempts` is moved to `now()` instead: its only future is the give-up,
+delaying it would gain nothing, and `on_fail` fires one claim sooner. When
+the cleared row next reaches a worker,
+`cb_job_start` checks the same comparison: starting would spend `attempt +
 1`, and if `attempt ≥ max_attempts` already, start **gives up instead of
 starting** and returns no work. Two call sites, one routine
 (`_cb_job_give_up`), one counter, one policy home (the queue row). A
 give-up arriving late — the run already `failing` or terminal because a
-sibling's give-up came first — hits the fence and no-ops; that is the whole
-idempotency story.
+sibling's give-up came first — fails the checks and changes nothing; that is
+the whole idempotency story.
 
 `max_attempts` bounds **total starts**, not verdicts: a crash consumed a
 start, and so did a graceful shutdown that canceled a running handler — the
-step had started, and the fence cannot distinguish a live zombie from a dead
-one, so redelivery must mint fresh. Stated plainly: "this step's handler
+step had started, and the checks cannot tell a stuck worker that may still
+report from a dead one, so redelivery must spend a fresh start. Stated
+plainly: "this step's handler
 will begin at most `max_attempts` times." The cost is that frequent deploys
 spend starts of long-running handlers — a job like that deserves its own
-`WithQueue` with generous terms. The justice half of the same rule: a step
+pool with generous terms. The other half of the same rule: a step
 that was **leased but never started** (its worker died before reaching it)
-lapses back to claimable with nothing spent — no evidence, no charge. The
+lapses back to claimable with no attempt spent — nothing began, nothing is
+charged. The
 worker's graceful path makes both halves explicit: unstarted claimed rows
-are released uncharged (`cb_job_release`, §4 — redelivered immediately),
+are released with no attempt spent (`cb_job_release`, §4 — redelivered
+immediately),
 and started handlers get their context canceled and are reported through
 `cb_job_fail` with the error `catbird: worker shutdown` — the same one
-charge the start already spent, but redelivery is backoff-paced from now
+start already spent, but redelivery is backoff-paced from now
 instead of from lease-lapse, and the attempt row records a verdict instead
-of silence. Silence remains what it says: nobody reported, because nobody
-could.
+of a NULL status. The NULL keeps meaning what it says: nobody reported,
+because nobody could.
 
 **The give-up's effects** (`_cb_job_give_up`, one transaction): the step
-turns `failed` with its error (for the silent road: "attempts exhausted; last
+turns `failed` with its error (when nobody ever reported: "attempts
+exhausted; last
 attempt ended in silence"); every other non-terminal step — queued, started,
-or waiting — turns `canceled` (a started sibling's later complete/fail hits
-the step guard and no-ops; its handler is reaped by the worker's status
-check, below). Then:
+or waiting — turns `canceled` (a started sibling's later complete/fail fails
+the step guard and changes nothing; its handler is stopped by the worker's
+status check, below). Then:
 
 - **`on_fail` declared** (on the run's birth job): the run turns `failing`;
   the `on_fail` job is spawned as an ordinary step — parent = the failed
   step, dispatch immediate, input built by the engine as `{job, error,
   input}` — and `steps_remaining := 1`. The chain then runs under the normal
-  rules: the fence admits it because the run is `failing` and everything
+  rules: the checks admit it because the run is `failing` and everything
   else is canceled; it may spawn, retry on its own terms, even wait on a
   signal; when its chain drains the count to zero the run finalizes as
   `failed`. If the engine gives up on the `on_fail` step itself, the run is
@@ -314,8 +321,8 @@ check, below). Then:
 `on_fail` firing on crash exhaustion too is the point: today's OnFail misses
 hard worker death, which is why ingest hand-rolled `sweep_stuck_deliveries`.
 
-**Cancel.** `cb_job_cancel(run_id, reason)` — fence (`running` or
-`failing`). In a `running` run it flips every non-terminal step and the run
+**Cancel.** `cb_job_cancel(run_id, reason)` — the checks admit `running` and
+`failing`. In a `running` run it flips every non-terminal step and the run
 to `canceled`; in a `failing` run it does not change the verdict, it stops
 waiting for cleanup — remaining steps turn `canceled` and the run finalizes
 `failed` at once. (Refusing would assume cleanup terminates; an `on_fail`
@@ -355,7 +362,7 @@ normal budget (§5).
 
 All engine logic is SQL: a thin client in any language calls these functions
 and gets identical semantics (D11). Every function except claim and release
-begins with §3's fence; handlers never run inside any of these transactions.
+begins with §3's checks; handlers never run inside any of these transactions.
 Full SQL sketches arrive per function at implementation; what follows is the
 contract each sketch must meet.
 
@@ -365,48 +372,54 @@ contract each sketch must meet.
   set) names a declared job and that `queue` (when set) has a terms row,
   raising otherwise — a deploy-time error instead of a runtime "spawn name
   not declared" on the first run. Define never deletes a queue row (§6).
-  The Go `jobs.Define` performs the whole declared set — jobs, pools,
-  schedules — in one advisory-locked transaction. Deploy-time setup, not
-  part of the worker contract.
+  The Go side mirrors these one to one — `jobs.Define`, `jobs.DefineQueue`,
+  `jobs.DefineSchedule` — and deploy code calls them in dependency order:
+  queues before the jobs that name them, `on_fail` targets first. Each call
+  is atomic and validated on its own, so a deploy that dies mid-way leaves
+  a consistent prefix and the next deploy converges the rest; an app that
+  wants the whole set to apply together runs the calls in its own
+  transaction. Deploy-time setup, not part of the worker contract.
 - **`cb_job_run(job, input, key, delay) → (run_id, existing)`** — birth,
   §3. Raises if the job is not defined. Callable on a `Conn`.
 - **`cb_job_claim(queues, worker) → rows of (run_id, step_id, name,
   lease_at)`** — `queues` is an array: one call serves every pool the
   worker holds handlers for, up to each pool's `claim_batch_size`. The one
-  function without the run fence (it locks step rows only, which is why it
+  function without the run lock (it locks step rows only, which is why it
   never gives up on anything). No per-call ttl: D23's override worked because the claim
   row stored the resolved terms for extend to renew; a step row has no claim
   row, and D27's loop owns the clock anyway — the queue row is the only
   source of terms. `name` lets a worker refuse a step it holds no handler
   for (release, below); `lease_at` is the deadline, from which a foreign
   worker derives its extend cadence without reading policy tables. One
-  statement over the partial index, two effects: **repair** — `started`
-  rows with a lapsed lease and a worker still stamped are rescheduled to
-  `backoff(attempt)` (`now()` at the attempt limit, §3) and cleared, not
-  handed out; **hand out** — eligible rows (`queued`, or `started` with no
-  worker — a repaired crash due for redelivery) get the caller's worker
+  statement over the partial index, two effects: **clear crashed rows** —
+  `started` rows with a lapsed lease and a worker still stamped get what
+  `cb_job_fail` would have done had the worker been able to report: stamp
+  cleared, rescheduled to
+  `backoff(attempt)` (`now()` at the attempt limit, §3), not
+  handed out; **hand out** — ready rows (`queued`, or `started` with no
+  worker — a cleared crash due for redelivery) get the caller's worker
   stamp and a lease of the pool's `claim_ttl`, `FOR UPDATE SKIP LOCKED`, ordered
   by `claimable_at`. Leased-but-unstarted rows whose lease lapses are
-  simply eligible again — availability needs no repair and no charge.
+  simply ready again — no clearing needed, no attempt spent.
 - **`cb_job_start(run_id, step_id, worker) → (name, input, signal,
   attempt)`** —
-  per claimed step. Fence, then the give-up check (§3): at the attempt
+  per claimed step. The checks, then the give-up comparison (§3): at the attempt
   limit it gives up (no attempt row — nothing started) and returns nothing.
   Otherwise flips the step `queued | started → started` (started-to-started
   because a crashed execution leaves `started` behind), bumps `attempt`,
   inserts the attempt row, and returns what the handler needs — `signal`
   is the satisfied payload for a signal-gated step, NULL otherwise (§3).
   Returns
-  nothing when the fence fails — a stale claim of a resolved step — and the
+  nothing when a check fails — a stale claim of a finished step — and the
   loop just moves on.
 - **`cb_job_extend(queues, worker) → held rows`** — pushes `claimable_at`
   forward on every row the worker still holds in those pools, one
   statement; the loop calls it on the D27 cadence and compares the returned
-  set to what it thinks it holds — a missing row means supersession, cancel
-  that handler.
+  set to what it thinks it holds — a missing row was taken over or
+  canceled: cancel that handler.
 - **`cb_job_release(run_id, step_id, worker, pause DEFAULT '0') →
-  boolean`** — hands back an unstarted claim, uncharged. The fence is the
-  step row alone (`queued`, this worker) — no run lock, like claim; it
+  boolean`** — hands back an unstarted claim, no attempt spent. The check is
+  on the step row alone (`queued`, this worker) — no run lock, like claim; it
   clears the worker stamp and sets `claimable_at = now() + pause`. Shutdown
   releases each unstarted held row with the default `0` — immediate
   redelivery. A worker that claims a step it holds no handler for — a
@@ -414,7 +427,7 @@ contract each sketch must meet.
   releases it with a short pause, so two old workers don't ping-pong it
   until a new worker arrives. False means the step already moved on.
 - **`cb_job_complete(run_id, step_id, attempt, output, spawns, run_output)
-  → boolean`** — the heart, one transaction, in this order: fence → resolve
+  → boolean`** — the heart, one transaction, in this order: checks → resolve
   the attempt (status, finished_at; step → `completed`, output stored) →
   validate and insert the spawned steps (names against `cb_jobs`, queue
   stamped from the definition, dispatch words;
@@ -423,11 +436,12 @@ contract each sketch must meet.
   remaining formula over the rows the insert
   actually returned (§3) → at zero, dispatch waiting barriers or finalize
   (output resolution, run-terminal notify) → notify each queue that gained
-  claimable rows, once, with its earliest new `claimable_at`. False means
-  the fence failed and nothing happened.
+  claimable rows, once, with its earliest new `claimable_at`. Returns
+  false, having changed nothing, when the checks at the top fail.
 - **`cb_job_fail(run_id, step_id, attempt, error) → boolean`** — §3:
   verdict on the attempt row, then retry (queued + backoff) or give-up,
-  one comparison, one transaction. False = fenced.
+  one comparison, one transaction. Returns false, having changed nothing,
+  when the checks at the top fail.
 - **`cb_job_cancel(run_id, reason DEFAULT NULL) → boolean`** — §3.
 - **`cb_job_signal(run_id, name, payload)`** — §3: satisfy or buffer, under
   the run lock; raises only if the run is missing or terminal.
@@ -465,51 +479,55 @@ nothing blocks; the buffer commits with your completion (`cb_job_complete`,
 §4). A handler that crashes mid-way submits nothing, and at-least-once
 redelivery replays it cleanly against the spawn identity (§2).
 
-Declarations are nouns, and one slice is the single source both deploy and
-runtime read: `jobs.Define(ctx, conn, defs...)` converges the whole set in
-one advisory-locked transaction — no half-deployed state, a new job and its
-pool arrive together — and `jobs.NewWorker(pool, defs...)` registers the
-same items' handlers and validates coverage against them. The handler
+Declarations mirror the SQL one to one (§4): deploy code calls
+`jobs.Define`, `jobs.DefineQueue` and `jobs.DefineSchedule`, each call the
+whole config — an opts struct whose zero fields mean the stock values,
+never "keep". The worker registers handlers by name (`w.Handle(job, fn)`)
+and reads everything else from `cb_jobs` at startup: which queues to claim
+is routing knowledge, and the database is its authority. The handler
 signature decides everything: a handler that takes a `*jobs.Plan` can
 enqueue follow-ons; one that doesn't is the whole story — its return value
-becomes the run output. `jobs.External(name, opts...)` declares a job with
-no handler — which fleet holds a handler is deployment knowledge,
-deliberately absent from the schema; coverage validation is the
-fleet-symmetric enforcement (§7). (`jobs.Job`, the item constructor,
-occupies the package's best identifier on purpose; exported types pick other
-names — `Def`, `Plan` — and user model types are unaffected behind the
-package qualifier.)
+becomes the run output. A defined job nobody `Handle`s is simply handled
+by another fleet — which fleet holds a handler is deployment knowledge,
+deliberately absent from the schema; the worker's startup checks are the
+fleet-symmetric enforcement (§7).
 
 ```go
-var defs = []jobs.Def{
-    jobs.Queue("payments",
-        jobs.WithRetry(5, jobs.FullJitter(time.Second, time.Minute))),
+// deploy: each call converges one declaration
+jobs.DefineQueue(ctx, conn, "payments", jobs.QueueOpts{
+    MaxAttempts: 5, Backoff: jobs.FullJitterBackoff(time.Second, time.Minute)})
 
-    jobs.Job("reserve", func(ctx context.Context, p *jobs.Plan, in Order) error {
-        res, err := reserve(in.Items)
-        if err != nil { return err }        // → cb_job_fail; retry or give up (§3)
-        p.Spawn("charge", Charge{Order: in, Reservation: res})
-        return nil                          //   parent hands its results forward
-    }, jobs.OnFail("notify_ops")),          // the run's failure job, when
-                                            //   "reserve" is the birth job (§3)
-    jobs.Job("charge", func(ctx context.Context, p *jobs.Plan, in Charge) error {
-        for _, parcel := range split(in) {
-            p.Spawn("ship", parcel)         // fan-out: N sibling steps, parallel
-        }
-        p.Spawn("confirm", in.Order, jobs.OnAllDone())  // barrier: dispatches
-        return nil                          //   when steps_remaining drains to zero
-    }, jobs.WithQueue("payments")),         // own pool + own retry terms (§6)
-    jobs.Job("ship", shipFn),               // plain func(ctx, Parcel) (Out, error):
-    jobs.Job("confirm", confirmFn),         //   no Plan, enqueues nothing
-    jobs.Job("notify_ops", notifyFn),       // receives {job, error, input}
-    jobs.External("transcode",              // declared job, no handler — handled
-        jobs.WithQueue("gpu")),             //   by another fleet (§7)
-}
+jobs.Define(ctx, conn, "notify_ops")        // receives {job, error, input}
+jobs.Define(ctx, conn, "reserve",           // on_fail = the run's failure job,
+    jobs.JobOpts{OnFail: "notify_ops"})     //   when "reserve" is the birth job (§3)
+jobs.Define(ctx, conn, "charge",
+    jobs.JobOpts{Queue: "payments"})        // own pool + own retry terms (§6)
+jobs.Define(ctx, conn, "ship")
+jobs.Define(ctx, conn, "confirm")
+jobs.Define(ctx, conn, "transcode",         // no Handle call anywhere in this
+    jobs.JobOpts{Queue: "gpu"})             //   fleet — another fleet handles it (§7)
 
-jobs.Define(ctx, conn, defs...)             // deploy: converge config, one transaction
-w := jobs.NewWorker(pool, defs...)          // runtime: register handlers, check coverage
+// runtime: register handlers, then Start reads cb_jobs and checks coverage
+w := jobs.NewWorker(pool)
+w.Handle("reserve", func(ctx context.Context, p *jobs.Plan, in Order) error {
+    res, err := reserve(in.Items)
+    if err != nil { return err }            // → cb_job_fail; retry or give up (§3)
+    p.Spawn("charge", Charge{Order: in, Reservation: res})
+    return nil                              //   parent hands its results forward
+})
+w.Handle("charge", func(ctx context.Context, p *jobs.Plan, in Charge) error {
+    for _, parcel := range split(in) {
+        p.Spawn("ship", parcel)             // fan-out: N sibling steps, parallel
+    }
+    p.Spawn("confirm", in.Order, jobs.OnAllDone())  // barrier: dispatches
+    return nil                              //   when steps_remaining drains to zero
+})
+w.Handle("ship", shipFn)                    // plain func(ctx, Parcel) (Out, error):
+w.Handle("confirm", confirmFn)              //   no Plan, enqueues nothing
+w.Handle("notify_ops", notifyFn)
+w.Start(ctx)
 
-runID, _, err := client.RunJob(ctx, "reserve", order, jobs.WithKey(order.ID))
+runID, _, err := jobs.Run(ctx, conn, "reserve", order, jobs.RunOpts{Key: order.ID})
 ```
 
 Surface, complete: `p.Spawn(name, input, opts...)` — the **one** Plan verb —
@@ -577,12 +595,14 @@ runs the handler and extends the lease, a worker that hangs or dies stops
 extending, and its work falls to another worker. The loop: claim a batch
 across its queues → per step: start → handler → complete/fail — extending on
 the cadence; on shutdown it releases unstarted leases and fails canceled
-handlers (§3). Handlers are registered per job name and invoked via the
-reflection utilities (ported from `task.go`). At startup the worker checks
-coverage: for every queue it claims, it must hold handlers for **all** jobs
-`cb_jobs` routes there, or it refuses to start — a claim is
+handlers (§3). Handlers are registered per job name (`Handle`) and invoked via the
+reflection utilities (ported from `task.go`). At startup the worker reads
+`cb_jobs` for the jobs it handles — the queues they route to are the queues
+it claims — and checks coverage both ways: it refuses to start when it
+handles a job nobody defined (a typo, caught at boot), and when a queue it
+claims routes a job it holds no handler for — a claim is
 indiscriminate within its pool, so partial coverage would strand steps (§7).
-Coverage is checked at startup only, and the definitions converge on deploy
+Both checks run at startup only, and the definitions converge on deploy
 while old workers still run — the release-with-pause path (§4) is what
 carries a new job across that skew window.
 
@@ -597,23 +617,24 @@ type Plan struct {
 ## 6. Retry terms — pools and pacing
 
 A job's terms are its pool's row in `cb_job_queues` (D4: policy in the
-database, applied by SQL): `max_attempts`, the backoff triple, `claim_ttl`,
-`claim_batch_size` — written whole by `jobs.Define`, so a redeploy converges
-them. Terms are pool properties, full stop: `WithRetry` is an option of
-`jobs.Queue`, never of a job — a job that needs its own terms (a
+database, applied by SQL): `max_attempts`, the backoff, `claim_ttl`,
+`claim_batch_size` — written whole by `jobs.DefineQueue`, so a redeploy
+converges
+them. Terms are pool properties, full stop: retry terms live in
+`QueueOpts`, never on a job — a job that needs its own terms (a
 rate-limited payment call, a GPU stage) declares its own pool and routes to
-it with `WithQueue`. Pools being global and cheap is the production
+it with `JobOpts.Queue`. Pools being global and cheap is the production
 isolation story: the migration seeds `default` for the bare install, and
 every family that matters declares its own pool with its own terms — one
-line — so one family's backlog or backoff never paces another's. Define
-never deletes a queue row — a row dropped from the declaration may still
+call — so one family's backlog or backoff never paces another's. There is
+no queue delete — a pool no longer declared may still
 have non-terminal steps routed to it, and a stale terms row is inert config,
 so removing one is a deliberate op.
 
 `default` is seeded with stated terms — `max_attempts` 3, full-jitter
 backoff 1s–1m, `claim_ttl` 30s, `claim_batch_size` 10 — and stays an
-ordinary row: `jobs.Queue("default", …)` redeclares it from the app's own
-code like any pool; only its existence is guaranteed.
+ordinary row: `jobs.DefineQueue(ctx, conn, "default", …)` redeclares it from
+the app's own code like any pool; only its existence is guaranteed.
 
 Pacing has two knobs, both live today: **which workers claim the pool**
 (fleet sizing per queue) and `claim_batch_size`. Two more are **deferred
@@ -641,9 +662,9 @@ documented in `docs/sql-api.md`, which M4a makes the normative spec:
 ```
 cb_job_claim(queues, worker)                  → [(run_id, step_id, name, lease_at)]
 cb_job_start(run_id, step_id, worker)         → (name, input, signal, attempt)
-                                              --  or nothing (fence, or give-up)
+                                              --  or nothing (a check failed, or give-up)
 cb_job_extend(queues, worker)                 → still-held rows (D23, D27)
-cb_job_release(run_id, step_id, worker, pause) → bool -- unstarted handback, uncharged
+cb_job_release(run_id, step_id, worker, pause) → bool -- unstarted handback, no attempt spent
 cb_job_complete(run_id, step_id, attempt, output, spawns, run_output) → bool
 cb_job_fail(run_id, step_id, attempt, error)  → bool  -- retry or give up, one call
 cb_job_signal(run_id, name, payload)
@@ -656,10 +677,12 @@ worker that never extends has its slow steps truthfully counted as crashes
 and slowed by backoff — legal, at-least-once, just noisy; the M4b demo
 worker is deliberately slower than the claim TTL to prove that path end to
 end. `cb_job_release` is politeness, not obligation: a worker that never
-releases is legal too — its leases lapse and come back uncharged, just
-slower. `attempt` travels from start through complete/fail — the fence's
-third column — so each start resolves at most once, and a false return means
-the execution was superseded and nothing happened. (`cb_job_run` and
+releases is legal too — its leases lapse and come back with no attempt
+spent, just
+slower. `attempt` travels from start through complete/fail — the third
+column the checks compare — so each start resolves at most once, and a
+false return means
+the step was taken over and nothing happened. (`cb_job_run` and
 `cb_job_cancel` are equally callable — any client with a Postgres
 connection starts and cancels runs; the *worker* contract is the seven
 above.)
@@ -728,8 +751,8 @@ the same-database design's front door.
   composition is one-directional and recorded: job's SQL calls stream's
   public SQL API (cursor read and advance), never the reverse, and the Go
   dependency rule stands untouched. Declared with the jobs it feeds:
-  `jobs.Trigger(name, stream, filter, jobName, opts...)` inside
-  `jobs.Define`.
+  `jobs.DefineTrigger(ctx, conn, name, stream, job, opts...)`, one call per
+  trigger like the other declarations (§5).
 
 The outbox example, end to end: the application publishes `order.created`
 in its own transaction — the log *is* the outbox, that's what transactional
@@ -799,8 +822,8 @@ spawns, barriers, signals, `on_fail`; M4c = triggers). The build items:
    `cb_job_steps_identity_key`, the signal-name partial unique index), the
    partial claim index `(queue, claimable_at)`, the seeded `default` queue
    row, version table `cb_job_migrations`.
-3. Functions (§4), M4a scope: `define`, `run`, `claim` (lease repair,
-   queue array), `start` (with the give-up check), `extend`, `release`,
+3. Functions (§4), M4a scope: `define`, `run`, `claim` (crashed-row
+   clearing, queue array), `start` (with the give-up check), `extend`, `release`,
    `complete` (raises on non-empty `spawns` until M4b; counts inserted
    spawns via `RETURNING`), `fail`, `cancel`, `_cb_job_give_up` (the
    `failing` machinery ships in M4a; only `on_fail` spawning stays dark
@@ -808,13 +831,14 @@ spawns, barriers, signals, `on_fail`; M4c = triggers). The build items:
    spawn/barrier/signal paths in `complete`, `cb_job_signal`, `on_fail`.
 4. The module's tick (kernel ticker): schedule delivery (§3), the
    run-retention janitor (§9).
-5. Go: the declaration nouns — `jobs.Job` / `jobs.Queue` / `jobs.External`
-   / `jobs.Schedule` / `jobs.Trigger` — plus `Define` (the whole set, one
-   advisory-locked transaction); one defs slice feeds `Define` and
-   `NewWorker`; the worker
+5. Go: the per-call declarations mirroring the SQL — `jobs.Define`,
+   `jobs.DefineQueue`, `jobs.DefineSchedule` (each an opts struct, zero =
+   stock; `jobs.DefineTrigger` at M4c); the worker — `NewWorker(pool)`,
+   `Handle(job, fn)`, `Start` — with the queue set read from `cb_jobs` and
+   coverage checked both ways at startup (§5); the worker
    loop on the kernel's D27 skeleton (extracted to `internal/`, the stream
    consumer rebased on it, suites green — D41) with queue-set claims,
-   coverage validation, status-check cancellation and release-plus-fail on
+   status-check cancellation and release-plus-fail on
    shutdown (§5); the Plan buffer; reflection utilities ported from
    `task.go` (including the with-Plan / without-Plan handler shapes); run
    lookup by id and by app key; `WaitForOutput` polling, notify at M5.
@@ -827,16 +851,17 @@ spawns, barriers, signals, `on_fail`; M4c = triggers). The build items:
    validation plus the loud stream-schema-required check — the delivery
    tick on the module's ticker, `jobs.Trigger` in `Define`.
 8. Tests, the semantic core:
-   - dedup + key lookup; duplicate complete/fail no-ops (fence).
+   - dedup + key lookup; duplicate complete/fail no-ops (the checks).
    - give-up from both roads — the exact inequalities: a verdict at
      `attempt = max_attempts` is given up in `fail`; a lapsed step at
      `attempt = max_attempts` is given up in `start`; total starts never
      exceed `max_attempts`.
-   - lease repair: a lapsed `started` row comes back after
-     `backoff(attempt)` exactly once (repair is idempotent under racing
-     claims), and unpaced (`now()`) at the attempt limit; a
+   - crashed-row clearing: a lapsed `started` row comes back after
+     `backoff(attempt)` exactly once (the clearing is idempotent under
+     racing claims), and at once (`now()`) at the attempt limit; a
      leased-but-unstarted row lapses back with `attempt`
-     untouched; a graceful release redelivers immediately, uncharged.
+     untouched; a graceful release redelivers immediately, no attempt
+     spent.
    - a graceful shutdown mid-handler spends exactly one start, as a verdict:
      the attempt row reads `worker shutdown` and redelivery follows
      `backoff(attempt)` with no lease-lapse wait (§3).
@@ -851,8 +876,9 @@ spawns, barriers, signals, `on_fail`; M4c = triggers). The build items:
    - the additive payload: a signal-gated step spawned with input receives
      both — spawn input unchanged, payload in `signal` (start returns it;
      `jobs.Signal[T]` NULL until satisfied).
-   - external defs: `jobs.External` converges like any declaration; a
-     worker claiming its pool without the handler refuses to start.
+   - external jobs: a defined job with no `Handle` call converges like any
+     declaration; a worker claiming its pool without the handler refuses
+     to start, and so does a worker handling a job nobody defined.
    - the remaining formula: chains, fan-out + barrier, barrier phases
      (including a barrier spawned by the draining completion), signal steps
      holding barriers and finalization.
@@ -861,20 +887,18 @@ spawns, barriers, signals, `on_fail`; M4c = triggers). The build items:
      a signal buffered before the phase drains is consumed at dispatch;
      finalization waits behind a dispatched-but-unsignaled step; the builder
      composes the two options into one dispatch word.
-   - supersession via extend: a repaired step's original worker extends,
-     the returned set is missing that row, the handler is canceled; its late
-     complete returns false and changes nothing.
+   - takeover via extend: after a lapsed step is cleared, its original
+     worker's next extend is missing that row and the handler is canceled;
+     its late complete returns false and changes nothing.
    - cancel mid-handler: `cb_job_cancel` while a handler runs — the
      status-check wrapper cancels the context, the late complete no-ops.
    - output resolution: an explicit `SetRunOutput` from a non-final step
      beats the finalizing step's output.
-   - routing: a `WithQueue` spawn lands in its pool with its terms; an
+   - routing: a spawn lands in its job's pool with that pool's terms; an
      undeclared spawn name walks the spawner to give-up through the normal
      budget (§5); worker coverage validation refuses partial pools; a worker
-     claiming a step it holds no handler for releases it with a pause,
-     uncharged; a queue-array claim serves several pools in one call; a
-     grouped `jobs.Define` declares jobs, pools and schedules in one
-     transaction.
+     claiming a step it holds no handler for releases it with a pause, no
+     attempt spent; a queue-array claim serves several pools in one call.
    - schedules: a due row births exactly one run and re-arms in one
      transaction; `catch_up` semantics ported from the scheduler tests.
    - define convergence: changed terms, jobs and schedules apply on
