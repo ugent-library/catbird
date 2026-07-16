@@ -10,22 +10,22 @@ import (
 	"github.com/ugent-library/catbird/internal/ticker"
 )
 
-// TickOpts tunes the background ticks. Zero fields mean the defaults.
-type TickOpts struct {
+// TickerOpts tunes the ticker. Zero fields mean the defaults.
+type TickerOpts struct {
 	AssignPositionsInterval time.Duration // 100ms: publish consume latency
 	DeliverInterval         time.Duration // 500ms: delayed message and schedule accuracy
 	PruneInterval           time.Duration // 60s
 	Logger                  *slog.Logger  // slog.Default()
 }
 
-// RunTicks runs the stream engine's background work: assigning positions,
+// StartTicker runs the stream engine's background work: assigning positions,
 // delivering due pending messages and schedules, and pruning expired
 // messages and keys.
 // Running this from multiple processes is safe, the SQL locks decide who
 // does the work. If none are running, delivery pauses but publishing keeps
 // working.
-func RunTicks(ctx context.Context, pool *pgxpool.Pool, opts ...TickOpts) error {
-	var o TickOpts
+func StartTicker(ctx context.Context, pool *pgxpool.Pool, opts ...TickerOpts) error {
+	var o TickerOpts
 	if len(opts) > 0 {
 		o = opts[0]
 	}

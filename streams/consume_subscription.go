@@ -2,37 +2,18 @@ package streams
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
-	"fmt"
 	"log/slog"
-	"os"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ugent-library/catbird/internal/claimloop"
 )
 
 // ConsumeSubscriptionOpts tunes the subscription consume loop. Zero fields mean the defaults.
 type ConsumeSubscriptionOpts struct {
 	PollInterval time.Duration // 250ms: how often to look for new messages when caught up
-}
-
-// errClaimLost reports that a claim expired and another consumer adopted it.
-var errClaimLost = errors.New("catbird: claim lost")
-
-// newConsumerName generates a unique name for a consumer. It consists
-// of the hostname, pid and a random suffix.
-func newConsumerName() string {
-	host, err := os.Hostname()
-	if err != nil || host == "" {
-		host = "consumer"
-	}
-	host = strings.ReplaceAll(host, ".", "_") // keep the generated consumer name dot-free
-	var r [8]byte
-	rand.Read(r[:])
-	return fmt.Sprintf("%s_%d_%x", host, os.Getpid(), r)
 }
 
 // ConsumeSubscription processes a subscription's messages: unordered, at-least-once,
@@ -53,47 +34,15 @@ func ConsumeSubscription(ctx context.Context, pool *pgxpool.Pool, stream, subscr
 		poll = 250 * time.Millisecond
 	}
 
-	consumer := newConsumerName()
+	consumer := claimloop.Name("consumer")
 
-	timer := time.NewTimer(poll)
-	defer timer.Stop()
-	wait := func(d time.Duration) error {
-		timer.Reset(d)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-			return nil
-		}
-	}
-
-	backoff := poll
-	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		worked, loopErr := consumeClaim(ctx, pool, stream, subscription, consumer, handler)
-
-		switch {
-		case ctx.Err() != nil:
-			return ctx.Err()
-		case errors.Is(loopErr, ErrNotDefined):
-			return loopErr // misconfiguration, not a transient failure
-		case loopErr != nil:
-			if err := wait(backoff); err != nil {
-				return err
-			}
-			backoff = min(backoff*2, maxConsumeBackoff)
-		case worked:
-			backoff = poll
-		default:
-			backoff = poll
-			if err := wait(poll); err != nil {
-				return err
-			}
-		}
-	}
+	return claimloop.Run(ctx, claimloop.Options{
+		Poll: poll,
+		// misconfiguration, not a transient failure
+		Fatal: func(err error) bool { return errors.Is(err, ErrNotDefined) },
+	}, func(ctx context.Context) (bool, error) {
+		return consumeClaim(ctx, pool, stream, subscription, consumer, handler)
+	})
 }
 
 // consumeClaim runs one claim cycle: claim a range, handle its messages,
@@ -169,9 +118,15 @@ func consumeClaim(ctx context.Context, pool *pgxpool.Pool, stream, subscription,
 			}
 		}
 
-		verdict, err := runHandler(ctx, stream, subscription, ttl, m, extend, handler)
+		verdict, err := claimloop.Handle(ctx, ttl/2, extend,
+			func(elapsed time.Duration) {
+				slog.Info("catbird: handler still running",
+					"stream", stream, "subscription", subscription, "pos", m.Pos,
+					"elapsed", elapsed)
+			},
+			func(hctx context.Context) error { return handler(hctx, m) })
 		switch {
-		case errors.Is(err, errClaimLost):
+		case errors.Is(err, claimloop.ErrLost):
 			return true, nil
 		case err != nil:
 			return true, err // extends cannot be delivered; not the message's fault
@@ -194,58 +149,4 @@ func consumeClaim(ctx context.Context, pool *pgxpool.Pool, stream, subscription,
 		return true, wrapErr(err)
 	}
 	return true, nil
-}
-
-// runHandler runs one handler call while the extend cadence keeps the claim
-// alive. The verdict is the handler's own outcome — its error, or its panic
-// reported as one. err is the loop's outcome: errClaimLost when the claim
-// expired anyway and another consumer took it, or the failed extend. On a
-// non-nil err the handler is canceled and awaited first, so one consumer
-// never runs two handlers at once, and the verdict is meaningless.
-func runHandler(ctx context.Context, stream, subscription string, ttl time.Duration, m Message,
-	extend func() (bool, error),
-	handler func(ctx context.Context, msg Message) error,
-) (verdict error, err error) {
-	hctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				done <- fmt.Errorf("catbird: handler panic: %v", r)
-			}
-		}()
-		done <- handler(hctx, m)
-	}()
-
-	interval := ttl / 2
-	if interval <= 0 {
-		interval = time.Second
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	started := time.Now()
-	for {
-		select {
-		case verdict := <-done:
-			return verdict, nil
-		case <-ticker.C:
-			ok, err := extend()
-			if err == nil && ok {
-				slog.Info("catbird: handler still running",
-					"stream", stream, "subscription", subscription, "pos", m.Pos,
-					"elapsed", time.Since(started))
-				continue
-			}
-			// the claim is no longer ours, or extends cannot be delivered:
-			// stop the handler and wait for it before handing off
-			cancel()
-			<-done
-			if err != nil {
-				return nil, err
-			}
-			return nil, errClaimLost
-		}
-	}
 }

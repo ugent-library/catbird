@@ -323,7 +323,7 @@ func TestConsume(t *testing.T) {
 	}
 }
 
-func TestRunTicks(t *testing.T) {
+func TestStartTicker(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
@@ -338,7 +338,7 @@ func TestRunTicks(t *testing.T) {
 	jctx, cancel := context.WithCancel(ctx)
 	ticksDone := make(chan error, 1)
 	go func() {
-		ticksDone <- RunTicks(jctx, pool, TickOpts{
+		ticksDone <- StartTicker(jctx, pool, TickerOpts{
 			AssignPositionsInterval: 20 * time.Millisecond,
 			DeliverInterval:         20 * time.Millisecond,
 			PruneInterval:           50 * time.Millisecond,
@@ -446,7 +446,7 @@ func TestConsumeSubscription(t *testing.T) {
 	jctx, cancel := context.WithCancel(ctx)
 	ticksDone := make(chan error, 1)
 	go func() {
-		ticksDone <- RunTicks(jctx, pool, TickOpts{
+		ticksDone <- StartTicker(jctx, pool, TickerOpts{
 			AssignPositionsInterval: 20 * time.Millisecond,
 			DeliverInterval:         20 * time.Millisecond,
 		})
@@ -1840,7 +1840,7 @@ func TestConsumeSubscriptionPoisonHandler(t *testing.T) {
 	jctx, cancel := context.WithCancel(ctx)
 	ticksDone := make(chan error, 1)
 	go func() {
-		ticksDone <- RunTicks(jctx, pool, TickOpts{
+		ticksDone <- StartTicker(jctx, pool, TickerOpts{
 			AssignPositionsInterval: 20 * time.Millisecond,
 			DeliverInterval:         20 * time.Millisecond,
 		})
@@ -2479,7 +2479,7 @@ func TestConsumeSubscriptionFiltered(t *testing.T) {
 	defer cancel()
 	ticksDone := make(chan error, 1)
 	go func() {
-		ticksDone <- RunTicks(jctx, pool, TickOpts{
+		ticksDone <- StartTicker(jctx, pool, TickerOpts{
 			AssignPositionsInterval: 20 * time.Millisecond,
 			DeliverInterval:         20 * time.Millisecond,
 		})
