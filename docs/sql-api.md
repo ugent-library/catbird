@@ -1,683 +1,540 @@
-# SQL API Reference
+# SQL API — the job module
 
-## SQL Usage Examples
+This is the SQL contract of the job module (`jobs/`). All engine logic lives
+in these functions: a worker or client in any language calls them over a
+plain Postgres connection and gets the same semantics as the Go package. The
+signatures and comments in `jobs/migrations/00001_job.sql` are the
+authority; this document is their reference.
 
-### Queues
+**Scope of this document.** The job module only. The stream module's SQL
+surface is documented in `docs/plan/01-stream.md` while it is pre-release.
+The old root-schema functions (`cb_run_task`, `cb_create_queue`, …) are
+frozen and scheduled for replacement; the [name table](#old-names-new-names)
+at the end maps them to their successors.
+
+**What is built today (M4a): single-execution runs.** `cb_job_signal` does
+not exist yet, and `cb_job_complete` raises on a non-empty `spawns`
+argument. Both arrive with M4b; each place that changes is marked below.
+
+## Vocabulary
+
+Four words, one per table: a **job** is the declared, named thing
+(`cb_jobs`); a **run** is one instance of a job — the group and the record
+(`cb_job_runs`); a **step** is a unit of owed work inside a run, running a
+declared job (`cb_job_steps`); an **attempt** is one execution of a step
+(`cb_job_attempts`). The step row that records the work is the unit a
+worker claims — there is no separate message, and nothing is copied or
+moved when a step retries.
+
+A **queue** is a global pool: it partitions claiming and carries the claim
+and retry terms (`cb_job_queues`). A job routes to one pool
+(`cb_jobs.queue`, NULL means `default`). The migration seeds the `default`
+row, so a bare install works; every other pool is declared, and `default`
+itself is redeclarable like any pool.
+
+Names — jobs, queues, schedules — match `[a-z][a-z0-9_]*`, at most 20 bytes.
+
+## Rules shared by every function
+
+**The checks.** Every function that changes a run locks the run row first
+(`FOR UPDATE`) and checks its status: only `running` and `failing` runs
+accept changes. `cb_job_complete` and `cb_job_fail` also check that the
+step is `started` and that the caller's `attempt` equals the step's. When a
+check fails, the function returns false (or nothing) and changes nothing:
+the caller is acting on outdated information — the step was finished or
+handed to another worker — and its late call must not disturb what already
+happened. Only `cb_job_start` increments `attempt`.
+
+**Locks.** The order is: run row first, then step rows. Functions that
+update several step rows lock them in `(run_id, id)` order. `cb_job_claim`
+and `cb_job_release` lock step rows only and never the run row; claim also
+skips rows that are already locked. One shared order plus skip-locked means
+engine calls cannot deadlock each other.
+
+**Notifications.** `cbq_<queue>` fires when a step becomes claimable; the
+payload is the step's `claimable_at` as an RFC 3339 UTC timestamp.
+`cbj_<job>` fires when a run reaches a terminal status; the payload is
+`<run_id>:<status>`. Channel names are prefixed with the current schema
+(so `LISTEN "public.cbq_default"` on a stock install).
+
+**Terminal steps.** `worker` and `claimable_at` are set to NULL when a step
+reaches `completed`, `failed` or `canceled`. The claim index covers only
+`queued` and `started` rows, so finished steps drop out of it.
+
+**Errors.** Error texts start with `catbird:`. Two SQLSTATEs: `IRD01` means
+the call is invalid, `IRD02` means a named object does not exist.
+
+## The worker contract
+
+A worker in any language is one loop against the six functions below
+(`cb_job_signal` joins them with M4b):
+
+1. `cb_job_claim` a batch across the queues it serves.
+2. Per claimed step: `cb_job_start` — nothing returned means the step moved
+   on, skip it. `name` tells the worker which handler to run; a step it
+   holds no handler for goes back with `cb_job_release`.
+3. Run the handler with the returned `input`.
+4. `cb_job_complete` or `cb_job_fail`.
+
+While handlers run, the worker calls `cb_job_extend` on the cadence
+`lease_at` implies (half the remaining lease is a good cadence) and cancels
+the handler of any step missing from the result. A worker that never
+extends is legal — its slow steps are counted as crashes and slowed by
+backoff, at-least-once still holds, it is just noisy. `cb_job_release` is
+politeness, not obligation: an unreleased lease lapses on its own and comes
+back with no attempt spent, just slower.
+
+`attempt` travels from start through complete or fail — it is the third
+column the checks compare — so each start resolves at most once, and a
+false return means the step was taken over and nothing happened.
+
+The argument lists are deliberately short: claim, start, extend, release,
+complete and fail take ids the worker already holds — no stream, topic or
+header to know, so nothing to pass wrongly. A scheduled run arrives as an
+ordinary claimed step.
+
+### cb_job_claim
 
 ```sql
--- Create a queue
-SELECT cb_create_queue(
-	name => 'my_queue'
-);
+cb_job_claim(queues text[], worker text)
+    RETURNS TABLE (run_id bigint, step_id bigint, name text, lease_at timestamptz)
+```
 
--- Send a message
-SELECT cb_send(
-	queue => 'my_queue',
-	body => '{"user_id": 123, "action": "process"}'::jsonb
-);
+Hands out steps that are ready to run. Per pool in `queues`: up to
+`claim_batch_size` step rows whose `claimable_at` has passed, oldest first,
+each stamped with the caller's worker name and leased until `now() +
+claim_ttl` (the lease lives in `claimable_at`). Returns the handed-out
+steps; `lease_at` is when the lease runs out, and `cb_job_extend` moves it
+forward while the handler runs. Raises `IRD02` when a named queue is not
+defined.
 
--- Publish to topic-bound queues
-SELECT cb_publish(
-	topic => 'events.user.created',
-	body => '{"user_id": 456}'::jsonb,
-	concurrency_key => 'user-456-created'
-);
+What happens to a ready row depends on its state:
 
--- Read messages (with 30 second visibility timeout)
-SELECT * FROM cb_read(
-	queue => 'my_queue',
-	quantity => 10,
-	hide_for => 30000
-);
+- `queued`: handed out. A worker stamp still on the row means a worker
+  claimed it earlier and died before calling start; no attempt was spent,
+  so the row is simply handed out again and the stamp overwritten.
+- `started` with a worker stamp: that worker started the step and has not
+  reported for a whole lease. It crashed, or it is stuck. Not handed out;
+  the row gets what `cb_job_fail` would have done had the worker been able
+  to report: stamp cleared, `claimable_at` moved to `now() +
+  backoff(attempt)`, or to plain `now()` when no attempts are left. The
+  status stays `started` so a worker that was merely stuck can still
+  deliver its result: complete and fail accept a `started` step at the same
+  attempt.
+- `started` without a worker stamp: a crashed row (previous bullet) whose
+  backoff has passed. Handed out. `cb_job_start` then spends the next
+  attempt, or marks the step failed when none are left.
 
--- Delete a message
-SELECT cb_delete(
-	queue => 'my_queue',
-	id => 1
-);
+A crashed row is cleared in one call and handed out in a later one, never
+both at once. Reason: the worker most likely to call claim right after a
+lease runs out is the stuck worker itself, alive again with the old handler
+still running. Given its own step back, it would run the step twice at the
+same time. With the stamp cleared first, its next `cb_job_extend` no longer
+returns the step, so it cancels the old handler before the step reaches any
+worker.
 
--- Bind queue to topic pattern
-SELECT cb_bind(
-	queue => 'user_events',
-	pattern => 'events.user.*'
-);
-SELECT cb_unbind(
-	queue => 'user_events',
-	pattern => 'events.user.*'
-);
+Clearing crashed rows uses batch slots, so a call can return fewer steps
+than are ready; the next call picks up the rest.
 
--- Bind a task to a topic pattern (event trigger)
-SELECT cb_bind_task(
-	name => 'send_email',
-	pattern => 'events.email.*'
-);
+### cb_job_start
 
--- Bind a flow to a topic pattern (event trigger)
-SELECT cb_bind_flow(
-	name => 'order_processing',
-	pattern => 'events.order.#'
-);
+```sql
+cb_job_start(run_id bigint, step_id bigint, worker text)
+    RETURNS (name text, input jsonb, signal jsonb, attempt int)
+```
 
--- Publishing now also triggers task/flow runs
-SELECT cb_publish(
-	topic => 'events.email.welcome',
-	body => '{"user_id": 123}'::jsonb,
-	concurrency_key => 'user-123-welcome'
-);
+Starts a claimed step: increments `attempt`, inserts the attempt row and
+returns what the handler needs. The checks, in order: the run accepts work;
+the step is `queued` or `started` (`started` happens when an earlier
+attempt crashed); the step still carries this worker's stamp. When a check
+fails the step was finished or taken over by another worker in the
+meantime: nothing is returned (`name` IS NULL) and the caller moves on to
+its next claimed step.
 
--- Unbind a task trigger
-SELECT cb_unbind_task(
-	name => 'send_email',
-	pattern => 'events.email.*'
+When the step's attempts are already used up, starting it would exceed the
+budget: the step is marked failed instead (error `attempts exhausted; last
+attempt ended in silence`), no attempt row is written, and nothing is
+returned. This check sits here and not in `cb_job_claim` because the
+give-up needs the run lock, which claim never takes.
+
+`signal` is the satisfied payload of a signal-gated step, NULL otherwise
+(M4b; NULL for every step until then).
+
+### cb_job_extend
+
+```sql
+cb_job_extend(queues text[], worker text)
+    RETURNS TABLE (run_id bigint, step_id bigint, lease_at timestamptz)
+```
+
+Moves the lease end (`claimable_at`) forward on every step this worker
+holds in the given pools, and returns those steps. A step the worker thinks
+it holds but that is missing from the result was taken over after its lease
+ran out, or canceled: the worker must cancel that handler. A lease that ran
+out but was not yet taken over can still be extended; until someone else
+claims the step, it is still this worker's.
+
+### cb_job_release
+
+```sql
+cb_job_release(run_id bigint, step_id bigint, worker text, pause interval DEFAULT '0')
+    RETURNS boolean
+```
+
+Gives back a claimed step this worker has not started. The stamp is cleared
+and the step becomes claimable again after `pause` (default 0:
+immediately). No attempt is spent. A worker that claims a step it has no
+handler for — possible during a rolling deploy — releases it with a short
+pause, so that two not-yet-updated workers do not pass it back and forth as
+fast as they can. Like claim, no run lock. Returns false when this worker
+no longer holds the step.
+
+### cb_job_complete
+
+```sql
+cb_job_complete(run_id bigint, step_id bigint, attempt int,
+                output jsonb DEFAULT NULL, spawns jsonb DEFAULT NULL,
+                run_output jsonb DEFAULT NULL)
+    RETURNS boolean
+```
+
+Records a successful attempt: the attempt row and the step store the
+result, and the run's `steps_remaining` drops by one. `run_output`, when
+given, becomes the run's output no matter which step this is; when several
+steps set it, the last one wins. SQL NULL means "not given", which is why
+an explicit run output can never be the JSON value `null`.
+
+When `steps_remaining` reaches zero the run is done: a `running` run
+becomes `completed`, a `failing` run becomes `failed`. The run's output is
+then the `run_output` if any call set one, otherwise the output of this
+last step. Returns false, having changed nothing, when the checks fail.
+
+`spawns` is the follow-on buffer — `[{name, input, dispatch}]` — and
+**raises `IRD01` when non-empty until M4b**. Pass NULL or `[]`.
+
+### cb_job_fail
+
+```sql
+cb_job_fail(run_id bigint, step_id bigint, attempt int, error text)
+    RETURNS boolean
+```
+
+Records a failed attempt on the attempt row, then one comparison decides.
+Attempts left: the step goes back to `queued` and becomes claimable again
+after `backoff(attempt)`; the retry is just this row becoming claimable
+later, nothing is copied or moved. Attempts used up: the engine gives up,
+in the same transaction (below). Returns false, having changed nothing,
+when the checks fail.
+
+### cb_job_signal — arrives with M4b
+
+```sql
+cb_job_signal(run_id bigint, name text, payload jsonb)   -- not built yet
+```
+
+Satisfies a waiting signal-gated step of that name, or buffers the payload
+in the run's slot for it (a second signal for a name nobody consumed yet
+overwrites the slot). Raises only when the run is missing or terminal.
+
+## Retries and giving up — one counter
+
+The step row's `attempt` column counts **starts**: every time
+`cb_job_start` hands the step to a handler, whatever later becomes of that
+execution. A reported failure, a crash, a graceful shutdown that canceled a
+running handler: each consumed a start. `max_attempts` therefore bounds
+total starts — "this step's handler will begin at most `max_attempts`
+times" — and it is checked in the two places an execution's fate is
+decided: `cb_job_fail` (a reported failure at the limit) and `cb_job_start`
+(a crashed row that comes back at the limit). The other half of the same
+rule: a step that was leased but never started lapses back to claimable
+with no attempt spent — nothing began, nothing is charged.
+
+The give-up (`_cb_job_give_up`, internal — called by start and fail, one
+transaction): the step turns `failed` with its error; every other
+unfinished step of the run turns `canceled`. Then:
+
+- If the run is `running` and its **birth job** (the job named in
+  `cb_job_run`) declares an `on_fail` job, the run turns `failing` and one
+  new step is created to run that job, with input `{job, error, input}`
+  describing the failed step. The run ends `failed` when that step — and,
+  from M4b, whatever it spawns — is done.
+- Otherwise the run ends `failed` now.
+
+A `failing` run never gets a second `on_fail` step, and it keeps its first
+error; the `on_fail` step's own failure is recorded on its step and attempt
+rows. `on_fail` fires on crash exhaustion too — a run whose worker died
+hard still gets its cleanup step.
+
+## Client calls
+
+Everything below works on any connection — the define calls in deploy code,
+`cb_job_run` and `cb_job_cancel` from any client. Deploy code calls the
+defines in dependency order: queues before the jobs that name them,
+`on_fail` targets first. Each call is atomic and validated on its own, so a
+deploy that dies mid-way leaves a consistent prefix and the next deploy
+converges the rest; an app that wants the whole set to apply together runs
+the calls in its own transaction.
+
+### cb_job_define_queue
+
+```sql
+cb_job_define_queue(queue text,
+                    claim_ttl interval DEFAULT NULL, claim_batch_size int DEFAULT NULL,
+                    max_attempts int DEFAULT NULL, backoff_kind cb_backoff_kind DEFAULT NULL,
+                    backoff_base interval DEFAULT NULL, backoff_max interval DEFAULT NULL)
+    RETURNS void
+```
+
+Declares a pool and all its terms in one call. An argument that is not
+given gets the stock value — `claim_ttl` 30s, `claim_batch_size` 10,
+`max_attempts` 3, full-jitter backoff 1s–1m, the same values the migration
+seeds for `default` — it never means "keep the current value". Declaring
+the same terms again writes nothing.
+
+`backoff_kind` is `none` (retry immediately), `fixed` (always
+`backoff_base`) or `full_jitter` (a random delay up to `backoff_base *
+2^(attempt-1)`, capped at `backoff_max`).
+
+There is no queue delete: a pool no longer declared may still have
+unfinished steps routed to it, and a stale terms row is inert config, so
+removing one is a deliberate op (a raw `DELETE`).
+
+### cb_job_define
+
+```sql
+cb_job_define(job text, queue text DEFAULT NULL, on_fail text DEFAULT NULL,
+              retention interval DEFAULT NULL)
+    RETURNS void
+```
+
+Declares a job and all its config in one call: `queue` NULL routes the job
+to `default`, `retention` NULL means the stock 30 days (`cb_forever()`
+keeps runs forever). `queue` must name a declared pool and `on_fail` a
+declared job, raising `IRD02` otherwise; checking this at declaration time
+turns a typo into a deploy error instead of a runtime failure. A job may
+name itself as its own `on_fail`. Declaring the same config again writes
+nothing.
+
+`on_fail` and `retention` matter when the job is a run's birth job; on a
+job only ever spawned mid-run they are inert config.
+
+### cb_job_define_schedule
+
+```sql
+cb_job_define_schedule(name text, job text, every interval,
+                       catch_up cb_job_catch_up_policy DEFAULT NULL,  -- NULL means 'skip'
+                       input jsonb DEFAULT NULL, start_at timestamptz DEFAULT NULL)
+    RETURNS void
+```
+
+Declares a schedule in one call: from `next_at` on, every `every`, run
+`job` with `input`. `every` is a fixed duration — hours or less; days,
+months and years need cron, which is not built yet. `next_at` is not
+declared config, the engine manages it: a fresh schedule first fires at
+`now() + every`, a redeclaration keeps the firing phase, a changed cadence
+re-anchors it to `now() + every`, and `start_at` sets it directly. `input`
+is stored exactly as given; NULL is a valid job input.
+
+`catch_up` decides what a backlog gets when the tick was down past one or
+more slots: `all` fires a run per missed slot, `skip` (the default) drops
+the backlog and fires only an on-time slot.
+
+### cb_job_delete_schedule
+
+```sql
+cb_job_delete_schedule(name text) RETURNS boolean
+```
+
+Deletes a schedule. Returns false when there was none. (Schedules get a
+delete because a forgotten one keeps creating runs; the other declarations
+are inert when unused.)
+
+### cb_job_run
+
+```sql
+cb_job_run(job text, input jsonb DEFAULT NULL, key text DEFAULT NULL,
+           delay interval DEFAULT NULL)
+    RETURNS (run_id bigint, existing boolean)
+```
+
+Creates a run: the run row plus its first step, queued on the job's pool,
+in one statement. Works on any connection, so an application can create a
+run inside its own transaction — commit the order and enqueue its
+confirmation atomically, no outbox glue. Raises `IRD02` when the job is not
+defined. `delay` holds the first step back.
+
+`key` deduplicates: when a run of this job with this key already exists —
+live or finished, within the job's retention — its id is returned with
+`existing = true` and nothing is inserted. The key is also the app-side
+lookup handle: `SELECT … FROM cb_job_runs WHERE job = $1 AND key = $2`.
+
+```sql
+SELECT * FROM cb_job_run(
+    job   => 'send_confirmation',
+    input => '{"order_id": 123}'::jsonb,
+    key   => 'order-123'
 );
 ```
 
-### Tasks
+### cb_job_cancel
 
 ```sql
--- Create a task definition
-SELECT cb_create_task(
-	name => 'send_email'
-);
-
--- Run a task
-SELECT * FROM cb_run_task(
-	name => 'send_email',
-	input => '{"to": "user@example.com"}'::jsonb
-);
+cb_job_cancel(run_id bigint, reason text DEFAULT NULL) RETURNS boolean
 ```
 
-### Workflows
+Cancels a run. A `running` run ends `canceled` with `error = reason`. A
+`failing` run already has its verdict and ends `failed`; cancel only stops
+the on_fail steps (refusing to cancel a `failing` run would assume its
+cleanup always finishes). All unfinished steps become `canceled`. A handler
+that is already running is not interrupted here: its worker sees the
+canceled step on the next extend and cancels it, and a late complete or
+fail fails the checks and changes nothing. Returns false when the run does
+not exist or is already finished.
+
+## Reading runs
+
+Rows are the truth, so status, output and history are plain `SELECT`s — no
+read functions. The run row is the durable handle, queryable by id or by
+`(job, key)` for as long as the job's retention keeps it:
 
 ```sql
--- Create a flow definition
-SELECT cb_create_flow(
-		name => 'order_processing',
-		steps => '[
-			{"name": "validate"},
-			{"name": "charge", "depends_on": [{"name": "validate"}]},
-			{"name": "ship", "depends_on": [{"name": "charge"}]}
-		]'::jsonb
-);
+-- the handle: status, output, error
+SELECT status, output, error FROM cb_job_runs WHERE id = $1;
 
--- Create a flow with a map step
-SELECT cb_create_flow(
-		name => 'map_example',
-		steps => '[
-			{"name": "numbers"},
-			{"name": "double", "step_type": "mapper", "map_source_step_name": "numbers", "depends_on": [{"name": "numbers"}]}
-		]'::jsonb
-);
+-- by app key
+SELECT * FROM cb_job_runs WHERE job = 'send_confirmation' AND key = 'order-123';
 
--- Run a flow
-SELECT * FROM cb_run_flow(
-		name => 'order_processing',
-		input => '{"order_id": 123}'::jsonb
-);
+-- what actually happened: every start, its worker, its verdict
+SELECT s.name, a.attempt, a.worker, a.status, a.error, a.started_at, a.finished_at
+FROM cb_job_steps s
+JOIN cb_job_attempts a ON (a.run_id, a.step_id) = (s.run_id, s.id)
+WHERE s.run_id = $1
+ORDER BY s.id, a.attempt;
 ```
 
-### Monitoring task and flow runs
+An attempt row with a NULL `status` never reported a result: the worker
+crashed, or the step was handed to another worker and the outcome of that
+start no longer counts.
 
-You can query task and flow run information directly:
+## The module's tick
+
+The two functions below are engine-internal (the underscore prefix): the
+module's ticker (`jobs.StartTicker` in Go) calls them on an interval, and a
+thin client without the Go package schedules them itself — pg_cron, a cron
+job, any loop. Running the tick from several processes is safe: `FOR
+UPDATE SKIP LOCKED` decides who does the work. Without a tick, on-demand
+runs keep working; only scheduled runs and pruning pause.
+
+### _cb_job_run_scheduled
 
 ```sql
--- List recent task runs (replace send_email with your task name)
-SELECT
-	id,
-	concurrency_key,
-	status,
-	input,
-	output,
-	error_message,
-	started_at,
-	completed_at,
-	failed_at
-FROM cb_t_send_email
-ORDER BY started_at DESC
-LIMIT 20;
-
--- Get flow run (replace order_processing with your flow name)
-SELECT
-	id,
-	concurrency_key,
-	status,
-	input,
-	output,
-	error_message,
-	started_at,
-	completed_at,
-	failed_at
-FROM cb_f_order_processing
-WHERE id = $1;
+_cb_job_run_scheduled(batch_size int DEFAULT 500) RETURNS int
 ```
 
-### External archiving
+Fires due schedules: each due row creates runs via `cb_job_run` and
+re-arms, in this one transaction — so a slot fires exactly once no matter
+how many processes tick. Runs are created without a key: every fired slot
+is its own run. Returns the number of runs created.
 
-For long-term archiving, export rows before they are deleted using a standard
-watermark-based query and write to your own storage (S3, data warehouse, etc.).
-Catbird does not manage the export destination or cursor state.
+### _cb_job_prune_runs
 
 ```sql
-SELECT *
-FROM cb_t_my_task
-WHERE status IN ('completed', 'failed', 'skipped', 'canceled')
-	AND finished_at < now() - interval '30 days'
-	AND finished_at > $watermark
+_cb_job_prune_runs(batch_size int DEFAULT 1000) RETURNS bigint
+```
+
+Deletes terminal runs older than their birth job's `retention`, together
+with their step, attempt and signal rows — oldest first, up to `batch_size`
+runs per call. Runs of a job whose retention is `cb_forever()` are kept.
+Live runs are never touched: a queued or waiting step is its own delivery,
+so a parked run pins only its own rows and pruning can never wedge it.
+Returns the number of runs deleted.
+
+For archiving before rows are pruned, export with a watermark query and
+write to your own storage:
+
+```sql
+SELECT * FROM cb_job_runs
+WHERE finished_at IS NOT NULL AND finished_at > $watermark
 ORDER BY finished_at, id
 LIMIT $batch_size;
 ```
 
-### Durable notifications
+## Spawns, gates and barriers — arrives with M4b
 
-```sql
--- Append a durable notification to an identity's inbox; returns the new id (cursor)
-SELECT cb_notify_durable(
-	identity => 'user-123',
-	topic => 'import.done',
-	message => 'Your import finished'
-);
+> Everything in this section is written from the design (`docs/plan/03-job.md`
+> §3) and is **not callable yet**: today `cb_job_complete` raises on a
+> non-empty `spawns`. It is documented here because these are the two places
+> a reader's intuition is most likely wrong.
 
--- Collapse progress updates: a newer message with the same collapse_key marks
--- prior unseen ones seen, so only the latest stays live (FCM collapse_key semantics)
-SELECT cb_notify_durable(
-	identity => 'user-123',
-	topic => 'import.progress',
-	message => '100%',
-	collapse_key => 'import-42',
-	expires_at => now() + interval '1 hour'
-);
+`spawns` carries the handler's buffered follow-ons as JSON: `[{name, input,
+dispatch}]`. The engine validates each name against `cb_jobs` and stamps
+the queue from the definition, so a worker spawns with zero knowledge of
+queue layout. `dispatch` is the combination of up to two independent
+gates — `all_done` (wait for the run's current work to drain) and `signal`
+(wait for a payload) — giving four words: `immediate`, `all_done`,
+`signal`, `all_done_signal`.
 
--- Read an identity's unseen, still-relevant notifications after a cursor
-SELECT id, topic, message, created_at
-FROM cb_notifications
-WHERE identity = 'user-123'
-	AND id > 0                       -- the client's last-seen cursor
-	AND seen_at IS NULL
-	AND (expires_at IS NULL OR expires_at > now())
-ORDER BY id
-LIMIT 50;
+**Gate composition.** The gates are independent, so they compose. The
+approval-gate-after-fan-out shape:
 
--- Ack as a bounded watermark: mark everything up to an id seen; returns rows marked
-SELECT cb_mark_seen_until(
-	identity => 'user-123',
-	id => 42
-);
-
--- Ack precisely: mark only the named ids seen (subset-scoped); returns rows marked
-SELECT cb_mark_seen(
-	identity => 'user-123',
-	ids => ARRAY[40, 42, 45]::bigint[]
-);
+```json
+[
+    {"name": "resize",  "input": {"img": 1}, "dispatch": "immediate"},
+    {"name": "resize",  "input": {"img": 2}, "dispatch": "immediate"},
+    {"name": "publish", "input": {},         "dispatch": "all_done_signal"}
+]
 ```
 
-Retention (physically dropping rows past their `expires_at`) folds into the core
-`cb_gc` sweep, which runs on worker heartbeat. A deployment that runs Wire but no
-worker therefore performs no GC — it must call `cb_gc()` / `Client.GC()` on its own
-schedule, or notifications accumulate. The unseen read already hides stale rows, so
-this is a storage concern, not a correctness one.
-
-## Public SQL API
-
-These are the functions most app code and external clients care about.
-
-**Queues & topics**
-
-### `cb_create_queue`
-- **What it does**: Create a queue definition.
-- **Inputs**: `cb_create_queue(name text, expires_at timestamptz DEFAULT NULL, description text DEFAULT NULL)`
-- **Returns**: `RETURNS void`
-
-### `cb_delete_queue`
-- **What it does**: Delete a queue definition and all its messages.
-- **Inputs**: `cb_delete_queue(name text)`
-- **Returns**: `RETURNS boolean`
-
-### `cb_bind`
-- **What it does**: Subscribe a queue to a topic pattern.
-- **Inputs**: `cb_bind(queue text, pattern text)`
-- **Returns**: `RETURNS void`
-
-### `cb_unbind`
-- **What it does**: Unsubscribe a queue from a topic pattern.
-- **Inputs**: `cb_unbind(queue text, pattern text)`
-- **Returns**: `RETURNS boolean`
-
-### `cb_bind_task`
-- **What it does**: Subscribe a task to a topic pattern. When a message is published to a matching topic, a task run is created with the message body as input.
-- **Inputs**: `cb_bind_task(name text, pattern text)`
-- **Returns**: `RETURNS void`
-
-### `cb_unbind_task`
-- **What it does**: Unsubscribe a task from a topic pattern.
-- **Inputs**: `cb_unbind_task(name text, pattern text)`
-- **Returns**: `RETURNS boolean`
-
-### `cb_bind_flow`
-- **What it does**: Subscribe a flow to a topic pattern. When a message is published to a matching topic, a flow run is created with the message body as input.
-- **Inputs**: `cb_bind_flow(name text, pattern text)`
-- **Returns**: `RETURNS void`
-
-### `cb_unbind_flow`
-- **What it does**: Unsubscribe a flow from a topic pattern.
-- **Inputs**: `cb_unbind_flow(name text, pattern text)`
-- **Returns**: `RETURNS boolean`
-
-### `cb_send` (single message)
-- **What it does**: Send one message to a specific queue.
-- **Inputs**: `cb_send(queue text, body jsonb, topic text DEFAULT NULL, concurrency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0, expires_at timestamptz DEFAULT NULL)`
-- **Returns**: `RETURNS bigint`
-
-### `cb_send` (batch)
-- **What it does**: Send multiple messages to a specific queue in one call.
-- **Inputs**: `cb_send(queue text, bodies jsonb[], topic text DEFAULT NULL, concurrency_keys text[] DEFAULT NULL, headers jsonb[] DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0, expires_at timestamptz DEFAULT NULL)`
-- **Returns**: `RETURNS bigint[]`
-
-### `cb_publish` (single message)
-- **What it does**: Publish one message to all queues, tasks, and flows matching a topic.
-- **Inputs**: `cb_publish(topic text, body jsonb, concurrency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0, expires_at timestamptz DEFAULT NULL)`
-- **Returns**: `RETURNS int`
-
-### `cb_publish` (batch)
-- **What it does**: Publish multiple messages to all queues, tasks, and flows matching a topic.
-- **Inputs**: `cb_publish(topic text, bodies jsonb[], concurrency_keys text[] DEFAULT NULL, headers jsonb[] DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0, expires_at timestamptz DEFAULT NULL)`
-- **Returns**: `RETURNS int`
-
-### `cb_read`
-- **What it does**: Read messages from a queue. Expired messages (past `expires_at`) are automatically skipped.
-- **Inputs**: `cb_read(queue text, quantity int, hide_for int)`
-- **Returns**: `RETURNS SETOF cb_message`
-
-### `cb_read_poll`
-- **What it does**: Read messages from a queue with polling. Expired messages (past `expires_at`) are automatically skipped.
-- **Inputs**: `cb_read_poll(queue text, quantity int, hide_for int, poll_for int, poll_interval int)`
-- **Returns**: `RETURNS SETOF cb_message`
-
-### `cb_hide` (single message)
-- **What it does**: Hide one message from being read.
-- **Inputs**: `cb_hide(queue text, id bigint, hide_for int)`
-- **Returns**: `RETURNS boolean`
-
-### `cb_hide` (batch)
-- **What it does**: Hide multiple messages from being read.
-- **Inputs**: `cb_hide(queue text, ids bigint[], hide_for int)`
-- **Returns**: `RETURNS bigint[]`
-
-### `cb_delete` (single message)
-- **What it does**: Delete one message from a queue.
-- **Inputs**: `cb_delete(queue text, id bigint)`
-- **Returns**: `RETURNS boolean`
-
-### `cb_delete` (batch)
-- **What it does**: Delete multiple messages from a queue.
-- **Inputs**: `cb_delete(queue text, ids bigint[])`
-- **Returns**: `RETURNS bigint[]`
-
-**Task definitions & runs**
-
-### `cb_create_task`
-- **What it does**: Create a task definition.
-- **Inputs**: `cb_create_task(name text, description text DEFAULT NULL, condition text DEFAULT NULL, retention_period interval DEFAULT NULL)`
-- **Returns**: `RETURNS void`
-
-### `cb_delete_task`
-- **What it does**: Delete a task definition and all its runs.
-- **Inputs**: `cb_delete_task(name text)`
-- **Returns**: `RETURNS boolean`
-
-### `cb_run_task`
-- **What it does**: Create a task run (enqueue a task execution).
-- **Inputs**: `cb_run_task(name text, input jsonb, concurrency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0, expires_at timestamptz DEFAULT NULL)`
-- **Returns**: `RETURNS bigint`
-
-### `cb_wait_task_output`
-- **What it does**: Long-poll for task completion without client-side polling loops.
-- **Inputs**: `cb_wait_task_output(name text, run_id bigint, poll_for int DEFAULT 5000, poll_interval int DEFAULT 200)`
-- **Returns**: `RETURNS TABLE(status text, output jsonb, error_message text)`
-
-### `cb_cancel_task`
-- **What it does**: Cancel a task run; if it is already terminal, this is a no-op.
-- **Inputs**: `cb_cancel_task(name text, run_id bigint, reason text DEFAULT NULL)`
-- **Returns**: `RETURNS boolean` (`true` when the run exists, `false` when the run does not exist)
-
-**Flow definitions & runs**
-
-### `cb_create_flow`
-- **What it does**: Create a flow definition.
-- **Inputs**: `cb_create_flow(name text, description text DEFAULT NULL, steps jsonb DEFAULT '[]'::jsonb, output_priority text[] DEFAULT NULL, retention_period interval DEFAULT NULL)`
-- **Expected `steps` shape**:
-	- `steps` must be a JSON array of step objects.
-	- Each step object:
-		- `name` (required, string): step name (`a-z`, `0-9`, `_`; not `input` or `signal`).
-		- `description` (optional, string)
-		- `depends_on` (optional, array): list of dependency objects `{ "name": "<step_name>" }`.
-		- `condition` (optional, string): condition expression.
-		- `signal` (optional, boolean; default `false`)
-		- `step_type` (optional, string; default `"normal"`): one of `normal | mapper | generator | reducer`.
-		- `map_source_step_name` (optional, string): only valid when `step_type = "mapper"`; if set, it must also appear in `depends_on`.
-		- `reduce_source_step_name` (optional, string): required when `step_type = "reducer"`; must also appear in `depends_on`.
-		- `ignore_output` (optional, array of strings): dependency step names whose output should not be fetched at claim time. Named steps must appear in `depends_on`. Stored as `ignore_output` boolean on `cb_step_dependencies`.
-- **Returns**: `RETURNS void`
-
-### `cb_delete_flow`
-- **What it does**: Delete a flow definition and all its runs.
-- **Inputs**: `cb_delete_flow(name text)`
-- **Returns**: `RETURNS boolean`
-
-### `cb_run_flow`
-- **What it does**: Create a flow run (enqueue a flow execution).
-- **Inputs**: `cb_run_flow(name text, input jsonb, concurrency_key text DEFAULT NULL, headers jsonb DEFAULT NULL, visible_at timestamptz DEFAULT NULL, priority int DEFAULT 0, expires_at timestamptz DEFAULT NULL)`
-- **Returns**: `RETURNS bigint`
-
-### `cb_wait_flow_output`
-- **What it does**: Long-poll for flow completion without client-side polling loops.
-- **Inputs**: `cb_wait_flow_output(flow_name text, run_id bigint, poll_for int DEFAULT 5000, poll_interval int DEFAULT 200)`
-- **Returns**: `RETURNS TABLE(status text, output jsonb, error_message text)`
-
-### `cb_signal_flow`
-- **What it does**: Deliver a signal to a waiting step run.
-- **Inputs**: `cb_signal_flow(flow_name text, run_id bigint, step_name text, input jsonb)`
-- **Returns**: `RETURNS boolean`
-
-### `cb_cancel_flow`
-- **What it does**: Cancel a flow run; active work may pass through `canceling` before `canceled`.
-- **Inputs**: `cb_cancel_flow(name text, run_id bigint, reason text DEFAULT NULL)`
-- **Returns**: `RETURNS boolean` (`true` when the run exists, `false` when the run does not exist)
-
-**Scheduling setup**
-
-### `cb_create_task_schedule`
-- **What it does**: Create or replace a cron schedule for a task with static JSON input and catch-up policy. If a schedule already exists for the task it is upserted: `cron_spec`, `input`, and `catch_up` are updated. `next_run_at` is only recomputed when `cron_spec` actually changes, so repeat calls with the same spec preserve any catch-up backlog.
-- **Inputs**: `cb_create_task_schedule(task_name text, cron_spec text, input jsonb DEFAULT '{}'::jsonb, catch_up text DEFAULT 'one')`
-- **Returns**: `RETURNS void`
-- **Catch-up policies**: `'skip'` (skip all missed ticks), `'one'` (enqueue one catch-up, default), `'all'` (replay every missed tick)
-
-### `cb_create_flow_schedule`
-- **What it does**: Create or replace a cron schedule for a flow with static JSON input and catch-up policy. If a schedule already exists for the flow it is upserted: `cron_spec`, `input`, and `catch_up` are updated. `next_run_at` is only recomputed when `cron_spec` actually changes, so repeat calls with the same spec preserve any catch-up backlog.
-- **Inputs**: `cb_create_flow_schedule(flow_name text, cron_spec text, input jsonb DEFAULT '{}'::jsonb, catch_up text DEFAULT 'one')`
-- **Returns**: `RETURNS void`
-- **Catch-up policies**: `'skip'` (skip all missed ticks), `'one'` (enqueue one catch-up, default), `'all'` (replay every missed tick)
-
-### `cb_delete_task_schedule`
-- **What it does**: Remove the cron schedule for a task. Returns `true` if a schedule existed, `false` otherwise (deleting a missing schedule is a no-op).
-- **Inputs**: `cb_delete_task_schedule(task_name text)`
-- **Returns**: `RETURNS boolean`
-
-### `cb_delete_flow_schedule`
-- **What it does**: Remove the cron schedule for a flow. Returns `true` if a schedule existed, `false` otherwise (deleting a missing schedule is a no-op).
-- **Inputs**: `cb_delete_flow_schedule(flow_name text)`
-- **Returns**: `RETURNS boolean`
-
-**Maintenance**
-
-### `cb_gc`
-- **What it does**: Garbage collection: deletes expired queues and messages, transitions expired task/flow runs to `'expired'` status, cleans stale workers and wire nodes, deletes durable notifications past their relevance window, purges old terminal runs.
-- **Inputs**: `cb_gc()`
-- **Returns**: `RETURNS jsonb`
-- **Returned JSON shape**:
-	- `{ "expired_queues_deleted": int, "expired_messages_deleted": int, "expired_task_runs": int, "expired_flow_runs": int, "stale_workers_deleted": int, "stale_wire_nodes_deleted": int, "expired_notifications_deleted": int, "task_runs_purged": int, "flow_runs_purged": int }`
-
-### `cb_clear_task_runs`
-- **What it does**: Delete all task runs regardless of status. In-flight work will be lost.
-- **Inputs**: `cb_clear_task_runs(name text)`
-- **Returns**: `RETURNS int`
-
-### `cb_clear_flow_runs`
-- **What it does**: Delete all flow runs regardless of status. Step runs and map tasks are deleted via cascade. In-flight work will be lost.
-- **Inputs**: `cb_clear_flow_runs(name text)`
-- **Returns**: `RETURNS int`
-
-### `cb_purge_task_runs`
-- **What it does**: Delete terminal task runs older than a given duration.
-- **Inputs**: `cb_purge_task_runs(name text, older_than interval)`
-- **Returns**: `RETURNS int`
-
-### `cb_purge_flow_runs`
-- **What it does**: Delete terminal flow runs older than a given duration.
-- **Inputs**: `cb_purge_flow_runs(name text, older_than interval)`
-- **Returns**: `RETURNS int`
-
-**Wire (SSE toolkit)**
-
-### `cb_notify`
-- **What it does**: Send a notification via pg NOTIFY on the schema-qualified cb_wire channel.
-- **Inputs**: `cb_notify(topic text, data text DEFAULT NULL, node_id uuid DEFAULT NULL)`
-- **Returns**: `RETURNS void`
-
-**Durable notifications (per-identity inbox)**
-
-### `cb_notify_durable`
-- **What it does**: Append a durable notification to an identity's inbox and return the new row id (the monotonic cursor). When `collapse_key` is set, prior unseen rows with the same `(identity, collapse_key)` are first marked seen (write-time keep-newest collapse, the FCM `collapse_key` semantics — the deliberate opposite of the queue's keep-oldest `concurrency_key`), so the new row is the only live one for that subject. `expires_at` is the relevance window and the GC drop trigger.
-- **Inputs**: `cb_notify_durable(identity text, topic text, message text DEFAULT NULL, collapse_key text DEFAULT NULL, expires_at timestamptz DEFAULT NULL)`
-- **Returns**: `RETURNS bigint`
-
-### `cb_mark_seen_until`
-- **What it does**: Bounded watermark ack: mark an identity's unseen notifications with `id <= id` as seen. Returns the number of rows marked. The `id` bound is load-bearing — it must not mark rows that arrived between a reader's fetch and its ack. Whole-inbox scope only; a by-`id` range is unsafe across interleaved subsets (use `cb_mark_seen` for subset-scoped acks).
-- **Inputs**: `cb_mark_seen_until(identity text, id bigint)`
-- **Returns**: `RETURNS bigint`
-
-### `cb_mark_seen`
-- **What it does**: Precise ack: mark the identity's unseen notifications whose `id` is in `ids` as seen. Returns the number of rows marked. Used for subset-scoped acks — a transport matches a subset's unseen rows and acks exactly those ids, since subsets' ids interleave in one inbox and a range would clobber siblings.
-- **Inputs**: `cb_mark_seen(identity text, ids bigint[])`
-- **Returns**: `RETURNS bigint`
-
-The unseen read is a plain parameterized `SELECT` against `cb_notifications` (unseen **and** still-relevant: `seen_at IS NULL AND (expires_at IS NULL OR expires_at > now())`), not a function — see the usage example above.
-
-## Internal / runtime SQL API
-
-These are mostly used by Catbird workers and scheduler internals. Most users should not call them directly.
-
-**Task worker runtime**
-
-### `cb_claim_tasks`
-- **What it does**: Claim task runs from the queue. Expired runs (past `expires_at`) are automatically skipped.
-- **Inputs**: `cb_claim_tasks(name text, quantity int, hide_for int)`
-- **Returns**: `RETURNS SETOF cb_task_claim`
-
-### `cb_hide_tasks`
-- **What it does**: Hide task runs from being read by workers.
-- **Inputs**: `cb_hide_tasks(name text, ids bigint[], hide_for int)`
-- **Returns**: `RETURNS void`
-
-### `cb_complete_task`
-- **What it does**: Mark a task run as completed.
-- **Inputs**: `cb_complete_task(name text, run_id bigint, output jsonb)`
-- **Returns**: `RETURNS void`
-
-### `cb_fail_task`
-- **What it does**: Mark a task run as failed.
-- **Inputs**: `cb_fail_task(name text, run_id bigint, error_message text)`
-- **Returns**: `RETURNS void`
-
-### `cb_claim_task_on_fail`
-- **What it does**: Claim failed task runs for on-fail handling.
-- **Inputs**: `cb_poll_task_on_fail(name text, quantity int)`
-- **Returns**: `RETURNS TABLE(id bigint, input jsonb, error_message text, attempts int, on_fail_attempts int, started_at timestamptz, failed_at timestamptz, concurrency_key text)`
-
-### `cb_complete_task_on_fail`
-- **What it does**: Mark on-fail handling as completed for a task run.
-- **Inputs**: `cb_complete_task_on_fail(name text, run_id bigint)`
-- **Returns**: `RETURNS void`
-
-### `cb_fail_task_on_fail`
-- **What it does**: Mark on-fail handling as failed and schedule retry (`retry_delay` is in milliseconds).
-- **Inputs**: `cb_fail_task_on_fail(name text, run_id bigint, error_message text, retry_exhausted boolean, retry_delay bigint)`
-- **Returns**: `RETURNS void`
-
-**Flow worker runtime**
-
-### `cb_start_steps`
-- **What it does**: Start steps in a flow that are ready to run.
-- **Inputs**: `cb_start_steps(flow_name text, run_id bigint, initial_visible_at timestamptz DEFAULT NULL)`
-- **Returns**: `RETURNS void`
-
-### `cb_claim_steps`
-- **What it does**: Claim step runs from a flow. Steps belonging to expired flow runs (past `expires_at`) are automatically skipped.
-- **Inputs**: `cb_claim_steps(flow_name text, step_name text, quantity int, hide_for int)`
-- **Returns**: `RETURNS SETOF cb_step_claim`
-
-### `cb_hide_steps`
-- **What it does**: Hide step runs from being read by workers.
-- **Inputs**: `cb_hide_steps(flow_name text, step_name text, ids bigint[], hide_for int)`
-- **Returns**: `RETURNS void`
-
-### `cb_complete_step`
-- **What it does**: Mark a step run as completed.
-- **Inputs**: `cb_complete_step(flow_name text, step_name text, id bigint, output jsonb)`
-- **Returns**: `RETURNS void`
-
-### `cb_fail_step`
-- **What it does**: Mark a step run as failed.
-- **Inputs**: `cb_fail_step(flow_name text, step_name text, id bigint, error_message text)`
-- **Returns**: `RETURNS void`
-
-### `cb_claim_map_tasks`
-- **What it does**: Claim map-item tasks for a specific map step.
-- **Inputs**: `cb_claim_map_tasks(flow_name text, step_name text, quantity int, hide_for int)`
-- **Returns**: `RETURNS TABLE(id bigint, flow_run_id bigint, attempts int, input jsonb, step_outputs jsonb, signal_input jsonb, item jsonb)`
-
-### `cb_hide_map_tasks`
-- **What it does**: Hide map tasks from workers for a duration.
-- **Inputs**: `cb_hide_map_tasks(flow_name text, step_name text, ids bigint[], hide_for int)`
-- **Returns**: `RETURNS void`
-
-### `cb_spawn_generator_map_tasks`
-- **What it does**: Spawn map tasks for a generator step batch.
-- **Inputs**: `cb_spawn_generator_map_tasks(flow_name text, step_name text, id bigint, items jsonb, visible_at timestamptz DEFAULT NULL)`
-- **Returns**: `RETURNS int`
-
-### `cb_complete_generator_step`
-- **What it does**: Mark generator as complete and finalize parent step if all map tasks are complete.
-- **Inputs**: `cb_complete_generator_step(flow_name text, step_name text, id bigint)`
-- **Returns**: `RETURNS void`
-
-### `cb_fail_generator_step`
-- **What it does**: Mark generator as failed and fail parent step/flow.
-- **Inputs**: `cb_fail_generator_step(flow_name text, step_name text, id bigint, error_message text)`
-- **Returns**: `RETURNS void`
-
-### `cb_complete_map_task`
-- **What it does**: Complete one map task and complete parent step when all items finish.
-- **Inputs**: `cb_complete_map_tasks(flow_name text, step_name text, ids bigint[], outputs jsonb[])`
-- **Returns**: `RETURNS void`
-
-### `cb_fail_map_task`
-- **What it does**: Fail one map task and fail parent step/flow.
-- **Inputs**: `cb_fail_map_task(flow_name text, step_name text, id bigint, error_message text)`
-- **Returns**: `RETURNS void`
-
-### `cb_wait_flow_step_output`
-- **What it does**: Long-poll for a step reaching terminal state.
-- **Inputs**: `cb_wait_flow_step_output(flow_name text, run_id bigint, step_name text, poll_for int DEFAULT 5000, poll_interval int DEFAULT 200)`
-- **Returns**: `RETURNS TABLE(status text, output jsonb, error_message text)`
-
-### `cb_get_flow_step_output`
-- **What it does**: Fetch a completed step output on demand.
-- **Inputs**: `cb_get_flow_step_output(flow_name text, run_id bigint, step_name text)`
-- **Returns**: `RETURNS jsonb`
-
-### `cb_get_flow_step_dependency_outputs`
-- **What it does**: Fetch the outputs a step's dependencies produced, in dependency (handler-argument) order, excluding `IgnoreOutput` dependencies. Backs `FlowFailure.FailedStepDependencyInputs`.
-- **Inputs**: `cb_get_flow_step_dependency_outputs(flow_name text, run_id bigint, step_name text)`
-- **Returns**: `RETURNS TABLE(dependency_step_name text, output jsonb)`
-
-### `cb_get_flow_step_status`
-- **What it does**: Read status details for a single step run.
-- **Inputs**: `cb_get_flow_step_status(flow_name text, run_id bigint, step_name text)`
-- **Returns**: `RETURNS TABLE(id bigint, status text, attempts int, output jsonb, error_message text, created_at timestamptz, visible_at timestamptz, started_at timestamptz, completed_at timestamptz, failed_at timestamptz, skipped_at timestamptz, canceled_at timestamptz)`
-
-### `cb_complete_flow_early`
-- **What it does**: Complete a flow run early and cancel remaining work.
-- **Inputs**: `cb_complete_flow_early(flow_name text, run_id bigint, step_name text, output jsonb, reason text DEFAULT NULL)`
-- **Returns**: `RETURNS boolean` (`true` when the run exists, `false` when the run does not exist)
-
-### `cb_claim_flow_on_fail`
-- **What it does**: Claim failed flow runs for on-fail handling.
-- **Inputs**: `cb_poll_flow_on_fail(name text, quantity int)`
-- **Returns**: `RETURNS TABLE(id bigint, input jsonb, error_message text, on_fail_attempts int, started_at timestamptz, failed_at timestamptz, concurrency_key text, failed_step_name text, failed_step_input jsonb, failed_step_signal_input jsonb, failed_step_attempts int)`
-
-### `cb_complete_flow_on_fail`
-- **What it does**: Mark on-fail handling as completed for a flow run.
-- **Inputs**: `cb_complete_flow_on_fail(name text, run_id bigint)`
-- **Returns**: `RETURNS void`
-
-### `cb_fail_flow_on_fail`
-- **What it does**: Mark on-fail handling as failed and schedule retry (`retry_delay` is in milliseconds).
-- **Inputs**: `cb_fail_flow_on_fail(name text, run_id bigint, error_message text, retry_exhausted boolean, retry_delay bigint)`
-- **Returns**: `RETURNS void`
-
-**Flow cancellation internals**
-
-### `cb_finalize_flow_cancellation`
-- **What it does**: Force final cancellation state for a flow run and stop remaining pending work.
-- **Inputs**: `cb_finalize_flow_cancellation(name text, run_id bigint)`
-- **Returns**: `RETURNS boolean`
-
-### `cb_cancel_step_run`
-- **What it does**: Cancel a specific step run within a flow.
-- **Inputs**: `cb_cancel_step_run(flow_name text, id bigint)`
-- **Returns**: `RETURNS bigint`
-
-### `cb_cancel_map_task_run`
-- **What it does**: Cancel a specific map task run for a flow step.
-- **Inputs**: `cb_cancel_map_task_run(flow_name text, id bigint)`
-- **Returns**: `RETURNS bigint`
-
-**Scheduler internals**
-
-### `cb_advance_task_schedule`
-- **What it does**: Move a task schedule’s `next_run_at` to its next cron tick, respecting the catch-up policy.
-- **Inputs**: `cb_advance_task_schedule(id bigint, catch_up text DEFAULT ‘one’)`
-- **Returns**: `RETURNS void`
-
-### `cb_advance_flow_schedule`
-- **What it does**: Move a flow schedule’s `next_run_at` to its next cron tick, respecting the catch-up policy.
-- **Inputs**: `cb_advance_flow_schedule(id bigint, catch_up text DEFAULT ‘one’)`
-- **Returns**: `RETURNS void`
-
-### `cb_execute_due_task_schedules`
-- **What it does**: Execute due task schedules for selected task names in batches. Returns the number of runs enqueued. Under the `skip` policy a tick is suppressed only when it is genuinely stale (a later tick is already due, i.e. `cb_next_cron_tick(cron_spec, next_run_at) <= now()`); an on-time tick still enqueues under every policy. Suppressed ticks leave `last_run_at` / `last_enqueued_at` untouched.
-- **Inputs**: `cb_execute_due_task_schedules(task_names text[], batch_size int DEFAULT 32)`
-- **Returns**: `RETURNS int`
-
-### `cb_execute_due_flow_schedules`
-- **What it does**: Execute due flow schedules for selected flow names in batches. Returns the number of runs enqueued. Under the `skip` policy a tick is suppressed only when it is genuinely stale (a later tick is already due, i.e. `cb_next_cron_tick(cron_spec, next_run_at) <= now()`); an on-time tick still enqueues under every policy. Suppressed ticks leave `last_run_at` / `last_enqueued_at` untouched.
-- **Inputs**: `cb_execute_due_flow_schedules(flow_names text[], batch_size int DEFAULT 32)`
-- **Returns**: `RETURNS int`
-
-**Worker bookkeeping & garbage collection**
-
-### `cb_worker_started`
-- **What it does**: Register a worker with the system. Emits `catbird.worker.started` via `cb_notify`.
-- **Inputs**: `cb_worker_started(id uuid, task_handlers jsonb, step_handlers jsonb)`
-- **Returns**: `RETURNS void`
-
-### `cb_worker_heartbeat`
-- **What it does**: Update worker heartbeat and run cleanup.
-- **Inputs**: `cb_worker_heartbeat(id uuid)`
-- **Returns**: `RETURNS jsonb`
-- **Returned JSON shape**:
-	- `{ "gc_info": { "expired_queues_deleted": int, "stale_workers_deleted": int, "stale_wire_nodes_deleted": int, "task_runs_purged": int, "flow_runs_purged": int } }`
-
-**Event emission (trigger functions)**
-
-### `cb_run_event`
-- **What it does**: Trigger function that emits `cb_notify` events on task/flow run status changes. Attached to `cb_t_*` and `cb_f_*` tables via `AFTER INSERT OR UPDATE OF status` triggers.
-- **Topics emitted**: `catbird.{task|flow}.{started|completed|failed|skipped|canceled|expired}`
-- **Payload**: `{"task"|"flow": name, "run_id": id, ...}` with `input` (started), `output` (completed), or `error` (failed) when applicable.
-
-### `cb_lifecycle_event`
-- **What it does**: Trigger function that emits `cb_notify` events on queue/task/flow creation and deletion. Attached to `cb_queues`, `cb_tasks`, and `cb_flows` via `AFTER INSERT OR DELETE` triggers.
-- **Topics emitted**: `catbird.{queue|task|flow}.{created|deleted}`
-- **Payload**: `{"queue"|"task"|"flow": name}`
-
-### `cb_worker_event`
-- **What it does**: Trigger function that emits `cb_notify` on worker deletion (stale cleanup or shutdown). Attached to `cb_workers` via `AFTER DELETE` trigger.
-- **Topics emitted**: `catbird.worker.stopped`
-- **Payload**: `{"worker_id": uuid}`
-
-**Utility helpers (advanced)**
-
-### `cb_next_cron_tick`
-- **What it does**: Compute the next timestamp after `from_time` that matches a cron specification.
-- **Inputs**: `cb_next_cron_tick(cron_spec text, from_time timestamptz)`
-- **Returns**: `RETURNS timestamptz`
+`publish` dispatches when both gates have cleared: the resizes (and
+everything else the run owes) are done, **and** someone called
+`cb_job_signal(run_id, 'publish', payload)`. A signal sent before the fan-out
+drains is buffered and consumed the moment the `all_done` gate clears —
+arrival order does not matter.
+
+**The barrier is run-wide.** An `all_done` gate waits for everything the
+run still owes — `steps_remaining` reaching zero — not just for its
+siblings in the same `spawns` array. Two consequences worth spelling out:
+
+- Position in the buffer carries no dispatch meaning. A barrier spawned
+  *between* two ungated spawns waits for both of them — and for a step some
+  other branch of the run queued earlier.
+- When the count reaches zero, **all** waiting `all_done` steps dispatch
+  together as the next phase, and the run finalizes only when no step is
+  left. Chained barriers therefore run as phases: fan-out, barrier, more
+  fan-out, barrier again — with no special case.
+
+A step waiting on an unsatisfied signal **counts** as owed work: barriers
+and the run's completion wait behind an unanswered signal (cancel the run
+if it will never come). A step whose `all_done` gate is unsatisfied does
+not count — which is why it can never block its own dispatch.
+
+## Old names, new names
+
+Both schemas are installed during the transition — the old root-schema
+functions via `migrations/`, the job module via `jobs/migrations/` — and no
+names collide. But several pairs are near-anagrams: the old names put the
+verb first (`cb_run_task`), the new names put the module first
+(`cb_job_run`). When completing by hand, check the prefix: everything in
+the job module starts with `cb_job_`.
+
+| Old | New | What changed |
+| --- | --- | --- |
+| `cb_create_task`, `cb_create_flow` | `cb_job_define` | One noun: a flow is a job whose steps spawn more steps; no flow object exists. |
+| `cb_delete_task`, `cb_delete_flow` | — | Definitions converge on deploy; removing one is a deliberate op (raw `DELETE`). |
+| `cb_create_queue` | `cb_job_define_queue` | A queue is a pool of claim and retry terms, not a message box. The message-queue half of the old API (`cb_send`, `cb_read`, `cb_publish`, `cb_bind`) is the stream module. |
+| `cb_run_task`, `cb_run_flow` | `cb_job_run` | Plus dedup and lookup by `key`. |
+| `cb_cancel_task`, `cb_cancel_flow` | `cb_job_cancel` | |
+| `cb_wait_task_output`, `cb_wait_flow_output` | — | Read `cb_job_runs`; the Go side polls it (`jobs.WaitForOutput`). |
+| `cb_signal_flow` | `cb_job_signal` | M4b. Signals are buffered; the payload arrives beside the input. |
+| `cb_claim_tasks`, `cb_claim_steps`, `cb_claim_map_tasks` | `cb_job_claim` | One claim for everything, per pool, queue-array in one call. |
+| — | `cb_job_start` | New: starting is its own call and spends the attempt. |
+| `cb_hide_tasks`, `cb_hide_steps` | `cb_job_extend` | The lease replaces hiding; one call covers every held step. |
+| — | `cb_job_release` | New: hand back an unstarted claim, no attempt spent. |
+| `cb_complete_task`, `cb_complete_step` | `cb_job_complete` | Spawns and run output ride the completion (M4b). |
+| `cb_fail_task`, `cb_fail_step` | `cb_job_fail` | Retry or give up, one call; policy from the pool row. |
+| `cb_claim_task_on_fail`, `cb_complete_task_on_fail`, `cb_fail_task_on_fail` (and the flow trio) | — | `on_fail` is an ordinary step the engine spawns at give-up; no separate machinery. |
+| `cb_create_task_schedule`, `cb_create_flow_schedule` | `cb_job_define_schedule` | Interval schedules; cron specs return later. |
+| `cb_delete_task_schedule`, `cb_delete_flow_schedule` | `cb_job_delete_schedule` | |
+| `cb_execute_due_task_schedules`, `cb_execute_due_flow_schedules` | `_cb_job_run_scheduled` | On the module's tick. |
+| `cb_gc`, `cb_purge_task_runs`, `cb_purge_flow_runs` | `_cb_job_prune_runs` | On the module's tick; retention is per job, set at define. |
+| `cb_bind_task`, `cb_bind_flow` | — | Triggers (M4c): a declared crossing from a stream to `cb_job_run`. |

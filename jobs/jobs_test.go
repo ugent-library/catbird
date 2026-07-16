@@ -21,7 +21,7 @@ var (
 // setupTest migrates once per process and wipes leftovers from earlier
 // runs: rows persist in the shared tables, so every test uses go_-prefixed
 // names and the wipe targets those.
-func setupTest(t *testing.T) *pgxpool.Pool {
+func setupTest(t testing.TB) *pgxpool.Pool {
 	t.Helper()
 	setupOnce.Do(func() {
 		db, err := sql.Open("pgx", testDSN)
@@ -55,7 +55,7 @@ func setupTest(t *testing.T) *pgxpool.Pool {
 
 // startTestWorker runs the worker until the test ends and fails the test
 // on anything but a clean shutdown.
-func startTestWorker(t *testing.T, w *Worker) {
+func startTestWorker(t testing.TB, w *Worker) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
