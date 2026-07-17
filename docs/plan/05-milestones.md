@@ -268,7 +268,12 @@ lifecycle, lease-repair idempotence under racing claims, the remaining
 formula's barrier phases); the **wide-map stress test** — hundreds of siblings
 completing into one run row, the D30 connection-occupancy watch item, deciding
 whether the mitigation ladder's first rung suffices, and watching
-`cb_job_steps` autovacuum (the D34 churn note, 03 §4); and the demo foreign
+`cb_job_steps` autovacuum (the D34 churn note, 03 §4) — *ran 2026-07-17
+(`TestWideMapStress`, `CB_SLOW_TESTS`): 400 siblings across four workers
+finish in ~250ms, 1.5–1.8k completions/s through one run row with zero
+retries and zero false crashes — above the D30 ~1k/s estimate, so the
+one-call completion transaction suffices and batched complete stays
+deferred*; and the demo foreign
 worker: a ~40-line Python script speaking the worker contract (03 §7),
 extend included (release is optional politeness it may skip), deliberately
 *slower than the claim TTL* — proving D11, D27

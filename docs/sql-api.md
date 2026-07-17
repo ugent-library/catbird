@@ -88,6 +88,10 @@ backoff, at-least-once still holds, it is just noisy. `cb_job_release` is
 politeness, not obligation: an unreleased lease lapses on its own and comes
 back with no attempt spent, just slower.
 
+A runnable version of this loop lives at `examples/pyworker/worker.py`: a
+Python worker with no SDK whose handler deliberately takes three times the
+claim TTL — the extend cadence is what keeps it alive.
+
 `attempt` travels from start through complete or fail — it is the third
 column the checks compare — so each start resolves at most once, and a
 false return means the step was taken over and nothing happened.
