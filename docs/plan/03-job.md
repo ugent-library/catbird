@@ -17,8 +17,8 @@
 > channels take one prefix per noun: `cbq_<queue>`, `cbj_<job>`.
 
 **One concept.** A run is one instance of a job: a group of steps, and every
-step may atomically enqueue follow-on steps when it completes — "a flow is a
-job whose steps spawn more steps" (D31, D39, D44), so no flow object exists
+step may atomically add new steps when it completes — "a flow is a job
+whose steps add more steps" (D31, D39, D44), so no flow object exists
 anywhere: not in the API, not in the schema, not in the vocabulary. A task
 is not a thing either: a job whose handler enqueues nothing is just a job,
 and one registration shape covers both (§5). Own migrations, version table
@@ -27,8 +27,8 @@ and one registration shape covers both (§5). Own migrations, version table
 **Rows are the truth — and the transport (D30, D34).** There is no event log,
 no projection, and no message either: the step row that records the work *is*
 the unit a worker claims. `cb_job_complete` applies everything — the outcome,
-the spawned steps, dispatch, the remaining count — in the completion
-transaction, and the spawned rows are immediately claimable. What the old
+the new steps, dispatch, the remaining count — in the completion
+transaction, and the new rows are immediately claimable. What the old
 designs wrote three times per edge (a step row, a ready message, an assigned
 position), this design writes once. Step-to-step latency is notify + claim —
 no assigner leg, no tick floor; the poll interval is the safety net (D17).
@@ -43,10 +43,10 @@ lapsed, and the lapsed row carries its own count.
 
 ## 1. The work table — steps are the messages
 
-- A spawned step inserts as a row with `claimable_at = now()` (or `now() +
+- A new step inserts as a row with `claimable_at = now()` (or `now() +
   delay`) and is claimable the moment its transaction commits. **One
   timestamp column, `claimable_at`, carries visibility, lease, and backoff**:
-  spawn sets it to when the step may first be handed out; claim sets it to
+  insert sets it to when the step may first be handed out; claim sets it to
   `now() + claim_ttl` (the lease deadline); extend pushes it; fail sets it to
   `now() + backoff(attempt)`; a crash simply lets it lapse.
 - **Wakeups** ride the old engine's proven contract: the engine fires
@@ -55,7 +55,7 @@ lapsed, and the lapsed row carries its own count.
   the claim loop at once or arms a timer for the earliest future time —
   `worker_notifier.go`'s existing protocol, pointed at new tables — and the
   channel being the pool means a `payments` worker never wakes for
-  `default` spawns. Fallback polling stays as the safety net (D17). A second
+  `default` steps. Fallback polling stays as the safety net (D17). A second
   channel per birth job (`cbj_<job>`) carries run-terminal events (payload
   `<run_id>:<status>`) for `WaitForOutput` (which polls until M5) and the
   dashboard.
@@ -69,7 +69,7 @@ lapsed, and the lapsed row carries its own count.
 - The hot index is partial: `(queue, claimable_at) WHERE status IN
   ('queued', 'started')` — terminal rows leave it, so the index holds only
   the working set. `queue` and `name` are denormalized onto the step row at
-  spawn so the claim query joins nothing (the hot-path rule, kept).
+  insert so the claim query joins nothing (the hot-path rule, kept).
 
 ## 2. Tables
 
@@ -80,14 +80,15 @@ code through the transition and its test suite runs on the shared `cb_tst`
 like every other module (05).
 
 - `cb_jobs (name PK, queue, on_fail, retention NOT NULL)` — one row per
-  declared job: the global authority spawns are validated against and the
-  routing map in one. `queue` names the job's pool (NULL means `default`)
-  and is stamped onto spawned steps by `cb_job_complete` — a typo'd spawn
-  raises, fails the spawning handler, and is given up on through the normal
-  budget (§5); a foreign worker spawns with zero knowledge of queue layout.
-  `on_fail` (naming a declared job) and `retention` matter when the job is
-  a run's **birth job**: the run inherits both (§3); on a job only ever
-  spawned mid-run they are inert config.
+  declared job: the global authority a handler's new steps are validated
+  against and the routing map in one. `queue` names the job's pool (NULL
+  means `default`) and is stamped onto new steps by `cb_job_complete` — a
+  typo'd step name raises, fails the handler that added it, and is given up
+  on through the normal budget (§5); a foreign worker adds steps with zero
+  knowledge of queue layout. `on_fail` (naming a declared job) and
+  `retention` matter when the job is a run's **birth job**: the run
+  inherits both (§3); on a job only ever run as a mid-run step they are
+  inert config.
 - `cb_job_queues (name PK, claim_ttl, claim_batch_size, max_attempts,
   backoff_kind, backoff_base, backoff_max)` — the retry and claim terms per
   pool, written whole by `jobs.DefineQueue` (D26: config deploys with code
@@ -112,24 +113,25 @@ like every other module (05).
   distinct. `steps_remaining` counts the steps the run still owes (§3).
   `next_step_id` hands out per-run step ids — the run row is locked in every
   engine call anyway, so the counter is free, and it gives dense ids and a
-  clean `0` sentinel for "spawned at birth".
+  clean `0` sentinel for "born with the run".
 - `cb_job_steps (PK (run_id, id), queue, name, parent_step_id NOT NULL,
-  ordinal NOT NULL, status, dispatch, input, signal, output, error, attempt
-  NOT NULL DEFAULT 0, claimable_at, worker, created_at, finished_at)` — the
-  work table. `name` is the declared job this step runs. `signal` is the
-  satisfied payload of a signal-gated step, NULL until then (§3). Status
-  `waiting | queued | started | completed | failed |
-  canceled`; `dispatch` is `immediate | all_done | signal |
-  all_done_signal` — two independent gates combined into one word (§3),
-  the same in the Go options, the spawns JSON and this column. Replay identity
-  is the plain tuple: `UNIQUE (run_id, parent_step_id, name, ordinal)`
-  (constraint `cb_job_steps_identity_key`), where **`ordinal` is the spawn's
-  zero-based index in its parent's Plan buffer** — deterministic across
-  replays because the buffer is replayed whole. `parent_step_id` is `0` for
-  the run's first step, the one running the birth job. A partial unique
-  index `(run_id, name) WHERE dispatch IN
-  ('signal', 'all_done_signal') AND status NOT IN ('completed', 'failed',
-  'canceled')` enforces §3's signal-name rule race-free.
+  ordinal NOT NULL, status, signal, input, signal_input,
+  output, error, attempt NOT NULL DEFAULT 0, claimable_at, worker,
+  created_at, finished_at)` — the work table. `name` is the declared job this
+  step runs. Status `waiting_for_steps | waiting_for_signal | queued |
+  started | completed | failed | canceled` — a waiting step's status says
+  what it waits for (§3); there are no gate columns. `signal` is a boolean
+  stored exactly as the wire stated it — whether the step asks for a
+  signal — and `signal_input` is what `cb_job_signal` delivered, NULL until
+  the signal arrives. Replay identity is the plain tuple:
+  `UNIQUE (run_id, parent_step_id, name, ordinal)` (constraint
+  `cb_job_steps_identity_key`), where **`ordinal` is the step's zero-based
+  position among the steps its parent's completion added** — deterministic
+  across replays because the whole list is replayed. `parent_step_id` is `0`
+  for the run's first step, the one running the birth job. A partial unique
+  index `(run_id, name) WHERE signal AND status NOT IN
+  ('completed', 'failed', 'canceled')` enforces §3's signal-name rule
+  race-free.
 - `cb_job_attempts (PK (run_id, step_id, attempt), worker, started_at,
   finished_at, status, error)` — per-attempt history, kept when the run
   turns terminal. `status` is `completed | failed | NULL`, and NULL means
@@ -148,7 +150,7 @@ change afterward — the hot claim/start/complete UPDATEs pay nothing; they
 also turn the janitor's children-first delete order from convention into a
 constraint. The two config references deliberately have **no** FK:
 `cb_job_steps.queue → cb_job_queues` and `cb_job_steps.name → cb_jobs` would
-take a KEY SHARE lock on one shared hot config row per spawn (multixact
+take a KEY SHARE lock on one shared hot config row per insert (multixact
 churn at volume), and `cb_job_complete` already validates both with better
 errors — the migration carries a one-line comment at each spot saying so, so
 nobody adds them later.
@@ -164,8 +166,10 @@ First it locks the run row (`FOR UPDATE`) and checks the run's status:
 `running` or `failing` for start / complete / fail / signal (`failing` admits
 the `on_fail` chain — the give-up canceled everything else, so no per-step
 marking is needed) and for cancel (in a `failing` run, cancel stops the
-cleanup, not the verdict — below). Anything else is a silent
-no-op returning false (signal raises instead, below). Then the step guard:
+cleanup, not the verdict — below). Anything else is a silent no-op returning
+false — signal included: a signal for a run that ended is a race the caller
+could not avoid, so it too returns false rather than raising (below). Then
+the step guard:
 complete and fail require `(status = 'started', attempt = $attempt)`; a
 mismatch means the caller is acting on outdated information — the step was
 finished or handed to another worker — and nothing happens. Only
@@ -194,60 +198,66 @@ is exactly-once per slot with no key gymnastics, and the run's first step
 lands on the birth job's queue like any other birth. `catch_up` keeps the
 stream scheduler's semantics (`skip` | `all`).
 
-**Dispatch is two gates, and the remaining count.** A spawn carries up to
-two independent gates: `all_done` (wait for the current phase to drain) and
-`signal` (wait for a payload). Dispatch is their combination — `immediate`
-means no gates, and the Go options `OnAllDone()` and `OnSignal()` compose
-into `all_done_signal`, the approval-gate-after-fan-out shape the old
-engine expressed as dependencies plus a signal. (The sequential half of
-that shape needs no gate at all: dependency-on-parent is inherent in
-spawn-at-completion.) `steps_remaining` counts the steps the run still owes —
-queued, started, or waiting on a signal. The arithmetic, exactly, in
-`cb_job_complete`:
+**Two waits, and the remaining count.** A new step states two waits, each a
+required boolean in the steps JSON, in the same words the statuses answer
+with: `waits_for_steps` — run only once everything
+the run owes has completed **successfully** (any give-up cancels the
+waiting step, so it never starts) — and `waits_for_signal` — wait for a
+payload delivered by name. A waiting step's **status says what it waits for**:
+`waiting_for_steps` or `waiting_for_signal`, never both — a step that asked
+for both waits for the steps first, and a signal that arrives early is
+buffered (below), so the waits are sequential on the row (D42; the old
+engine's `waiting_for_dependencies` / `waiting_for_signal` statuses are the
+same design). A step with both booleans off is claimable at once. Both
+together are the approval-after-fan-out shape the old engine expressed as
+dependencies plus a signal; the sequential half of that shape needs no wait
+at all — dependency-on-parent is inherent in add-at-completion.
+`steps_remaining` counts the steps the run still owes — queued, started, or
+waiting for a signal. The arithmetic, exactly, in `cb_job_complete`:
 
 ```
-steps_remaining := steps_remaining − 1 + count(inserted spawns with no all_done gate)
+steps_remaining := steps_remaining − 1 + count(inserted steps not in waiting_for_steps)
 ```
 
-A spawn with no gates inserts its step as `queued`, claimable at once — the
-parent is complete by construction, so a sequential edge needs no
-bookkeeping beyond the spawn itself. A gated spawn inserts as `waiting`. A
-step with an **unsatisfied `all_done` gate** stays outside the count until
-it dispatches — which is why it can never block its own dispatch; a
-signal-only step **counts** — barriers and the run's completion wait behind
-an unanswered signal. When a completion brings `steps_remaining` to zero: if
-`all_done`-gated steps are waiting, **all of them** dispatch together as the
-next phase — the gate clears, and each becomes `queued`, claimable now (a
-buffered signal slot is consumed on the spot), unless its signal gate is
-still unanswered, in which case it stays `waiting` and **now counts**;
-`steps_remaining := count(dispatched)`. Otherwise the run finalizes. A
-barrier inserted by the very completion that drained the count dispatches
-in that same call — the at-zero check runs after the inserts. Phases repeat
-with no special case. Buffer position carries no dispatch meaning —
-`ordinal` is identity only: a barrier spawned *between* two ungated spawns
-in the same Plan waits for both of them, and for everything else the run
-still owes. The failure
-story the formula guards against: birth sets the count to 1; if the first
-step's completion only decremented, a run whose first step spawns its
-successor would finalize with work still queued. The count comes from the
-insert's `RETURNING`, never from the argument: if the identity `ON CONFLICT
-DO NOTHING` (§4) ever swallows a row, arithmetic that counted requests would
+A step with both waits off inserts as `queued`, claimable at once — the
+parent has already finished, so a sequential edge needs no bookkeeping. A
+step in **`waiting_for_steps`** stays outside the count until it
+dispatches — which is why it can never block its own dispatch; a
+`waiting_for_signal` step **counts** — barriers and the run's completion
+wait behind an unanswered signal. When a completion brings
+`steps_remaining` to zero: if steps are waiting in `waiting_for_steps`,
+**all of them** dispatch together as the next phase — each becomes
+`queued`, claimable now (a buffered signal slot is consumed on the spot),
+unless its signal is still unanswered, in which case it moves to
+`waiting_for_signal` and **now counts**; `steps_remaining :=
+count(dispatched)`. Otherwise the run finalizes. A barrier inserted by the
+very completion that drained the count dispatches in that same call — the
+at-zero check runs after the inserts. Phases repeat with no special case.
+Buffer position carries no dispatch meaning — `ordinal` is identity only: a
+barrier added *between* two immediate steps in the same Plan waits for both
+of them, and for everything else the run still owes. The failure story the
+formula guards against: birth sets the count to 1; if the first step's
+completion only decremented, a run whose first step adds its successor
+would finalize with work still queued. The count comes from the insert's
+`RETURNING`, never from the argument: if the identity `ON CONFLICT DO
+NOTHING` (§4) ever skips a row, arithmetic that counted requests would
 charge the run for a step that doesn't exist, and the run could never drain
 to zero.
 
 **Completion and run output.** A run finalizes when `steps_remaining` reaches
 zero and no barrier is left waiting — in a `running` run as `completed`, in a
-`failing` run as `failed`. Only executions spawn, so such a run can never
-grow again — no explicit "done" call exists. Output resolution, in order: an
-explicit `run_output` passed to any `cb_job_complete` wins (last writer
-wins — writes are serialized by the run lock; SQL NULL means "not passed",
-so an explicit run output cannot be null — wrap it if you mean it);
-otherwise the step output of the completion that finalized the run, if it
-set one; otherwise null. The
-finalizing completion is a single, well-defined call, so the default is
-deterministic for every sequential shape; a run that ends in parallel
-siblings races for last place and should say what it means with
-`SetRunOutput`. Finalization fires the run-terminal notify (`cbj_<job>`,
+`failing` run as `failed`. Only executions add steps, so such a run can never
+grow again — no explicit "done" call exists. Output resolution: the run's
+output is what `run_output` calls set — an explicit `run_output` passed to
+any `cb_job_complete` (last writer wins — writes are serialized by the run
+lock; SQL NULL means "not passed", so an explicit run output cannot be
+null — wrap it if you mean it). There is no fallback: a step's output
+stays on its row, and a run whose completions never pass `run_output`
+finishes with output null. A fallback would have been the finalizing
+completion's step output — deterministic for sequential shapes but an
+arbitrary pick when several steps finish the run together, so the rule is
+explicit-or-null for every shape.
+Finalization fires the run-terminal notify (`cbj_<job>`,
 payload `<run_id>:<status>`). `WaitForOutput` keeps its API: it polls the run
 row until M5, then wakes on the notify with the poll demoted to safety net.
 
@@ -306,14 +316,14 @@ the step guard and changes nothing; its handler is stopped by the worker's
 status check, below). Then:
 
 - **`on_fail` declared** (on the run's birth job): the run turns `failing`;
-  the `on_fail` job is spawned as an ordinary step — parent = the failed
-  step, dispatch immediate, input built by the engine as `{job, error,
+  the `on_fail` job is added as an ordinary step — parent = the failed
+  step, no waits, input built by the engine as `{job, error,
   input}` — and `steps_remaining := 1`. The chain then runs under the normal
   rules: the checks admit it because the run is `failing` and everything
-  else is canceled; it may spawn, retry on its own terms, even wait on a
-  signal; when its chain drains the count to zero the run finalizes as
+  else is canceled; it may add steps, retry on its own terms, even wait for
+  a signal; when its chain drains the count to zero the run finalizes as
   `failed`. If the engine gives up on the `on_fail` step itself, the run is
-  already `failing`, so `_cb_job_give_up` spawns nothing and the run turns
+  already `failing`, so `_cb_job_give_up` adds nothing and the run turns
   `failed` — one rule, no regress.
 - **No `on_fail`**: the run turns `failed`, `error` set, run-terminal notify
   fired.
@@ -335,28 +345,31 @@ longer `started` — one cheap indexed read, covering cancel, a sibling's
 give-up, and supersession alike.
 
 **Signals are buffered, and the payload arrives beside the input.** A
-signal-gated spawn carries its input like any other spawn; the payload is
-delivered separately — stamped into the step's `signal` column at
-satisfaction and returned by `cb_job_start` — so a step can be spawned with
+signal-waiting step carries its input like any other step; the payload is
+delivered separately — stamped into the step's `signal_input` column at
+satisfaction and returned by `cb_job_start` — so a step can be added with
 context and still wait for an approval.
-`cb_job_signal(run_id, name, payload)`: under the run lock, if a
-signal-gated step of that name is `waiting` with its signal gate the only
-one left, it is satisfied — the payload lands in `signal`, status
-`waiting → queued`, claimable now (`steps_remaining` unchanged: such a step
-already counts). Otherwise — no such step yet, or its `all_done` gate still
-pending — the payload is buffered in the run's slot for that name
-(overwriting an unconsumed older one). The mirror happens whenever a
-signal-gated step's other gates clear — at insert for a signal-only spawn,
-at phase dispatch for a combined one: a buffered slot, if present, is
-consumed on the spot and the step proceeds `queued` instead of `waiting` —
-arrival order does not matter. The call
-raises only if the run is missing or terminal (`failing` accepts signals: a
-cleanup chain may legitimately await an operator). The synchronous
-`ErrSignalNotDelivered` is retired (README amendment 12). A signal-gated
+`cb_job_signal(run_id, name, payload)` returns a boolean: under the run lock,
+if the run holds a step of that name in `waiting_for_signal`, it is
+satisfied — the payload lands in `signal_input`, status
+`waiting_for_signal → queued`, claimable now
+(`steps_remaining` unchanged: such a step already counts). Otherwise — no
+such step yet, or it is still in `waiting_for_steps` — the payload is
+buffered in the run's slot for that name (overwriting an unconsumed older
+one). Either way it returns true: the payload landed. The mirror happens
+whenever a step stops waiting for anything else — at insert for a
+signal-only step, at phase dispatch for one that waited for the run's other
+steps first: a buffered slot, if present, is consumed on the spot and the
+step proceeds `queued` — arrival order does not matter. The call returns
+**false**, changing nothing, only when the run is missing or already
+finished: the run ended at the same time, which the caller could not have
+avoided, so this is not a raise (`failing` accepts signals: a cleanup chain
+may legitimately await an operator). The synchronous
+`ErrSignalNotDelivered` is retired (README amendment 12). A signal-waiting
 step's name must be unique among the run's unresolved steps — the partial
-unique index (§2) enforces it at spawn time; violating it fails the
-spawning completion, which is a handler bug and is given up on through the
-normal budget (§5).
+unique index (§2) enforces it at insert time; violating it fails the
+completion that added the step, which is a handler bug and is given up on
+through the normal budget (§5).
 
 ## 4. The functions — the completion transaction is the engine (D30)
 
@@ -370,7 +383,7 @@ contract each sketch must meet.
   and schedule declarations — the whole-declaration upserts (D26), guarded
   so unchanged declarations write nothing. It checks that `on_fail` (when
   set) names a declared job and that `queue` (when set) has a terms row,
-  raising otherwise — a deploy-time error instead of a runtime "spawn name
+  raising otherwise — a deploy-time error instead of a runtime "step name
   not declared" on the first run. Define never deletes a queue row (§6).
   The Go side mirrors these one to one — `jobs.Define`, `jobs.DefineQueue`,
   `jobs.DefineSchedule` — and deploy code calls them in dependency order:
@@ -401,14 +414,14 @@ contract each sketch must meet.
   stamp and a lease of the pool's `claim_ttl`, `FOR UPDATE SKIP LOCKED`, ordered
   by `claimable_at`. Leased-but-unstarted rows whose lease lapses are
   simply ready again — no clearing needed, no attempt spent.
-- **`cb_job_start(run_id, step_id, worker) → (name, input, signal,
+- **`cb_job_start(run_id, step_id, worker) → (name, input, signal_input,
   attempt)`** —
   per claimed step. The checks, then the give-up comparison (§3): at the attempt
   limit it gives up (no attempt row — nothing started) and returns nothing.
   Otherwise flips the step `queued | started → started` (started-to-started
   because a crashed execution leaves `started` behind), bumps `attempt`,
-  inserts the attempt row, and returns what the handler needs — `signal`
-  is the satisfied payload for a signal-gated step, NULL otherwise (§3).
+  inserts the attempt row, and returns what the handler needs — `signal_input`
+  is the satisfied payload for a step that waited for one, NULL otherwise (§3).
   Returns
   nothing when a check fails — a stale claim of a finished step — and the
   loop just moves on.
@@ -426,13 +439,13 @@ contract each sketch must meet.
   rolling deploy declared a new job before this worker's fleet restarted —
   releases it with a short pause, so two old workers don't ping-pong it
   until a new worker arrives. False means the step already moved on.
-- **`cb_job_complete(run_id, step_id, attempt, output, spawns, run_output)
+- **`cb_job_complete(run_id, step_id, attempt, output, steps, run_output)
   → boolean`** — the heart, one transaction, in this order: checks → resolve
   the attempt (status, finished_at; step → `completed`, output stored) →
-  validate and insert the spawned steps (names against `cb_jobs`, queue
-  stamped from the definition, dispatch words;
-  identity `ON CONFLICT DO NOTHING` as defense in depth) → consume signal
-  slots for signal-gated spawns as they become eligible (§3) → apply §3's
+  validate and insert the new steps (names against `cb_jobs`, queue
+  stamped from the definition, both booleans required;
+  identity `ON CONFLICT DO NOTHING` as a backstop) → consume signal
+  slots for signal-only steps as they insert (§3) → apply §3's
   remaining formula over the rows the insert
   actually returned (§3) → at zero, dispatch waiting barriers or finalize
   (output resolution, run-terminal notify) → notify each queue that gained
@@ -443,8 +456,9 @@ contract each sketch must meet.
   one comparison, one transaction. Returns false, having changed nothing,
   when the checks at the top fail.
 - **`cb_job_cancel(run_id, reason DEFAULT NULL) → boolean`** — §3.
-- **`cb_job_signal(run_id, name, payload)`** — §3: satisfy or buffer, under
-  the run lock; raises only if the run is missing or terminal.
+- **`cb_job_signal(run_id, name, payload) → boolean`** — §3: satisfy or
+  buffer under the run lock, returning true; returns false, changing nothing,
+  when the run is missing or already finished.
 
 The leaner argument lists are deliberate: claim, start, release, complete
 and fail take ids the worker already holds — no stream, topic or header to
@@ -477,7 +491,7 @@ queue is the documented escape hatch if one pool's churn ever dominates.
 The key mechanic is unchanged: **`*Plan` is a buffer.** Every method buffers;
 nothing blocks; the buffer commits with your completion (`cb_job_complete`,
 §4). A handler that crashes mid-way submits nothing, and at-least-once
-redelivery replays it cleanly against the spawn identity (§2).
+redelivery replays it cleanly against the step identity (§2).
 
 Declarations mirror the SQL one to one (§4): deploy code calls
 `jobs.Define`, `jobs.DefineQueue` and `jobs.DefineSchedule`, each call the
@@ -485,9 +499,15 @@ whole config — an opts struct whose zero fields mean the stock values,
 never "keep". The worker registers handlers by name (`w.Handle(job, fn)`)
 and reads everything else from `cb_jobs` at startup: which queues to claim
 is routing knowledge, and the database is its authority. The handler
-signature decides everything: a handler that takes a `*jobs.Plan` can
-enqueue follow-ons; one that doesn't is the whole story — its return value
-becomes the run output. A defined job nobody `Handle`s is simply handled
+signature decides everything: a handler that takes a `*jobs.Plan` can add
+steps and set the run's output; one that doesn't is the whole story. A
+handler that returns `(Out, error)` records the return value as its
+**step's** output — the function metaphor itself, and internal: it stays
+on the step row, read by `StepOutput(s)` and kept for debugging; the
+error-only shapes record none. The run's public output is a separate,
+deliberate act — `p.SetRunOutput` — and nothing else: the engine never
+promotes a step's output to the run, which would be an arbitrary pick
+when several steps finish the run together (§3). A defined job nobody `Handle`s is simply handled
 by another fleet — which fleet holds a handler is deployment knowledge,
 deliberately absent from the schema; the worker's startup checks are the
 fleet-symmetric enforcement (§7).
@@ -512,15 +532,15 @@ w := jobs.NewWorker(pool)
 w.Handle("reserve", func(ctx context.Context, p *jobs.Plan, in Order) error {
     res, err := reserve(in.Items)
     if err != nil { return err }            // → cb_job_fail; retry or give up (§3)
-    p.Spawn("charge", Charge{Order: in, Reservation: res})
+    p.Step("charge", Charge{Order: in, Reservation: res})
     return nil                              //   parent hands its results forward
 })
 w.Handle("charge", func(ctx context.Context, p *jobs.Plan, in Charge) error {
     for _, parcel := range split(in) {
-        p.Spawn("ship", parcel)             // fan-out: N sibling steps, parallel
+        p.Step("ship", parcel)              // fan-out: N sibling steps, parallel
     }
-    p.Spawn("confirm", in.Order, jobs.OnAllDone())  // barrier: dispatches
-    return nil                              //   when steps_remaining drains to zero
+    p.After().Step("confirm", in.Order)     // barrier: runs when steps_remaining
+    return nil                              //   drains to zero
 })
 w.Handle("ship", shipFn)                    // plain func(ctx, Parcel) (Out, error):
 w.Handle("confirm", confirmFn)              //   no Plan, enqueues nothing
@@ -530,60 +550,97 @@ w.Start(ctx)
 runID, _, err := jobs.Run(ctx, conn, "reserve", order, jobs.RunOpts{Key: order.ID})
 ```
 
-Surface, complete: `p.Spawn(name, input, opts...)` — the **one** Plan verb —
-with the spawn options `jobs.OnAllDone()` and `jobs.OnSignal()` (combinable —
-§3's gates) ·
-`p.SetOutput(v)` / `p.SetRunOutput(v)` · `jobs.Input[T](p)` /
-`jobs.Signal[T](p)` (the satisfied payload, NULL until then) /
-`jobs.OutputOf[T](p, "name")` (read from the step rows, typed via the
-existing reflection utilities; a multi-instance name yields a slice). The
-rule: **a spawn dispatches immediately unless an `On*` option defers it**
-(§3). There is no entry-point declaration — `RunJob` names the job you mean
-— and no special failure job: `OnFail` on a declaration names another
-declared job, consulted when that declaration is a run's birth job.
+Surface, complete: `p.Step(name, input, opts...)` — the **one** verb that
+adds a step — and `p.After().Step(...)` — `After` scopes what the step
+waits for, bare meaning everything the run owes (§3); its return value's
+only method is `Step`, so a half-built chain has nothing else to call and
+buffers nothing. `jobs.WaitsForSignal()` is the lone step option and composes
+in both positions: `p.Step(n, in, jobs.WaitsForSignal())` waits for the signal
+only, `p.After().Step(n, in, jobs.WaitsForSignal())` waits for the steps first,
+then the signal. The payload is sent with `jobs.Signal(ctx, conn, runID,
+name, payload)`, mirroring `cb_job_signal` name for name — which is why the
+reader below is `SignalInput`, the column it reads: one package cannot hold
+a delivery function and a generic reader under one name. Also:
+`p.SetRunOutput(v)` ·
+`jobs.RunInput[T](p)` (the run's birth input; a step's own input is the
+handler argument) / `jobs.SignalInput[T](p)` (the satisfied payload, NULL
+until then) / `jobs.StepOutput[T](p, "name")` and `jobs.StepOutputs[T](p,
+"name")` (read from the step rows: `StepOutput` wants the run's one
+completed step of that name, `StepOutputs` returns one element per step —
+the fan-out reader; a single name reading both ways would be ambiguous
+when the one step's output is itself an array, so the call states the
+shape). One naming convention across the surface: **every reader and
+writer names its subject** — `Run`, `Step`, `Signal` — in the function
+name; the only unnamed channels are the two the function metaphor carries,
+the handler's argument (this step's input) and its return value (this
+step's output).
+The rule: **a step runs at once unless it says what it waits for** (§3).
+There is no entry-point declaration — `RunJob` names the job you mean — and
+no special failure job: `OnFail` on a declaration names another declared
+job, consulted when that declaration is a run's birth job.
 
-The naming rule behind the options: name the **dispatch condition from the
-step's own viewpoint**, never the engine's mechanics, and nothing may sound
-like it acts now. The `On*` idiom never reads as blocking — `OnClick` doesn't
-wait. Rejected on that rule: `Then`/`Next` (`p.Then(a); p.Then(b)` misreads
-as sequential), `Gather` (sounds like collecting right now), `Join`
-(`thread.join` blocks), `AfterAll`. Also rejected: any flow or group noun in
-the API — the group is a declaration-time convenience, not an engine
-concept, and giving it a name would grow it back into one. The dispatch
-words are the same in Go, the spawns JSON and the column, and the two
-gates compose: `immediate` | `all_done` | `signal` | `all_done_signal`.
+The naming rules behind the surface. **The API speaks the engine's own
+noun**: a step is the glossary word, the table, the `step_id` in every
+signature, so `p.Step(name, input)` is the glossary sentence — "a unit of
+owed work, running a declared job" — as a call; the earlier `Spawn` was a
+coined verb that appeared nowhere in the schema and needed translation
+sentences ("spawns become step rows") wherever it met SQL. **`After`'s
+argument slot always means "what is waited on"**, never "what is added" —
+bare today, a group later (partial joins are deferred until a real workload
+asks, D31), so grouped waits arrive without a rename; that slot rule is
+also why `p.After(name, input)` as a second adding verb was rejected — its
+first argument misreads as the dependency. Dropping *succeed* from the name (the option was
+`WhenAllSucceed` for a day) is safe **here**, unlike in Airflow: the engine
+has exactly one failure behavior — a give-up cancels every waiting step,
+and cleanup-despite-failure has its own road, `on_fail` — so there is no
+run-despite-failures alternative for `After` to be confused with; one
+contract sentence carries it. `WaitsForSignal` states its bit in the same
+words as the wire key and the status (the old API's `WithSignal` was
+carried at first, but stopped echoing its bit once the keys were renamed).
+Rejected en route: `OnAllDone`/`Last` (imply
+run-despite-failure), `Gather` (sounds like collecting right now), `Join`
+(`thread.join` blocks), `Then`/`Next` (misread as sequential), and any flow
+or group noun — the group is a declaration-time convenience, not an engine
+concept, and naming it would grow it back into one. The two waits are
+independent booleans in the steps JSON, `waits_for_steps` and
+`waits_for_signal` — the request states what the step waits for in the
+same words the status answers it with (the earlier `after_all` key slowed
+readers down). The row needs no `waits_for_steps` column at all, and
+`waits_for_signal` lands on it as the boolean it arrived as (§2); there is
+no combined word, because every combination already works (D42).
 
-**The input rule:** a step's input is exactly what it was spawned with, with
+**The input rule:** a step's input is exactly what it was added with, with
 one stated exception where the engine supplies it: an `on_fail` step's input
-is the engine-built `{job, error, input}`. A signal-gated step is no
-exception: its input is its spawn input, and the signal's payload arrives
-beside it — `jobs.Signal[T](p)`, NULL until satisfied (§3). Spawning
-happens at completion, so a parent passes its results forward *in* the
-spawn input; a barrier, whose siblings' outputs didn't exist when it was
-spawned, reads them with `OutputOf`. This is also what `input` and `signal`
+is the engine-built `{job, error, input}`. A signal-waiting step is no
+exception: its input is what it was added with, and the signal's payload
+arrives beside it — `jobs.SignalInput[T](p)`, NULL until satisfied (§3). Steps
+are added at completion, so a parent passes its results forward *in* the
+step input; a barrier, whose siblings' outputs didn't exist when it was
+added, reads them with `StepOutputs`. This is also what `input` and `signal`
 mean in the SQL contract (§7). (A trigger-born run's input is the message
 envelope — the trigger is the caller there, not an exception here, §8.)
 
-**Validation is layered.** The Go side fails fast where it can: `Spawn`
+**Validation is layered.** The Go side fails fast where it can: `Step`
 panics on a name not declared — a panic becomes a failed attempt (D27),
 close to the bug. The SQL
-side enforces the same rules for every language (§4): an invalid spawn
-raises, failing the spawning completion — the worker reports it through
+side enforces the same rules for every language (§4): an invalid step
+raises, failing the completion that added it — the worker reports it through
 `cb_job_fail` like any handler error, and the normal budget applies, so a
 deterministic bug is given up on after `max_attempts` backoff-paced tries.
 Deliberately no fast-path give-up flag: that would be a second exhaustion
 road (D38), and the cost of walking the normal one is a few wasted retries
 on a bug the attempt rows make visible immediately.
 
-**Dead concepts become user patterns** (D31, D32, D39): edges (`After`,
-`*SpawnRef`) — a sequential edge is just a spawn at completion, fan-in is
-`OnAllDone`; map — spawn N in a loop plus a barrier; conditions — a Go `if`
-before `Spawn` (the engine never guards); `Optional[T]` — you only spawn
-what exists; `AwaitSignal` — the `OnSignal` spawn option; `CompleteEarly` —
-a return *is* completion (`p.SetOutput` + `return nil`); the task engine and
-the flow object — one registration shape, the Plan parameter optional. A
-one-step run is also the recommended shape for everything the old world put
-on a work queue — it *is* the queue, with a handle (README, D37).
+**Dead concepts become user patterns** (D31, D32, D39): edges (the old
+engine's `DependsOn`, `*SpawnRef`) — a sequential edge is just a step added
+at completion, fan-in is `After()`; map — add N in a loop plus a barrier;
+conditions — a Go `if` before `Step` (the engine never guards);
+`Optional[T]` — you only add what exists; `AwaitSignal` — the `WaitsForSignal`
+step option; `CompleteEarly` — a return *is* completion (`p.SetRunOutput` +
+`return nil`); the task engine and the flow object — one registration
+shape, the Plan parameter optional. A one-step run is also the recommended
+shape for everything the old world put on a work queue — it *is* the queue,
+with a handle (README, D37).
 
 **The worker** runs on the kernel's claim-loop skeleton (`internal/`, D27,
 D41) — the same skeleton the stream consumer uses: the modules share the
@@ -608,9 +665,8 @@ carries a new job across that skew window.
 
 ```go
 type Plan struct {
-	spawns    []spawnSpec     // {name, input, dispatch: immediate|all_done|signal|all_done_signal}
-	output    json.RawMessage // optional — side-effect-or-error stays legal
-	runOutput json.RawMessage
+	steps     []step          // {name, input, waits_for_steps bool, waits_for_signal bool}
+	runOutput json.RawMessage // SetRunOutput's buffer; the step's own output is the handler's return value
 }
 ```
 
@@ -661,13 +717,13 @@ documented in `docs/sql-api.md`, which M4a makes the normative spec:
 
 ```
 cb_job_claim(queues, worker)                  → [(run_id, step_id, name, lease_at)]
-cb_job_start(run_id, step_id, worker)         → (name, input, signal, attempt)
+cb_job_start(run_id, step_id, worker)         → (name, input, signal_input, attempt)
                                               --  or nothing (a check failed, or give-up)
 cb_job_extend(queues, worker)                 → still-held rows (D23, D27)
 cb_job_release(run_id, step_id, worker, pause) → bool -- unstarted handback, no attempt spent
-cb_job_complete(run_id, step_id, attempt, output, spawns, run_output) → bool
+cb_job_complete(run_id, step_id, attempt, output, steps, run_output) → bool
 cb_job_fail(run_id, step_id, attempt, error)  → bool  -- retry or give up, one call
-cb_job_signal(run_id, name, payload)
+cb_job_signal(run_id, name, payload)          → bool  -- deliver or buffer; false on a finished run
 ```
 
 The loop: claim → per step `cb_job_start` → run the handler →
@@ -689,11 +745,11 @@ above.)
 No headers to parse, no streams to name, no scheduled-message shapes to
 recognize — a scheduled run arrives as an ordinary claimed step.
 
-`spawns` carries the buffered Plan as JSON — `[{name, input, dispatch}]`,
-the same dispatch words as the column (§2) — and the engine routes
-each spawn by `cb_jobs`, so dynamic spawning is fully available to a
-Python worker with zero knowledge of queue layout. The DSL is sugar, not
-capability. Explicitly out of scope, same line as before: cross-language
+`steps` carries the handler's buffer as JSON — `[{name, input,
+waits_for_steps, waits_for_signal}]`, both booleans required (§3) — and
+the engine routes each new
+step by `cb_jobs`, so adding steps is fully available to a Python worker
+with zero knowledge of queue layout. The DSL is sugar, not capability. Explicitly out of scope, same line as before: cross-language
 job *definition*, typed payload schemas or registries, SDK parity. The
 contract is job name in, JSON in, JSON out, plus the seven calls. Hold that
 line.
@@ -767,7 +823,7 @@ for the composition rule.
 
 ## 9. Retention, audit, history (D30)
 
-Rows are the history. A step row per spawn, an attempt row per start —
+Rows are the history. A row per step, an attempt row per start —
 `cb_job_attempts` is kept when the run turns terminal, and a NULL status is
 itself a record: a start that never reported (§3). The dashboard's run detail
 view reads what actually happened — who started what, which attempts failed
@@ -810,7 +866,7 @@ header contracts — is deleted rather than relocated.
 ## 11. Build checklist
 
 Sequencing and exit criteria live in 05 (M4a = single-execution runs, M4b =
-spawns, barriers, signals, `on_fail`; M4c = triggers). The build items:
+new steps, barriers, signals, `on_fail`; M4c = triggers). The build items:
 
 1. The kernel SQL unit (D41): its own migration dir and version table,
    auto-applied by `internal/migrate` before any module's migrations; seeds
@@ -824,11 +880,11 @@ spawns, barriers, signals, `on_fail`; M4c = triggers). The build items:
    row, version table `cb_job_migrations`.
 3. Functions (§4), M4a scope: `define`, `run`, `claim` (crashed-row
    clearing, queue array), `start` (with the give-up check), `extend`, `release`,
-   `complete` (raises on non-empty `spawns` until M4b; counts inserted
-   spawns via `RETURNING`), `fail`, `cancel`, `_cb_job_give_up` (the
-   `failing` machinery ships in M4a; only `on_fail` spawning stays dark
+   `complete` (raises on non-empty `steps` until M4b; counts inserted
+   steps via `RETURNING`), `fail`, `cancel`, `_cb_job_give_up` (the
+   `failing` machinery ships in M4a; only the `on_fail` step stays dark
    until a job declares one) — backoff from the kernel unit. M4b: the
-   spawn/barrier/signal paths in `complete`, `cb_job_signal`, `on_fail`.
+   new-step/barrier/signal paths in `complete`, `cb_job_signal`, `on_fail`.
 4. The module's tick (kernel ticker): schedule delivery (§3), the
    run-retention janitor (§9).
 5. Go: the per-call declarations mirroring the SQL — `jobs.Define`,
@@ -844,8 +900,8 @@ spawns, barriers, signals, `on_fail`; M4c = triggers). The build items:
    lookup by id and by app key; `WaitForOutput` polling, notify at M5.
 6. `docs/sql-api.md`: rewrite as the normative worker contract (§7), with
    the old-vs-new name table for the transition, and worked examples for
-   gate composition and the run-wide barrier rule (§3) — the two places a
-   reader's intuition is most likely wrong.
+   combining the two waits and the run-wide barrier rule (§3) — the two
+   places a reader's intuition is most likely wrong.
 7. M4c — triggers (§8, D41): migration `jobs/migrations/00002_trigger.sql`
    (`cb_triggers`), `cb_trigger_define` / `cb_trigger_delete` — define-time
    validation plus the loud stream-schema-required check — the delivery
@@ -866,36 +922,38 @@ spawns, barriers, signals, `on_fail`; M4c = triggers). The build items:
      the attempt row reads `worker shutdown` and redelivery follows
      `backoff(attempt)` with no lease-lapse wait (§3).
    - the `failing` lifecycle: the give-up cancels siblings, `on_fail`
-     receives `{job, error, input}`, its chain may spawn (barriers
+     receives `{job, error, input}`, its chain may add steps (barriers
      included) and signal, its exhaustion ends the run `failed` with no
      second `on_fail`; cancel of a `failing` run cancels the cleanup chain
      and finalizes `failed` at once.
-   - signal slot semantics: signal-before-spawn buffered and consumed;
-     overwrite of an unconsumed slot; sequential same-name steps; duplicate
-     signal-step name fails the spawning completion.
-   - the additive payload: a signal-gated step spawned with input receives
-     both — spawn input unchanged, payload in `signal` (start returns it;
-     `jobs.Signal[T]` NULL until satisfied).
+   - signal slot semantics: signal-before-step buffered and consumed;
+     overwrite of an unconsumed slot; sequential same-name steps; a
+     duplicate signal-step name fails the completion that added it.
+   - the additive payload: a signal-waiting step added with input receives
+     both — its input unchanged, payload in `signal_input` (start returns it;
+     `jobs.SignalInput[T]` NULL until satisfied).
    - external jobs: a defined job with no `Handle` call converges like any
      declaration; a worker claiming its pool without the handler refuses
      to start, and so does a worker handling a job nobody defined.
    - the remaining formula: chains, fan-out + barrier, barrier phases
-     (including a barrier spawned by the draining completion), signal steps
+     (including a barrier added by the draining completion), signal steps
      holding barriers and finalization.
-   - combined gates (`OnAllDone()` + `OnSignal()` → `all_done_signal`): the
-     step dispatches at phase drain and then waits for its signal, counting;
-     a signal buffered before the phase drains is consumed at dispatch;
-     finalization waits behind a dispatched-but-unsignaled step; the builder
-     composes the two options into one dispatch word.
+   - both waits on one step (`p.After().Step(n, in, jobs.WaitsForSignal())`):
+     the step moves `waiting_for_steps → waiting_for_signal` at the phase
+     drain and now counts; a signal buffered before the drain is consumed
+     at dispatch; finalization waits behind a dispatched-but-unsignaled
+     step. No combined word: the two waits compose in sequence.
    - takeover via extend: after a lapsed step is cleared, its original
      worker's next extend is missing that row and the handler is canceled;
      its late complete returns false and changes nothing.
    - cancel mid-handler: `cb_job_cancel` while a handler runs — the
      status-check wrapper cancels the context, the late complete no-ops.
-   - output resolution: an explicit `SetRunOutput` from a non-final step
-     beats the finalizing step's output.
-   - routing: a spawn lands in its job's pool with that pool's terms; an
-     undeclared spawn name walks the spawner to give-up through the normal
+   - output resolution: the run's output is explicit or null — a
+     `SetRunOutput` from any step lands (last completion wins), and a run
+     whose steps never set one finishes with output null, the finishing
+     step's own output untouched on its row.
+   - routing: a new step lands in its job's pool with that pool's terms; an
+     undeclared step name walks its parent to give-up through the normal
      budget (§5); worker coverage validation refuses partial pools; a worker
      claiming a step it holds no handler for releases it with a pause, no
      attempt spent; a queue-array claim serves several pools in one call.

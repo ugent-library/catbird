@@ -14,7 +14,7 @@ type JobOpts struct {
 	// pool's row carries the job's retry and claim terms, and it must be
 	// defined first.
 	Queue string
-	// OnFail names the job spawned when a run of this job is given up
+	// OnFail names the job the cleanup step runs when a run of this job is given up
 	// on — after max_attempts failed or crashed starts. It receives
 	// {job, error, input} describing the failed step, must be defined
 	// first (a job may name itself), and applies when this job is the

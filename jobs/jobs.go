@@ -38,10 +38,12 @@ const Forever = -time.Second
 
 // Run and step statuses. A run is 'running', 'failing' (the outcome is
 // already failed, only the on_fail chain still executes) or terminal. A
-// step is 'waiting' (a gate has not cleared), 'queued', 'started' or
-// terminal.
+// step is waiting (its status says what it waits for), 'queued',
+// 'started' or terminal.
 const (
-	StatusWaiting   = "waiting"
+	StatusWaitingForSteps  = "waiting_for_steps"
+	StatusWaitingForSignal = "waiting_for_signal"
+
 	StatusQueued    = "queued"
 	StatusStarted   = "started"
 	StatusRunning   = "running"

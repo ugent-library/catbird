@@ -159,6 +159,29 @@ func WaitForOutput(ctx context.Context, conn Conn, runID int64, out any, opts ..
 	}
 }
 
+// Signal sends a payload to the run's step named name, mirroring
+// cb_job_signal. A step waiting for the signal dispatches at once; when no
+// step waits for it yet, the payload is buffered in the run's slot for
+// that name, overwriting an unconsumed older one — arrival order does not
+// matter. The handler reads the payload with SignalInput. Reports false,
+// having changed nothing, when the run does not exist or is already
+// finished — the run ended at the same time, which the caller could not
+// have avoided, so that is not an error.
+func Signal(ctx context.Context, conn Conn, runID int64, name string, payload any) (bool, error) {
+	var in any
+	if payload != nil {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return false, err
+		}
+		in = json.RawMessage(b)
+	}
+	var accepted bool
+	err := conn.QueryRow(ctx, `SELECT cb_job_signal($1, $2, $3)`,
+		runID, name, in).Scan(&accepted)
+	return accepted, wrapErr(err)
+}
+
 // Cancel cancels a run. Steps not yet started never run; a handler that is
 // already running has its context canceled on the worker's next extend. A
 // 'failing' run keeps its failed verdict — cancel only stops the cleanup

@@ -12,9 +12,12 @@ The old root-schema functions (`cb_run_task`, `cb_create_queue`, …) are
 frozen and scheduled for replacement; the [name table](#old-names-new-names)
 at the end maps them to their successors.
 
-**What is built today (M4a): single-execution runs.** `cb_job_signal` does
-not exist yet, and `cb_job_complete` raises on a non-empty `spawns`
-argument. Both arrive with M4b; each place that changes is marked below.
+**What the module does.** A run is a group of steps. A handler completes its
+step and may add new steps in the same call — `steps` — each of which can
+wait for the run's other steps (`waits_for_steps`) or for an external
+signal (`waits_for_signal`)
+before it runs. A run whose one step adds nothing is a single-execution run,
+the smaller and most common case.
 
 ## Vocabulary
 
@@ -66,8 +69,9 @@ the call is invalid, `IRD02` means a named object does not exist.
 
 ## The worker contract
 
-A worker in any language is one loop against the six functions below
-(`cb_job_signal` joins them with M4b):
+A worker in any language is one loop against the six functions below.
+(`cb_job_signal`, further down, is not part of the loop — it is the call
+that unblocks a signal-gated step.)
 
 1. `cb_job_claim` a batch across the queues it serves.
 2. Per claimed step: `cb_job_start` — nothing returned means the step moved
@@ -140,7 +144,7 @@ than are ready; the next call picks up the rest.
 
 ```sql
 cb_job_start(run_id bigint, step_id bigint, worker text)
-    RETURNS (name text, input jsonb, signal jsonb, attempt int)
+    RETURNS (name text, input jsonb, signal_input jsonb, attempt int)
 ```
 
 Starts a claimed step: increments `attempt`, inserts the attempt row and
@@ -157,8 +161,8 @@ attempt ended in silence`), no attempt row is written, and nothing is
 returned. This check sits here and not in `cb_job_claim` because the
 give-up needs the run lock, which claim never takes.
 
-`signal` is the satisfied payload of a signal-gated step, NULL otherwise
-(M4b; NULL for every step until then).
+`signal_input` is the payload delivered to a step that waited for one, NULL
+for a step that asked for no signal or was not yet signaled.
 
 ### cb_job_extend
 
@@ -193,24 +197,33 @@ no longer holds the step.
 
 ```sql
 cb_job_complete(run_id bigint, step_id bigint, attempt int,
-                output jsonb DEFAULT NULL, spawns jsonb DEFAULT NULL,
+                output jsonb DEFAULT NULL, steps jsonb DEFAULT NULL,
                 run_output jsonb DEFAULT NULL)
     RETURNS boolean
 ```
 
-Records a successful attempt: the attempt row and the step store the
-result, and the run's `steps_remaining` drops by one. `run_output`, when
-given, becomes the run's output no matter which step this is; when several
-steps set it, the last one wins. SQL NULL means "not given", which is why
-an explicit run output can never be the JSON value `null`.
+Records a successful attempt and applies what the handler enqueued: the
+attempt row and the step store the result, the new `steps` are inserted,
+and the run's owed-step count moves by `−1 + (new steps not waiting for the
+run's other steps)`. `run_output`, when given, becomes the run's output no
+matter which step this is; when several steps set it, the last one wins. It
+is the only way a run gets an output: a run whose completions never pass
+one finishes with output NULL — the engine never falls back to a step's
+output, which would be an arbitrary pick when several steps finish the run
+together. SQL NULL means "not given", which is why an explicit run output
+can never be the JSON value `null`.
 
-When `steps_remaining` reaches zero the run is done: a `running` run
-becomes `completed`, a `failing` run becomes `failed`. The run's output is
-then the `run_output` if any call set one, otherwise the output of this
-last step. Returns false, having changed nothing, when the checks fail.
+When the count reaches zero the run either dispatches its next phase or
+finishes. If steps are waiting in `waiting_for_steps`, they all dispatch
+together as that phase (see [New steps, waits and
+barriers](#new-steps-waits-and-barriers)). Otherwise the run is done: a
+`running` run becomes `completed`, a `failing` run becomes `failed`, its
+output whatever `run_output` calls set along the way. Returns false,
+having changed nothing, when the checks fail.
 
-`spawns` is the follow-on buffer — `[{name, input, dispatch}]` — and
-**raises `IRD01` when non-empty until M4b**. Pass NULL or `[]`.
+`steps` is the handler's buffer as JSON — `[{name, input, waits_for_steps,
+waits_for_signal}]`, both booleans required. See [New steps, waits and
+barriers](#new-steps-waits-and-barriers) for the shape and the waits.
 
 ### cb_job_fail
 
@@ -226,15 +239,21 @@ later, nothing is copied or moved. Attempts used up: the engine gives up,
 in the same transaction (below). Returns false, having changed nothing,
 when the checks fail.
 
-### cb_job_signal — arrives with M4b
+### cb_job_signal
 
 ```sql
-cb_job_signal(run_id bigint, name text, payload jsonb)   -- not built yet
+cb_job_signal(run_id bigint, name text, payload jsonb DEFAULT NULL)
+    RETURNS boolean
 ```
 
-Satisfies a waiting signal-gated step of that name, or buffers the payload
-in the run's slot for it (a second signal for a name nobody consumed yet
-overwrites the slot). Raises only when the run is missing or terminal.
+Delivers a signal to the run's `waiting_for_signal` step of that name, or
+buffers the payload in the run's slot for it (a newer signal nobody consumed
+yet overwrites the slot; a later match consumes it — arrival order does not
+matter). Returns true when the payload landed, whether it satisfied a step
+or was buffered. Returns false, changing nothing, when the run is missing or
+already finished: the run ended at the same time, which the caller could not
+have avoided, so this is not a raise. A `failing` run accepts signals — its
+cleanup chain may wait for one.
 
 ## Retries and giving up — one counter
 
@@ -256,8 +275,8 @@ unfinished step of the run turns `canceled`. Then:
 - If the run is `running` and its **birth job** (the job named in
   `cb_job_run`) declares an `on_fail` job, the run turns `failing` and one
   new step is created to run that job, with input `{job, error, input}`
-  describing the failed step. The run ends `failed` when that step — and,
-  from M4b, whatever it spawns — is done.
+  describing the failed step. The run ends `failed` when that step — and
+  whatever steps it adds — is done.
 - Otherwise the run ends `failed` now.
 
 A `failing` run never gets a second `on_fail` step, and it keeps its first
@@ -316,7 +335,7 @@ name itself as its own `on_fail`. Declaring the same config again writes
 nothing.
 
 `on_fail` and `retention` matter when the job is a run's birth job; on a
-job only ever spawned mid-run they are inert config.
+job only ever run as a mid-run step they are inert config.
 
 ### cb_job_define_schedule
 
@@ -459,54 +478,71 @@ ORDER BY finished_at, id
 LIMIT $batch_size;
 ```
 
-## Spawns, gates and barriers — arrives with M4b
+## New steps, waits and barriers
 
-> Everything in this section is written from the design (`docs/plan/03-job.md`
-> §3) and is **not callable yet**: today `cb_job_complete` raises on a
-> non-empty `spawns`. It is documented here because these are the two places
-> a reader's intuition is most likely wrong.
+`steps` carries the handler's buffer as JSON: `[{name, input,
+waits_for_steps, waits_for_signal}]`. The engine validates each `name`
+against `cb_jobs` and stamps
+the queue from the definition, so a worker adds steps with zero knowledge
+of queue layout. Because the steps are written by code, nothing is
+defaulted: every step states both booleans, and a missing one raises
+`IRD01` — a misspelled key looks the same as an omitted one, and defaulting
+would turn that bug into a step that silently waits for nothing.
 
-`spawns` carries the handler's buffered follow-ons as JSON: `[{name, input,
-dispatch}]`. The engine validates each name against `cb_jobs` and stamps
-the queue from the definition, so a worker spawns with zero knowledge of
-queue layout. `dispatch` is the combination of up to two independent
-gates — `all_done` (wait for the run's current work to drain) and `signal`
-(wait for a payload) — giving four words: `immediate`, `all_done`,
-`signal`, `all_done_signal`.
+Each new step states two waits, in the same words the statuses answer
+with:
 
-**Gate composition.** The gates are independent, so they compose. The
-approval-gate-after-fan-out shape:
+- `waits_for_steps` — run only once everything the run owes has completed
+  **successfully**. On any give-up the waiting step is canceled, so it
+  never starts.
+- `waits_for_signal` — run when a payload arrives for the step's name, via
+  `cb_job_signal`.
+
+A step with both `false` is claimable at once — its parent has already
+finished, so a sequential chain needs no bookkeeping.
+
+**Status says what a step waits for.** A new step lands directly in one of
+three statuses: `queued` (waits for nothing), `waiting_for_steps`, or
+`waiting_for_signal`. A step that asked for
+both waits for the steps first, then the signal — a signal that arrives
+early is buffered, never lost, so a step is only ever waiting for one
+thing at a time and its status names it. The `waits_for_signal` boolean is
+stored on the row exactly as the wire stated it and is never updated; the
+payload lands in `signal_input`, which `cb_job_start` returns.
+
+**Composition.** The two waits combine with no special case. The
+approval-after-fan-out shape:
 
 ```json
 [
-    {"name": "resize",  "input": {"img": 1}, "dispatch": "immediate"},
-    {"name": "resize",  "input": {"img": 2}, "dispatch": "immediate"},
-    {"name": "publish", "input": {},         "dispatch": "all_done_signal"}
+    {"name": "resize",  "input": {"img": 1}, "waits_for_steps": false, "waits_for_signal": false},
+    {"name": "resize",  "input": {"img": 2}, "waits_for_steps": false, "waits_for_signal": false},
+    {"name": "publish", "input": {},         "waits_for_steps": true,  "waits_for_signal": true}
 ]
 ```
 
-`publish` dispatches when both gates have cleared: the resizes (and
-everything else the run owes) are done, **and** someone called
-`cb_job_signal(run_id, 'publish', payload)`. A signal sent before the fan-out
-drains is buffered and consumed the moment the `all_done` gate clears —
-arrival order does not matter.
+`publish` runs when both waits are over: the resizes (and everything else
+the run owes) are done, **and** someone called `cb_job_signal(run_id,
+'publish', payload)`. A signal sent before the fan-out drains buffers in
+the run's slot and is consumed at the phase dispatch — arrival order does
+not matter.
 
-**The barrier is run-wide.** An `all_done` gate waits for everything the
-run still owes — `steps_remaining` reaching zero — not just for its
-siblings in the same `spawns` array. Two consequences worth spelling out:
+**The barrier is run-wide.** `waits_for_steps` waits for everything the run
+still owes — `steps_remaining` reaching zero — not just for its siblings in
+the same `steps` array. Two consequences worth spelling out:
 
-- Position in the buffer carries no dispatch meaning. A barrier spawned
-  *between* two ungated spawns waits for both of them — and for a step some
-  other branch of the run queued earlier.
-- When the count reaches zero, **all** waiting `all_done` steps dispatch
+- Position in the buffer carries no dispatch meaning. A barrier added
+  *between* two immediate steps waits for both of them — and for a step
+  some other branch of the run queued earlier.
+- When the count reaches zero, **all** `waiting_for_steps` steps dispatch
   together as the next phase, and the run finalizes only when no step is
   left. Chained barriers therefore run as phases: fan-out, barrier, more
   fan-out, barrier again — with no special case.
 
-A step waiting on an unsatisfied signal **counts** as owed work: barriers
-and the run's completion wait behind an unanswered signal (cancel the run
-if it will never come). A step whose `all_done` gate is unsatisfied does
-not count — which is why it can never block its own dispatch.
+A step in `waiting_for_signal` **counts** as owed work: barriers and the
+run's completion wait behind an unanswered signal (cancel the run if it
+will never come). A step in `waiting_for_steps` does not count — which is
+why it can never block its own dispatch.
 
 ## Old names, new names
 
@@ -519,20 +555,20 @@ the job module starts with `cb_job_`.
 
 | Old | New | What changed |
 | --- | --- | --- |
-| `cb_create_task`, `cb_create_flow` | `cb_job_define` | One noun: a flow is a job whose steps spawn more steps; no flow object exists. |
+| `cb_create_task`, `cb_create_flow` | `cb_job_define` | One noun: a flow is a job whose steps add more steps; no flow object exists. |
 | `cb_delete_task`, `cb_delete_flow` | — | Definitions converge on deploy; removing one is a deliberate op (raw `DELETE`). |
 | `cb_create_queue` | `cb_job_define_queue` | A queue is a pool of claim and retry terms, not a message box. The message-queue half of the old API (`cb_send`, `cb_read`, `cb_publish`, `cb_bind`) is the stream module. |
 | `cb_run_task`, `cb_run_flow` | `cb_job_run` | Plus dedup and lookup by `key`. |
 | `cb_cancel_task`, `cb_cancel_flow` | `cb_job_cancel` | |
 | `cb_wait_task_output`, `cb_wait_flow_output` | — | Read `cb_job_runs`; the Go side polls it (`jobs.WaitForOutput`). |
-| `cb_signal_flow` | `cb_job_signal` | M4b. Signals are buffered; the payload arrives beside the input. |
+| `cb_signal_flow` | `cb_job_signal` | Buffered; returns a boolean, never raises; the payload arrives beside the input. |
 | `cb_claim_tasks`, `cb_claim_steps`, `cb_claim_map_tasks` | `cb_job_claim` | One claim for everything, per pool, queue-array in one call. |
 | — | `cb_job_start` | New: starting is its own call and spends the attempt. |
 | `cb_hide_tasks`, `cb_hide_steps` | `cb_job_extend` | The lease replaces hiding; one call covers every held step. |
 | — | `cb_job_release` | New: hand back an unstarted claim, no attempt spent. |
-| `cb_complete_task`, `cb_complete_step` | `cb_job_complete` | Spawns and run output ride the completion (M4b). |
+| `cb_complete_task`, `cb_complete_step` | `cb_job_complete` | New steps and run output ride the completion. |
 | `cb_fail_task`, `cb_fail_step` | `cb_job_fail` | Retry or give up, one call; policy from the pool row. |
-| `cb_claim_task_on_fail`, `cb_complete_task_on_fail`, `cb_fail_task_on_fail` (and the flow trio) | — | `on_fail` is an ordinary step the engine spawns at give-up; no separate machinery. |
+| `cb_claim_task_on_fail`, `cb_complete_task_on_fail`, `cb_fail_task_on_fail` (and the flow trio) | — | `on_fail` is an ordinary step the engine adds at give-up; no separate machinery. |
 | `cb_create_task_schedule`, `cb_create_flow_schedule` | `cb_job_define_schedule` | Interval schedules; cron specs return later. |
 | `cb_delete_task_schedule`, `cb_delete_flow_schedule` | `cb_job_delete_schedule` | |
 | `cb_execute_due_task_schedules`, `cb_execute_due_flow_schedules` | `_cb_job_run_scheduled` | On the module's tick. |

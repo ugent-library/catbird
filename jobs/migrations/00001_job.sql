@@ -7,19 +7,26 @@
 -- records the work is the unit a worker claims. Uses the kernel's SQL unit
 -- (cb_valid_name, cb_forever, cb_backoff), applied before this file.
 
--- Dispatch is two independent gates combined into one word: all_done waits
--- for the run's current phase to drain, signal waits for a payload. The
--- words are the same in the Go options, the spawns JSON and the column.
-CREATE TYPE cb_job_dispatch AS ENUM ('immediate', 'all_done', 'signal', 'all_done_signal');
+-- A step can wait before it runs, and its status says what it waits for:
+-- 'waiting_for_steps' — everything the run owes must complete successfully
+-- first; 'waiting_for_signal' — a payload must arrive for the step's name.
+-- A step that asked for both waits for the steps first, then the signal;
+-- a signal that arrives early is buffered, so a step never waits for both
+-- at once. The steps a handler adds (cb_job_complete) state each wait as
+-- a required boolean, waits_for_steps and waits_for_signal — the same
+-- words the statuses answer with. waits_for_signal is stored on the row
+-- exactly as given and the payload lands in signal_input; which wait is
+-- open is what status says.
 CREATE TYPE cb_job_catch_up_policy AS ENUM ('skip', 'all');
 
--- One row per declared job: the authority spawns are validated against and
--- the routing map in one. on_fail and retention matter when the job is a
--- run's birth job; on a job only ever spawned mid-run they are inert config.
+-- One row per declared job: the authority a handler's new steps are
+-- validated against and the routing map in one. on_fail and retention
+-- matter when the job is a run's birth job; on a job only ever run as a
+-- mid-run step they are inert config.
 CREATE TABLE cb_jobs (
     name text PRIMARY KEY CHECK (cb_valid_name(name)),
     queue text,   -- pool the job routes to; NULL means 'default'
-    on_fail text, -- job spawned at give-up; cb_job_define checks it names a declared job
+    on_fail text, -- job the give-up cleanup step runs; cb_job_define checks it names a declared job
     retention interval NOT NULL DEFAULT interval '30 days'
         CHECK (retention = cb_forever() OR retention > interval '0')
 );
@@ -62,8 +69,9 @@ CREATE INDEX ON cb_job_schedules (next_at);
 -- A run is one instance of a job: the group of steps and the record.
 -- 'failing' means the outcome is already decided (failed) and only the
 -- on_fail chain may still execute. steps_remaining counts the steps the
--- run still owes: queued, started, or waiting on a signal — a step with an
--- unsatisfied all_done gate stays outside the count until it dispatches.
+-- run still owes: queued, started, or waiting for a signal — a step
+-- waiting for the run's other steps stays outside the count until the
+-- phase dispatches it.
 -- next_step_id hands out per-run step ids; a plain counter is enough
 -- because every engine call that creates steps already holds the run lock.
 CREATE TABLE cb_job_runs (
@@ -89,17 +97,17 @@ CREATE INDEX cb_job_runs_finished_idx ON cb_job_runs (finished_at)
 
 -- The work table: one timestamp column, claimable_at, carries visibility,
 -- lease and backoff. Replay identity is the plain tuple (run_id,
--- parent_step_id, name, ordinal), where ordinal is the spawn's zero-based
--- index in its parent's Plan buffer — deterministic across replays because
--- the buffer is replayed whole. parent_step_id is 0 for the run's first
--- step, the one running the birth job. attempt counts starts: the whole
--- retry budget, one number.
+-- parent_step_id, name, ordinal), where ordinal is the step's zero-based
+-- position among the steps its parent's completion added — deterministic
+-- across replays because the whole list is replayed. parent_step_id is 0
+-- for the run's first step, the one running the birth job. attempt counts
+-- starts: the whole retry budget, one number.
 CREATE TABLE cb_job_steps (
     run_id bigint NOT NULL REFERENCES cb_job_runs (id),
     id bigint NOT NULL,
-    -- queue and name are denormalized from the job's definition at spawn so
+    -- queue and name are denormalized from the job's definition at insert so
     -- the claim query joins nothing. Deliberately no FK on either: an FK to
-    -- a shared hot config row takes a KEY SHARE lock per spawn (multixact
+    -- a shared hot config row takes a KEY SHARE lock per insert (multixact
     -- churn at volume), and cb_job_complete already validates both with
     -- better errors.
     queue text NOT NULL,
@@ -107,10 +115,11 @@ CREATE TABLE cb_job_steps (
     parent_step_id bigint NOT NULL,
     ordinal int NOT NULL,
     status text NOT NULL
-        CHECK (status IN ('waiting', 'queued', 'started', 'completed', 'failed', 'canceled')),
-    dispatch cb_job_dispatch NOT NULL,
+        CHECK (status IN ('waiting_for_steps', 'waiting_for_signal', 'queued',
+                          'started', 'completed', 'failed', 'canceled')),
+    waits_for_signal boolean NOT NULL DEFAULT false,
     input jsonb,
-    signal jsonb, -- the satisfied payload of a signal-gated step, NULL until then
+    signal_input jsonb, -- what cb_job_signal delivered, NULL until the signal arrives
     output jsonb,
     error text,
     attempt int NOT NULL DEFAULT 0,
@@ -129,7 +138,7 @@ CREATE INDEX cb_job_steps_claim_idx ON cb_job_steps (queue, claimable_at)
 -- A signal-gated step's name must be unique among the run's unresolved
 -- steps, so cb_job_signal can address it by name.
 CREATE UNIQUE INDEX cb_job_steps_signal_name_idx ON cb_job_steps (run_id, name)
-    WHERE dispatch IN ('signal', 'all_done_signal')
+    WHERE waits_for_signal
       AND status NOT IN ('completed', 'failed', 'canceled');
 
 -- One row per start of a step, kept when the run finishes. A NULL status
@@ -415,8 +424,9 @@ BEGIN
     ),
     _step AS (
         INSERT INTO cb_job_steps
-            (run_id, id, queue, name, parent_step_id, ordinal, status, dispatch, input, claimable_at)
-        SELECT r.id, 1, _queue, cb_job_run.job, 0, 0, 'queued', 'immediate',
+            (run_id, id, queue, name, parent_step_id, ordinal, status,
+             input, claimable_at)
+        SELECT r.id, 1, _queue, cb_job_run.job, 0, 0, 'queued',
                cb_job_run.input, _claimable_at
         FROM _run r
     )
@@ -445,7 +455,7 @@ END; $$;
 --   * If the run is 'running' and its birth job declares an on_fail job,
 --     the run turns 'failing' and one new step is created to run that
 --     job, with input {job, error, input} describing the failed step. The
---     run ends 'failed' when that step, and whatever it spawns, is done.
+--     run ends 'failed' when that step, and whatever steps it adds, is done.
 --   * Otherwise the run ends 'failed' now. A 'failing' run never gets a
 --     second on_fail step, and it keeps its first error; the on_fail
 --     step's own failure is recorded on its step and attempt rows.
@@ -455,7 +465,7 @@ DECLARE
     _run_id bigint := _cb_job_give_up.run.id;
     _step_id bigint := _cb_job_give_up.step.id;
     _on_fail cb_jobs;
-    _spawn_id bigint := _cb_job_give_up.run.next_step_id;
+    _cleanup_id bigint := _cb_job_give_up.run.next_step_id;
     _queue text;
     _claimable_at timestamptz;
 BEGIN
@@ -478,7 +488,7 @@ BEGIN
         SELECT s.run_id, s.id FROM cb_job_steps s
         WHERE s.run_id = _run_id
           AND s.id <> _step_id
-          AND s.status IN ('waiting', 'queued', 'started')
+          AND s.status IN ('waiting_for_steps', 'waiting_for_signal', 'queued', 'started')
         ORDER BY s.run_id, s.id
         FOR UPDATE
     ) locked
@@ -499,13 +509,14 @@ BEGIN
             SET status = 'failing',
                 error = _cb_job_give_up.error,
                 steps_remaining = 1,
-                next_step_id = _spawn_id + 1
+                next_step_id = _cleanup_id + 1
             WHERE r.id = _run_id;
 
             INSERT INTO cb_job_steps
-                (run_id, id, queue, name, parent_step_id, ordinal, status, dispatch, input, claimable_at)
+                (run_id, id, queue, name, parent_step_id, ordinal, status,
+                 input, claimable_at)
             VALUES (
-                _run_id, _spawn_id, _queue, _on_fail.name, _step_id, 0, 'queued', 'immediate',
+                _run_id, _cleanup_id, _queue, _on_fail.name, _step_id, 0, 'queued',
                 jsonb_build_object(
                     'job',   _cb_job_give_up.step.name,
                     'error', _cb_job_give_up.error,
@@ -645,10 +656,10 @@ CREATE FUNCTION cb_job_start(
     step_id bigint,
     worker  text,
 
-    OUT name    text,
-    OUT input   jsonb,
-    OUT signal  jsonb,
-    OUT attempt int
+    OUT name         text,
+    OUT input        jsonb,
+    OUT signal_input jsonb,
+    OUT attempt      int
 )
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -690,7 +701,7 @@ BEGIN
 
     name := _step.name;
     input := _step.input;
-    signal := _step.signal;
+    signal_input := _step.signal_input;
 END; $$;
 -- +goose statementend
 
@@ -764,32 +775,60 @@ END; $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- Records a successful attempt: the attempt row and the step store the
--- result, and the run's steps_remaining drops by one. run_output, when
--- given, becomes the run's output no matter which step this is; when
--- several steps set it, the last one wins. SQL NULL means "not given",
--- which is why an explicit run output can never be the JSON value null.
+-- Records a successful attempt and applies what the handler enqueued, in
+-- one transaction: the attempt row and the step store the result, the
+-- handler's new steps are inserted, and the run's count of owed steps
+-- moves by
 --
--- When steps_remaining reaches zero the run is done: a 'running' run
--- becomes 'completed', a 'failing' run becomes 'failed'. The run's output
--- is then the run_output if any call set one, otherwise the output of
--- this last step. Returns false, having changed nothing, when the checks
--- at the top fail.
+--     steps_remaining := steps_remaining - 1 + (new steps not waiting for the run's other steps)
+--
+-- steps is a JSON array of {name, input, waits_for_steps,
+-- waits_for_signal}, in the order the handler added them; both booleans
+-- are required on every step, nothing is defaulted. Each name must be a
+-- declared job; the new step lands on that job's pool. A step that waits
+-- for nothing is claimable at once — its parent has already finished, so
+-- a sequential chain needs no bookkeeping. waits_for_steps: everything
+-- the run owes must complete successfully first ('waiting_for_steps').
+-- waits_for_signal: a payload must arrive for the step's name
+-- ('waiting_for_signal'). A step that asked for both waits for the steps
+-- first. A signal-only step whose payload is already buffered starts out
+-- 'queued' instead, taking the slot — arrival order does not matter.
+--
+-- run_output, when given, becomes the run's output no matter which step
+-- this is; when several steps set it, the last one wins. It is the only
+-- way a run gets an output: a run whose completions never pass one
+-- finishes with output NULL — the engine never falls back to a step's
+-- output, which would be an arbitrary pick when several steps finish the
+-- run together. SQL NULL means "not given", which is why an explicit run
+-- output can never be the JSON value null.
+--
+-- When steps_remaining reaches zero and steps are waiting in
+-- 'waiting_for_steps', all of them dispatch together as the next phase.
+-- Otherwise the run is done: a 'running' run becomes 'completed', a
+-- 'failing' run becomes 'failed', and the run's output is whatever
+-- run_output calls set along the way. Returns false, having changed
+-- nothing, when the checks at the top fail.
 CREATE FUNCTION cb_job_complete(
     run_id     bigint,
     step_id    bigint,
     attempt    int,
     output     jsonb DEFAULT NULL,
-    spawns     jsonb DEFAULT NULL,
+    steps      jsonb DEFAULT NULL,
     run_output jsonb DEFAULT NULL
 )
 RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE
     _run cb_job_runs;
     _step cb_job_steps;
-    _remaining int;
-    _status text;
+    _new_step_count int := coalesce(jsonb_array_length(cb_job_complete.steps), 0);
+    _bad_step text;   -- first step that fails validation, for the error message
+    _new_owed int := 0; -- how many new steps the run owes at once (all but 'waiting_for_steps')
+    _remaining int;   -- steps_remaining after this completion is counted
+    _dispatched int;  -- how many steps the phase moved on
+    _pool record;     -- one queue to wake, with its earliest claimable_at
+    _status text;     -- the run's terminal status
 BEGIN
+    ---- The checks: the run accepts changes, this attempt still owns the step. ----
     SELECT r.* INTO _run FROM cb_job_runs r
     WHERE r.id = cb_job_complete.run_id
     FOR UPDATE;
@@ -806,11 +845,7 @@ BEGIN
         RETURN false;
     END IF;
 
-    -- the spawns branch opens with M4b
-    IF cb_job_complete.spawns IS NOT NULL AND jsonb_array_length(cb_job_complete.spawns) > 0 THEN
-        RAISE EXCEPTION 'catbird: spawns are not supported yet' USING ERRCODE = 'IRD01';
-    END IF;
-
+    ---- Record the result on the attempt and the step. ----
     UPDATE cb_job_attempts a
     SET status = 'completed',
         finished_at = clock_timestamp()
@@ -825,22 +860,194 @@ BEGIN
         finished_at = clock_timestamp()
     WHERE s.run_id = cb_job_complete.run_id AND s.id = cb_job_complete.step_id;
 
+    ---- Insert the handler's new steps, each in the status its waits imply. ----
+    IF _new_step_count > 0 THEN
+        -- Nothing in the JSON gets a default: steps are written by code,
+        -- and a misspelled key looks the same as a missing one — a default
+        -- would turn that bug into a step that silently waits for nothing.
+        SELECT step.name INTO _bad_step
+        FROM jsonb_to_recordset(cb_job_complete.steps)
+            AS step(name text, waits_for_steps boolean, waits_for_signal boolean)
+        WHERE step.waits_for_steps IS NULL OR step.waits_for_signal IS NULL
+        LIMIT 1;
+        IF FOUND THEN
+            RAISE EXCEPTION 'catbird: step % must say waits_for_steps and waits_for_signal', _bad_step
+                USING ERRCODE = 'IRD01';
+        END IF;
+
+        -- Every step must run a declared job.
+        SELECT step.name INTO _bad_step
+        FROM jsonb_to_recordset(cb_job_complete.steps) AS step(name text)
+        LEFT JOIN cb_jobs job ON job.name = step.name
+        WHERE job.name IS NULL
+        LIMIT 1;
+        IF FOUND THEN
+            RAISE EXCEPTION 'catbird: job % not defined', _bad_step USING ERRCODE = 'IRD02';
+        END IF;
+
+        WITH _new_steps AS (
+            -- the handler's steps, in the order it added them; that
+            -- position is the ordinal, part of the replay identity
+            SELECT step.pos::int - 1 AS ordinal, -- WITH ORDINALITY counts from 1
+                   step.name, step.input, step.waits_for_steps, step.waits_for_signal
+            FROM ROWS FROM (
+                jsonb_to_recordset(cb_job_complete.steps)
+                    AS (name text, input jsonb, waits_for_steps boolean, waits_for_signal boolean)
+            ) WITH ORDINALITY AS step(name, input, waits_for_steps, waits_for_signal, pos)
+        ),
+        -- a signal can arrive before its step exists; it waits in
+        -- cb_job_signals. A signal-only step among the new steps picks its
+        -- early signal up now: the slot is deleted, the payload kept
+        _early_signals AS (
+            DELETE FROM cb_job_signals slot
+            USING _new_steps step
+            WHERE slot.run_id = cb_job_complete.run_id
+              AND slot.name = step.name
+              AND step.waits_for_signal AND NOT step.waits_for_steps
+            RETURNING slot.name, slot.payload
+        ),
+        -- work out how each step lands: the pool its job routes to, and
+        -- the status that says what it still waits for
+        _steps_to_insert AS (
+            SELECT step.ordinal, step.name, step.input, step.waits_for_signal,
+                   coalesce(job.queue, 'default') AS queue,
+                   CASE WHEN step.waits_for_steps THEN 'waiting_for_steps'
+                        WHEN step.waits_for_signal AND early.name IS NULL THEN 'waiting_for_signal'
+                        ELSE 'queued' END AS status,
+                   early.payload AS signal_input
+            FROM _new_steps step
+            JOIN cb_jobs job ON job.name = step.name
+            LEFT JOIN _early_signals early
+                ON early.name = step.name AND step.waits_for_signal AND NOT step.waits_for_steps
+        ),
+        _inserted AS (
+            INSERT INTO cb_job_steps
+                (run_id, id, queue, name, parent_step_id, ordinal, status,
+                 waits_for_signal, input, signal_input, claimable_at)
+            SELECT cb_job_complete.run_id,
+                   _run.next_step_id + new_step.ordinal,
+                   new_step.queue, new_step.name, cb_job_complete.step_id, new_step.ordinal,
+                   new_step.status, new_step.waits_for_signal, new_step.input, new_step.signal_input,
+                   CASE WHEN new_step.status = 'queued' THEN clock_timestamp() END
+            FROM _steps_to_insert new_step
+            -- a replay of this completion inserts the same identities
+            -- again; the duplicates are skipped, not doubled — a backstop,
+            -- since the step check at the top already blocks a second
+            -- complete
+            ON CONFLICT ON CONSTRAINT cb_job_steps_identity_key DO NOTHING
+            RETURNING status
+        )
+        -- The run now owes the new steps, except those waiting for its
+        -- other steps — they stay outside the count until the phase
+        -- dispatches them. Count rows actually inserted, not the
+        -- argument: charging the run for a duplicate the insert skipped
+        -- would keep it from ever draining to zero.
+        SELECT count(*) FILTER (WHERE _inserted.status <> 'waiting_for_steps')
+        INTO _new_owed
+        FROM _inserted;
+    END IF;
+
+    ---- Count this step off, and count the new owed steps in. ----
     UPDATE cb_job_runs r
-    SET steps_remaining = r.steps_remaining - 1,
+    SET steps_remaining = r.steps_remaining - 1 + _new_owed,
+        next_step_id = r.next_step_id + _new_step_count,
         output = coalesce(cb_job_complete.run_output, r.output)
     WHERE r.id = cb_job_complete.run_id
     RETURNING r.steps_remaining INTO _remaining;
 
     IF _remaining > 0 THEN
+        -- The run continues. Wake the pools that got new claimable steps:
+        -- one notify per queue, at its earliest claimable_at. Only this
+        -- step's children can be newly claimable — a step completes once,
+        -- so it has no older children.
+        IF _new_step_count > 0 THEN
+            FOR _pool IN
+                SELECT s.queue, min(s.claimable_at) AS claimable_at
+                FROM cb_job_steps s
+                WHERE s.run_id = cb_job_complete.run_id
+                  AND s.parent_step_id = cb_job_complete.step_id
+                  AND s.status = 'queued'
+                GROUP BY s.queue
+            LOOP
+                PERFORM pg_notify(current_schema || '.cbq_' || _pool.queue,
+                    to_char(_pool.claimable_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+            END LOOP;
+        END IF;
         RETURN true;
     END IF;
 
-    ---- All steps done: finish the run. ---- (M4b: dispatch waiting all_done steps here first)
+    ---- The count is at zero: dispatch the next phase, or finish the run. ----
+    -- Everything the run owed has completed successfully — exactly what
+    -- the 'waiting_for_steps' steps were waiting for. They all move on
+    -- together, as the next phase: to 'queued', claimable now, or on to
+    -- 'waiting_for_signal' when a signal was asked for and has not
+    -- arrived. A step inserted by this same call can be in the phase;
+    -- that is why this runs after the insert.
+    WITH _waiting_steps AS (
+        -- locked in (run_id, id) order; see the lock rules above
+        SELECT s.run_id, s.id, s.name, s.waits_for_signal
+        FROM cb_job_steps s
+        WHERE s.run_id = cb_job_complete.run_id
+          AND s.status = 'waiting_for_steps'
+        ORDER BY s.run_id, s.id
+        FOR UPDATE
+    ),
+    -- a signal that arrived while its step was still waiting for the
+    -- run's other steps waits in cb_job_signals. That step picks its
+    -- early signal up now: the slot is deleted, the payload kept
+    _early_signals AS (
+        DELETE FROM cb_job_signals slot
+        USING _waiting_steps step
+        WHERE slot.run_id = cb_job_complete.run_id
+          AND slot.name = step.name
+          AND step.waits_for_signal
+        RETURNING slot.name, slot.payload
+    ),
+    -- work out where each one moves: 'queued', unless its signal is
+    -- still missing
+    _steps_to_dispatch AS (
+        SELECT step.run_id, step.id,
+               CASE WHEN step.waits_for_signal AND early.name IS NULL
+                    THEN 'waiting_for_signal' ELSE 'queued' END AS status,
+               early.payload AS signal_input
+        FROM _waiting_steps step
+        LEFT JOIN _early_signals early ON early.name = step.name AND step.waits_for_signal
+    )
+    UPDATE cb_job_steps step
+    SET status = moved.status,
+        signal_input = moved.signal_input,
+        claimable_at = CASE WHEN moved.status = 'queued' THEN clock_timestamp() END
+    FROM _steps_to_dispatch moved
+    WHERE (step.run_id, step.id) = (moved.run_id, moved.id);
+
+    GET DIAGNOSTICS _dispatched = ROW_COUNT;
+
+    IF _dispatched > 0 THEN
+        -- the phase's steps are what the run owes now
+        UPDATE cb_job_runs r
+        SET steps_remaining = _dispatched
+        WHERE r.id = cb_job_complete.run_id;
+
+        -- Wake the pools, as above. At zero the run had nothing else
+        -- claimable, so every 'queued' row is one the phase just
+        -- dispatched.
+        FOR _pool IN
+            SELECT s.queue, min(s.claimable_at) AS claimable_at
+            FROM cb_job_steps s
+            WHERE s.run_id = cb_job_complete.run_id AND s.status = 'queued'
+            GROUP BY s.queue
+        LOOP
+            PERFORM pg_notify(current_schema || '.cbq_' || _pool.queue,
+                to_char(_pool.claimable_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+        END LOOP;
+        RETURN true;
+    END IF;
+
+    ---- All steps done: finish the run. ----
     _status := CASE _run.status WHEN 'running' THEN 'completed' ELSE 'failed' END;
 
     UPDATE cb_job_runs r
     SET status = _status,
-        output = coalesce(r.output, cb_job_complete.output),
         finished_at = clock_timestamp()
     WHERE r.id = cb_job_complete.run_id;
 
@@ -915,6 +1122,62 @@ END; $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- Delivers a signal to a waiting step, or buffers the payload. Under the
+-- run lock: when the run holds a step of this name in 'waiting_for_signal',
+-- the payload lands in signal_input and the step dispatches — 'queued',
+-- claimable now. steps_remaining does not
+-- move: a step waiting for a signal already counts. At most one row can
+-- match; the partial unique index allows one unresolved signal-gated step
+-- per name.
+--
+-- Otherwise the payload is stored in the run's slot for this name — a
+-- newer signal nobody consumed yet overwrites the older one. The slot is
+-- consumed when a matching step stops waiting for anything else: at insert
+-- for a signal-only step, at phase dispatch for one that waits for the
+-- run's other steps first — arrival order does not matter.
+--
+-- Returns false, having changed nothing, when the run is missing or
+-- already finished: the run ended at the same time, which the caller could
+-- not have avoided, so this is not an error. A 'failing' run accepts
+-- signals — its cleanup chain may be waiting for one.
+CREATE FUNCTION cb_job_signal(run_id bigint, name text, payload jsonb DEFAULT NULL)
+RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE
+    _run cb_job_runs;
+    _queue text;
+    _claimable_at timestamptz;
+BEGIN
+    SELECT r.* INTO _run FROM cb_job_runs r
+    WHERE r.id = cb_job_signal.run_id
+    FOR UPDATE;
+    IF NOT FOUND OR _run.status NOT IN ('running', 'failing') THEN
+        RETURN false;
+    END IF;
+
+    UPDATE cb_job_steps s
+    SET status = 'queued',
+        signal_input = cb_job_signal.payload,
+        claimable_at = clock_timestamp()
+    WHERE s.run_id = cb_job_signal.run_id
+      AND s.name = cb_job_signal.name
+      AND s.status = 'waiting_for_signal'
+    RETURNING s.queue, s.claimable_at INTO _queue, _claimable_at;
+
+    IF FOUND THEN
+        PERFORM pg_notify(current_schema || '.cbq_' || _queue,
+            to_char(_claimable_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+        RETURN true;
+    END IF;
+
+    INSERT INTO cb_job_signals (run_id, name, payload)
+    VALUES (cb_job_signal.run_id, cb_job_signal.name, cb_job_signal.payload)
+    ON CONFLICT ON CONSTRAINT cb_job_signals_pkey
+        DO UPDATE SET payload = excluded.payload, created_at = now();
+    RETURN true;
+END; $$;
+-- +goose statementend
+
+-- +goose statementbegin
 -- Cancels a run. A 'running' run ends 'canceled'. A 'failing' run already
 -- has its verdict and ends 'failed'; cancel only stops the on_fail steps
 -- (refusing to cancel a 'failing' run would assume its cleanup always
@@ -945,7 +1208,7 @@ BEGIN
         -- locked in (run_id, id) order; see the lock rules above
         SELECT s.run_id, s.id FROM cb_job_steps s
         WHERE s.run_id = cb_job_cancel.run_id
-          AND s.status IN ('waiting', 'queued', 'started')
+          AND s.status IN ('waiting_for_steps', 'waiting_for_signal', 'queued', 'started')
         ORDER BY s.run_id, s.id
         FOR UPDATE
     ) locked
@@ -1064,6 +1327,7 @@ END; $$;
 DROP FUNCTION _cb_job_prune_runs(int);
 DROP FUNCTION _cb_job_run_scheduled(int);
 DROP FUNCTION cb_job_cancel(bigint, text);
+DROP FUNCTION cb_job_signal(bigint, text, jsonb);
 DROP FUNCTION cb_job_fail(bigint, bigint, int, text);
 DROP FUNCTION cb_job_complete(bigint, bigint, int, jsonb, jsonb, jsonb);
 DROP FUNCTION cb_job_release(bigint, bigint, text, interval);
@@ -1085,4 +1349,3 @@ DROP TABLE cb_job_schedules;
 DROP TABLE cb_job_queues;
 DROP TABLE cb_jobs;
 DROP TYPE cb_job_catch_up_policy;
-DROP TYPE cb_job_dispatch;

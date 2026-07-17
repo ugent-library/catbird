@@ -296,10 +296,12 @@ func TestWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := NewWorker(pool)
-	w.Handle("go_double", func(ctx context.Context, in struct {
+	w.Handle("go_double", func(ctx context.Context, p *Plan, in struct {
 		N int `json:"n"`
 	}) (map[string]int, error) {
-		return map[string]int{"doubled": in.N * 2}, nil
+		out := map[string]int{"doubled": in.N * 2}
+		p.SetRunOutput(out)
+		return out, nil
 	})
 	startTestWorker(t, w)
 
@@ -361,10 +363,11 @@ func TestWorkerRetry(t *testing.T) {
 	}
 	var calls atomic.Int32
 	w := NewWorker(pool)
-	w.Handle("go_flaky", func(ctx context.Context, in struct{}) (string, error) {
+	w.Handle("go_flaky", func(ctx context.Context, p *Plan, in struct{}) (string, error) {
 		if calls.Add(1) < 3 {
 			return "", errors.New("not yet")
 		}
+		p.SetRunOutput("done")
 		return "done", nil
 	})
 	startTestWorker(t, w)
@@ -575,12 +578,13 @@ func TestWorkerShutdown(t *testing.T) {
 	}
 	var calls atomic.Int32
 	started := make(chan struct{}, 1)
-	handler := func(ctx context.Context, in struct{}) (string, error) {
+	handler := func(ctx context.Context, p *Plan, in struct{}) (string, error) {
 		if calls.Add(1) == 1 {
 			started <- struct{}{}
 			<-ctx.Done()
 			return "", ctx.Err()
 		}
+		p.SetRunOutput("second time lucky")
 		return "second time lucky", nil
 	}
 

@@ -203,7 +203,7 @@ and schedule suites do not move; the throughput benchmark re-run confirms the
 happy path did not move. `git grep 'sr\.' stream/` finds only tombstone
 comments.
 
-## M4 — one engine: single-execution runs, then spawns (was: tasks, then flows)
+## M4 — one engine: single-execution runs, then steps that add steps (was: tasks, then flows)
 
 There is no separate task engine to build (D31, D39): a job whose handler
 enqueues nothing is just a job — one registration shape. The engine rides
@@ -211,7 +211,7 @@ its own rows (D34) — package `jobs` depends on the kernel only, so M4 has **no
 stream-layer prerequisite** and does not wait for M3r. The 2026-07-12 "tasks
 first" sequencing survives as **M4a / M4b** — the single-execution shape is
 the smaller customer of the same machinery, so the schema, the fences and the
-claim loop get validated at that scale before spawning exists at all. **M4c**
+claim loop get validated at that scale before any step adds another. **M4c**
 adds triggers (D40) — a feature of `jobs/`, not a module (D41) — once M1 and
 M4a stand.
 
@@ -219,7 +219,7 @@ M4a stand.
 tables, nothing deferred, `default` seeded) and the M4a function set: `define`,
 `run`, `claim` (lease repair, queue array), `start` (give-up check
 included), `extend`, `release`, `complete` — which **raises** on non-empty
-`spawns` until M4b — `fail`, `cancel`, `_cb_job_give_up`;
+`steps` until M4b — `fail`, `cancel`, `_cb_job_give_up`;
 the module's tick (schedule delivery + the run-retention janitor). The
 kernel SQL unit lands first in this milestone (D41): `cb_backoff` seeded,
 stream's `cb_valid_name`/`cb_forever` migrated into it, names unchanged
@@ -248,11 +248,11 @@ properties); semantic core of `task_test.go` green against the new engine;
 step-to-step latency measured — notify + claim, no assigner leg in the path
 (03 §4); throughput ≥ the old `BenchmarkTaskThroughput` envelope.
 
-**M4b — spawns.** The `spawns` branch of `cb_job_complete` (insert on the
-identity tuple, queue stamped from the definitions, `steps_remaining`
-accounting), barriers (`OnAllDone`, including a second phase), signals
-(`OnSignal` + `cb_job_signal`, one buffered slot per name), combined gates
-(`all_done_signal`, D42), `on_fail` at
+**M4b — steps that add steps.** The `steps` branch of `cb_job_complete`
+(insert on the identity tuple, queue stamped from the definitions,
+`steps_remaining` accounting), barriers (`p.After().Step`, including a
+second phase), signals (`jobs.WaitsForSignal()` + `cb_job_signal`, one buffered
+slot per name), both waits on one step (sequential, D42), `on_fail` at
 give-up under the `failing` status — which thereby fires on hard worker
 death too (ingest's `sweep_stuck_deliveries` exists because today's OnFail
 doesn't) — the Plan buffer surface. Port from current code: the
@@ -261,8 +261,8 @@ with-Plan / without-Plan handler shapes; `backoff.go` is a
 deliberate per-module copy (D34).
 
 *Exit (M4b):* semantic core of `flow_test.go` green against the new engine —
-sequential spawn chains, fan-out + barrier (map-as-pattern), signals including
-signal-before-spawn, cancel, `on_fail` receiving the failed job's name, error
+sequential step chains, fan-out + barrier (map-as-pattern), signals including
+signal-before-step, cancel, `on_fail` receiving the failed job's name, error
 and input, dedup, output resolution — plus 03 §11's list (the `failing`
 lifecycle, lease-repair idempotence under racing claims, the remaining
 formula's barrier phases); the **wide-map stress test** — hundreds of siblings

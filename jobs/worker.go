@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ugent-library/catbird/internal/claimloop"
 )
@@ -28,14 +29,15 @@ const (
 
 // Worker claims and executes steps: register a handler per job with
 // Handle, then Start. Which queues the worker claims is read from cb_jobs
-// at startup — the routing authority steps are stamped from.
+// at startup — the same routing authority that steps are stamped from.
 type Worker struct {
-	pool     *pgxpool.Pool
-	name     string
-	logger   *slog.Logger
-	handlers map[string]handlerFunc
-	queues   []string
-	err      error
+	pool        *pgxpool.Pool
+	name        string
+	logger      *slog.Logger
+	handlers    map[string]handlerFunc
+	queues      []string
+	definedJobs map[string]bool
+	err         error
 }
 
 func NewWorker(pool *pgxpool.Pool) *Worker {
@@ -48,14 +50,13 @@ func NewWorker(pool *pgxpool.Pool) *Worker {
 }
 
 // Handle registers the handler for a job. fn must have signature
-// func(ctx context.Context, in In) (Out, error); a wrong shape surfaces as
+// func(context.Context, In) error or (Out, error), with an optional
+// *jobs.Plan parameter before In — four shapes; a wrong shape surfaces as
 // an error from Start.
 func (w *Worker) Handle(job string, fn any) {
 	h, err := newHandler(fn)
 	if err != nil {
-		if w.err == nil {
-			w.err = fmt.Errorf("catbird: job %s: %w", job, err)
-		}
+		w.err = errors.Join(w.err, fmt.Errorf("catbird: job %s: %w", job, err))
 		return
 	}
 	w.handlers[job] = h
@@ -79,6 +80,9 @@ func (w *Worker) Start(ctx context.Context) error {
 		return err
 	}
 	w.queues = queues
+	if err := w.readDefinedJobs(ctx); err != nil {
+		return err
+	}
 
 	var schema string
 	if err := w.pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
@@ -173,6 +177,55 @@ func (w *Worker) readQueues(ctx context.Context) ([]string, error) {
 			strings.Join(queues, ", "), strings.Join(unhandled, ", "))
 	}
 	return queues, nil
+}
+
+// readDefinedJobs snapshots the defined job names for Plan.Step's check.
+// A job defined after this worker started is looked up on first use
+// (jobDefined) instead.
+func (w *Worker) readDefinedJobs(ctx context.Context) error {
+	rows, err := w.pool.Query(ctx, `SELECT j.name FROM cb_jobs j`)
+	if err != nil {
+		return err
+	}
+	names, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	w.definedJobs = make(map[string]bool, len(names))
+	for _, n := range names {
+		w.definedJobs[n] = true
+	}
+	return nil
+}
+
+// jobDefined is Plan.Step's check that a step names a declared job. A
+// name outside the startup snapshot is asked of the database — the job
+// may have been defined since. When that lookup itself fails the answer
+// is yes: cb_job_complete enforces the same rule and is the authority.
+// Only the running handler calls this, so the map needs no lock.
+func (w *Worker) jobDefined(ctx context.Context, name string) bool {
+	if w.definedJobs[name] {
+		return true
+	}
+	var exists bool
+	if err := w.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT FROM cb_jobs j WHERE j.name = $1)`, name).Scan(&exists); err != nil {
+		return true
+	}
+	if exists {
+		w.definedJobs[name] = true
+	}
+	return exists
+}
+
+func (w *Worker) newPlan(ctx context.Context, runID int64, signalInput json.RawMessage) *Plan {
+	return &Plan{
+		ctx:         ctx,
+		conn:        w.pool,
+		runID:       runID,
+		signalInput: signalInput,
+		defined:     w.jobDefined,
+	}
 }
 
 type claimedStep struct {
@@ -287,11 +340,11 @@ func (w *Worker) processClaim(ctx context.Context) (bool, error) {
 		}
 
 		var name *string
-		var input, signal json.RawMessage
+		var input, signalInput json.RawMessage
 		var attempt *int
 		if err := w.pool.QueryRow(ctx,
-			`SELECT s.name, s.input, s.signal, s.attempt FROM cb_job_start($1, $2, $3) s`,
-			s.RunID, s.StepID, w.name).Scan(&name, &input, &signal, &attempt); err != nil {
+			`SELECT s.name, s.input, s.signal_input, s.attempt FROM cb_job_start($1, $2, $3) s`,
+			s.RunID, s.StepID, w.name).Scan(&name, &input, &signalInput, &attempt); err != nil {
 			releaseFrom(i)
 			return true, wrapErr(err)
 		}
@@ -300,9 +353,9 @@ func (w *Worker) processClaim(ctx context.Context) (bool, error) {
 			delete(held, k)
 			continue
 		}
-		_ = signal // the payload of a signal-gated step; arrives with M4b
 
 		var output json.RawMessage
+		var plan *Plan
 		verdict, err := claimloop.Handle(ctx, ttl/2,
 			func() (bool, error) { return extendAll(k) },
 			func(elapsed time.Duration) {
@@ -311,8 +364,9 @@ func (w *Worker) processClaim(ctx context.Context) (bool, error) {
 					"elapsed", elapsed)
 			},
 			func(hctx context.Context) error {
+				plan = w.newPlan(hctx, s.RunID, signalInput)
 				var herr error
-				output, herr = handle(hctx, input)
+				output, herr = handle(hctx, plan, input)
 				return herr
 			})
 
@@ -330,14 +384,14 @@ func (w *Worker) processClaim(ctx context.Context) (bool, error) {
 			// the lease, and the attempt row records why
 			rctx := context.WithoutCancel(ctx)
 			if verdict == nil {
-				_ = w.complete(rctx, s, *attempt, output)
+				_ = w.complete(rctx, s, *attempt, output, plan)
 			} else {
-				_ = w.fail(rctx, s, *attempt, shutdownError(verdict))
+				_ = w.fail(rctx, s, *attempt, shutdownMessage(verdict))
 			}
 			releaseFrom(i + 1)
 			return true, ctx.Err()
 		case verdict == nil:
-			if err := w.complete(ctx, s, *attempt, output); err != nil {
+			if err := w.complete(ctx, s, *attempt, output, plan); err != nil {
 				releaseFrom(i + 1)
 				return true, err
 			}
@@ -351,11 +405,52 @@ func (w *Worker) processClaim(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-func (w *Worker) complete(ctx context.Context, s claimedStep, attempt int, output json.RawMessage) error {
+// complete reports the successful attempt, with the steps and run output
+// the Plan buffered. When the engine refuses a buffered step, the refusal
+// is the handler's own bug: it is recorded through cb_job_fail like any
+// handler error, so the normal attempt budget applies.
+func (w *Worker) complete(ctx context.Context, s claimedStep, attempt int, output json.RawMessage, p *Plan) error {
+	var steps, runOutput json.RawMessage
+	if p != nil {
+		if len(p.steps) > 0 {
+			b, err := json.Marshal(p.steps)
+			if err != nil {
+				return err
+			}
+			steps = b
+		}
+		runOutput = p.runOutput
+	}
 	var applied bool
-	err := w.pool.QueryRow(ctx, `SELECT cb_job_complete($1, $2, $3, $4)`,
-		s.RunID, s.StepID, attempt, output).Scan(&applied)
-	return wrapErr(err)
+	err := wrapErr(w.pool.QueryRow(ctx, `SELECT cb_job_complete($1, $2, $3, $4, $5, $6)`,
+		s.RunID, s.StepID, attempt, output, steps, runOutput).Scan(&applied))
+	if msg, ok := invalidStep(err); ok {
+		return w.fail(ctx, s, attempt, msg)
+	}
+	return err
+}
+
+// invalidStep reports whether the completion failed because a step the
+// handler added was invalid — it names an undefined job, misses a wait
+// key, or reuses the name of a still-unresolved signal-waiting step — and
+// gives the message to record on the attempt.
+func invalidStep(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	if errors.Is(err, ErrInvalid) || errors.Is(err, ErrNotDefined) {
+		return err.Error(), true
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" &&
+		pgErr.ConstraintName == "cb_job_steps_signal_name_idx" {
+		msg := "catbird: a signal-waiting step with this name is already unresolved in this run"
+		if pgErr.Detail != "" {
+			msg += " (" + pgErr.Detail + ")"
+		}
+		return msg, true
+	}
+	return "", false
 }
 
 func (w *Worker) fail(ctx context.Context, s claimedStep, attempt int, errMsg string) error {
@@ -365,10 +460,10 @@ func (w *Worker) fail(ctx context.Context, s claimedStep, attempt int, errMsg st
 	return wrapErr(err)
 }
 
-// shutdownError words the verdict of a handler that ended during shutdown:
-// one that stopped because its context was canceled failed by the
-// worker's hand, not its own.
-func shutdownError(verdict error) string {
+// shutdownMessage words the verdict of a handler that ended during
+// shutdown: one that stopped because its context was canceled failed by
+// the worker's hand, not its own.
+func shutdownMessage(verdict error) string {
 	if errors.Is(verdict, context.Canceled) {
 		return "catbird: worker shutdown"
 	}
