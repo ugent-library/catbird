@@ -31,6 +31,10 @@ var (
 	ErrNotFound    = errors.New("catbird: not found")
 	ErrRunFailed   = errors.New("catbird: run failed")
 	ErrRunCanceled = errors.New("catbird: run canceled")
+	// ErrStreamsRequired: the call needs the stream module's schema and it
+	// is not installed in this database. Defining nothing fixes it; run the
+	// stream migrations.
+	ErrStreamsRequired = errors.New("catbird: stream schema required")
 )
 
 // Forever mirrors cb_forever(): a retention with no limit.
@@ -135,6 +139,8 @@ func wrapErr(err error) error {
 		sentinel = ErrInvalid
 	case "IRD02":
 		sentinel = ErrNotDefined
+	case "IRD03":
+		sentinel = ErrStreamsRequired
 	default:
 		return err
 	}

@@ -281,22 +281,27 @@ and the lease contract for real. `docs/sql-api.md` rewritten as the
 normative contract, with the old-vs-new name table for the transition.
 
 **M4c — triggers (D40, D41).** A feature of `jobs/` (03 §8): migration
-`jobs/migrations/00002_trigger.sql` (`cb_triggers`),
+`jobs/migrations/00002_trigger.sql` (`cb_triggers` — name, stream, job; the
+filter lives on the trigger's cursor),
 `cb_trigger_define`/`cb_trigger_delete` with define-time validation (stream
 exists, job declared, filter compiles) and the loud stream-schema-required
-check, the delivery tick (cursor read → `cb_job_run` per match → advance,
-one transaction), `jobs.Trigger` in `Define`.
+check (IRD03), the delivery tick (cursor read → `cb_job_run(job, payload,
+'<trigger>:<pos>')` per match → advance; one transaction per trigger, so a
+stalled trigger never blocks the others), `jobs.DefineTrigger` /
+`jobs.DeleteTrigger`. The stream layer gains
+`cb_stream_define_cursor`/`cb_stream_delete_cursor` in the same pass
+(D26's define-when-first-needed).
 Needs M1 (cursors + filters) and M4a (runs); independent of M4b and M5,
 poll-first like everything else (D17).
 
 *Exit (M4c):* the outbox demo end to end — publish in the app's transaction,
 the trigger creates the job exactly once, the job executes with retries;
-kill the tick mid-batch and the batch rolls back with no duplicate runs; an
-undefined job stalls the trigger loudly at its cursor and delivery resumes
-after the define; `deduplicate` and `start_pos` honored; only
-matching messages deliver; the job schema installs without the stream
-schema, and a trigger define there raises `catbird: stream schema required`
-(03 §11's trigger list).
+kill the tick mid-batch and the batch rolls back with no duplicate runs; a
+deleted job stalls the trigger loudly at its cursor and delivery resumes
+after the define; the run's input equals the payload as published;
+`start_pos` honored; only matching messages deliver; the job schema
+installs without the stream schema, and a trigger define there raises
+`catbird: stream schema required` (03 §11's trigger list).
 
 ## M5 — NOTIFY wake-up, wire + inbox
 
@@ -433,3 +438,11 @@ nothing outside history.
   "patterns, not primitives" list are the two lines most likely to erode under
   porting pressure. The plan documents exist precisely so you notice when you're
   crossing them.
+- **One stalled schedule stalls them all** (M4a as built, noticed while ruling
+  M4c): `_cb_job_run_scheduled` fires every due schedule in one transaction, so
+  a raise from one fire — reachable only by a raw `DELETE` of a still-scheduled
+  job, there is no delete API — rolls back the whole sweep, and every schedule
+  retries and fails each tick until the job is defined again. The failure is
+  loud (the tick logs every interval) and the fix is one define. The trigger
+  tick deliberately delivers per trigger to avoid this shape; align the
+  schedule tick to per-name calls only if this ever bites in practice.

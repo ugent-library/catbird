@@ -386,8 +386,9 @@ contract each sketch must meet.
   raising otherwise — a deploy-time error instead of a runtime "step name
   not declared" on the first run. Define never deletes a queue row (§6).
   The Go side mirrors these one to one — `jobs.Define`, `jobs.DefineQueue`,
-  `jobs.DefineSchedule` — and deploy code calls them in dependency order:
-  queues before the jobs that name them, `on_fail` targets first. Each call
+  `jobs.DefineSchedule`, `jobs.DefineTrigger` — and deploy code calls them
+  in dependency order: queues before the jobs that name them, `on_fail`
+  targets first, triggers after the jobs and streams they bind. Each call
   is atomic and validated on its own, so a deploy that dies mid-way leaves
   a consistent prefix and the next deploy converges the rest; an app that
   wants the whole set to apply together runs the calls in its own
@@ -494,9 +495,9 @@ nothing blocks; the buffer commits with your completion (`cb_job_complete`,
 redelivery replays it cleanly against the step identity (§2).
 
 Declarations mirror the SQL one to one (§4): deploy code calls
-`jobs.Define`, `jobs.DefineQueue` and `jobs.DefineSchedule`, each call the
-whole config — an opts struct whose zero fields mean the stock values,
-never "keep". The worker registers handlers by name (`w.Handle(job, fn)`)
+`jobs.Define`, `jobs.DefineQueue`, `jobs.DefineSchedule` and
+`jobs.DefineTrigger`, each call the whole config — an opts struct whose
+zero fields mean the stock values, never "keep". The worker registers handlers by name (`w.Handle(job, fn)`)
 and reads everything else from `cb_jobs` at startup: which queues to claim
 is routing knowledge, and the database is its authority. The handler
 signature decides everything: a handler that takes a `*jobs.Plan` can add
@@ -617,8 +618,9 @@ arrives beside it — `jobs.SignalInput[T](p)`, NULL until satisfied (§3). Step
 are added at completion, so a parent passes its results forward *in* the
 step input; a barrier, whose siblings' outputs didn't exist when it was
 added, reads them with `StepOutputs`. This is also what `input` and `signal`
-mean in the SQL contract (§7). (A trigger-born run's input is the message
-envelope — the trigger is the caller there, not an exception here, §8.)
+mean in the SQL contract (§7). (A trigger-born run is no exception either:
+its input is the message payload, exactly as published — the publisher is
+the caller there, §8.)
 
 **Validation is layered.** The Go side fails fast where it can: `Step`
 panics on a name not declared — a panic becomes a failed attempt (D27),
@@ -766,49 +768,65 @@ common case declarative — the outbox pattern with zero glue code, which is
 the same-database design's front door.
 
 - **A trigger is a row, not a process**: `cb_triggers (name PK, stream,
-  pattern, condition, job, deduplicate, start_pos, created_at)` — declared
-  whole by `cb_trigger_define` (D26 semantics; `cb_trigger_delete` removes
-  one), validated at define time: the stream exists, the job is declared,
-  the filter compiles (the D29 topic-pattern and condition languages, the
-  same compiler subscriptions and cursors use). Each trigger owns a cursor
-  bearing its filter; `start_pos` seeds it (`tail` | `begin` | position).
-- **Delivery is a tick on the kernel ticker**, per trigger, one
+  job, created_at)` — declared whole by `cb_trigger_define` (D26
+  semantics; `cb_trigger_delete` removes one), validated at define time:
+  the stream exists, the job is declared, the filter compiles (the D29
+  topic-pattern and condition languages, the same compiler subscriptions
+  and cursors use). The trigger owns the cursor named after it on its
+  stream, and that cursor is the filter's single home — source text and
+  compiled form together, kept true on every redeclare through
+  `cb_stream_define_cursor`; the trigger row stores no copy that could
+  drift. `start_pos` is a define parameter, not a column — the one
+  deliberate poke at the cursor's position, exactly
+  `cb_job_define_schedule.start_at`: 0 delivers the stream from the
+  beginning, N from after N, NULL at create starts at the tail, NULL on
+  redeclare keeps the position.
+- **Delivery is a tick on the module's ticker**, per trigger, one
   transaction: read the cursor's next batch of matching messages, call
-  `cb_job_run(job, envelope, key)` per message, advance the cursor.
-  Exactly-once event→job creation by cursor semantics — the composition
-  rule made mechanical. No deployed consumer code, and cross-language by
-  construction: a Python-only shop declares triggers through SQL and gets
-  outbox-triggered jobs without writing a consumer loop.
-- **The input is the envelope whole** — `{stream, position, topic, key,
-  headers, payload}` — the engine-supplies-it rule (§5): when the engine
-  builds an input, it is self-describing. Handlers read `.payload`.
-- **Every match births one run** by default: the dedup key is
-  `<trigger>:<position>`, so creation stays idempotent even across a
-  cursor reset. `jobs.Deduplicate()` (column `deduplicate`, default false)
-  collapses instead: messages sharing a publish key create one run within
-  the dedup window — right for "reindex record X" where fifty updates
-  deserve one pending job, wrong for "send confirmation" where every event
-  matters; keyless messages still get one run each. The surprise that
-  makes it opt-in: the dedup window is the run's retention, so a
-  terminal-but-retained run swallows later same-key events —
-  deduplicating triggers want short-retention jobs.
+  `cb_job_run(job, payload, key)` per message, advance the cursor
+  (`_cb_job_run_triggered`; the Go tick calls it once per trigger row, so
+  a stalled trigger never blocks the others). Exactly-once event→job
+  creation by cursor semantics — the composition rule made mechanical. No
+  deployed consumer code, and cross-language by construction: a
+  Python-only shop declares triggers through SQL and gets outbox-triggered
+  jobs without writing a consumer loop.
+- **The input is the message payload, exactly as published.** The engine
+  passes app-authored input through verbatim — the publisher authors a
+  triggered run's input the way a caller authors `cb_job_run`'s and a
+  schedule its declared `input` — and synthesizes one only where none
+  exists (`on_fail`, §5). Provenance does not ride the input: the run key
+  records it, and a handler needing the event's own fields wants them in
+  the payload, where every caller can supply them.
+- **Every match births one run**: the run key is `<trigger>:<position>`,
+  so creation stays idempotent even across a cursor reset. A bare suffix
+  is always a position; a later key kind must name itself (`:key:` is
+  reserved), so no future format can collide with position keys. There is
+  deliberately no burst-collapse option here: collapsing same-key events
+  belongs to the stream layer — keep-newest coalescing in pending (D5),
+  beside the delay and dedup machinery it composes with — not to run
+  creation, whose only dedup window (run retention) answers a different
+  question.
 - **Failure is loud and ordered.** Run creation can only fail
-  deterministically (job undefined, invalid input), and a raise rolls back
-  the batch and stalls the trigger at its cursor — visible lag, no silent
-  skips, fixed by a define or a deploy. Execution failures are the job's
-  own retry / `on_fail` story; the trigger never learns of them.
-  Backpressure is the pool's problem by design: a burst of events becomes a
-  burst of queued steps, paced by §6.
+  deterministically (the job's row deleted, invalid input), and a raise
+  rolls back the batch and stalls the trigger at its cursor — visible
+  lag, the tick logs it every interval, no silent skips, fixed by a
+  define or a deploy. Execution failures are the job's own retry /
+  `on_fail` story; the trigger never learns of them. Backpressure is the
+  pool's problem by design: a burst of events becomes a burst of queued
+  steps, paced by §6.
 - **Packaging**: a feature of this module, not a module of its own (D41).
   `cb_triggers` and the trigger functions live in job's migrations —
   PL/pgSQL bodies are late-bound, so the job schema installs cleanly
   without the stream schema present — and `cb_trigger_define` and the
-  delivery tick raise `catbird: stream schema required` at use. The
-  composition is one-directional and recorded: job's SQL calls stream's
-  public SQL API (cursor read and advance), never the reverse, and the Go
-  dependency rule stands untouched. Declared with the jobs it feeds:
-  `jobs.DefineTrigger(ctx, conn, name, stream, job, opts...)`, one call per
-  trigger like the other declarations (§5).
+  delivery tick raise `catbird: stream schema required` at use (SQLSTATE
+  `IRD03`, `jobs.ErrStreamsRequired`). The composition is one-directional
+  and recorded: job's SQL calls stream's public SQL API
+  (`cb_stream_define_cursor`, `cb_stream_delete_cursor`,
+  `cb_stream_read`), never the reverse, and the Go dependency rule stands
+  untouched. Declared with the jobs it feeds:
+  `jobs.DefineTrigger(ctx, conn, name, stream, job, opts...)`, one call
+  per trigger like the other declarations (§5); `jobs.DeleteTrigger`
+  removes one.
 
 The outbox example, end to end: the application publishes `order.created`
 in its own transaction — the log *is* the outbox, that's what transactional
@@ -903,9 +921,14 @@ new steps, barriers, signals, `on_fail`; M4c = triggers). The build items:
    combining the two waits and the run-wide barrier rule (§3) — the two
    places a reader's intuition is most likely wrong.
 7. M4c — triggers (§8, D41): migration `jobs/migrations/00002_trigger.sql`
-   (`cb_triggers`), `cb_trigger_define` / `cb_trigger_delete` — define-time
-   validation plus the loud stream-schema-required check — the delivery
-   tick on the module's ticker, `jobs.Trigger` in `Define`.
+   (`cb_triggers` — name, stream, job; the filter lives on the trigger's
+   cursor), `cb_trigger_define` / `cb_trigger_delete` — define-time
+   validation plus the loud stream-schema-required check (IRD03) — the
+   delivery tick `_cb_job_run_triggered` on the module's ticker, one call
+   per trigger; `jobs.DefineTrigger` / `jobs.DeleteTrigger`, per-call like
+   the other declarations. The stream layer gains
+   `cb_stream_define_cursor` and `cb_stream_delete_cursor` in the same
+   pass (D26's define-when-first-needed, 01 §4).
 8. Tests, the semantic core:
    - dedup + key lookup; duplicate complete/fail no-ops (the checks).
    - give-up from both roads — the exact inequalities: a verdict at
@@ -965,10 +988,10 @@ new steps, barriers, signals, `on_fail`; M4c = triggers). The build items:
    - cancel during a retry gap (step queued with future `claimable_at` →
      canceled, never claimed).
    - triggers (M4c): exactly-once creation — kill the tick mid-batch, the
-     batch rolls back, no duplicate runs; an undefined job stalls the
+     batch rolls back, no duplicate runs; a deleted job stalls the
      trigger loudly at its cursor and delivery resumes after the define;
-     the position key stays idempotent across a cursor reset; message-key
-     deduplication creates one run for N same-key messages; `start_pos`
+     the position key stays idempotent across a cursor reset; the run's
+     input equals the payload as published; `start_pos`
      honored; only matching messages deliver; the job schema installs
      without the stream schema, and `cb_trigger_define` there raises
      `catbird: stream schema required` (D41).

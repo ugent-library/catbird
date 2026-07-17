@@ -377,6 +377,90 @@ END; $$;
 -- +goose statementend
 
 -- +goose statementbegin
+-- Declares a cursor whole: creating and updating are the same call, an
+-- identical declaration writes nothing. The filter (topic, condition) is
+-- the cursor's config and is recompiled when it changes; pos is reading
+-- state and stays put — start_pos, when given, sets it deliberately.
+-- When creating, NULL start_pos means the stream's tail. Unlike
+-- cb_stream_ensure_cursor, whose start_pos applies at birth only, this
+-- start_pos repositions an existing cursor every time it is given.
+CREATE FUNCTION cb_stream_define_cursor(
+    stream text,
+    cursor text,
+    start_pos bigint DEFAULT NULL,
+    topic text DEFAULT NULL,
+    condition text DEFAULT NULL
+)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    _start bigint;
+    _topic_re text;
+    _headers_cond jsonpath;
+    _payload_cond jsonpath;
+BEGIN
+    IF NOT cb_valid_name(cb_stream_define_cursor.cursor) THEN
+        RAISE EXCEPTION 'catbird: invalid cursor name %; use [a-z][a-z0-9_]*, max 20 bytes',
+            cb_stream_define_cursor.cursor USING ERRCODE = 'IRD01';
+    END IF;
+    IF NOT cb_valid_name(cb_stream_define_cursor.stream) THEN
+        RAISE EXCEPTION 'catbird: invalid stream name %; use [a-z][a-z0-9_]*, max 20 bytes',
+            cb_stream_define_cursor.stream USING ERRCODE = 'IRD01';
+    END IF;
+
+    -- NULL start = tail: skip everything already in the stream.
+    SELECT coalesce(cb_stream_define_cursor.start_pos, s.last_pos)
+    INTO _start FROM cb_streams s WHERE s.name = cb_stream_define_cursor.stream;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'catbird: stream % not defined',
+            cb_stream_define_cursor.stream USING ERRCODE = 'IRD02';
+    END IF;
+
+    IF cb_stream_define_cursor.topic IS NOT NULL THEN
+        _topic_re := _cb_stream_compile_topic(cb_stream_define_cursor.topic);
+    END IF;
+    IF cb_stream_define_cursor.condition IS NOT NULL THEN
+        SELECT c.headers_condition, c.payload_condition INTO _headers_cond, _payload_cond
+        FROM _cb_stream_compile_condition(cb_stream_define_cursor.condition) c;
+    END IF;
+
+    INSERT INTO cb_stream_cursors AS c
+        (stream, name, pos, topic, topic_regex, condition, headers_condition, payload_condition)
+    VALUES (cb_stream_define_cursor.stream, cb_stream_define_cursor.cursor, _start,
+            cb_stream_define_cursor.topic, _topic_re,
+            cb_stream_define_cursor.condition, _headers_cond, _payload_cond)
+    ON CONFLICT ON CONSTRAINT cb_stream_cursors_pkey DO UPDATE
+    SET topic             = excluded.topic,
+        topic_regex       = excluded.topic_regex,
+        condition         = excluded.condition,
+        headers_condition = excluded.headers_condition,
+        payload_condition = excluded.payload_condition,
+        pos = CASE WHEN cb_stream_define_cursor.start_pos IS NOT NULL
+                   THEN cb_stream_define_cursor.start_pos
+                   ELSE c.pos END
+    -- an identical declaration writes nothing; comparing the source text
+    -- covers the compiled columns, which are functions of it
+    WHERE (c.topic, c.condition) IS DISTINCT FROM (excluded.topic, excluded.condition)
+       OR cb_stream_define_cursor.start_pos IS NOT NULL;
+END; $$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- Removes a cursor. Reports whether one existed; deleting a missing
+-- cursor is a no-op.
+CREATE FUNCTION cb_stream_delete_cursor(stream text, cursor text)
+RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE
+    _found boolean;
+BEGIN
+    DELETE FROM cb_stream_cursors c
+    WHERE c.stream = cb_stream_delete_cursor.stream
+      AND c.name = cb_stream_delete_cursor.cursor
+    RETURNING true INTO _found;
+    RETURN coalesce(_found, false);
+END; $$;
+-- +goose statementend
+
+-- +goose statementbegin
 CREATE FUNCTION cb_stream_ensure_subscription(
     stream         text,
     subscription          text,
@@ -1519,6 +1603,8 @@ DROP FUNCTION cb_stream_extend_claim(text, text, text, bigint, interval);
 DROP FUNCTION cb_stream_claim(text, text, text, interval);
 DROP FUNCTION _cb_stream_retry(cb_stream_claims);
 DROP FUNCTION cb_stream_ensure_subscription(text, text, bigint, interval, int, cb_backoff_kind, interval, interval, cb_fail_policy, int, text, text);
+DROP FUNCTION cb_stream_delete_cursor(text, text);
+DROP FUNCTION cb_stream_define_cursor(text, text, bigint, text, text);
 DROP FUNCTION cb_stream_ensure_cursor(text, text, bigint, text, text);
 DROP FUNCTION cb_stream_read_claim(text, text, bigint, bigint);
 DROP FUNCTION cb_stream_read(text, text, int);

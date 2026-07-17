@@ -203,7 +203,7 @@ CREATE TABLE cb_job_signals (
 -- only 'queued' and 'started' rows, so finished steps drop out of it.
 --
 -- Errors. SQLSTATE IRD01: the call is invalid. IRD02: a named object
--- does not exist.
+-- does not exist. IRD03: a required module is not installed.
 
 -- +goose statementbegin
 -- Declares a pool and all its terms in one call. An argument that is not

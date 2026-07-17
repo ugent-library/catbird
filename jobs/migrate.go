@@ -9,7 +9,7 @@ import (
 	"github.com/ugent-library/catbird/internal/migrate"
 )
 
-const SchemaVersion = 1
+const SchemaVersion = 2
 const migrationsTable = "cb_job_migrations"
 
 //go:embed migrations/*.sql

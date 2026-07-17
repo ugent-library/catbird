@@ -127,3 +127,49 @@ func DeleteSchedule(ctx context.Context, conn Conn, name string) (bool, error) {
 	err := conn.QueryRow(ctx, `SELECT cb_job_delete_schedule($1)`, name).Scan(&deleted)
 	return deleted, wrapErr(err)
 }
+
+// TriggerOpts tune a trigger: a zero field means the default.
+type TriggerOpts struct {
+	// Topic: which topics deliver, applied server-side. '*' matches one
+	// segment, '#' zero or more trailing segments. "" delivers every topic.
+	Topic string
+	// Condition: AND-only expression over message headers and payload,
+	// compiled at define time. MVP forms: exists($.payload.a.b),
+	// $.headers.a.b == <scalar>.
+	Condition string
+	// StartPos: where a new trigger begins; everything at or below it is
+	// skipped. nil starts at the stream's tail, At(0) delivers the stream
+	// from the beginning. On an existing trigger nil keeps the position
+	// and a value repositions it.
+	StartPos *int64
+}
+
+// At names a stream position for TriggerOpts.StartPos.
+func At(pos int64) *int64 { return &pos }
+
+// DefineTrigger declares that every matching message on a stream creates a
+// run of a job, mirroring cb_trigger_define: creating and updating are the
+// same call, and an identical declaration writes nothing. The job and the
+// stream must be defined first, and the module's tick (StartTicker)
+// delivers. The run's input is the message payload, exactly as published;
+// its key is the trigger's name and the message's position, so creation is
+// exactly-once. The trigger owns the cursor named after it on its stream.
+// Without the stream schema installed this returns ErrStreamsRequired.
+func DefineTrigger(ctx context.Context, conn Conn, name, stream, job string, opts ...TriggerOpts) error {
+	var o TriggerOpts
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+	_, err := conn.Exec(ctx,
+		`SELECT cb_trigger_define($1, $2, $3, $4, $5, $6)`,
+		name, stream, job, nullText(o.Topic), nullText(o.Condition), o.StartPos)
+	return wrapErr(err)
+}
+
+// DeleteTrigger removes a trigger and its cursor. It reports whether one
+// existed; deleting a missing trigger is a no-op.
+func DeleteTrigger(ctx context.Context, conn Conn, name string) (bool, error) {
+	var deleted bool
+	err := conn.QueryRow(ctx, `SELECT cb_trigger_delete($1)`, name).Scan(&deleted)
+	return deleted, wrapErr(err)
+}

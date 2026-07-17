@@ -342,6 +342,18 @@ cursor advances over skipped rows, and claims tile positions regardless of
 matches. There is no consumer-targeting predicate at all: retries live in
 per-subscription rows (D35), so ownership is a column, not a filter.
 
+Cursors have all three verbs. `cb_stream_ensure_cursor` births: initial
+filter and start, never modifying an existing cursor, so a booting fleet is
+safe and its `start_pos` means "if new". `cb_stream_define_cursor` declares
+the whole config: the filter recompiles when its source text changes, the
+position stays put, and `start_pos` — when given — repositions
+deliberately, on every call. `cb_stream_delete_cursor` removes one. Define
+and delete arrived with the job module's trigger (03 §8), the
+define-when-first-needed moment D26 recorded: the trigger owns the cursor
+named after it and keeps its filter true through these two functions. Both
+verbs stay because their start semantics genuinely differ — a birth seed
+versus a deliberate poke.
+
 Freshness is also a per-consumer policy, not a message property. A handler that
 doesn't want old messages skips anything whose `created_at` is older than its own
 tolerance — one line. Different consumers can differ: the same message may be
@@ -1054,6 +1066,37 @@ per touched stream. `_cb_stream_deliver_pending` owes three things per delivered
 message: swap the dedup ref from `pending` to the delivered message, notify the
 assigner, and fire the stream's wire notify. Delivery *is* the append, so the
 notifies move with it.
+
+### Deferred: pending merged into the log, keys as a unique index
+
+`cb_stream_keys` has one job no unique index over the row tables could do:
+the claim spans the pending/message split, because a keyed waiting message
+owns its key before it is a message. If waiting messages lived in
+`cb_stream_messages` itself — a `deliver_at` column and the pending row's
+`key` column move in, the assigner skips rows not yet due — one unique index
+on `(stream, key)` (legal on the partitioned table: the partition key is
+among the index columns) would be the whole dedup mechanism:
+one uniqueness home, a window that is exactly the row's lifetime so the
+key-row/message-row prune skew dies, and `cb_stream_keys`,
+`_cb_stream_prune_keys`, the `ref_kind` flip and the `ref_created_at` bump
+all deleted. An investigation, not a design — what it must answer first:
+
+- the assigner scans `pos IS NULL`; every waiting message would sit in that
+  scan for its whole delay, re-read on every pass;
+- retention needs an answer for rows that have not delivered yet — pruning
+  by `created_at` would delete a message delayed past its stream's retention
+  before it ever delivers (today waiting rows are exempt by living in
+  another table);
+- the dedup window would start at publish, not delivery — today the
+  `ref_created_at` bump gives a delayed message its full window as a
+  message;
+- publish keeps the claim-or-learn construction either way (`WHERE FALSE` +
+  `UNION ALL` against the index), so publish itself gets no simpler.
+
+Parked rather than scheduled because what it would delete is small and
+self-contained — publish claims, delivery flips, the janitor prunes, nothing
+else touches the table. Worth opening only when the pending path is being
+reworked for its own reasons.
 
 ## 9. Dead letters are dead rows (D36, supersedes D6)
 

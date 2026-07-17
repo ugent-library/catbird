@@ -35,7 +35,14 @@ and retry terms (`cb_job_queues`). A job routes to one pool
 row, so a bare install works; every other pool is declared, and `default`
 itself is redeclarable like any pool.
 
-Names — jobs, queues, schedules — match `[a-z][a-z0-9_]*`, at most 20 bytes.
+A **trigger** (`cb_triggers`) turns events into work: every message on a
+stream that matches its filter creates one run of a job, delivered by the
+module's tick. It is the one feature that reads the stream module's schema
+and it refuses loudly without it; everything else here installs and runs
+with the job schema alone.
+
+Names — jobs, queues, schedules, triggers — match `[a-z][a-z0-9_]*`, at
+most 20 bytes.
 
 ## Rules shared by every function
 
@@ -64,8 +71,10 @@ payload is the step's `claimable_at` as an RFC 3339 UTC timestamp.
 reaches `completed`, `failed` or `canceled`. The claim index covers only
 `queued` and `started` rows, so finished steps drop out of it.
 
-**Errors.** Error texts start with `catbird:`. Two SQLSTATEs: `IRD01` means
-the call is invalid, `IRD02` means a named object does not exist.
+**Errors.** Error texts start with `catbird:`. Three SQLSTATEs: `IRD01`
+means the call is invalid, `IRD02` means a named object does not exist,
+`IRD03` means a required module is not installed (today: the trigger
+functions without the stream schema).
 
 ## The worker contract
 
@@ -372,6 +381,47 @@ Deletes a schedule. Returns false when there was none. (Schedules get a
 delete because a forgotten one keeps creating runs; the other declarations
 are inert when unused.)
 
+### cb_trigger_define
+
+```sql
+cb_trigger_define(name text, stream text, job text,
+                  topic text DEFAULT NULL, condition text DEFAULT NULL,
+                  start_pos bigint DEFAULT NULL)
+    RETURNS void
+```
+
+Declares a trigger in one call: every message on `stream` that matches the
+filter creates one run of `job`. Creating and updating are the same call,
+and an identical declaration writes nothing. Needs the stream module's
+schema in the same database — without it the call raises `IRD03`
+(`catbird: stream schema required`); a broken declaration is refused here,
+not discovered by the tick: `IRD02` when the job or the stream is not
+defined, `IRD01` when the filter does not compile.
+
+The filter — a `topic` pattern and a `condition`, the same languages
+cursors and subscriptions use — is stored on the cursor the trigger owns:
+the row in `cb_stream_cursors` named exactly like the trigger, on its
+stream. That cursor is the filter's single home and remembers how far
+delivery got. A redeclared filter is recompiled there; the position stays
+put. `start_pos`, when given, sets the position deliberately: 0 delivers
+the stream from the beginning, N from after N; when creating, NULL starts
+at the tail — only messages published from now on deliver.
+
+The run a match creates gets the message payload as its input, exactly as
+published — a job has one input shape no matter who creates the run — and
+`<trigger name>:<stream position>` as its key, so creation is exactly-once
+even if the batch is replayed.
+
+### cb_trigger_delete
+
+```sql
+cb_trigger_delete(name text) RETURNS boolean
+```
+
+Removes the trigger and its cursor. Returns false when there was none.
+Matches still sitting between the cursor and the stream's head are gone
+with it — the trigger is its cursor's only reader.
+
 ### cb_job_run
 
 ```sql
@@ -441,12 +491,12 @@ start no longer counts.
 
 ## The module's tick
 
-The two functions below are engine-internal (the underscore prefix): the
+The functions below are engine-internal (the underscore prefix): the
 module's ticker (`jobs.StartTicker` in Go) calls them on an interval, and a
 thin client without the Go package schedules them itself — pg_cron, a cron
 job, any loop. Running the tick from several processes is safe: `FOR
 UPDATE SKIP LOCKED` decides who does the work. Without a tick, on-demand
-runs keep working; only scheduled runs and pruning pause.
+runs keep working; only scheduled runs, triggers and pruning pause.
 
 ### _cb_job_run_scheduled
 
@@ -458,6 +508,26 @@ Fires due schedules: each due row creates runs via `cb_job_run` and
 re-arms, in this one transaction — so a slot fires exactly once no matter
 how many processes tick. Runs are created without a key: every fired slot
 is its own run. Returns the number of runs created.
+
+### _cb_job_run_triggered
+
+```sql
+_cb_job_run_triggered(trigger text, batch_size int DEFAULT 100) RETURNS int
+```
+
+Delivers one trigger's next batch: read the matching messages after the
+trigger's cursor, create one run per message, advance the cursor — one
+transaction, so a raise rolls the whole batch back and the trigger stalls
+at its cursor with nothing half-done. Creation can only fail
+deterministically (the job's row deleted, an input refused); the tick logs
+the error every interval and delivery resumes when a define fixes the
+cause — the run keys make even a replayed batch idempotent. Returns how
+many messages delivered.
+
+The tick calls it once per `cb_triggers` row, so a stalled trigger never
+blocks the others. The trigger row is locked `FOR UPDATE SKIP LOCKED`: one
+deliverer per trigger, and a concurrent tick skips instead of queueing.
+Raises `IRD03` when the stream schema is absent.
 
 ### _cb_job_prune_runs
 
