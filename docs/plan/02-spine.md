@@ -127,17 +127,26 @@ became engine code.
 
 ## 5. The ephemeral path (wire)
 
-Unchanged in principle from the original chapter. wire never touches storage.
-Every append fires `pg_notify` on a channel named after its stream, inside the
-transaction; Postgres delivers on commit, so push-only-on-commit is free. wire
-subscribes to the channels of the streams it cares about — domain streams like
-`records`, not a well-known bus. The notify follows the *actual* append: a
-delayed publish notifies when due (`_cb_stream_deliver_pending`), a
-dedup-skipped publish not at all. NOTIFY deduplicates identical (channel,
-payload) pairs per transaction, so batch publishes cost one notification per
-distinct topic. The kernel's notifier holds the one LISTEN connection per
-process and fans out to in-process subscribers (04); it arrives at M5 (D17).
-Payloads above the 8000-byte NOTIFY limit send topic-only; wire re-pulls state.
+wire never touches storage, and it does not read the log. Browser-bound events
+arrive whole on wire's own bus channel (`cbw`), sent by `cb_wire_notify` /
+`wire.Notify` — callable inside the app's transaction, and Postgres delivers
+NOTIFY on commit, so push-only-on-commit is free. The payload must fit
+NOTIFY's 8000-byte limit: send a pointer to state, not the state (the
+function's documented contract; a storage-free path has nothing to re-pull).
+
+The stream channels are wakes, not transport: `cbs_<stream>` carries only the
+topic, follows the *actual* append (a delayed publish notifies when due, a
+dedup-skipped publish not at all), and NOTIFY deduplicates identical
+(channel, payload) pairs per transaction, so batch publishes cost one
+notification per distinct topic. Stream traffic therefore reaches browsers
+through a consumer: a subscription or cursor handler holds the full message
+and calls `wire.Notify` — or `wire.NotifyDurable` for the inbox — exactly the
+vision's "a cursor plus a function". The earlier design here — wire
+subscribing to `cbs_*` directly and re-pulling state — is dead: it re-invents
+a consumer inside wire without a cursor's guarantees (D45, 04).
+
+The shared notifier holds the one LISTEN connection per process and fans out
+to in-process subscribers (04); it arrives at M5 (D17).
 
 ## 6. What died, and what would revive it
 

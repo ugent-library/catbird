@@ -313,7 +313,7 @@ The shared notifier arrives here: one shared implementation in a public
 apps construct it and pass it to each consume loop and ticker the way
 they pass a pool. It holds one LISTEN connection, applies LISTEN and
 UNLISTEN on it live as subscribers come and go (consume loops start at
-different times, and wire subscribes per SSE topic at runtime), and
+different times, and wire's own Start may follow the notifier's), and
 hands each notification's raw (channel, payload) to that channel's
 subscribers. Consumers with per-object channel sets — the worker's
 queues, the assigner's and the trigger tick's streams — read them once
@@ -322,7 +322,8 @@ so an object defined while a process runs is served by that process's
 poll until it restarts. Parsing stays at the subscriber, because
 the payload dialects differ: `cbq_*` and `cb_tick` carry a due
 timestamp, `cbs_*` a topic, `cbj_*` a `<run_id>:<status>` run-terminal
-event, `cb_failed` a `<stream>.<subscription>` pair — a fan-out that
+event, `cb_failed` a `<stream>.<subscription>` pair, and wire's two arrive
+here: `cbw` the event JSON, `cbw_inbox` an identity — a fan-out that
 dropped payloads could serve the claim loops but never wire. The wake
 seams it feeds: `claimloop.Options.Wake` (in place since M4a) and a
 third select case the ticker gains here — M0's exit deferred that seam
@@ -346,13 +347,17 @@ poll-paced — accepted, no new SQL for them. Second, the **jobs half**:
 workers have listened on `cbq_*` since M4a through the transitional
 listener — M5 moves them onto the shared notifier — and `WaitForOutput`
 stays polling (its audience is CLIs, scripts and tests; the latency
-customers of `cbj_*` are wire and the dashboard). Third, **wire** (04):
-SSE onto the notifier, inbox `read_at`/`MarkRead`, retention tiers,
-`NotifyDurable`. Inbox rows are written explicitly by handlers holding
+customers of `cbj_*` are wire and the dashboard). Third, **wire** (04): a module —
+`cb_wire_*` SQL and its own channels, colliding with none of the old
+schema's live names — SSE onto the notifier behind wire's own dispatch
+goroutine, inbox `read_at`/`MarkRead`, retention tiers, `NotifyDurable`
+with the identity-addressed nudge; presence and `collapse_key` do not
+port, no customer (04 §2–§3). Inbox rows are written explicitly by handlers holding
 the identity (D29 confirmed the old suspicion: interpolated identities
 were data all along) — no relay kind, no `identity_from`.
 
-*Exit:* ported `wire_test.go`/`notifications_test.go` green; new seen/read and
+*Exit:* ported `wire_test.go`/`notifications_test.go` green (presence and
+collapse tests retire with their features); new seen/read and
 retention tests; 04 §5's failure pair — a rolled-back `NotifyDurable`
 delivers neither row nor nudge, and an offline client catches up via
 poll after missed SSE; **the M1 latency gate re-measured with the accelerator — target
@@ -399,13 +404,13 @@ nothing outside history.
 |---|---|
 | `worker_notifier.go` (the LISTEN machinery — `notifier.go` does not exist; CLAUDE.md is stale), `notify.go` (send helper), wire.go's embedded listener | the LISTEN machinery lives on as the public `notify` package (M5, D17); wire's listener consolidates onto it at M5; originals serve the old worker until deleted at M6 |
 | `jobs/notify.go` (M4a's transitional per-worker listener) | absorbed into the `notify` package at M5 — scaffolding, not worth preserving |
-| `topic_trie.go`, `topic.go` | trie kept for app-side in-process dispatchers (one event against many subscriber rows, webhook-style); the engine's matcher is SQL (D29, M3); `topic.go` retires with the old API (M6) |
+| `topic_trie.go`, `topic.go` | the trie and `matchTopic` are copied into `wire/` at M5 (unexported here; in-process pattern dispatch — the engine's matcher is SQL, D29/M3); the root originals serve the old API until M6 |
 | `migrate.go` | parameterized per module (M0) |
 | `queue.go` + `cb_q_*` SQL | replaced by subscriptions (feed half, M1–M2) and one-step runs (work half, M4 — D37); `Send/Read/Hide/Delete` API retired |
 | `scheduler.go` | dissolved into `cb_stream_schedules` (M2) + `cb_job_schedules` (M4a) + builder sugar |
 | `task.go` reflection, `util.go` | ported into `job` (M4); `backoff.go`'s semantics move to the kernel SQL unit, one implementation for both modules (M4a, D41) |
 | `flow.go`, `worker.go`, `cancel.go`, `complete_early.go` | semantics ported to the row engine (D30–D39); code largely rewritten (M4) — the claim-loop shape and the NOTIFY wake contract are the parts that carry over most directly |
-| `wire.go`, `wire_token.go`, `notifications.go` | ported, extended with read_at (M5) |
+| `wire.go`, `wire_token.go`, `notifications.go` | ported into `wire/` with module-prefixed SQL and channels (`cb_wire_*`, `cbw`, `cbw_inbox`), extended with `read_at` and the inbox nudge; presence and `collapse_key` deferred — no customer (M5, 04) |
 | `circuit_breaker.go` | stays client-side, unchanged |
 | `dashboard/`, `tui/`, `cmd/` | re-pointed at new tables, moved to `cb` module (M6) |
 
