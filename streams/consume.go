@@ -3,17 +3,31 @@ package streams
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ugent-library/catbird/internal/claimloop"
+	"github.com/ugent-library/catbird/notify"
 )
 
 // ConsumeOpts tunes the consume loop. Zero fields mean the defaults.
 type ConsumeOpts struct {
-	BatchSize    int           // 100
-	PollInterval time.Duration // 250ms: how often to look for new messages when caught up
+	BatchSize    int              // 100
+	PollInterval time.Duration    // 250ms: how often to look for new messages when caught up
+	Notifier     *notify.Notifier // wakes the consumer the moment new messages are readable; nil = wake by poll only
+}
+
+// notifyChannel prefixes a channel name with the connection's schema —
+// the SQL notifies on '<schema>.<name>'.
+func notifyChannel(ctx context.Context, pool *pgxpool.Pool, name string) (string, error) {
+	var schema string
+	if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		return "", err
+	}
+	return schema + "." + name, nil
 }
 
 // Consume processes the stream in order: at-least-once, so handlers must be
@@ -32,13 +46,32 @@ func Consume(ctx context.Context, pool *pgxpool.Pool, stream, cursor string,
 	if batchSize <= 0 {
 		batchSize = 100
 	}
-	poll := o.PollInterval
-	if poll <= 0 {
-		poll = 250 * time.Millisecond
+	pollInterval := o.PollInterval
+	if pollInterval <= 0 {
+		pollInterval = 250 * time.Millisecond
+	}
+
+	var wake <-chan struct{}
+	if o.Notifier != nil {
+		channel, err := notifyChannel(ctx, pool, "cbs_"+stream)
+		if err != nil {
+			return err
+		}
+		waker := notify.NewWaker()
+		defer waker.Stop()
+		cancel := o.Notifier.Subscribe(channel, func(string) { waker.Wake() })
+		defer cancel()
+		wake = waker.C
+		slog.Info(fmt.Sprintf("catbird: consumer waking on notify, poll safety net every %s", pollInterval),
+			"stream", stream, "cursor", cursor)
+	} else {
+		slog.Info(fmt.Sprintf("catbird: consumer waking by poll every %s", pollInterval),
+			"stream", stream, "cursor", cursor)
 	}
 
 	return claimloop.Run(ctx, claimloop.Options{
-		Poll: poll,
+		PollInterval: pollInterval,
+		Wake:         wake,
 		// misconfiguration, not a transient failure
 		Fatal: func(err error) bool { return errors.Is(err, ErrNotDefined) },
 	}, func(ctx context.Context) (bool, error) {

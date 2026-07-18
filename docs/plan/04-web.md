@@ -23,9 +23,9 @@ JSON, aimed at server-rendered apps generally. htmx appears in examples only.
 ## 2. Ephemeral (wire proper)
 
 Ports as-is: topics, SSE handler, tokens, presence. Two changes. First, subscribe
-to the kernel notifier instead of owning a LISTEN connection. That means one
+to the shared notifier instead of owning a LISTEN connection. That means one
 connection per process, shared with the assigner/ticker wakeups. Second,
-push-on-commit is inherited from `pg_notify` semantics (02 §4). There is no
+push-on-commit is inherited from `pg_notify` semantics (02 §5). There is no
 storage, no cursor, and delivery is at-most-once. A disconnected browser misses
 ephemeral pushes. That is by design: filling that gap is the inbox's job.
 
@@ -79,7 +79,7 @@ subsystem.
 
 ## 5. Build checklist
 
-1. Port `wire.go`/`wire_token.go` onto the kernel notifier; keep the public API.
+1. Port `wire.go`/`wire_token.go` onto the shared notifier; keep the public API.
 2. Inbox DDL (`cb_wire_*`, own goose table); port `notifications.go`; add
    `read_at` + `MarkRead`/`MarkReadUntil`; retention janitor on the kernel ticker.
 3. `NotifyDurable` helper.

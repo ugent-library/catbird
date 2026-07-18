@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"os"
 	"slices"
@@ -18,11 +19,15 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/ugent-library/catbird/notify"
 )
 
 var (
 	testPool *pgxpool.Pool
 	testOnce sync.Once
+
+	notifierOnce  sync.Once
+	suiteNotifier *notify.Notifier
 )
 
 func TestMain(m *testing.M) {
@@ -320,6 +325,106 @@ func TestConsume(t *testing.T) {
 	})
 	if !errors.Is(err, ErrNotDefined) {
 		t.Fatalf("consume on undefined cursor returned %v, want ErrNotDefined", err)
+	}
+}
+
+// testNotifier starts one notifier for the whole suite, the way a real
+// process runs one for all its consumers. It lives until the process ends.
+func testNotifier(t *testing.T) *notify.Notifier {
+	t.Helper()
+	pool := setupTest(t)
+	notifierOnce.Do(func() {
+		suiteNotifier = notify.New(pool)
+		go func() { _ = suiteNotifier.Start(context.Background()) }()
+	})
+	return suiteNotifier
+}
+
+// With every poll interval at 10s and every timeout at 5s, only the
+// notify path can deliver: publish wakes the assigner, assigned positions
+// wake the cursor and subscription consumers, and a delayed message's
+// due time wakes delivery.
+func TestNotifyWake(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+	n := testNotifier(t)
+
+	if err := Ensure(ctx, pool, "go_nfy"); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureCursor(ctx, pool, "go_nfy", "w", CursorOpts{StartPos: At(0)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureSubscription(ctx, pool, "go_nfy", "q"); err != nil {
+		t.Fatal(err)
+	}
+
+	slow := 10 * time.Second
+	jctx, cancel := context.WithCancel(ctx)
+	ticksDone := make(chan error, 1)
+	go func() {
+		ticksDone <- StartTicker(jctx, pool, TickerOpts{
+			AssignPositionsInterval: slow,
+			DeliverInterval:         slow,
+			Notifier:                n,
+		})
+	}()
+
+	cursorGot := make(chan Message, 16)
+	cursorDone := make(chan error, 1)
+	go func() {
+		cursorDone <- Consume(jctx, pool, "go_nfy", "w", func(_ context.Context, batch []Message) error {
+			for _, m := range batch {
+				cursorGot <- m
+			}
+			return nil
+		}, ConsumeOpts{PollInterval: slow, Notifier: n})
+	}()
+
+	subGot := make(chan Message, 16)
+	subDone := make(chan error, 1)
+	go func() {
+		subDone <- ConsumeSubscription(jctx, pool, "go_nfy", "q", func(_ context.Context, m Message) error {
+			subGot <- m
+			return nil
+		}, ConsumeSubscriptionOpts{PollInterval: slow, Notifier: n})
+	}()
+
+	// give the new subscriptions a moment to reach the LISTEN connection:
+	// a notification sent before that is gone, and this test has no poll
+	// to fall back on
+	time.Sleep(500 * time.Millisecond)
+
+	expect := func(c chan Message, pos int64) {
+		t.Helper()
+		select {
+		case m := <-c:
+			if m.Pos != pos {
+				t.Fatalf("pos = %d, want %d", m.Pos, pos)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("pos %d did not arrive within the notify window", pos)
+		}
+	}
+
+	if _, err := Publish(ctx, pool, "go_nfy", "t", 1); err != nil {
+		t.Fatal(err)
+	}
+	expect(cursorGot, 1)
+	expect(subGot, 1)
+
+	// a delayed message rides the due-time wake of the delivery tick
+	if _, err := Publish(ctx, pool, "go_nfy", "t", 2, PublishOpts{Delay: 300 * time.Millisecond}); err != nil {
+		t.Fatal(err)
+	}
+	expect(cursorGot, 2)
+	expect(subGot, 2)
+
+	cancel()
+	for _, done := range []chan error{ticksDone, cursorDone, subDone} {
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -685,6 +790,40 @@ func TestDefineSchedule(t *testing.T) {
 	deleted, err = DeleteSchedule(ctx, pool, "go_sched", "digest")
 	if err != nil || deleted {
 		t.Fatalf("second delete = %v, %v, want false", deleted, err)
+	}
+}
+
+// Concurrent ensures of new streams must serialize, not deadlock: the
+// partition DDL locks cb_streams through the cloned foreign key, so an
+// ensure that inserted its row before taking the ensure lock could
+// deadlock with one holding the lock. Two booting nodes is the
+// production shape.
+func TestEnsureConcurrent(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	const workers = 4
+	errs := make(chan error, workers)
+	for w := range workers {
+		go func() {
+			for i := range 5 {
+				// distinct new streams and shared ones, interleaved
+				if err := Ensure(ctx, pool, fmt.Sprintf("go_enc%d_%d", w, i)); err != nil {
+					errs <- err
+					return
+				}
+				if err := Ensure(ctx, pool, "go_enc_shared"); err != nil {
+					errs <- err
+					return
+				}
+			}
+			errs <- nil
+		}()
+	}
+	for range workers {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

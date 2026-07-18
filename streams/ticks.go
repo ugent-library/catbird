@@ -2,20 +2,23 @@ package streams
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ugent-library/catbird/internal/ticker"
+	"github.com/ugent-library/catbird/notify"
 )
 
 // TickerOpts tunes the ticker. Zero fields mean the defaults.
 type TickerOpts struct {
-	AssignPositionsInterval time.Duration // 100ms: publish consume latency
-	DeliverInterval         time.Duration // 500ms: delayed message and schedule accuracy
-	PruneInterval           time.Duration // 60s
-	Logger                  *slog.Logger  // slog.Default()
+	AssignPositionsInterval time.Duration    // 100ms: publish consume latency
+	DeliverInterval         time.Duration    // 500ms: delayed message and schedule accuracy
+	PruneInterval           time.Duration    // 60s
+	Logger                  *slog.Logger     // slog.Default()
+	Notifier                *notify.Notifier // wakes the assigner on publish and delivery on due times; nil = wake by poll only
 }
 
 // StartTicker runs the stream engine's background work: assigning positions,
@@ -42,10 +45,54 @@ func StartTicker(ctx context.Context, pool *pgxpool.Pool, opts ...TickerOpts) er
 		o.Logger = slog.Default()
 	}
 
+	var assignWake, deliverWake <-chan struct{}
+	if o.Notifier != nil {
+		var schema string
+		if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+			return err
+		}
+
+		// The assigner wakes when any stream publishes. The stream set is
+		// read once at start, like the jobs worker reads its queues: a
+		// stream ensured while the ticker runs is served by poll until
+		// the process restarts.
+		rows, err := pool.Query(ctx, `SELECT name FROM cb_streams`)
+		if err != nil {
+			return err
+		}
+		streams, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return err
+		}
+		assignWaker := notify.NewWaker()
+		defer assignWaker.Stop()
+		for _, s := range streams {
+			cancel := o.Notifier.Subscribe(schema+".cbs_"+s, func(string) { assignWaker.Wake() })
+			defer cancel()
+		}
+		assignWake = assignWaker.C
+
+		// a cb_tick payload is a deliver_at: delivery wakes when the
+		// earliest pending one arrives instead of polling for it
+		deliverWaker := notify.NewWaker()
+		defer deliverWaker.Stop()
+		cancelTick := o.Notifier.Subscribe(schema+".cb_tick", func(payload string) {
+			deliverWaker.WakeAt(notify.ParseTime(payload))
+		})
+		defer cancelTick()
+		deliverWake = deliverWaker.C
+
+		o.Logger.Info(fmt.Sprintf("catbird: stream assigner waking on notify, poll safety net every %s", o.AssignPositionsInterval))
+		o.Logger.Info(fmt.Sprintf("catbird: stream delivery waking on notify, poll safety net every %s", o.DeliverInterval))
+	} else {
+		o.Logger.Info(fmt.Sprintf("catbird: stream assigner waking by poll every %s", o.AssignPositionsInterval))
+		o.Logger.Info(fmt.Sprintf("catbird: stream delivery waking by poll every %s", o.DeliverInterval))
+	}
+
 	t := ticker.New(o.Logger)
-	t.Add(ticker.Tick{Name: "stream.assign", Every: o.AssignPositionsInterval,
+	t.Add(ticker.Tick{Name: "stream.assign", Every: o.AssignPositionsInterval, Wake: assignWake,
 		Run: func(ctx context.Context) (int, error) { return assignPositions(ctx, pool) }})
-	t.Add(ticker.Tick{Name: "stream.deliver", Every: o.DeliverInterval,
+	t.Add(ticker.Tick{Name: "stream.deliver", Every: o.DeliverInterval, Wake: deliverWake,
 		Run: func(ctx context.Context) (int, error) { return deliver(ctx, pool) }})
 	t.Add(ticker.Tick{Name: "stream.prune", Every: o.PruneInterval,
 		Run: func(ctx context.Context) (int, error) { return prune(ctx, pool) }})

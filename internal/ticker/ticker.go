@@ -11,6 +11,7 @@ type Tick struct {
 	Name  string
 	Every time.Duration
 	Run   func(ctx context.Context) (int, error)
+	Wake  <-chan struct{} // optional: ends an idle wait early
 }
 
 type Ticker struct {
@@ -63,6 +64,10 @@ func (t *Ticker) run(ctx context.Context, tick Tick) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-tick.Wake:
+			if !timer.Stop() {
+				<-timer.C
+			}
 		case <-timer.C:
 		}
 	}

@@ -47,13 +47,16 @@ the one breaking release, at M6. Ground rules:
   originals keep serving the old worker untouched until M6 deletes them.
   Temporary duplication is cheaper than destabilizing what raven runs on.
 - **Shared machinery lives under `internal/` during the transition**
-  (`internal/ticker`, `internal/migrate`; the M5 notifier joins them), not the
+  (`internal/ticker`, `internal/migrate`, `internal/claimloop`), not the
   root package. D15 describes the *end state*. The trap this avoids: the final
   layout puts the shared machinery + facade in the root. Then `catbird.Publish`
   delegates to `stream`, and `stream` imports the root for shared types. That is
   an import cycle. Until M6 the root simply stays the old API. Subpackages import
   the `internal/` packages plus the root's existing `Conn`. The cycle is resolved
-  once, at M6 (see there).
+  once, at M6 (see there). One carve-out: the M5 notifier is a **public**
+  `notify` leaf package, because apps construct it — one notifier per
+  process, handed to every consume loop. It depends on pgx alone, never
+  on the root, so the cycle this rule guards against cannot arise there.
 - **Tests ride the existing rails.** `./scripts/test.sh` already runs
   `go test ./...`. New subpackages are picked up automatically, and the
   drop-and-recreate of `cb_tst` covers them — the job module included, since
@@ -305,26 +308,54 @@ installs without the stream schema, and a trigger define there raises
 
 ## M5 — NOTIFY wake-up, wire + inbox
 
-The shared notifier arrives here: one LISTEN connection per process, subscribers
-registered by channel. Per the plumbing rules it is a **copy** of
-`worker_notifier.go`, and the original keeps serving the old worker. Wire's
-embedded listener is consolidated onto it in the same milestone. Three consumers
-of it land together. First, the **ticker wake accelerator** (D17). Assigner,
-cursors and subscriptions, and the periodic jobs attach the notifier to the wake
-seam built in M0. They wake on the notifications the SQL has emitted since M1.
-The poll interval is demoted to safety net. Second, **job workers and
-`WaitForOutput`** attach to the `cbq_*`/`cbj_*` channels — whose
-earliest-due payload contract is exactly the one `worker_notifier.go`
-already speaks (03 §1; the channel is the pool, so no payload prefix),
-emitted since M4. The trigger tick (M4c) attaches to its streams' channels
-the same way. Third, **wire** (04): SSE onto the notifier,
-inbox `read_at`/`MarkRead`, retention tiers, `NotifyDurable`. Inbox rows are
-written explicitly by handlers holding the identity (D29 confirmed the old
-suspicion: interpolated identities were data all along) — no relay kind, no
-`identity_from`.
+The shared notifier arrives here: one shared implementation in a public
+`notify` leaf package, one notifier object per process by composition —
+apps construct it and pass it to each consume loop and ticker the way
+they pass a pool. It holds one LISTEN connection, applies LISTEN and
+UNLISTEN on it live as subscribers come and go (consume loops start at
+different times, and wire subscribes per SSE topic at runtime), and
+hands each notification's raw (channel, payload) to that channel's
+subscribers. Consumers with per-object channel sets — the worker's
+queues, the assigner's and the trigger tick's streams — read them once
+at start, the worker's own convention: the catalog changes at deploys,
+so an object defined while a process runs is served by that process's
+poll until it restarts. Parsing stays at the subscriber, because
+the payload dialects differ: `cbq_*` and `cb_tick` carry a due
+timestamp, `cbs_*` a topic, `cbj_*` a `<run_id>:<status>` run-terminal
+event, `cb_failed` a `<stream>.<subscription>` pair — a fan-out that
+dropped payloads could serve the claim loops but never wire. The wake
+seams it feeds: `claimloop.Options.Wake` (in place since M4a) and a
+third select case the ticker gains here — M0's exit deferred that seam
+to M5. Per the plumbing rules the notifier derives from
+`worker_notifier.go`'s LISTEN machinery, via `jobs/notify.go` (M4a's
+transitional copy, absorbed here — do not preserve it); the original
+keeps serving the old worker. Wire's embedded listener is consolidated
+onto it in the same milestone. A nil notifier wakes by poll alone — a
+legitimate configuration (transaction-pooled connections cannot LISTEN;
+cron-paced workloads do not care about delivery latency), never worded
+as an error or a lesser mode: every consume loop states its wake source
+at startup, in symmetric wording in both configs.
+
+Three consumers land together. First, the **ticker wake accelerator**
+(D17). The assigner, cursor and subscription consumers, and the delivery
+and trigger ticks attach the notifier to their wake seams and wake on
+the notifications the SQL has emitted since M1/M4. The poll interval is
+demoted to safety net **for fresh publishes**; retry redelivery
+(`cb_stream_fail` emits no due-time notify) and job schedules stay
+poll-paced — accepted, no new SQL for them. Second, the **jobs half**:
+workers have listened on `cbq_*` since M4a through the transitional
+listener — M5 moves them onto the shared notifier — and `WaitForOutput`
+stays polling (its audience is CLIs, scripts and tests; the latency
+customers of `cbj_*` are wire and the dashboard). Third, **wire** (04):
+SSE onto the notifier, inbox `read_at`/`MarkRead`, retention tiers,
+`NotifyDurable`. Inbox rows are written explicitly by handlers holding
+the identity (D29 confirmed the old suspicion: interpolated identities
+were data all along) — no relay kind, no `identity_from`.
 
 *Exit:* ported `wire_test.go`/`notifications_test.go` green; new seen/read and
-retention tests; **the M1 latency gate re-measured with the accelerator — target
+retention tests; 04 §5's failure pair — a rolled-back `NotifyDurable`
+delivers neither row nor nudge, and an offline client catches up via
+poll after missed SSE; **the M1 latency gate re-measured with the accelerator — target
 ~30–80ms publish→consume — and step-to-step re-measured (notify + claim)**;
 the fallback test: kill the LISTEN connection mid-run
 and verify delivery degrades to tick latency with zero loss; an end-to-end demo:
@@ -366,7 +397,8 @@ nothing outside history.
 
 | Current | Fate |
 |---|---|
-| `worker_notifier.go` (the LISTEN machinery — `notifier.go` does not exist; CLAUDE.md is stale), `notify.go` (send helper), wire.go's embedded listener | copied/consolidated into a shared `internal/` notifier package (M5, D17); originals serve the old worker until deleted at M6 |
+| `worker_notifier.go` (the LISTEN machinery — `notifier.go` does not exist; CLAUDE.md is stale), `notify.go` (send helper), wire.go's embedded listener | the LISTEN machinery lives on as the public `notify` package (M5, D17); wire's listener consolidates onto it at M5; originals serve the old worker until deleted at M6 |
+| `jobs/notify.go` (M4a's transitional per-worker listener) | absorbed into the `notify` package at M5 — scaffolding, not worth preserving |
 | `topic_trie.go`, `topic.go` | trie kept for app-side in-process dispatchers (one event against many subscriber rows, webhook-style); the engine's matcher is SQL (D29, M3); `topic.go` retires with the old API (M6) |
 | `migrate.go` | parameterized per module (M0) |
 | `queue.go` + `cb_q_*` SQL | replaced by subscriptions (feed half, M1–M2) and one-step runs (work half, M4 — D37); `Send/Read/Hide/Delete` API retired |

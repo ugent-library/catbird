@@ -41,8 +41,11 @@ func setupBenchmark(b *testing.B, workers int) {
 		}
 		b.Cleanup(wpool.Close)
 
-		w := NewWorker(wpool)
-		w.Handle("go_bench", func(ctx context.Context, in int) (int, error) {
+		w := NewWorker(wpool, WorkerOpts{Notifier: testNotifier(b)})
+		// the run's output is only what SetRunOutput set, and the
+		// benchmarks read their result from the run row
+		w.Handle("go_bench", func(ctx context.Context, p *Plan, in int) (int, error) {
+			p.SetRunOutput(in + 1)
 			return in + 1, nil
 		})
 		startTestWorker(b, w)

@@ -61,7 +61,7 @@ func TestWideMapStress(t *testing.T) {
 	}
 
 	for range workers {
-		w := NewWorker(pool)
+		w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 		w.Handle("go_wms_split", func(ctx context.Context, p *Plan, in struct{}) error {
 			for i := range siblings {
 				p.Step("go_wms_work", i)

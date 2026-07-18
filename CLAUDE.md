@@ -8,7 +8,7 @@ Catbird is a PostgreSQL-backed message queue with task and workflow (DAG) execut
 
 ## Rewrite in progress
 
-New code lives in `streams/`, `internal/ticker/`, and `internal/migrate/` (later `jobs/` and `wire/`) per `docs/plan/`. The top-level API is **frozen**: bugfixes only, no improvements — everything here is scheduled for replacement. The new stream schema is goose-managed in `streams/migrations/` with its own version table (`cb_stream_migrations`), separate from the old `migrations/`. Shared pure SQL (`cb_backoff`, `cb_valid_name`, `cb_forever`) lives in the kernel unit `internal/migrate/migrations/`, applied automatically before any module's migrations. Scenario tests live in the Go suite (`streams/stream_test.go`); `scripts/stream_torture.sh` stress-tests the assigner separately.
+New code lives in `streams/`, `jobs/`, `notify/`, `internal/ticker/`, `internal/claimloop/`, and `internal/migrate/` (later `wire/`) per `docs/plan/`. The top-level API is **frozen**: bugfixes only, no improvements — everything here is scheduled for replacement. The new stream schema is goose-managed in `streams/migrations/` with its own version table (`cb_stream_migrations`), separate from the old `migrations/`. Shared pure SQL (`cb_backoff`, `cb_valid_name`, `cb_forever`) lives in the kernel unit `internal/migrate/migrations/`, applied automatically before any module's migrations. Scenario tests live in the Go suite (`streams/stream_test.go`); `scripts/stream_torture.sh` stress-tests the assigner separately.
 
 ## Development Commands
 

@@ -9,43 +9,60 @@ import (
 	"maps"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ugent-library/catbird/internal/claimloop"
+	"github.com/ugent-library/catbird/notify"
 )
 
 const (
-	// fallback poll: the notify listener is the primary wake signal
-	workerPoll = 2 * time.Second
+	// how often to look for claimable steps when idle
+	workerPollInterval = 2 * time.Second
 	// hand-back pause for a step the worker has no handler for, so two
 	// not-yet-updated workers do not pass it back and forth as fast as
 	// they can during a rolling deploy
 	noHandlerPause = 5 * time.Second
 )
 
+// WorkerOpts tunes a worker. Zero fields mean the defaults.
+type WorkerOpts struct {
+	PollInterval time.Duration    // 2s: how often to look for claimable steps when idle
+	Notifier     *notify.Notifier // wakes the worker the moment a step becomes claimable; nil = wake by poll only
+}
+
 // Worker claims and executes steps: register a handler per job with
 // Handle, then Start. Which queues the worker claims is read from cb_jobs
 // at startup — the same routing authority that steps are stamped from.
 type Worker struct {
-	pool        *pgxpool.Pool
-	name        string
-	logger      *slog.Logger
-	handlers    map[string]handlerFunc
-	queues      []string
-	definedJobs map[string]bool
-	err         error
+	pool         *pgxpool.Pool
+	name         string
+	logger       *slog.Logger
+	pollInterval time.Duration
+	notifier     *notify.Notifier
+	handlers     map[string]handlerFunc
+	queues       []string
+	definedJobs  map[string]bool
+	err          error
 }
 
-func NewWorker(pool *pgxpool.Pool) *Worker {
+func NewWorker(pool *pgxpool.Pool, opts ...WorkerOpts) *Worker {
+	var o WorkerOpts
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+	if o.PollInterval <= 0 {
+		o.PollInterval = workerPollInterval
+	}
 	return &Worker{
-		pool:     pool,
-		name:     claimloop.Name("worker"),
-		logger:   slog.Default(),
-		handlers: make(map[string]handlerFunc),
+		pool:         pool,
+		name:         claimloop.Name("worker"),
+		logger:       slog.Default(),
+		pollInterval: o.PollInterval,
+		notifier:     o.Notifier,
+		handlers:     make(map[string]handlerFunc),
 	}
 }
 
@@ -84,31 +101,33 @@ func (w *Worker) Start(ctx context.Context) error {
 		return err
 	}
 
-	var schema string
-	if err := w.pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
-		return err
+	var wake <-chan struct{}
+	if w.notifier != nil {
+		var schema string
+		if err := w.pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+			return err
+		}
+		// a queue-channel payload is a step's claimable_at: a time
+		// already reached wakes the loop at once, a future one arms one
+		// timer for the earliest pending wake — that is how a
+		// backoff-paced retry is claimed on time without polling for it
+		waker := notify.NewWaker()
+		defer waker.Stop()
+		for _, q := range w.queues {
+			cancel := w.notifier.Subscribe(schema+".cbq_"+q, func(payload string) {
+				waker.WakeAt(notify.ParseTime(payload))
+			})
+			defer cancel()
+		}
+		wake = waker.C
+		w.logger.Info(fmt.Sprintf("catbird: worker waking on notify, poll safety net every %s", w.pollInterval))
+	} else {
+		w.logger.Info(fmt.Sprintf("catbird: worker waking by poll every %s", w.pollInterval))
 	}
-
-	n := &notifier{
-		pool:   w.pool,
-		logger: w.logger,
-		wake:   make(chan struct{}, 1),
-	}
-	for _, q := range w.queues {
-		n.channels = append(n.channels, schema+".cbq_"+q)
-	}
-
-	nctx, cancel := context.WithCancel(ctx)
-	var wg sync.WaitGroup
-	defer wg.Wait()
-	defer cancel()
-	wg.Go(func() {
-		n.run(nctx)
-	})
 
 	return claimloop.Run(ctx, claimloop.Options{
-		Poll: workerPoll,
-		Wake: n.wake,
+		PollInterval: w.pollInterval,
+		Wake:         wake,
 		// misconfiguration, not a transient failure
 		Fatal: func(err error) bool { return errors.Is(err, ErrNotDefined) },
 	}, w.processClaim)

@@ -10,14 +10,16 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ugent-library/catbird/internal/ticker"
+	"github.com/ugent-library/catbird/notify"
 )
 
 // TickerOpts tunes the ticker. Zero fields mean the defaults.
 type TickerOpts struct {
-	ScheduleInterval time.Duration // 500ms: scheduled-run accuracy
-	TriggerInterval  time.Duration // 500ms: trigger delivery accuracy
-	PruneInterval    time.Duration // 60s
-	Logger           *slog.Logger  // slog.Default()
+	ScheduleInterval time.Duration    // 500ms: scheduled-run accuracy
+	TriggerInterval  time.Duration    // 500ms: trigger delivery accuracy
+	PruneInterval    time.Duration    // 60s
+	Logger           *slog.Logger     // slog.Default()
+	Notifier         *notify.Notifier // wakes the trigger tick the moment a source stream publishes; nil = wake by poll only
 }
 
 // StartTicker runs the job engine's background work: firing scheduled runs,
@@ -43,6 +45,36 @@ func StartTicker(ctx context.Context, pool *pgxpool.Pool, opts ...TickerOpts) er
 		o.Logger = slog.Default()
 	}
 
+	// The trigger tick wakes when one of its source streams publishes.
+	// Which streams that is, is read once at start, like the worker reads
+	// its queues: a trigger defined while the ticker runs is served by
+	// poll until the process restarts.
+	var triggerWake <-chan struct{}
+	if o.Notifier != nil {
+		var schema string
+		if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+			return err
+		}
+		rows, err := pool.Query(ctx, `SELECT DISTINCT stream FROM cb_triggers`)
+		if err != nil {
+			return err
+		}
+		streams, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return err
+		}
+		waker := notify.NewWaker()
+		defer waker.Stop()
+		for _, s := range streams {
+			cancel := o.Notifier.Subscribe(schema+".cbs_"+s, func(string) { waker.Wake() })
+			defer cancel()
+		}
+		triggerWake = waker.C
+		o.Logger.Info(fmt.Sprintf("catbird: trigger delivery waking on notify, poll safety net every %s", o.TriggerInterval))
+	} else {
+		o.Logger.Info(fmt.Sprintf("catbird: trigger delivery waking by poll every %s", o.TriggerInterval))
+	}
+
 	t := ticker.New(o.Logger)
 	t.Add(ticker.Tick{Name: "job.run_scheduled", Every: o.ScheduleInterval,
 		Run: func(ctx context.Context) (int, error) {
@@ -50,7 +82,7 @@ func StartTicker(ctx context.Context, pool *pgxpool.Pool, opts ...TickerOpts) er
 			err := pool.QueryRow(ctx, `SELECT _cb_job_run_scheduled()`).Scan(&n)
 			return n, err
 		}})
-	t.Add(ticker.Tick{Name: "job.run_triggered", Every: o.TriggerInterval,
+	t.Add(ticker.Tick{Name: "job.run_triggered", Every: o.TriggerInterval, Wake: triggerWake,
 		Run: func(ctx context.Context) (int, error) { return runTriggered(ctx, pool) }})
 	t.Add(ticker.Tick{Name: "job.prune_runs", Every: o.PruneInterval,
 		Run: func(ctx context.Context) (int, error) {

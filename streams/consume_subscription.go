@@ -3,17 +3,20 @@ package streams
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ugent-library/catbird/internal/claimloop"
+	"github.com/ugent-library/catbird/notify"
 )
 
 // ConsumeSubscriptionOpts tunes the subscription consume loop. Zero fields mean the defaults.
 type ConsumeSubscriptionOpts struct {
-	PollInterval time.Duration // 250ms: how often to look for new messages when caught up
+	PollInterval time.Duration    // 250ms: how often to look for new messages when caught up
+	Notifier     *notify.Notifier // wakes the consumer the moment new messages are readable; nil = wake by poll only
 }
 
 // ConsumeSubscription processes a subscription's messages: unordered, at-least-once,
@@ -29,15 +32,34 @@ func ConsumeSubscription(ctx context.Context, pool *pgxpool.Pool, stream, subscr
 	if len(opts) > 0 {
 		o = opts[0]
 	}
-	poll := o.PollInterval
-	if poll <= 0 {
-		poll = 250 * time.Millisecond
+	pollInterval := o.PollInterval
+	if pollInterval <= 0 {
+		pollInterval = 250 * time.Millisecond
 	}
 
 	consumer := claimloop.Name("consumer")
 
+	var wake <-chan struct{}
+	if o.Notifier != nil {
+		channel, err := notifyChannel(ctx, pool, "cbs_"+stream)
+		if err != nil {
+			return err
+		}
+		waker := notify.NewWaker()
+		defer waker.Stop()
+		cancel := o.Notifier.Subscribe(channel, func(string) { waker.Wake() })
+		defer cancel()
+		wake = waker.C
+		slog.Info(fmt.Sprintf("catbird: consumer waking on notify, poll safety net every %s", pollInterval),
+			"stream", stream, "subscription", subscription)
+	} else {
+		slog.Info(fmt.Sprintf("catbird: consumer waking by poll every %s", pollInterval),
+			"stream", stream, "subscription", subscription)
+	}
+
 	return claimloop.Run(ctx, claimloop.Options{
-		Poll: poll,
+		PollInterval: pollInterval,
+		Wake:         wake,
 		// misconfiguration, not a transient failure
 		Fatal: func(err error) bool { return errors.Is(err, ErrNotDefined) },
 	}, func(ctx context.Context) (bool, error) {

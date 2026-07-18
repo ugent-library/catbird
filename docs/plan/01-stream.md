@@ -70,7 +70,7 @@ safe.
 kernel ticker, per stream with unassigned rows. Wakeups are staged (D17). Until M5
 the assigner wakes on a plain fixed-interval poll (~50–250ms, configurable); that
 alone is correct, and it is all M1–M4 need. M5 adds a NOTIFY wake with a small
-debounce (~10–25ms), once the kernel notifier lands with wire. Correctness never
+debounce (~10–25ms), once the shared notifier lands with wire. Correctness never
 depends on a notification arriving; the tick remains the safety net:
 
 ```sql
@@ -151,6 +151,12 @@ assigner dies mid-tick. The next tick, on any node, picks up.
 ## 3. Table shape
 
 All static — creating a stream creates a partition, never a table family.
+The partition is the one piece of runtime DDL, and it sets the rule for
+callers: ensure at boot, in its own transaction. The whole ensure
+serializes on one advisory lock taken before it writes anything, and the
+partition DDL briefly locks the whole message table — an ensure that runs
+after reads or writes in the same transaction can therefore deadlock with
+another process's ensure.
 
 ```
 cb_streams          name PK · last_position · retention config (§10) · created_at

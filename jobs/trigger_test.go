@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ugent-library/catbird/streams"
@@ -357,7 +358,7 @@ func TestTriggerDelivery(t *testing.T) {
 	}
 
 	// A worker executes the runs; the handler takes the payload's own shape.
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_tg_confirm", func(ctx context.Context, in struct{ N int }) (struct{}, error) {
 		return struct{}{}, nil
 	})
@@ -367,6 +368,50 @@ func TestTriggerDelivery(t *testing.T) {
 			t.Fatalf("run %d: %v", id, err)
 		}
 	}
+}
+
+// With the trigger interval at 10s and the timeout at 5s, only the
+// notify wake explains a prompt delivery: the source stream's publish
+// and position assignment reach the trigger tick through its channel.
+func TestTriggerNotifyWake(t *testing.T) {
+	pool := setupTriggerTest(t)
+	ctx := t.Context()
+
+	ensureStream(t, ctx, pool, "gj_nfy")
+	if err := Define(ctx, pool, "go_tg_nfy_job"); err != nil {
+		t.Fatal(err)
+	}
+	if err := DefineTrigger(ctx, pool, "gj_nfy_t", "gj_nfy", "go_tg_nfy_job"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = DeleteTrigger(context.Background(), pool, "gj_nfy_t") })
+
+	jctx, cancel := context.WithCancel(ctx)
+	ticksDone := make(chan error, 1)
+	go func() {
+		ticksDone <- StartTicker(jctx, pool, TickerOpts{
+			TriggerInterval: 10 * time.Second,
+			Notifier:        testNotifier(t),
+		})
+	}()
+	defer func() {
+		cancel()
+		if err := <-ticksDone; err != nil && !errors.Is(err, context.Canceled) {
+			t.Error(err)
+		}
+	}()
+
+	// give the trigger's subscription a moment to reach the LISTEN
+	// connection: a notification sent before that is gone, and this test
+	// has no poll to fall back on
+	time.Sleep(500 * time.Millisecond)
+
+	publish(t, ctx, pool, "gj_nfy", "e.v", `{"i": 1}`)
+	assignPositions(t, ctx, pool, "gj_nfy")
+
+	waitFor(t, 5*time.Second, "the triggered run", func() bool {
+		return runCount(t, ctx, pool, "go_tg_nfy_job") == 1
+	})
 }
 
 func TestTriggerExactlyOnce(t *testing.T) {

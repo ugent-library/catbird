@@ -43,7 +43,7 @@ func TestPlanChain(t *testing.T) {
 		}
 	}
 
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_chain_first", func(ctx context.Context, p *Plan, in struct {
 		N int `json:"n"`
 	}) (map[string]string, error) {
@@ -112,7 +112,7 @@ func TestFanOutBarrier(t *testing.T) {
 		}
 	}
 
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_fb_split", func(ctx context.Context, p *Plan, in struct{}) (map[string]int, error) {
 		for i := 1; i <= 3; i++ {
 			p.Step("go_fb_work", map[string]int{"i": i})
@@ -185,7 +185,7 @@ func TestSignalDelivered(t *testing.T) {
 		}
 	}
 
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_sig_start", func(ctx context.Context, p *Plan, in struct{}) error {
 		p.Step("go_sig_approve", map[string]int{"doc": 7}, WaitsForSignal())
 		return nil
@@ -252,7 +252,7 @@ func TestSignalBuffered(t *testing.T) {
 
 	started := make(chan int64, 1)
 	proceed := make(chan struct{})
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_buf_start", func(ctx context.Context, p *Plan, in struct{}) error {
 		started <- p.runID
 		select {
@@ -317,7 +317,7 @@ func TestAfterStepWaitsForSignal(t *testing.T) {
 		}
 	}
 
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_bw_start", func(ctx context.Context, p *Plan, in struct{}) error {
 		p.Step("go_bw_work", nil)
 		p.After().Step("go_bw_gate", nil, WaitsForSignal())
@@ -366,7 +366,7 @@ func TestStepUndefinedPanics(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_undef", func(ctx context.Context, p *Plan, in struct{}) error {
 		p.Step("go_undef_missing", nil)
 		return nil
@@ -399,7 +399,7 @@ func TestDuplicateSignalStepName(t *testing.T) {
 		}
 	}
 
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_dup", func(ctx context.Context, p *Plan, in struct{}) error {
 		// legal in the buffer, refused by the engine: two unresolved
 		// signal-waiting steps with one name
@@ -458,7 +458,7 @@ func TestGiveUpCancelsWaits(t *testing.T) {
 		}
 	}
 
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_gcw_split", func(ctx context.Context, p *Plan, in struct{}) error {
 		p.Step("go_gcw_poison", nil)
 		p.Step("go_gcw_sig", nil, WaitsForSignal())
@@ -518,7 +518,7 @@ func TestOnFailCleanupChain(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_ofc_main", func(ctx context.Context, in struct{}) error {
 		return errors.New("main exploded")
 	})
@@ -586,7 +586,7 @@ func TestSignalSlotOverwrite(t *testing.T) {
 
 	started := make(chan struct{}, 1)
 	proceed := make(chan struct{})
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_slot_start", func(ctx context.Context, p *Plan, in struct{}) error {
 		started <- struct{}{}
 		select {
@@ -645,7 +645,7 @@ func TestSequentialSignalSteps(t *testing.T) {
 		}
 	}
 
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_seq_start", func(ctx context.Context, p *Plan, in struct{}) error {
 		p.Step("go_seq_x", map[string]bool{"first": true}, WaitsForSignal())
 		return nil
@@ -724,7 +724,7 @@ func TestBothWaitsEarlySignal(t *testing.T) {
 
 	workStarted := make(chan struct{}, 1)
 	proceed := make(chan struct{})
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_bwe_start", func(ctx context.Context, p *Plan, in struct{}) error {
 		p.Step("go_bwe_work", nil)
 		p.After().Step("go_bwe_gate", nil, WaitsForSignal())
@@ -796,7 +796,7 @@ func TestBarrierAtDrain(t *testing.T) {
 		}
 	}
 
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_bad_split", func(ctx context.Context, p *Plan, in struct{}) error {
 		p.Step("go_bad_work", nil)
 		p.Step("go_bad_work", nil)

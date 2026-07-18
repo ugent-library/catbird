@@ -11,12 +11,28 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ugent-library/catbird/notify"
 )
 
 var (
 	setupOnce sync.Once
 	testPool  *pgxpool.Pool
+
+	notifierOnce  sync.Once
+	suiteNotifier *notify.Notifier
 )
+
+// testNotifier starts one notifier for the whole suite, the way a real
+// process runs one for all its workers. It lives until the process ends.
+func testNotifier(t testing.TB) *notify.Notifier {
+	t.Helper()
+	pool := setupTest(t)
+	notifierOnce.Do(func() {
+		suiteNotifier = notify.New(pool)
+		go func() { _ = suiteNotifier.Start(context.Background()) }()
+	})
+	return suiteNotifier
+}
 
 // setupTest migrates once per process and wipes leftovers from earlier
 // runs: rows persist in the shared tables, so every test uses go_-prefixed
@@ -285,6 +301,38 @@ func TestRunDedupAndLookup(t *testing.T) {
 	}
 }
 
+// A worker without a notifier wakes by poll alone — the configuration
+// for transaction-pooled connections, where LISTEN cannot work.
+func TestWorkerPollOnly(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	if err := DefineQueue(ctx, pool, "go_pollq"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Define(ctx, pool, "go_poll_echo", JobOpts{Queue: "go_pollq"}); err != nil {
+		t.Fatal(err)
+	}
+	w := NewWorker(pool, WorkerOpts{PollInterval: 50 * time.Millisecond})
+	w.Handle("go_poll_echo", func(ctx context.Context, p *Plan, in int) (int, error) {
+		p.SetRunOutput(in)
+		return in, nil
+	})
+	startTestWorker(t, w)
+
+	id, _, err := Run(ctx, pool, "go_poll_echo", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out int
+	if err := WaitForOutput(ctx, pool, id, &out, fastWait); err != nil {
+		t.Fatal(err)
+	}
+	if out != 7 {
+		t.Fatalf("output = %d", out)
+	}
+}
+
 func TestWorker(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
@@ -295,7 +343,7 @@ func TestWorker(t *testing.T) {
 	if err := Define(ctx, pool, "go_double", JobOpts{Queue: "go_wq1"}); err != nil {
 		t.Fatal(err)
 	}
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_double", func(ctx context.Context, p *Plan, in struct {
 		N int `json:"n"`
 	}) (map[string]int, error) {
@@ -362,7 +410,7 @@ func TestWorkerRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	var calls atomic.Int32
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_flaky", func(ctx context.Context, p *Plan, in struct{}) (string, error) {
 		if calls.Add(1) < 3 {
 			return "", errors.New("not yet")
@@ -408,7 +456,7 @@ func TestWorkerGiveUp(t *testing.T) {
 	if err := Define(ctx, pool, "go_poison", JobOpts{Queue: "go_wq3"}); err != nil {
 		t.Fatal(err)
 	}
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_poison", func(ctx context.Context, in struct{}) (struct{}, error) {
 		panic("kaboom")
 	})
@@ -466,7 +514,7 @@ func TestOnFailChain(t *testing.T) {
 	if err := Define(ctx, pool, "go_boom", JobOpts{Queue: "go_wq4", OnFail: "go_cleanup"}); err != nil {
 		t.Fatal(err)
 	}
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_cleanup", func(ctx context.Context, in failure) (struct{}, error) {
 		got <- in
 		return struct{}{}, nil
@@ -521,7 +569,7 @@ func TestCancelMidHandler(t *testing.T) {
 	}
 	started := make(chan struct{}, 1)
 	handlerDone := make(chan error, 1)
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_block", func(ctx context.Context, in struct{}) (struct{}, error) {
 		started <- struct{}{}
 		<-ctx.Done()
@@ -588,7 +636,7 @@ func TestWorkerShutdown(t *testing.T) {
 		return "second time lucky", nil
 	}
 
-	w1 := NewWorker(pool)
+	w1 := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w1.Handle("go_slow", handler)
 	w1ctx, w1cancel := context.WithCancel(context.Background())
 	w1done := make(chan error, 1)
@@ -625,7 +673,7 @@ func TestWorkerShutdown(t *testing.T) {
 	}
 
 	// redelivery: a fresh worker finishes the run
-	w2 := NewWorker(pool)
+	w2 := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w2.Handle("go_slow", handler)
 	startTestWorker(t, w2)
 	var out string
@@ -821,14 +869,14 @@ func TestWorkerStartChecks(t *testing.T) {
 	}
 
 	// a claim is indiscriminate within its pool: partial coverage refuses
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_cov_a", okHandler)
 	if err := w.Start(ctx); err == nil || !strings.Contains(err.Error(), "go_cov_ext") {
 		t.Fatalf("partial coverage: %v", err)
 	}
 
 	// a handler for a job nobody defined is a deploy mistake
-	w = NewWorker(pool)
+	w = NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_cov_a", okHandler)
 	w.Handle("go_cov_ext", okHandler)
 	w.Handle("go_cov_typo", okHandler)
@@ -837,7 +885,7 @@ func TestWorkerStartChecks(t *testing.T) {
 	}
 
 	// a wrong handler shape surfaces at Start
-	w = NewWorker(pool)
+	w = NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_cov_a", func() {})
 	if err := w.Start(ctx); err == nil || !strings.Contains(err.Error(), "signature") {
 		t.Fatalf("wrong shape: %v", err)
@@ -856,7 +904,7 @@ func TestWorkerReleasesUnknownStep(t *testing.T) {
 	if err := Define(ctx, pool, "go_rd_a", JobOpts{Queue: "go_wq10"}); err != nil {
 		t.Fatal(err)
 	}
-	w := NewWorker(pool)
+	w := NewWorker(pool, WorkerOpts{Notifier: testNotifier(t)})
 	w.Handle("go_rd_a", okHandler)
 	startTestWorker(t, w)
 

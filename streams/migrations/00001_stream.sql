@@ -297,6 +297,9 @@ RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
     _partition text := 'cbm_' || _cb_stream_ensure_partition.stream;
 BEGIN
+    -- cb_stream_ensure already holds this lock; taking it again in the
+    -- same transaction is free, and it keeps this function safe for any
+    -- caller of its own.
     PERFORM pg_advisory_xact_lock(hashtext('cb_stream_ensure'));
     EXECUTE format(
         'CREATE TABLE IF NOT EXISTS %I PARTITION OF cb_stream_messages FOR VALUES IN (%L)',
@@ -319,6 +322,14 @@ BEGIN
         RAISE EXCEPTION 'catbird: retention must be positive, or cb_forever() for no limit (got %)',
             cb_stream_ensure.retention USING ERRCODE = 'IRD01';
     END IF;
+
+    -- The whole ensure serializes on this lock, taken before the insert.
+    -- The partition DDL below needs a share-row-exclusive lock on
+    -- cb_streams (the partition clones the stream foreign key), so with
+    -- the insert first two ensures deadlock: one holds its cb_streams
+    -- row lock and waits here, the other holds this lock and waits on
+    -- that row.
+    PERFORM pg_advisory_xact_lock(hashtext('cb_stream_ensure'));
 
     INSERT INTO cb_streams (name, retention)
     VALUES (cb_stream_ensure.stream, coalesce(cb_stream_ensure.retention, cb_forever()))

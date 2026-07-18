@@ -111,12 +111,12 @@ func WaitForOutput(ctx context.Context, conn Conn, runID int64, out any, opts ..
 	if len(opts) > 0 {
 		o = opts[0]
 	}
-	poll := o.PollInterval
-	if poll <= 0 {
-		poll = 250 * time.Millisecond
+	pollInterval := o.PollInterval
+	if pollInterval <= 0 {
+		pollInterval = 250 * time.Millisecond
 	}
 
-	timer := time.NewTimer(poll)
+	timer := time.NewTimer(pollInterval)
 	defer timer.Stop()
 	for {
 		var status string
@@ -150,7 +150,7 @@ func WaitForOutput(ctx context.Context, conn Conn, runID int64, out any, opts ..
 			return ErrRunCanceled
 		}
 
-		timer.Reset(poll)
+		timer.Reset(pollInterval)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

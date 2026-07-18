@@ -60,6 +60,11 @@ type EnsureOpts struct {
 	Retention time.Duration // how long messages are kept; forever by default
 }
 
+// Ensure creates the stream when it does not exist yet; an existing
+// stream is never modified. Call it at boot, in its own transaction:
+// creating a stream briefly locks the whole message table, so an ensure
+// that runs after reads or writes in the same transaction can deadlock
+// with another process's ensure.
 func Ensure(ctx context.Context, conn Conn, stream string, opts ...EnsureOpts) error {
 	var o EnsureOpts
 	if len(opts) > 0 {

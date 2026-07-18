@@ -33,17 +33,17 @@ func Name(kind string) string {
 	return fmt.Sprintf("%s_%d_%x", host, os.Getpid(), r)
 }
 
-// Options tunes Run. Poll is required; zero values elsewhere mean the
+// Options tunes Run. PollInterval is required; zero values elsewhere mean the
 // defaults.
 type Options struct {
-	Poll       time.Duration        // wait between passes when there is nothing to do
-	MaxBackoff time.Duration        // cap for the error backoff; 30s by default
-	Wake       <-chan struct{}      // optional: ends an idle or backoff wait early
-	Fatal      func(err error) bool // optional: a process error that ends the loop
+	PollInterval time.Duration        // wait between passes when there is nothing to do
+	MaxBackoff   time.Duration        // cap for the error backoff; 30s by default
+	Wake         <-chan struct{}      // optional: ends an idle or backoff wait early
+	Fatal        func(err error) bool // optional: a process error that ends the loop
 }
 
 // Run repeats process until ctx ends. A pass that found work runs again at
-// once; an idle pass waits Poll (or a Wake signal); a failing pass is
+// once; an idle pass waits PollInterval (or a Wake signal); a failing pass is
 // retried with exponential backoff. A process error for which Fatal
 // returns true ends the loop.
 func Run(ctx context.Context, o Options, process func(ctx context.Context) (worked bool, err error)) error {
@@ -52,7 +52,7 @@ func Run(ctx context.Context, o Options, process func(ctx context.Context) (work
 		maxBackoff = 30 * time.Second
 	}
 
-	timer := time.NewTimer(o.Poll)
+	timer := time.NewTimer(o.PollInterval)
 	defer timer.Stop()
 	wait := func(d time.Duration) error {
 		timer.Reset(d)
@@ -69,7 +69,7 @@ func Run(ctx context.Context, o Options, process func(ctx context.Context) (work
 		}
 	}
 
-	backoff := o.Poll
+	backoff := o.PollInterval
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -88,10 +88,10 @@ func Run(ctx context.Context, o Options, process func(ctx context.Context) (work
 			}
 			backoff = min(backoff*2, maxBackoff)
 		case worked:
-			backoff = o.Poll
+			backoff = o.PollInterval
 		default:
-			backoff = o.Poll
-			if err := wait(o.Poll); err != nil {
+			backoff = o.PollInterval
+			if err := wait(o.PollInterval); err != nil {
 				return err
 			}
 		}
