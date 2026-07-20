@@ -106,7 +106,7 @@ notifications work. A row leaves the inbox when its explicit `expires_at`
 passes, or when the identity is done with it: `read_at` older than R,
 `seen_at` older than S, `created_at` older than A. Defaults R 30d < S 90d <
 A 365d, per-app config (`wire.TickerOpts` — wire has no definitions table, so
-the windows are arguments to `_cb_wire_prune`, the `cb_purge_task_runs`
+the windows are arguments to `_cb_wire_prune_inbox`, the `cb_purge_task_runs`
 precedent). The wait-until-seen guarantee from #39 survives as: **a row that
 was never seen and has no `expires_at` is not deleted before A** — an explicit
 `expires_at` always wins, seen or not (a stale prompt is not worth keeping).
@@ -148,15 +148,16 @@ learns nothing about scheduling or messaging.
 ## 5. Build checklist
 
 1. Module skeleton: `wire/migrations` + `cb_wire_migrations`,
-   `Migrate`/`MigrateUpTo`/`MigrateDownTo`, `wire.Conn`, module copies of the
-   topic trie + `matchTopic` (unexported in the root package; in-process
-   pattern dispatch — the engine's matcher stays the streams SQL grammar) and
-   the schema-prefixed channel helper.
+   `MigrateUpTo`/`MigrateDownTo` (the streams/jobs shape), `wire.Conn`, and
+   module copies of the topic trie + `matchTopic` (unexported in the root
+   package; in-process pattern dispatch — the engine's matcher stays the
+   streams SQL grammar). Channel names are built inline from
+   `current_schema()`, as in streams and jobs.
 2. Port `wire.go`/`wire_token.go` per §2: two notifier subscriptions, own
    dispatch goroutine, opts-struct constructor; presence out.
 3. Inbox DDL + functions: `cb_wire_notify`, `cb_wire_notify_durable` (insert +
    nudge), `cb_wire_mark_seen_until`, `cb_wire_mark_seen`, `cb_wire_mark_read`,
-   `cb_wire_mark_read_until`, `_cb_wire_prune`; port `notifications.go` —
+   `cb_wire_mark_read_until`, `_cb_wire_prune_inbox`; port `notifications.go` —
    `ReadAt` in, `CollapseKey` out.
 4. `wire.StartTicker`: the retention tick.
 5. Tests: port `wire_test.go` + `notifications_test.go` (presence and collapse

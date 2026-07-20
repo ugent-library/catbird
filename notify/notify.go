@@ -45,8 +45,9 @@ type Notifier struct {
 }
 
 type subscriber struct {
-	channel string
-	fn      func(payload string)
+	channel     string
+	onNotify    func(payload string)
+	onReconnect func() // may be nil
 }
 
 func New(pool *pgxpool.Pool, opts ...Opts) *Notifier {
@@ -64,15 +65,25 @@ func New(pool *pgxpool.Pool, opts ...Opts) *Notifier {
 	}
 }
 
-// Subscribe registers fn for a channel's notifications, before or while
-// the notifier runs. fn runs on the notifier's connection goroutine and
-// must not block. Payloads arrive as the SQL sent them; each subscriber
-// parses its own channel's payload format. After every (re)connect fn is
-// called once with an empty payload: notifications sent while the
-// connection was down are gone, so the subscriber must look for itself.
+// Subscribe registers callbacks for a channel's notifications, before or
+// while the notifier runs. They run on the notifier's connection
+// goroutine and must not block.
+//
+// onNotify is called once per notification, with the payload the SQL
+// sent — always a real payload, never a synthetic one. Each subscriber
+// parses its own channel's payload format.
+//
+// onReconnect, when not nil, is called once after every (re)connect.
+// Notifications sent while the connection was down are gone, so a
+// subscriber that needs to catch up looks for itself here. Pass nil when
+// there is nothing to recover — an at-most-once channel whose missed
+// events are simply missed. Reconnect is its own callback, not an
+// onNotify call with an empty payload, so onNotify never has to tell a
+// real notification from a reconnect.
+//
 // The returned function ends the subscription.
-func (n *Notifier) Subscribe(channel string, fn func(payload string)) func() {
-	s := &subscriber{channel: channel, fn: fn}
+func (n *Notifier) Subscribe(channel string, onNotify func(payload string), onReconnect func()) func() {
+	s := &subscriber{channel: channel, onNotify: onNotify, onReconnect: onReconnect}
 	n.mu.Lock()
 	n.subscribers[channel] = append(n.subscribers[channel], s)
 	cancelWait := n.cancelWait
@@ -135,7 +146,7 @@ func (n *Notifier) listenOnce(ctx context.Context) error {
 	}
 
 	// notifications sent while the connection was down are gone: tell
-	// every subscriber to look for itself
+	// every subscriber that has something to recover to look for itself
 	n.mu.Lock()
 	var all []*subscriber
 	for _, subs := range n.subscribers {
@@ -143,7 +154,9 @@ func (n *Notifier) listenOnce(ctx context.Context) error {
 	}
 	n.mu.Unlock()
 	for _, s := range all {
-		s.fn("")
+		if s.onReconnect != nil {
+			s.onReconnect()
+		}
 	}
 
 	for {
@@ -190,7 +203,7 @@ func (n *Notifier) listenOnce(ctx context.Context) error {
 		subs := append([]*subscriber(nil), n.subscribers[notification.Channel]...)
 		n.mu.Unlock()
 		for _, s := range subs {
-			s.fn(notification.Payload)
+			s.onNotify(notification.Payload)
 		}
 	}
 }

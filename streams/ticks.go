@@ -67,7 +67,9 @@ func StartTicker(ctx context.Context, pool *pgxpool.Pool, opts ...TickerOpts) er
 		assignWaker := notify.NewWaker()
 		defer assignWaker.Stop()
 		for _, s := range streams {
-			cancel := o.Notifier.Subscribe(schema+".cbs_"+s, func(string) { assignWaker.Wake() })
+			cancel := o.Notifier.Subscribe(schema+".cbs_"+s,
+				func(string) { assignWaker.Wake() },
+				func() { assignWaker.Wake() })
 			defer cancel()
 		}
 		assignWake = assignWaker.C
@@ -76,9 +78,9 @@ func StartTicker(ctx context.Context, pool *pgxpool.Pool, opts ...TickerOpts) er
 		// earliest pending one arrives instead of polling for it
 		deliverWaker := notify.NewWaker()
 		defer deliverWaker.Stop()
-		cancelTick := o.Notifier.Subscribe(schema+".cb_tick", func(payload string) {
-			deliverWaker.WakeAt(notify.ParseTime(payload))
-		})
+		cancelTick := o.Notifier.Subscribe(schema+".cb_tick",
+			func(payload string) { deliverWaker.WakeAt(notify.ParseTime(payload)) },
+			func() { deliverWaker.Wake() })
 		defer cancelTick()
 		deliverWake = deliverWaker.C
 

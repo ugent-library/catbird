@@ -114,9 +114,9 @@ func (w *Worker) Start(ctx context.Context) error {
 		waker := notify.NewWaker()
 		defer waker.Stop()
 		for _, q := range w.queues {
-			cancel := w.notifier.Subscribe(schema+".cbq_"+q, func(payload string) {
-				waker.WakeAt(notify.ParseTime(payload))
-			})
+			cancel := w.notifier.Subscribe(schema+".cbq_"+q,
+				func(payload string) { waker.WakeAt(notify.ParseTime(payload)) },
+				func() { waker.Wake() })
 			defer cancel()
 		}
 		wake = waker.C

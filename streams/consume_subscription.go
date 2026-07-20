@@ -47,7 +47,9 @@ func ConsumeSubscription(ctx context.Context, pool *pgxpool.Pool, stream, subscr
 		}
 		waker := notify.NewWaker()
 		defer waker.Stop()
-		cancel := o.Notifier.Subscribe(channel, func(string) { waker.Wake() })
+		cancel := o.Notifier.Subscribe(channel,
+			func(string) { waker.Wake() },
+			func() { waker.Wake() })
 		defer cancel()
 		wake = waker.C
 		slog.Info(fmt.Sprintf("catbird: consumer waking on notify, poll safety net every %s", pollInterval),

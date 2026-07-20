@@ -66,7 +66,9 @@ func StartTicker(ctx context.Context, pool *pgxpool.Pool, opts ...TickerOpts) er
 		waker := notify.NewWaker()
 		defer waker.Stop()
 		for _, s := range streams {
-			cancel := o.Notifier.Subscribe(schema+".cbs_"+s, func(string) { waker.Wake() })
+			cancel := o.Notifier.Subscribe(schema+".cbs_"+s,
+				func(string) { waker.Wake() },
+				func() { waker.Wake() })
 			defer cancel()
 		}
 		triggerWake = waker.C

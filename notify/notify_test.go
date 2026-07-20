@@ -62,8 +62,8 @@ func sendUntil(t *testing.T, pool *pgxpool.Pool, channel, payload string, got <-
 			if p == payload {
 				return
 			}
-			// an empty payload is the (re)connect signal, anything else
-			// a leftover of an earlier retried send; keep waiting
+			// anything but the payload we want is a leftover of an
+			// earlier retried send; keep waiting
 		case <-deadline:
 			t.Fatalf("no notification arrived on %s", channel)
 		case <-time.After(50 * time.Millisecond):
@@ -78,9 +78,9 @@ func TestNotifier(t *testing.T) {
 	a1 := make(chan string, 16)
 	a2 := make(chan string, 16)
 	b := make(chan string, 16)
-	cancelA1 := n.Subscribe("nt_a", func(p string) { a1 <- p })
-	n.Subscribe("nt_a", func(p string) { a2 <- p })
-	n.Subscribe("nt_b", func(p string) { b <- p })
+	cancelA1 := n.Subscribe("nt_a", func(p string) { a1 <- p }, nil)
+	n.Subscribe("nt_a", func(p string) { a2 <- p }, nil)
+	n.Subscribe("nt_b", func(p string) { b <- p }, nil)
 
 	// both subscribers of a channel get the payload as sent
 	sendUntil(t, pool, "nt_a", "hello", a1)
@@ -123,11 +123,11 @@ func TestNotifierSubscribeWhileRunning(t *testing.T) {
 	// let the notifier reach its notification wait first, so this
 	// subscription must interrupt a blocked wait to apply its LISTEN
 	warm := make(chan string, 16)
-	n.Subscribe("nt_warm", func(p string) { warm <- p })
+	n.Subscribe("nt_warm", func(p string) { warm <- p }, nil)
 	sendUntil(t, pool, "nt_warm", "up", warm)
 
 	got := make(chan string, 16)
-	n.Subscribe("nt_late", func(p string) { got <- p })
+	n.Subscribe("nt_late", func(p string) { got <- p }, nil)
 	start := time.Now()
 	sendUntil(t, pool, "nt_late", "prompt", got)
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
@@ -145,12 +145,18 @@ func TestNotifierReconnect(t *testing.T) {
 	defer pool.Close()
 	n := startNotifier(t, pool)
 
+	// Reconnect is its own callback, distinct from delivery; the marker
+	// makes each firing visible on the test's channel. onNotify only ever
+	// gets real payloads.
+	const reconnectMarker = "<reconnect>"
 	got := make(chan string, 16)
-	n.Subscribe("nt_re", func(p string) { got <- p })
+	n.Subscribe("nt_re",
+		func(p string) { got <- p },
+		func() { got <- reconnectMarker })
 
-	// the connect signal: one empty payload telling the subscriber to
-	// look for itself
-	waitPayload(t, got, "")
+	// the connect signal: onReconnect fires once, telling the subscriber
+	// to look for itself
+	waitPayload(t, got, reconnectMarker)
 	sendUntil(t, setupTest(t), "nt_re", "before", got)
 
 	// kill the notifier's connection; it must reconnect, signal the
@@ -160,7 +166,7 @@ func TestNotifierReconnect(t *testing.T) {
 		 WHERE application_name = $1`, appName); err != nil {
 		t.Fatal(err)
 	}
-	waitPayload(t, got, "")
+	waitPayload(t, got, reconnectMarker)
 	sendUntil(t, setupTest(t), "nt_re", "after", got)
 }
 
