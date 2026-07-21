@@ -141,9 +141,10 @@ dedup-skipped publish not at all), and NOTIFY deduplicates identical
 notification per distinct topic. Stream traffic therefore reaches browsers
 through a consumer: a subscription or cursor handler holds the full message
 and calls `wire.Notify` — or `wire.NotifyDurable` for the inbox — exactly the
-vision's "a cursor plus a function". The earlier design here — wire
-subscribing to `cbs_*` directly and re-pulling state — is dead: it re-invents
-a consumer inside wire without a cursor's guarantees (D45, 04).
+vision's "a cursor plus a function". Declaring that consumer server-side — a
+relay wire's own tick walks — is agreed open work (04 §6). The earlier design
+here — wire subscribing to `cbs_*` directly and re-pulling state — is dead:
+it re-invents a consumer inside wire without a cursor's guarantees (D45, 04).
 
 The shared notifier holds the one LISTEN connection per process and fans out
 to in-process subscribers (04); it arrives at M5 (D17).

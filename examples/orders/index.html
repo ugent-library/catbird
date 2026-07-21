@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>catbird orders demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.4rem; }
+  h2 { font-size: 1rem; margin-bottom: .3rem; }
+  button { font: inherit; padding: .45rem .9rem; margin-right: .5rem; cursor: pointer; }
+  #status { color: #666; margin-top: .5rem; min-height: 1.2rem; }
+  ul { list-style: none; padding: 0; }
+  #feed li, #inbox li { padding: .3rem .5rem; border-bottom: 1px solid #eee; }
+  #feed li.placed { color: #1a5fb4; }
+  #feed li.picked { color: #666; }
+  #feed li.processed { color: #26a269; font-weight: 600; }
+  #unseen { display: inline-block; min-width: 1.4rem; text-align: center; background: #c01c28; color: #fff; border-radius: .7rem; font-size: .8rem; padding: .1rem .3rem; margin-left: .4rem; }
+  #unseen.empty { background: #ccc; }
+  section { margin-top: 1.5rem; }
+</style>
+</head>
+<body>
+<h1>catbird orders demo</h1>
+<p>
+  One button, one transaction: an order row and one published message,
+  committed together. Everything below reacts to that commit — and the
+  rollback button proves that without it, nothing moves.
+</p>
+
+<button id="place">Place order</button>
+<button id="placeFail">Place order, then roll back</button>
+<div id="status"></div>
+
+<section>
+  <h2>Live feed <small>(SSE)</small></h2>
+  <ul id="feed"></ul>
+</section>
+
+<section>
+  <h2>Inbox <span id="unseen" class="empty">0</span>
+    <button id="markRead">Mark all read</button>
+  </h2>
+  <ul id="inbox"></ul>
+</section>
+
+<script>
+  const token = "{{.Token}}";
+  const feed = document.getElementById("feed");
+  const inbox = document.getElementById("inbox");
+  const unseen = document.getElementById("unseen");
+  const status = document.getElementById("status");
+  let inboxCursor = 0;
+
+  // the live feed: each named event is one rendered fragment
+  const es = new EventSource(`/events?token=${token}`);
+  for (const topic of ["order.placed", "order.item_picked", "order.processed"]) {
+    es.addEventListener(topic, (e) => feed.insertAdjacentHTML("afterbegin", e.data));
+  }
+  // the reserved inbox frame carries no body: it means "re-pull your inbox"
+  es.addEventListener("inbox", refreshInbox);
+
+  // the poll surface returns the unseen rows, rendered; the response
+  // header carries the cursor the mark-read watermark uses
+  async function refreshInbox() {
+    const resp = await fetch(`/inbox?token=${token}&after=0`);
+    inbox.innerHTML = await resp.text();
+    inboxCursor = Number(resp.headers.get("X-Wire-Cursor")) || inboxCursor;
+    const count = inbox.querySelectorAll("li").length;
+    unseen.textContent = count;
+    unseen.classList.toggle("empty", count === 0);
+  }
+
+  document.getElementById("markRead").addEventListener("click", async () => {
+    await fetch(`/inbox/read?until=${inboxCursor}`, { method: "POST" });
+    refreshInbox();
+  });
+
+  async function placeOrder(fail) {
+    const resp = await fetch(`/order${fail ? "?fail=1" : ""}`, { method: "POST" });
+    status.textContent = await resp.text();
+  }
+  document.getElementById("place").addEventListener("click", () => placeOrder(false));
+  document.getElementById("placeFail").addEventListener("click", () => placeOrder(true));
+
+  refreshInbox();
+</script>
+</body>
+</html>

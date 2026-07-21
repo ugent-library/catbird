@@ -403,6 +403,20 @@ nothing outside history.
 
 ---
 
+## Open work — direction agreed, not scheduled
+
+- **Declared server-side relays (wire).** The orders demo's relay loop —
+  a cursor handler calling `wire.Notify` and `NotifyDurable` — should be
+  declarable and run by wire's tick in SQL: M4c's trigger machinery
+  pointed at wire, one transaction per batch, which makes inbox rows
+  exactly-once (the Go loop can't) and gives foreign-language stacks
+  browser push without Go. Per-recipient text, multi-identity fan-out and
+  conditional inbox writes should be supported, likely via message
+  headers. Direction agreed 2026-07-21; identity source, header grammar
+  and the surface still to rule — the full record is 04 §6. Own chunk,
+  after the M5 exit gates; neighbor of the M6 raven cutover (deletes
+  raven's hand-built `record_events` → `cb_notify` trigger).
+
 ## Reuse map (current file → fate)
 
 | Current | Fate |

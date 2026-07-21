@@ -169,3 +169,62 @@ learns nothing about scheduling or messaging.
    cross-deliver; dispatch overflow drops without stalling the notifier;
    nil-notifier single-process delivery.
 6. `docs/sql-api.md` gains the wire contract.
+
+## 6. Open — declared relays (direction agreed 2026-07-21, surface not ratified)
+
+The orders demo (`examples/orders`) put a number on §2's consumer-callback
+relay: the most common web case — push what was published to the browsers,
+keep a durable copy in the inbox — costs a hand-written consume loop per
+app, more code than the demo's whole job chain. Three facts say this
+deserves a built-in: every live UI writes that loop; raven already ships a
+hand-built SQL version in production (its `record_events` DB trigger calls
+`cb_notify` directly — evidence the scenario begs for a server-side home);
+and the Go loop is subtly wrong on the durable leg — `NotifyDurable` runs
+on the pool while the cursor advances separately, so a crash between them
+redelivers the batch and writes duplicate inbox rows.
+
+The agreed direction: M4c's trigger machinery pointed at wire. A declared
+relay is a stream cursor (`cb_stream_define_cursor`, the IRD03 reuse path)
+plus a per-message action run by wire's tick in one transaction — read
+after the cursor, per message `cb_wire_notify(topic, payload)` or the
+inbox insert, advance the cursor, commit. That transaction is the point:
+inbox rows become exactly-once (insert and advance commit together), the
+push becomes once-per-message (NOTIFY fires only on commit), and a
+foreign-language stack gets both legs with zero Go running. Wire's ticker
+gains a `Notifier` and reads its relay-source streams once at start, the
+worker convention. The relayed message is the payload verbatim (M4c's rule
+for trigger input); renderers compose the human text at read time, so the
+inbox is literally the durable copy of the feed.
+
+This is not §2's dead design (wire subscribing to `cbs_*` wakes and
+re-pulling): that re-invented a consumer without a cursor's guarantees.
+A declared relay *is* a cursor with an action, and D45 holds — channels
+stay fixed, coordinates ride payloads.
+
+The verbatim shape alone is too narrow. Per-recipient text, multi-identity
+fan-out and conditional inbox writes should be supported (ruled
+2026-07-21), likely carried by **message headers** — the publisher already
+controls headers per message, and the relay would read declared header
+fields. Conditions may need no new mechanism at all: the relay's cursor
+takes the D29 `Topic` + `Condition` filters. Fan-out and per-recipient
+text have no sketched grammar yet.
+
+To rule before building:
+
+- **Identity source.** §3's ruling — inbox rows are written by handlers
+  holding the identity, no `identity_from` — killed *topic*-interpolated
+  identities, on the grounds that identities are data. A declared read of
+  payload or header data (`$.payload.customer`, the vocabulary D29's
+  `Condition` already uses) is arguably that ruling's own conclusion, but
+  it grazes its letter; needs an explicit amendment or the durable leg
+  stays handler-written.
+- **The header grammar** for recipients and per-recipient text.
+- **One verb or two** (`DefineRelay` + `DefineInboxRelay`, or one with
+  options).
+- **Oversize policy.** `cb_wire_notify` raises past NOTIFY's 8000 bytes; a
+  relay must skip-and-log rather than wedge its cursor on one fat payload.
+- **SQL names** — provisional until transcription, as always.
+
+The handler-written relay stays documented for whatever the declared shape
+cannot say. Own chunk, after the M5 exit gates; natural neighbor of the M6
+raven cutover, which would otherwise re-create the Go loop it deletes.
