@@ -428,6 +428,168 @@ func TestNotifyWake(t *testing.T) {
 	}
 }
 
+// requireSlowTests skips tests unless CB_SLOW_TESTS is enabled.
+// Set CB_SLOW_TESTS=1 (or true/yes) to run long-running stress/concurrency tests.
+func requireSlowTests(t testing.TB) {
+	t.Helper()
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("CB_SLOW_TESTS")))
+	if v == "1" || v == "true" || v == "yes" {
+		return
+	}
+	t.Skip("slow test skipped; set CB_SLOW_TESTS=1 to include")
+}
+
+// The M5 exit fallback test. A LISTEN connection killed mid-run loses no
+// messages: while it is down the polls and the reconnect's
+// look-for-yourself wake serve delivery, after the reconnect the notify
+// path is live again without a restart, and a notifier stopped for good
+// leaves the polls as the only wake source — there is no separate
+// dead-LISTEN code path.
+func TestNotifyKillListen(t *testing.T) {
+	requireSlowTests(t)
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	// a dedicated notifier on its own pool, with an application_name only
+	// its LISTEN connection carries: the kill below targets exactly that
+	// backend and leaves the suite notifier alone
+	npool, err := pgxpool.New(ctx, testDSN+"&application_name=go_kill_listen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(npool.Close)
+	n := notify.New(npool)
+
+	// the probe reports each (re)connect; it fires after the connection's
+	// channel set is LISTENed, so once it reports, notifications flow
+	connected := make(chan struct{}, 4)
+	unsubscribe := n.Subscribe("go_kill_probe", func(string) {}, func() {
+		connected <- struct{}{}
+	})
+	defer unsubscribe()
+
+	nctx, stopNotifier := context.WithCancel(ctx)
+	notifierDone := make(chan error, 1)
+	go func() { notifierDone <- n.Start(nctx) }()
+
+	waitConnected := func(what string) {
+		t.Helper()
+		select {
+		case <-connected:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out waiting for the notifier to %s", what)
+		}
+	}
+	waitConnected("connect")
+
+	if err := Ensure(ctx, pool, "go_kill"); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureCursor(ctx, pool, "go_kill", "w", CursorOpts{StartPos: At(0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// polls slow enough that a fast arrival can only be the notify path,
+	// fast enough that the poll-served phases stay short
+	poll := 5 * time.Second
+	cctx, cancel := context.WithCancel(ctx)
+	ticksDone := make(chan error, 1)
+	go func() {
+		ticksDone <- StartTicker(cctx, pool, TickerOpts{
+			AssignPositionsInterval: poll,
+			DeliverInterval:         poll,
+			Notifier:                n,
+		})
+	}()
+
+	got := make(chan int, 16)
+	consumeDone := make(chan error, 1)
+	go func() {
+		consumeDone <- Consume(cctx, pool, "go_kill", "w", func(_ context.Context, batch []Message) error {
+			for _, m := range batch {
+				var i int
+				if err := json.Unmarshal(m.Payload, &i); err != nil {
+					return err
+				}
+				got <- i
+			}
+			return nil
+		}, ConsumeOpts{PollInterval: poll, Notifier: n})
+	}()
+
+	// give the ticker's and the consumer's subscriptions a moment to
+	// reach the LISTEN connection — the probe only covers channels
+	// subscribed before Start
+	time.Sleep(500 * time.Millisecond)
+
+	publish := func(i int) {
+		t.Helper()
+		if _, err := Publish(ctx, pool, "go_kill", "t", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expect := func(i int, within time.Duration) {
+		t.Helper()
+		select {
+		case g := <-got:
+			if g != i {
+				t.Fatalf("payload = %d, want %d", g, i)
+			}
+		case <-time.After(within):
+			t.Fatalf("message %d did not arrive within %s", i, within)
+		}
+	}
+
+	// notify path live: every poll is 5s away, so a fast arrival can only
+	// be the notification
+	publish(1)
+	expect(1, 2*time.Second)
+
+	// kill the LISTEN backend; exactly one connection carries the name
+	var killed int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM (
+		     SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+		     WHERE application_name = 'go_kill_listen'
+		 ) k`).Scan(&killed); err != nil {
+		t.Fatal(err)
+	}
+	if killed != 1 {
+		t.Fatalf("terminated %d backends, want 1", killed)
+	}
+
+	// published into the dead window (the notifier waits a second before
+	// reconnecting): nothing is lost and order holds — the reconnect wake
+	// or the polls deliver, whichever comes first
+	for i := 2; i <= 6; i++ {
+		publish(i)
+	}
+	for i := 2; i <= 6; i++ {
+		expect(i, 3*poll)
+	}
+
+	// the reconnect re-LISTENs every subscribed channel before the probe
+	// reports, so a fast arrival here proves LISTEN is live again
+	waitConnected("reconnect")
+	publish(7)
+	expect(7, 2*time.Second)
+
+	// a notifier stopped for good leaves the polls as the only wake source
+	stopNotifier()
+	if err := <-notifierDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("notifier returned %v, want context.Canceled", err)
+	}
+	publish(8)
+	expect(8, 3*poll)
+
+	cancel()
+	for _, done := range []chan error{ticksDone, consumeDone} {
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestStartTicker(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
