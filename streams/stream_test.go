@@ -38,7 +38,7 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func setupTest(t *testing.T) *pgxpool.Pool {
+func setupTest(t testing.TB) *pgxpool.Pool {
 	t.Helper()
 	testOnce.Do(func() {
 		ctx := context.Background()
@@ -330,7 +330,7 @@ func TestConsume(t *testing.T) {
 
 // testNotifier starts one notifier for the whole suite, the way a real
 // process runs one for all its consumers. It lives until the process ends.
-func testNotifier(t *testing.T) *notify.Notifier {
+func testNotifier(t testing.TB) *notify.Notifier {
 	t.Helper()
 	pool := setupTest(t)
 	notifierOnce.Do(func() {

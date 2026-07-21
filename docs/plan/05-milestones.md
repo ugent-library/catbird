@@ -361,7 +361,12 @@ collapse tests retire with their features); new seen/read and
 retention tests; 04 §5's failure pair — a rolled-back `NotifyDurable`
 delivers neither row nor nudge, and an offline client catches up via
 poll after missed SSE; **the M1 latency gate re-measured with the accelerator — target
-~30–80ms publish→consume — and step-to-step re-measured (notify + claim)**;
+~30–80ms publish→consume — and step-to-step re-measured (notify + claim)**
+(measured 2026-07-20, Apple M3 Pro, local PostgreSQL 18: publish→consume
+0.7ms with the notifier, 257ms poll-only at the default intervals;
+step-to-step 1.4ms, down from 2.0ms at M4a —
+`BenchmarkPublishConsumeLatency` in `streams/`, `BenchmarkRunThroughput`
+in `jobs/`);
 the fallback test: kill the LISTEN connection mid-run
 and verify delivery degrades to tick latency with zero loss; an end-to-end demo:
 one `Publish` in a transaction → worker consumes, a trigger births a job
