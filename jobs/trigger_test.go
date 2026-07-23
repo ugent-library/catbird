@@ -42,7 +42,7 @@ func setupTriggerTest(t testing.TB) *pgxpool.Pool {
 			return
 		}
 		for _, q := range []string{
-			`DELETE FROM cb_triggers WHERE name LIKE 'gj_%'`,
+			`DELETE FROM cb_job_triggers WHERE name LIKE 'gj_%'`,
 			`DELETE FROM cb_streams WHERE name LIKE 'gj_%'`, // cursors cascade
 		} {
 			if _, err := db.Exec(q); err != nil {
@@ -178,7 +178,7 @@ func TestDefineTrigger(t *testing.T) {
 	}
 	var leaked int
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM cb_triggers WHERE name = 'gj_t1'`).Scan(&leaked); err != nil {
+		`SELECT count(*) FROM cb_job_triggers WHERE name = 'gj_t1'`).Scan(&leaked); err != nil {
 		t.Fatal(err)
 	}
 	if leaked != 0 {
@@ -202,14 +202,14 @@ func TestDefineTrigger(t *testing.T) {
 	}
 
 	// An identical redeclaration writes nothing to either table.
-	triggerV := rowVersion(t, ctx, pool, `SELECT xmin::text FROM cb_triggers WHERE name = 'gj_t1'`)
+	triggerV := rowVersion(t, ctx, pool, `SELECT xmin::text FROM cb_job_triggers WHERE name = 'gj_t1'`)
 	cursorV := rowVersion(t, ctx, pool,
 		`SELECT xmin::text FROM cb_stream_cursors WHERE stream = 'gj_s1' AND name = 'gj_t1'`)
 	if err := DefineTrigger(ctx, pool, "gj_t1", "gj_s1", "go_tg_job",
 		TriggerOpts{Topic: "order.created"}); err != nil {
 		t.Fatal(err)
 	}
-	if v := rowVersion(t, ctx, pool, `SELECT xmin::text FROM cb_triggers WHERE name = 'gj_t1'`); v != triggerV {
+	if v := rowVersion(t, ctx, pool, `SELECT xmin::text FROM cb_job_triggers WHERE name = 'gj_t1'`); v != triggerV {
 		t.Fatal("identical redeclare wrote the trigger row")
 	}
 	if v := rowVersion(t, ctx, pool,
@@ -222,7 +222,7 @@ func TestDefineTrigger(t *testing.T) {
 		TriggerOpts{Topic: "order.#"}); err != nil {
 		t.Fatal(err)
 	}
-	if v := rowVersion(t, ctx, pool, `SELECT xmin::text FROM cb_triggers WHERE name = 'gj_t1'`); v != triggerV {
+	if v := rowVersion(t, ctx, pool, `SELECT xmin::text FROM cb_job_triggers WHERE name = 'gj_t1'`); v != triggerV {
 		t.Fatal("filter change wrote the trigger row")
 	}
 	if err := pool.QueryRow(ctx,

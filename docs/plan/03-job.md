@@ -767,9 +767,9 @@ deployed Go loop whose handler calls `cb_job_run`. The trigger makes the
 common case declarative — the outbox pattern with zero glue code, which is
 the same-database design's front door.
 
-- **A trigger is a row, not a process**: `cb_triggers (name PK, stream,
-  job, created_at)` — declared whole by `cb_trigger_define` (D26
-  semantics; `cb_trigger_delete` removes one), validated at define time:
+- **A trigger is a row, not a process**: `cb_job_triggers (name PK, stream,
+  job, created_at)` — declared whole by `cb_job_define_trigger` (D26
+  semantics; `cb_job_delete_trigger` removes one), validated at define time:
   the stream exists, the job is declared, the filter compiles (the D29
   topic-pattern and condition languages, the same compiler subscriptions
   and cursors use). The trigger owns the cursor named after it on its
@@ -815,9 +815,9 @@ the same-database design's front door.
   pool's problem by design: a burst of events becomes a burst of queued
   steps, paced by §6.
 - **Packaging**: a feature of this module, not a module of its own (D41).
-  `cb_triggers` and the trigger functions live in job's migrations —
+  `cb_job_triggers` and the trigger functions live in job's migrations —
   PL/pgSQL bodies are late-bound, so the job schema installs cleanly
-  without the stream schema present — and `cb_trigger_define` and the
+  without the stream schema present — and `cb_job_define_trigger` and the
   delivery tick raise `catbird: stream schema required` at use (SQLSTATE
   `IRD03`, `jobs.ErrStreamsRequired`). The composition is one-directional
   and recorded: job's SQL calls stream's public SQL API
@@ -921,8 +921,8 @@ new steps, barriers, signals, `on_fail`; M4c = triggers). The build items:
    combining the two waits and the run-wide barrier rule (§3) — the two
    places a reader's intuition is most likely wrong.
 7. M4c — triggers (§8, D41): migration `jobs/migrations/00002_trigger.sql`
-   (`cb_triggers` — name, stream, job; the filter lives on the trigger's
-   cursor), `cb_trigger_define` / `cb_trigger_delete` — define-time
+   (`cb_job_triggers` — name, stream, job; the filter lives on the trigger's
+   cursor), `cb_job_define_trigger` / `cb_job_delete_trigger` — define-time
    validation plus the loud stream-schema-required check (IRD03) — the
    delivery tick `_cb_job_run_triggered` on the module's ticker, one call
    per trigger; `jobs.DefineTrigger` / `jobs.DeleteTrigger`, per-call like
@@ -993,7 +993,7 @@ new steps, barriers, signals, `on_fail`; M4c = triggers). The build items:
      the position key stays idempotent across a cursor reset; the run's
      input equals the payload as published; `start_pos`
      honored; only matching messages deliver; the job schema installs
-     without the stream schema, and `cb_trigger_define` there raises
+     without the stream schema, and `cb_job_define_trigger` there raises
      `catbird: stream schema required` (D41).
    - step-to-step latency benchmark (notify + claim — no tick in the path);
      throughput ≥ the old `BenchmarkTaskThroughput` / `FlowThroughput`

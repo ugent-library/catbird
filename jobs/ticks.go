@@ -55,7 +55,7 @@ func StartTicker(ctx context.Context, pool *pgxpool.Pool, opts ...TickerOpts) er
 		if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
 			return err
 		}
-		rows, err := pool.Query(ctx, `SELECT DISTINCT stream FROM cb_triggers`)
+		rows, err := pool.Query(ctx, `SELECT DISTINCT stream FROM cb_job_triggers`)
 		if err != nil {
 			return err
 		}
@@ -100,7 +100,7 @@ func StartTicker(ctx context.Context, pool *pgxpool.Pool, opts ...TickerOpts) er
 // skipped, never blocking the others; the tick logs the collected errors
 // every interval until a define or a deploy fixes the cause.
 func runTriggered(ctx context.Context, pool *pgxpool.Pool) (int, error) {
-	rows, err := pool.Query(ctx, `SELECT name FROM cb_triggers ORDER BY name`)
+	rows, err := pool.Query(ctx, `SELECT name FROM cb_job_triggers ORDER BY name`)
 	if err != nil {
 		return 0, err
 	}

@@ -36,7 +36,7 @@ and retry terms (`cb_job_queues`). A job routes to one pool
 row, so a bare install works; every other pool is declared, and `default`
 itself is redeclarable like any pool.
 
-A **trigger** (`cb_triggers`) turns events into work: every message on a
+A **trigger** (`cb_job_triggers`) turns events into work: every message on a
 stream that matches its filter creates one run of a job, delivered by the
 module's tick. It is the one feature that reads the stream module's schema
 and it refuses loudly without it; everything else here installs and runs
@@ -382,10 +382,10 @@ Deletes a schedule. Returns false when there was none. (Schedules get a
 delete because a forgotten one keeps creating runs; the other declarations
 are inert when unused.)
 
-### cb_trigger_define
+### cb_job_define_trigger
 
 ```sql
-cb_trigger_define(name text, stream text, job text,
+cb_job_define_trigger(name text, stream text, job text,
                   topic text DEFAULT NULL, condition text DEFAULT NULL,
                   start_pos bigint DEFAULT NULL)
     RETURNS void
@@ -413,10 +413,10 @@ published — a job has one input shape no matter who creates the run — and
 `<trigger name>:<stream position>` as its key, so creation is exactly-once
 even if the batch is replayed.
 
-### cb_trigger_delete
+### cb_job_delete_trigger
 
 ```sql
-cb_trigger_delete(name text) RETURNS boolean
+cb_job_delete_trigger(name text) RETURNS boolean
 ```
 
 Removes the trigger and its cursor. Returns false when there was none.
@@ -525,7 +525,7 @@ the error every interval and delivery resumes when a define fixes the
 cause — the run keys make even a replayed batch idempotent. Returns how
 many messages delivered.
 
-The tick calls it once per `cb_triggers` row, so a stalled trigger never
+The tick calls it once per `cb_job_triggers` row, so a stalled trigger never
 blocks the others. The trigger row is locked `FOR UPDATE SKIP LOCKED`: one
 deliverer per trigger, and a concurrent tick skips instead of queueing.
 Raises `IRD03` when the stream schema is absent.

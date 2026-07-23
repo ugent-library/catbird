@@ -68,7 +68,7 @@ the one breaking release, at M6. Ground rules:
 - **Migrations are per module and additive.** Each subpackage embeds its own
   `migrations/` FS with its own goose table (`cb_stream_migrations`, …). The
   existing `migrate.go` and `migrations/` are untouched until M6. None of the
-  new names (`cb_stream_*`, `cb_job_*`/`cb_jobs`, `cb_triggers`) can collide
+  new names (`cb_stream_*`, `cb_job_*`/`cb_jobs`, `cb_job_triggers`) can collide
   with the old ones — the old flow tables are `cb_flows`/`cb_flow_*`, which
   the new schema no longer uses (D39) — so every new suite shares one
   database with the old code. The runner auto-applies the kernel's SQL unit
@@ -284,9 +284,9 @@ and the lease contract for real. `docs/sql-api.md` rewritten as the
 normative contract, with the old-vs-new name table for the transition.
 
 **M4c — triggers (D40, D41).** A feature of `jobs/` (03 §8): migration
-`jobs/migrations/00002_trigger.sql` (`cb_triggers` — name, stream, job; the
+`jobs/migrations/00002_trigger.sql` (`cb_job_triggers` — name, stream, job; the
 filter lives on the trigger's cursor),
-`cb_trigger_define`/`cb_trigger_delete` with define-time validation (stream
+`cb_job_define_trigger`/`cb_job_delete_trigger` with define-time validation (stream
 exists, job declared, filter compiles) and the loud stream-schema-required
 check (IRD03), the delivery tick (cursor read → `cb_job_run(job, payload,
 '<trigger>:<pos>')` per match → advance; one transaction per trigger, so a

@@ -10,13 +10,13 @@
 -- SQL calls stream public functions (cb_stream_define_cursor,
 -- cb_stream_delete_cursor, cb_stream_read), never the reverse. PL/pgSQL
 -- bodies are late-bound, so this migration installs cleanly without the
--- stream schema; cb_trigger_define and the tick check for it and raise
+-- stream schema; cb_job_define_trigger and the tick check for it and raise
 -- 'catbird: stream schema required' at use (SQLSTATE IRD03: a required
 -- module is not installed).
-CREATE TABLE cb_triggers (
+CREATE TABLE cb_job_triggers (
     name text PRIMARY KEY CHECK (cb_valid_name(name)),
     -- No FK on stream: it lives in the other module's schema. No FK on
-    -- job: same choice as cb_job_schedules — cb_trigger_define checks it,
+    -- job: same choice as cb_job_schedules — cb_job_define_trigger checks it,
     -- and a job deleted out from under a live trigger stalls delivery
     -- loudly instead of making the delete impossible.
     stream text NOT NULL,
@@ -34,7 +34,7 @@ CREATE TABLE cb_triggers (
 -- stays put on redeclare; start_pos, when given, sets it deliberately: 0
 -- delivers the stream from the beginning, N from after N. When creating,
 -- NULL starts at the tail — only messages published from now on deliver.
-CREATE FUNCTION cb_trigger_define(
+CREATE FUNCTION cb_job_define_trigger(
     name      text,
     stream    text,
     job       text,
@@ -44,38 +44,38 @@ CREATE FUNCTION cb_trigger_define(
 )
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
-    _old cb_triggers;
+    _old cb_job_triggers;
 BEGIN
     IF to_regclass('cb_streams') IS NULL THEN
         RAISE EXCEPTION 'catbird: stream schema required (a trigger reads a stream; install the stream module first)'
             USING ERRCODE = 'IRD03';
     END IF;
 
-    IF NOT cb_valid_name(cb_trigger_define.name) THEN
+    IF NOT cb_valid_name(cb_job_define_trigger.name) THEN
         RAISE EXCEPTION 'catbird: invalid trigger name %; use [a-z][a-z0-9_]*, max 20 bytes',
-            cb_trigger_define.name USING ERRCODE = 'IRD01';
+            cb_job_define_trigger.name USING ERRCODE = 'IRD01';
     END IF;
 
-    PERFORM 1 FROM cb_jobs j WHERE j.name = cb_trigger_define.job;
+    PERFORM 1 FROM cb_jobs j WHERE j.name = cb_job_define_trigger.job;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'catbird: job % not defined',
-            cb_trigger_define.job USING ERRCODE = 'IRD02';
+            cb_job_define_trigger.job USING ERRCODE = 'IRD02';
     END IF;
 
     -- The row lock serializes this declaration against the delivery tick
     -- and reads the old stream name for the move below.
-    SELECT t.* INTO _old FROM cb_triggers t
-    WHERE t.name = cb_trigger_define.name
+    SELECT t.* INTO _old FROM cb_job_triggers t
+    WHERE t.name = cb_job_define_trigger.name
     FOR UPDATE;
 
     -- A trigger moved to another stream leaves no cursor behind.
-    IF FOUND AND _old.stream <> cb_trigger_define.stream THEN
+    IF FOUND AND _old.stream <> cb_job_define_trigger.stream THEN
         PERFORM cb_stream_delete_cursor(_old.stream, _old.name);
     END IF;
 
-    INSERT INTO cb_triggers AS t (name, stream, job)
-    VALUES (cb_trigger_define.name, cb_trigger_define.stream, cb_trigger_define.job)
-    ON CONFLICT ON CONSTRAINT cb_triggers_pkey DO UPDATE
+    INSERT INTO cb_job_triggers AS t (name, stream, job)
+    VALUES (cb_job_define_trigger.name, cb_job_define_trigger.stream, cb_job_define_trigger.job)
+    ON CONFLICT ON CONSTRAINT cb_job_triggers_pkey DO UPDATE
     SET stream = excluded.stream,
         job    = excluded.job
     -- an identical declaration writes nothing
@@ -85,11 +85,11 @@ BEGIN
     -- unchanged and start_pos is not given, so calling it every time
     -- keeps the no-op property.
     PERFORM cb_stream_define_cursor(
-        cb_trigger_define.stream,
-        cb_trigger_define.name,
-        cb_trigger_define.start_pos,
-        cb_trigger_define.topic,
-        cb_trigger_define.condition);
+        cb_job_define_trigger.stream,
+        cb_job_define_trigger.name,
+        cb_job_define_trigger.start_pos,
+        cb_job_define_trigger.topic,
+        cb_job_define_trigger.condition);
 END; $$;
 -- +goose statementend
 
@@ -97,13 +97,13 @@ END; $$;
 -- Removes a trigger and its cursor. Reports whether one existed; deleting
 -- a missing trigger is a no-op. Matches between the cursor and the
 -- stream's head are gone with it — the trigger is its cursor's only reader.
-CREATE FUNCTION cb_trigger_delete(name text)
+CREATE FUNCTION cb_job_delete_trigger(name text)
 RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE
-    _old cb_triggers;
+    _old cb_job_triggers;
 BEGIN
-    DELETE FROM cb_triggers t
-    WHERE t.name = cb_trigger_delete.name
+    DELETE FROM cb_job_triggers t
+    WHERE t.name = cb_job_delete_trigger.name
     RETURNING t.* INTO _old;
     IF NOT FOUND THEN
         RETURN false;
@@ -130,7 +130,7 @@ END; $$;
 CREATE FUNCTION _cb_job_run_triggered(trigger text, batch_size int DEFAULT 100)
 RETURNS int LANGUAGE plpgsql AS $$
 DECLARE
-    _trigger cb_triggers;
+    _trigger cb_job_triggers;
     _message record; -- a cb_stream_messages row; declared loosely so this
                      -- function never names the other module's row type
     _n int := 0;
@@ -142,7 +142,7 @@ BEGIN
 
     -- One deliverer per trigger: a concurrent tick skips instead of
     -- queueing, and a redeclare waits for the in-flight batch to commit.
-    SELECT t.* INTO _trigger FROM cb_triggers t
+    SELECT t.* INTO _trigger FROM cb_job_triggers t
     WHERE t.name = _cb_job_run_triggered.trigger
     FOR UPDATE SKIP LOCKED;
     IF NOT FOUND THEN
@@ -171,6 +171,6 @@ END; $$;
 -- +goose down
 
 DROP FUNCTION _cb_job_run_triggered(text, int);
-DROP FUNCTION cb_trigger_delete(text);
-DROP FUNCTION cb_trigger_define(text, text, text, text, text, bigint);
-DROP TABLE cb_triggers;
+DROP FUNCTION cb_job_delete_trigger(text);
+DROP FUNCTION cb_job_define_trigger(text, text, text, text, text, bigint);
+DROP TABLE cb_job_triggers;

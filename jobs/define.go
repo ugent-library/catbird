@@ -148,7 +148,7 @@ type TriggerOpts struct {
 func At(pos int64) *int64 { return &pos }
 
 // DefineTrigger declares that every matching message on a stream creates a
-// run of a job, mirroring cb_trigger_define: creating and updating are the
+// run of a job, mirroring cb_job_define_trigger: creating and updating are the
 // same call, and an identical declaration writes nothing. The job and the
 // stream must be defined first, and the module's tick (StartTicker)
 // delivers. The run's input is the message payload, exactly as published;
@@ -161,7 +161,7 @@ func DefineTrigger(ctx context.Context, conn Conn, name, stream, job string, opt
 		o = opts[0]
 	}
 	_, err := conn.Exec(ctx,
-		`SELECT cb_trigger_define($1, $2, $3, $4, $5, $6)`,
+		`SELECT cb_job_define_trigger($1, $2, $3, $4, $5, $6)`,
 		name, stream, job, nullText(o.Topic), nullText(o.Condition), o.StartPos)
 	return wrapErr(err)
 }
@@ -170,6 +170,6 @@ func DefineTrigger(ctx context.Context, conn Conn, name, stream, job string, opt
 // existed; deleting a missing trigger is a no-op.
 func DeleteTrigger(ctx context.Context, conn Conn, name string) (bool, error) {
 	var deleted bool
-	err := conn.QueryRow(ctx, `SELECT cb_trigger_delete($1)`, name).Scan(&deleted)
+	err := conn.QueryRow(ctx, `SELECT cb_job_delete_trigger($1)`, name).Scan(&deleted)
 	return deleted, wrapErr(err)
 }
