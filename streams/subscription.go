@@ -41,7 +41,8 @@ type SubscriptionOpts struct {
 	Topic string
 	// Condition: AND-only expression over headers and payload, parsed once
 	// at creation and applied server-side after the topic pattern. MVP
-	// forms: exists($.payload.a.b), $.headers.a.b == <scalar>. Slower than
+	// forms: exists($.payload.a.b), $.headers.a.b == <scalar>,
+	// $.recipients == "name" (a recipient the publisher named). Slower than
 	// topic matching: costs a per-row jsonb evaluation, never
 	// index-assisted.
 	Condition string

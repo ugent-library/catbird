@@ -43,8 +43,8 @@ func testNotifier(t testing.TB) *notify.Notifier {
 }
 
 // setupTest migrates once per process and wipes leftovers from earlier
-// runs: inbox rows persist in the shared table, so every test uses
-// gw_-prefixed identities and the wipe targets those.
+// runs: rows persist in the shared tables, so every test uses gw_-prefixed
+// recipients and gwr-prefixed relay names, and the wipe targets those.
 func setupTest(t testing.TB) *pgxpool.Pool {
 	t.Helper()
 	setupOnce.Do(func() {
@@ -56,8 +56,15 @@ func setupTest(t testing.TB) *pgxpool.Pool {
 		if err := MigrateUpTo(context.Background(), db, SchemaVersion); err != nil {
 			panic(err)
 		}
-		if _, err := db.Exec(`DELETE FROM cb_wire_inbox WHERE identity LIKE 'gw\_%'`); err != nil {
-			panic(err)
+		for _, q := range []string{
+			`DELETE FROM cb_wire_inbox WHERE recipient LIKE 'gw\_%'`,
+			`DELETE FROM cb_wire_subscriptions WHERE recipient LIKE 'gw\_%'`,
+			`DELETE FROM cb_wire_presence WHERE recipient LIKE 'gw\_%'`,
+			`DELETE FROM cb_wire_relays WHERE name LIKE 'gwr%'`,
+		} {
+			if _, err := db.Exec(q); err != nil {
+				panic(err)
+			}
 		}
 		testPool, err = pgxpool.New(context.Background(), testDSN)
 		if err != nil {
@@ -69,7 +76,7 @@ func setupTest(t testing.TB) *pgxpool.Pool {
 
 // startTestWire runs the wire until the test ends and fails the test on
 // anything but a clean shutdown. It leaves a moment for the notifier's
-// LISTEN to apply, so an event sent right after is not lost.
+// LISTEN to apply, so a frame sent right after is not lost.
 func startTestWire(t testing.TB, w *Wire) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -116,13 +123,13 @@ func connectSSE(t *testing.T, w *Wire, token string) *http.Response {
 func TestTokenMintVerify(t *testing.T) {
 	w := New(setupTest(t), testSecret)
 
-	token := w.Token([]string{"a.b", "c.*"}, TokenOpts{Identity: "alice", ValidFor: time.Hour})
+	token := w.Token([]string{"a.b", "c.*"}, TokenOpts{Recipient: "alice", ValidFor: time.Hour})
 	p, err := w.verifyToken(token)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Identity != "alice" {
-		t.Errorf("identity = %q, want alice", p.Identity)
+	if p.Recipient != "alice" {
+		t.Errorf("recipient = %q, want alice", p.Recipient)
 	}
 	if len(p.Topics) != 2 || p.Topics[0] != "a.b" || p.Topics[1] != "c.*" {
 		t.Errorf("topics = %v", p.Topics)
@@ -140,8 +147,8 @@ func TestTokenNoOpts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Identity != "" || p.Expiry != 0 {
-		t.Errorf("payload = %+v, want no identity, no expiry", p)
+	if p.Recipient != "" || p.Expiry != 0 {
+		t.Errorf("payload = %+v, want no recipient, no expiry", p)
 	}
 }
 
@@ -182,7 +189,7 @@ func TestTokenInvalid(t *testing.T) {
 	}
 }
 
-// --- SSE tests ---
+// --- SSE surface ---
 
 func TestServeSSEUnauthorized(t *testing.T) {
 	w := New(setupTest(t), testSecret)
@@ -196,281 +203,22 @@ func TestServeSSEUnauthorized(t *testing.T) {
 	}
 }
 
-func TestNotifySSE(t *testing.T) {
-	w := New(setupTest(t), testSecret, Opts{Notifier: testNotifier(t)})
-	startTestWire(t, w)
-
-	topic := "gw.sse." + uuid.NewString()[:8]
-	resp := connectSSE(t, w, w.Token([]string{topic}))
-
-	// The cross-process path: pg NOTIFY with no sender to skip.
-	if err := Notify(t.Context(), testPool, topic, "<div>hello</div>"); err != nil {
-		t.Fatal(err)
-	}
-
-	events := readSSEEvents(t, resp, 1, 2*time.Second)
-	if len(events) == 0 {
-		t.Fatal("no SSE events received")
-	}
-	if events[0].event != topic {
-		t.Errorf("event = %q, want %q", events[0].event, topic)
-	}
-	if events[0].data != "<div>hello</div>" {
-		t.Errorf("data = %q, want %q", events[0].data, "<div>hello</div>")
-	}
-}
-
-func TestNotifySSEWildcard(t *testing.T) {
-	w := New(setupTest(t), testSecret, Opts{Notifier: testNotifier(t)})
-	startTestWire(t, w)
-
-	base := "gw.wc." + uuid.NewString()[:8]
-	resp := connectSSE(t, w, w.Token([]string{base + ".#"}))
-
-	subtopic := base + ".batch_edit.done"
-	if err := Notify(t.Context(), testPool, subtopic, "finished"); err != nil {
-		t.Fatal(err)
-	}
-
-	events := readSSEEvents(t, resp, 1, 2*time.Second)
-	if len(events) == 0 {
-		t.Fatal("no SSE events received for wildcard subscription")
-	}
-	if events[0].event != subtopic {
-		t.Errorf("event = %q, want %q", events[0].event, subtopic)
-	}
-	if events[0].data != "finished" {
-		t.Errorf("data = %q, want %q", events[0].data, "finished")
-	}
-}
-
-// TestNilNotifierLocalDelivery proves the nil-notifier single-process
-// configuration works: the wire's own Notify delivers to its SSE
-// subscribers and Listen handlers without any LISTEN connection.
-func TestNilNotifierLocalDelivery(t *testing.T) {
-	w := New(setupTest(t), testSecret)
-	startTestWire(t, w)
-
-	topic := "gw.local." + uuid.NewString()[:8]
-
-	var mu sync.Mutex
-	var heard []string
-	w.Listen(topic, func(ctx context.Context, topic, message string) {
-		mu.Lock()
-		heard = append(heard, message)
-		mu.Unlock()
-	})
-
-	resp := connectSSE(t, w, w.Token([]string{topic}))
-
-	if err := w.Notify(t.Context(), topic, "ping"); err != nil {
-		t.Fatal(err)
-	}
-
-	events := readSSEEvents(t, resp, 1, 2*time.Second)
-	if len(events) != 1 || events[0].data != "ping" {
-		t.Fatalf("events = %+v, want one ping", events)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(heard) != 1 || heard[0] != "ping" {
-		t.Fatalf("listen heard = %v, want [ping]", heard)
-	}
-}
-
-// TestTwoWiresCrossDeliver proves two wires sharing one notifier
-// cross-deliver: what one sends, the other's subscribers receive.
-func TestTwoWiresCrossDeliver(t *testing.T) {
-	a := New(setupTest(t), testSecret, Opts{Notifier: testNotifier(t)})
-	b := New(setupTest(t), testSecret, Opts{Notifier: testNotifier(t)})
-	startTestWire(t, a)
-	startTestWire(t, b)
-
-	topic := "gw.cross." + uuid.NewString()[:8]
-	resp := connectSSE(t, b, b.Token([]string{topic}))
-
-	if err := a.Notify(t.Context(), topic, "over"); err != nil {
-		t.Fatal(err)
-	}
-
-	events := readSSEEvents(t, resp, 1, 2*time.Second)
-	if len(events) != 1 || events[0].data != "over" {
-		t.Fatalf("events = %+v, want one event from the other wire", events)
-	}
-}
-
-// --- Listen tests ---
-
-func TestListenExactTopic(t *testing.T) {
-	topic := "gw.listen." + uuid.NewString()[:8]
-
-	var mu sync.Mutex
-	var received []string
-
-	w := New(setupTest(t), testSecret, Opts{Notifier: testNotifier(t)})
-	w.Listen(topic, func(ctx context.Context, topic, message string) {
-		mu.Lock()
-		received = append(received, topic)
-		mu.Unlock()
-	})
-	startTestWire(t, w)
-
-	if err := Notify(t.Context(), testPool, topic, ""); err != nil {
-		t.Fatal(err)
-	}
-
-	time.Sleep(500 * time.Millisecond)
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(received) != 1 || received[0] != topic {
-		t.Errorf("received = %v, want [%s]", received, topic)
-	}
-}
-
-func TestListenWildcards(t *testing.T) {
-	prefix := "gw.lwc." + uuid.NewString()[:8]
-
-	var mu sync.Mutex
-	var star, hash []string
-
-	w := New(setupTest(t), testSecret, Opts{Notifier: testNotifier(t)})
-	w.Listen(prefix+".*", func(ctx context.Context, topic, message string) {
-		mu.Lock()
-		star = append(star, topic)
-		mu.Unlock()
-	})
-	w.Listen(prefix+".#", func(ctx context.Context, topic, message string) {
-		mu.Lock()
-		hash = append(hash, topic)
-		mu.Unlock()
-	})
-	startTestWire(t, w)
-
-	for _, topic := range []string{prefix, prefix + ".created", prefix + ".sub.created"} {
-		if err := Notify(t.Context(), testPool, topic, ""); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	time.Sleep(500 * time.Millisecond)
-
-	mu.Lock()
-	defer mu.Unlock()
-	// * matches exactly one extra token; # matches zero or more.
-	if len(star) != 1 || star[0] != prefix+".created" {
-		t.Errorf("star matches = %v, want [%s]", star, prefix+".created")
-	}
-	if len(hash) != 3 {
-		t.Errorf("hash matches = %v, want all 3", hash)
-	}
-}
-
-func TestListenMultipleHandlers(t *testing.T) {
-	topic := "gw.lmulti." + uuid.NewString()[:8]
-
-	var mu sync.Mutex
-	var count int
-	inc := func(ctx context.Context, topic, message string) {
-		mu.Lock()
-		count++
-		mu.Unlock()
-	}
-
-	w := New(setupTest(t), testSecret, Opts{Notifier: testNotifier(t)})
-	w.Listen(topic, inc)
-	w.Listen(topic, inc)
-	startTestWire(t, w)
-
-	if err := Notify(t.Context(), testPool, topic, ""); err != nil {
-		t.Fatal(err)
-	}
-
-	time.Sleep(500 * time.Millisecond)
-
-	mu.Lock()
-	defer mu.Unlock()
-	if count != 2 {
-		t.Errorf("count = %d, want 2", count)
-	}
-}
-
-func TestListenNoMatch(t *testing.T) {
-	prefix := "gw.lnomatch." + uuid.NewString()[:8]
-
-	var mu sync.Mutex
-	var received bool
-
-	w := New(setupTest(t), testSecret, Opts{Notifier: testNotifier(t)})
-	w.Listen(prefix+".specific", func(ctx context.Context, topic, message string) {
-		mu.Lock()
-		received = true
-		mu.Unlock()
-	})
-	startTestWire(t, w)
-
-	if err := Notify(t.Context(), testPool, prefix+".other", ""); err != nil {
-		t.Fatal(err)
-	}
-
-	time.Sleep(500 * time.Millisecond)
-
-	mu.Lock()
-	defer mu.Unlock()
-	if received {
-		t.Error("handler was called for non-matching topic")
-	}
-}
-
-func TestListenSkipSelf(t *testing.T) {
-	topic := "gw.lskipself." + uuid.NewString()[:8]
-
-	var mu sync.Mutex
-	var count int
-
-	w := New(setupTest(t), testSecret, Opts{Notifier: testNotifier(t)})
-	w.Listen(topic, func(ctx context.Context, topic, message string) {
-		mu.Lock()
-		count++
-		mu.Unlock()
-	})
-	startTestWire(t, w)
-
-	// SentBy = this wire's ID: the wire skips the echo of what it already
-	// delivered locally — here nothing was delivered locally, so nothing
-	// arrives at all.
-	if err := Notify(t.Context(), testPool, topic, "", NotifyOpts{SentBy: w.ID()}); err != nil {
-		t.Fatal(err)
-	}
-	// No sender to skip: delivered.
-	if err := Notify(t.Context(), testPool, topic, ""); err != nil {
-		t.Fatal(err)
-	}
-
-	time.Sleep(500 * time.Millisecond)
-
-	mu.Lock()
-	defer mu.Unlock()
-	if count != 1 {
-		t.Errorf("count = %d, want 1 (skip-self should have prevented one delivery)", count)
-	}
-}
-
 // --- Dispatch queue ---
 
 // TestDispatchOverflowDrops proves the notifier-side callbacks never
-// block: with the dispatch queue full they drop the event and return,
+// block: with the dispatch queue full they drop the frame and return,
 // so a stalled wire cannot stall the process's shared LISTEN connection.
 func TestDispatchOverflowDrops(t *testing.T) {
 	w := New(setupTest(t), testSecret) // never Started: nothing drains the queue
 
 	for range dispatchSize {
-		w.dispatch <- dispatchEvent{topic: "gw.fill"}
+		w.dispatch <- frame{Topic: "gw.fill"}
 	}
 
 	done := make(chan struct{})
 	go func() {
-		w.enqueueBus(`{"sent_by": null, "topic": "gw.overflow", "message": ""}`)
+		w.enqueueFrame(`{"stream": "s", "pos": 1, "topic": "gw.overflow"}`)
+		w.enqueueFrame(`{"topic": "gw.overflow.presence"}`)
 		w.enqueueInbox("gw_someone")
 		w.enqueueInboxReconnect()
 		close(done)
@@ -500,10 +248,10 @@ func TestServePollUnauthorized(t *testing.T) {
 	}
 }
 
-func TestServePollRequiresIdentity(t *testing.T) {
+func TestServePollRequiresRecipient(t *testing.T) {
 	w := New(setupTest(t), testSecret)
 
-	// A token without an identity can't address the identity-keyed inbox.
+	// A token without a recipient can't address the recipient-keyed inbox.
 	token := w.Token([]string{"notif.#"})
 
 	rr := httptest.NewRecorder()
@@ -517,39 +265,39 @@ func TestServePollRequiresIdentity(t *testing.T) {
 
 // TestServePoll exercises the poll transport end to end: the same Render
 // definition projects stored inbox rows, the token's topic scope filters the
-// identity-keyed inbox to a subset, the cursor advances past skipped rows, and the
-// poll is a pure read (no ack). The rows are written while no SSE client is
-// connected — this is also the offline catch-up path: a client that missed
-// every nudge finds the rows on its next poll.
+// recipient-keyed inbox to a subset, the cursor advances past skipped rows,
+// and the poll is a pure read (no ack). The rows are written while no SSE
+// client is connected — this is also the offline catch-up path: a client
+// that missed every nudge finds the rows on its next poll.
 func TestServePoll(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 	w := New(pool, testSecret)
 
-	identity := "gw_poll_" + uuid.NewString()[:8]
+	recipient := "gw_poll_" + uuid.NewString()[:8]
 	base := "notif." + uuid.NewString()[:8]
 	drawerTopic := base + ".message"
 	otherTopic := "change." + uuid.NewString()[:8] // out of the token's scope
 
-	// One renderer, shared by both transports: wrap the message in an <li>.
-	w.Render(base+".#", func(r *http.Request, topic, message string) (Fragment, error) {
-		return Fragment{Data: "<li>" + message + "</li>"}, nil
+	// One typed renderer, shared by both transports: wrap the payload in an <li>.
+	Render(w, base+".#", func(r *http.Request, topic string, data string) (Fragment, error) {
+		return Fragment{Data: "<li>" + data + "</li>"}, nil
 	})
 
 	// Seed the inbox: two in-scope rows interleaved with one out-of-scope row.
-	if _, err := NotifyDurable(ctx, pool, identity, drawerTopic, "one"); err != nil {
+	if _, err := Send(ctx, pool, recipient, drawerTopic, "one"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NotifyDurable(ctx, pool, identity, otherTopic, "ignored"); err != nil {
+	if _, err := Send(ctx, pool, recipient, otherTopic, "ignored"); err != nil {
 		t.Fatal(err)
 	}
-	lastID, err := NotifyDurable(ctx, pool, identity, drawerTopic, "two")
+	lastID, err := Send(ctx, pool, recipient, drawerTopic, "two")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Identity token scoped to the drawer subset only.
-	token := w.Token([]string{base + ".#"}, TokenOpts{Identity: identity})
+	// Recipient token scoped to the drawer subset only.
+	token := w.Token([]string{base + ".#"}, TokenOpts{Recipient: recipient})
 
 	rr := httptest.NewRecorder()
 	w.ServePoll(rr, httptest.NewRequest("GET", "/poll?after=0", nil), token)
@@ -567,12 +315,28 @@ func TestServePoll(t *testing.T) {
 	}
 
 	// Pure read: nothing was acked, so all three rows are still unseen.
-	unseen, err := ReadUnseen(ctx, pool, identity, 0, 10)
+	unseen, err := ReadUnseen(ctx, pool, recipient, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(unseen) != 3 {
 		t.Fatalf("expected 3 rows still unseen (poll must not ack), got %d", len(unseen))
+	}
+
+	// The JSON mode returns the same in-scope rows as data.
+	rj := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/poll?after=0", nil)
+	req.Header.Set("Accept", "application/json")
+	w.ServePoll(rj, req, token)
+	if ct := rj.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("json mode content type = %q", ct)
+	}
+	var rows []Notification
+	if err := json.Unmarshal(rj.Body.Bytes(), &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].Payload != `"one"` || rows[1].Payload != `"two"` {
+		t.Fatalf("json rows = %+v", rows)
 	}
 
 	// Polling again from the returned cursor is caught up: empty body.
@@ -585,10 +349,10 @@ func TestServePoll(t *testing.T) {
 
 // --- The inbox nudge ---
 
-// TestInboxNudgeReachesOnlyItsIdentity proves the nudge is
-// identity-addressed: NotifyDurable for one identity sends the reserved
-// inbox frame to that identity's connections and to nobody else.
-func TestInboxNudgeReachesOnlyItsIdentity(t *testing.T) {
+// TestInboxNudgeReachesOnlyItsRecipient proves the nudge is
+// recipient-addressed: Send for one recipient sends the reserved
+// inbox frame to that recipient's connections and to nobody else.
+func TestInboxNudgeReachesOnlyItsRecipient(t *testing.T) {
 	w := New(setupTest(t), testSecret, Opts{Notifier: testNotifier(t)})
 	startTestWire(t, w)
 
@@ -596,10 +360,10 @@ func TestInboxNudgeReachesOnlyItsIdentity(t *testing.T) {
 	alice := "gw_alice_" + uuid.NewString()[:8]
 	bob := "gw_bob_" + uuid.NewString()[:8]
 
-	aliceResp := connectSSE(t, w, w.Token([]string{topic}, TokenOpts{Identity: alice}))
-	bobResp := connectSSE(t, w, w.Token([]string{topic}, TokenOpts{Identity: bob}))
+	aliceResp := connectSSE(t, w, w.Token([]string{topic}, TokenOpts{Recipient: alice}))
+	bobResp := connectSSE(t, w, w.Token([]string{topic}, TokenOpts{Recipient: bob}))
 
-	if _, err := NotifyDurable(t.Context(), testPool, alice, topic, "for alice"); err != nil {
+	if _, err := Send(t.Context(), testPool, alice, topic, "for alice"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -616,24 +380,23 @@ func TestInboxNudgeReachesOnlyItsIdentity(t *testing.T) {
 	}
 }
 
-// TestNotifyDurableRollback proves the failure pair: a rolled-back
-// NotifyDurable delivers neither the row nor the nudge, and a committed
-// one delivers both.
-func TestNotifyDurableRollback(t *testing.T) {
+// TestSendRollback proves the failure pair: a rolled-back Send delivers
+// neither the row nor the nudge, and a committed one delivers both.
+func TestSendRollback(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 	w := New(pool, testSecret, Opts{Notifier: testNotifier(t)})
 	startTestWire(t, w)
 
-	identity := "gw_rollback_" + uuid.NewString()[:8]
+	recipient := "gw_rollback_" + uuid.NewString()[:8]
 	topic := "gw.rollback." + uuid.NewString()[:8]
-	resp := connectSSE(t, w, w.Token([]string{topic}, TokenOpts{Identity: identity}))
+	resp := connectSSE(t, w, w.Token([]string{topic}, TokenOpts{Recipient: recipient}))
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NotifyDurable(ctx, tx, identity, topic, "never happened"); err != nil {
+	if _, err := Send(ctx, tx, recipient, topic, "never happened"); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Rollback(ctx); err != nil {
@@ -642,7 +405,7 @@ func TestNotifyDurableRollback(t *testing.T) {
 
 	// The committed insert that follows is the fence: its nudge arriving
 	// first (and alone) proves the rolled-back one never fired.
-	if _, err := NotifyDurable(ctx, pool, identity, topic, "committed"); err != nil {
+	if _, err := Send(ctx, pool, recipient, topic, "committed"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -651,12 +414,28 @@ func TestNotifyDurableRollback(t *testing.T) {
 		t.Fatalf("events = %+v, want exactly one inbox frame", events)
 	}
 
-	unseen, err := ReadUnseen(ctx, pool, identity, 0, 10)
+	unseen, err := ReadUnseen(ctx, pool, recipient, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(unseen) != 1 || unseen[0].Message != "committed" {
+	if len(unseen) != 1 || unseen[0].Payload != `"committed"` {
 		t.Fatalf("unseen = %+v, want only the committed row", unseen)
+	}
+}
+
+// --- The glue ---
+
+func TestServeScript(t *testing.T) {
+	w := New(setupTest(t), testSecret)
+
+	rr := httptest.NewRecorder()
+	w.ServeScript(rr, httptest.NewRequest("GET", "/wire.js", nil))
+
+	if ct := rr.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
+		t.Fatalf("content type = %q", ct)
+	}
+	if !strings.Contains(rr.Body.String(), "window.wire") {
+		t.Fatal("script body does not define window.wire")
 	}
 }
 
@@ -667,10 +446,11 @@ type sseEvent struct {
 	data  string
 }
 
-func readSSEEvents(t *testing.T, resp *http.Response, count int, timeout time.Duration) []sseEvent {
-	t.Helper()
-
-	ch := make(chan sseEvent, count)
+// sseReader starts one scanner goroutine for the connection and returns a
+// pull function. A test that reads in phases must use one reader — a
+// second scanner on the same body would race the first for its bytes.
+func sseReader(resp *http.Response) func(count int, timeout time.Duration) []sseEvent {
+	ch := make(chan sseEvent, 64)
 	go func() {
 		scanner := bufio.NewScanner(resp.Body)
 		var currentEvent, currentData string
@@ -690,15 +470,22 @@ func readSSEEvents(t *testing.T, resp *http.Response, count int, timeout time.Du
 		}
 	}()
 
-	var events []sseEvent
-	deadline := time.After(timeout)
-	for range count {
-		select {
-		case ev := <-ch:
-			events = append(events, ev)
-		case <-deadline:
-			return events
+	return func(count int, timeout time.Duration) []sseEvent {
+		var events []sseEvent
+		deadline := time.After(timeout)
+		for range count {
+			select {
+			case ev := <-ch:
+				events = append(events, ev)
+			case <-deadline:
+				return events
+			}
 		}
+		return events
 	}
-	return events
+}
+
+func readSSEEvents(t *testing.T, resp *http.Response, count int, timeout time.Duration) []sseEvent {
+	t.Helper()
+	return sseReader(resp)(count, timeout)
 }

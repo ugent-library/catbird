@@ -1,230 +1,222 @@
-# 04 — wire: async web delivery
+# 04 — wire: delivering events to people
 
-One package, two storage stories (D12). The vision said wire and the inbox share
-no machinery. That was already false in the current code: they share Fragment
-rendering, token auth, and the poll transport (PR #41). The honest claim, and the
-design rule: **independent storage and delivery, shared presentation.** The
-package is `wire` and it depends on the kernel and the `notify` package — never
-on `streams` or `jobs` (D45). (It used to optionally import `stream` to register
-an `inbox` relay kind; relays died with routing — D29 — and inbox rows are
-written explicitly by handlers holding the identity.)
+Wire is the browser boundary: server-rendered fragments over SSE, a
+durable per-recipient inbox read by poll, and presence. It owns no
+events. The model, ratified 2026-07-30 (D46), in one rule:
 
-Module conventions apply whole (D41): own migrations (`wire/migrations`, goose
-table `cb_wire_migrations`), own `Conn`, opts-struct surface, every SQL name
-module-prefixed (`cb_wire_*`), and two NOTIFY channels of wire's own — `cbw`
-carries the event JSON `{sent_by, topic, message}`, `cbw_inbox` carries an
-identity. The old names stay live in the old schema until M6 — raven's
-`record_events` trigger calls `cb_notify` in production, and old and new share
-one database — so nothing here reuses them: not the
-`cb_wire_nodes`/`cb_wire_presence` tables, not the
-`cb_notify*`/`cb_mark_seen*` functions, not the `cb_wire` channel.
+**Every message is a row; there is no rowless delivery.** A row is one of
+three kinds, each with its own lifecycle:
 
-## 1. Shape
+| Row | Lives in | Lifecycle | Meaning |
+|---|---|---|---|
+| relayed stream message | the log (`cb_stream_messages`) | append, kept for the stream's retention | a fact of the system |
+| inbox row | `cb_wire_inbox` | kept until read or expired | a thing *for* someone |
+| presence row | `cb_wire_presence` | newest wins, evaporates on silence | where someone *is* |
 
-```
-wire/
-├── ephemeral: SSE hub, Listen handlers, notifier subscriber    (today's wire.go, minus presence)
-├── inbox:     durable per-identity store + poll + nudge        (today's notifications.go, extended)
-└── shared:    Fragment rendering, tokens, ServePoll, the trie  (explicitly shared internals)
-```
+The NOTIFY channels carry **addresses, never content**: `{stream, pos,
+topic}` for a relayed message, `{recipient}` for an inbox nudge,
+`{topic}` for a presence change. The receiving wire fetches the row
+(`cb_stream_fetch` — the one log read wire makes), renders it through the
+registry, and pushes a frame. Consequences, each load-bearing:
 
-Framework positioning (README amendment 1): the surface is SSE + HTML fragments +
-JSON, aimed at server-rendered apps generally. htmx appears in examples only.
+- **No replay, no resume, no SSE ids.** Anything a client misses is
+  refetchable, because everything is a row — live frames are a latency
+  optimization over refetch, never the source of truth. An SSE id would
+  promise resume, so none is ever sent.
+- **No size rules anywhere.** Payloads never ride a NOTIFY frame, so the
+  8000-byte limit stays an internal constant of one hop nobody sees.
+- **Reconnect is refetch.** A page that reconnects re-pulls the state it
+  renders (its inbox, its presence rooms, its own app endpoints); there
+  is nothing else to catch up on.
 
-## 2. Ephemeral (wire proper)
+The two products are the token's two claims: **topics** grant the live
+feed (at-most-once, while connected), **recipient** grants the inbox
+(exactly-once, presence-independent). Module conventions apply whole
+(D41): own migrations (`cb_wire_migrations`), own `Conn`, opts-struct
+surface, every SQL name `cb_wire_*`, two fixed NOTIFY channels (`cbw`,
+`cbw_inbox` — channels scale with the declared catalog, payloads carry
+runtime coordinates, D45). Wire's Go depends on the kernel and `notify`,
+never on `streams` or `jobs`; its one composition with streams is SQL,
+through the stream module's public API (`cb_stream_define_cursor`,
+`cb_stream_read`, `cb_stream_fetch`), the D41 direction.
 
-Ports: topics and the in-process trie dispatch, the SSE handler, tokens,
-`Listen`/`Render`. Wire subscribes to its two channels once, at `Start` — the
-trie routes topics in-process, so the channel count never grows with topics,
-subscribers or identities (D45). The changes from today's wire.go:
+The old root-schema names (`cb_notify`, `cb_notifications`, the `cb_wire`
+channel) stay live beside this module until M6 — raven's `record_events`
+trigger calls `cb_notify` in production — and nothing here reuses them.
 
-- **The shared notifier replaces the owned LISTEN connection.** `Start` may run
-  after the notifier's; both subscriptions land on the live connection. The
-  notifier runs callbacks on the shared connection's goroutine, and wire hands
-  that goroutine to nobody: both callbacks only enqueue into wire's own
-  buffered dispatch channel (cap ~256), drained by one wire goroutine that
-  runs the `Listen` handlers and the SSE fan-out. Overflow drops the event
-  with a warning — ephemeral delivery is at-most-once by design, and an app
-  `Listen` handler must never be able to stall every consume loop in the
-  process.
-- **Surface**: `wire.New(pool, secret, Opts{Notifier, Logger})`. A nil
-  notifier is a working single-process configuration — local delivery and
-  both HTTP surfaces function; only cross-process push needs the notifier.
-  `Start` states the wake source at Info, symmetric wording: "pushing on
-  notify across processes" / "pushing within this process; clients catch up
-  by poll".
-- **The `catbird.%` reserved-topic guard drops**: no system producer
-  publishes on this bus — engine events ride `cbs_*`/`cbj_*`.
-- **The 8000-byte NOTIFY limit is the caller's contract** (godoc on
-  `wire.Notify`/`cb_wire_notify`): send a pointer to state, not the state;
-  oversize raises in the caller's transaction.
+## 1. Relays — the log's messages, forwarded to people
 
-**Presence does not port** — deferred, with its slot. No caller exists (raven,
-dashboard and TUI use none of it; its only exerciser was its own test), and
-its cross-node change signals never worked: both call sites name a `cb_notify`
-parameter that does not exist and discard the error. When a customer arrives,
-it returns additively as identity-keyed presence rows plus an instance
-heartbeat (`cb_wire_presence`, `cb_wire_instances`) and a sweep tick.
+A relay is the trigger shape pointed at people (`cb_wire_relays`: name
+PK, stream, expires_after, created_at): every message on its stream that
+matches its filter is forwarded, by the module's tick, in one transaction
+per batch — no consumer code deployed, cross-language by construction.
+The relay owns the cursor named after it on its stream; the cursor is the
+filter's single home (topic pattern + condition, the D29 languages,
+`$.recipients == "name"` included) and remembers how far delivery got.
 
-## 3. Inbox — own table, not the log (D13)
+Per matching message, two legs in that one transaction:
 
-`cb_wire_inbox (id, identity, topic, message, created_at, seen_at, read_at,
-expires_at)` — `id` is a global identity column and the poll cursor; `message`
-stays `text` (the same opaque substance as the ephemeral dialect; renderers
-and apps decode — raven stores JSON strings in it); partial indexes serve the
-unseen poll path and the expiry sweep. It deliberately does **not** store rows
-on the substrate's log. The log's retention floor is the lowest cursor, and the
-log can only drop rows below that floor. Inbox cursors would be per-identity,
-and most users sit idle. One dormant account would pin partitions forever. The
-vision said "the inbox can ride on the substrate". That is amended (README
-#10): the inbox is its **own identity-keyed store** (D13). Handlers write rows
-directly via `wire.NotifyDurable` — the handler that finishes a job knows
-exactly which user asked for it, so identity is a value in its hand, not
-something extracted from a topic (D29). Storage and retention stay
-identity-local.
+- **Live leg**: one `pg_notify` on `cbw` carrying the message's address.
+  Every wire process fetches the row, renders it per connection, and
+  pushes the frame to the connections whose token topics match. NOTIFY
+  fires on commit — the push is once per message; the leg is at-most-once
+  per connection, by contract.
+- **Durable leg**: one inbox row per addressed recipient — the union of
+  the `recipients` the publisher named on the message (02 §3) and every
+  matching watch (§3). Insert and cursor advance share the commit, so
+  inbox rows are **exactly-once** — the guarantee the hand-written Go
+  loop could not give (a crash between `Send` and the cursor's own commit
+  redelivered the batch; the orders demo measured that loop as more code
+  than its whole job chain).
 
-`collapse_key` does not port — no customer (raven passes only `ExpiresAt`).
-Keep-newest collapse (the FCM semantics) is recorded as a deferred design; it
-returns as one nullable column, one partial index and one write-time update.
+The relevance window is channel policy: `RelayOpts.ExpiresAfter`, an
+interval anchored at each **message's** `created_at`. One knob sets and
+filters: an inbox row expires that long after the event happened, and a
+message already past its window writes no rows — a stalled relay catching
+up must not flood inboxes with stale rows granted fresh windows
+(delivery-time anchoring was rejected for exactly that). Failure policy:
+declaration defects are refused at define (the filter compiles or the
+call raises); a message with no topic is skipped quietly — wire routes
+and renders by topic — and the cursor never wedges on log-borne content,
+because a bad message is in an immutable log and no deploy removes it.
 
-**seen / read distinction.** Three timestamps, two verbs:
+`wire.DefineRelay(ctx, conn, name, stream, RelayOpts{Topic, Condition,
+StartPos, ExpiresAfter})` — one verb, D26 semantics, an identical
+declaration writes nothing; `DeleteRelay` removes relay and cursor.
 
-| State | Meaning | Set by |
-|---|---|---|
-| delivered | row exists (created_at) | `wire.NotifyDurable` |
-| **seen** | rendered in the client's list — clears the badge | `MarkSeenUntil(identity, watermark)` / `MarkSeen(identity, ids)` — the PR #41 acks, unchanged |
-| **read** | user opened/acted on this item | `MarkRead(identity, id)`, `MarkReadUntil(identity, id)` — **new** |
+## 2. The inbox — own table, not the log (D13)
 
-**Reading implies seeing**: an opened row must leave the badge count, so both
-mark-read functions stamp `seen_at` too; every stamp keeps its first value.
-`MarkRead` returns whether the row exists — marking an already-read row is a
-no-op that still returns true (the idempotent-API rule). Unseen count drives
-badges. Unread drives item styling.
+`cb_wire_inbox (id, recipient, topic, payload, created_at, seen_at,
+read_at, expires_at)` — `id` is the poll cursor; `payload` is the event
+itself, exactly as published, rendered at read time (the uniform event
+model: the demo once minted an `inbox.order` topic with pre-rendered text
+purely to compensate for a split renderer story — with rows carrying the
+event, the feed's renderer serves the inbox unchanged). The inbox
+deliberately does **not** store rows on the substrate's log: log
+retention is positional and one dormant account would pin partitions
+forever; inbox retention is per-person state (D13, unchanged).
 
-**Retention** resolves the open seen-row follow-up from the durable-
-notifications work. A row leaves the inbox when its explicit `expires_at`
-passes, or when the identity is done with it: `read_at` older than R,
-`seen_at` older than S, `created_at` older than A. Defaults R 30d < S 90d <
-A 365d, per-app config (`wire.TickerOpts` — wire has no definitions table, so
-the windows are arguments to `_cb_wire_prune_inbox`, the `cb_purge_task_runs`
-precedent). The wait-until-seen guarantee from #39 survives as: **a row that
-was never seen and has no `expires_at` is not deleted before A** — an explicit
-`expires_at` always wins, seen or not (a stale prompt is not worth keeping).
-The prune is one `DELETE` on wire's own tick (`wire.StartTicker`, no Notifier
-field — nothing wakes retention); the inbox holds human-scale rows, so no
-batching until a measurement asks for it. `NULL` timestamps fail the age
-comparisons, so unread and unseen rows pass through their tiers untouched by
-construction.
+Writes arrive two ways. A relay's durable leg (§1) covers events whose
+audience is data — named recipients, watches. `wire.Send(ctx, conn,
+recipient, topic, payload, SendOpts{ExpiresAt})` — `cb_wire_send`, wire's
+one write — covers the author who holds the recipient in hand, in the
+author's transaction: the row commits with the app's writes, the nudge
+fires only on commit, a rollback delivers neither. Exactly-once in the
+store, at-most-once on the nudge.
 
-## 4. Durable push — built-in, optional (D12)
+**The nudge is recipient-addressed in the payload of one fixed channel**
+(`cbw_inbox`): wire keeps a recipient → connections map beside the topic
+trie and writes one reserved `event: inbox` frame (empty data) to that
+recipient's connections; the client answers by re-pulling its poll
+endpoint. A topic-addressed nudge would ping every holder of a shared
+topic grant, and a payload-carrying nudge would double-render (a frame
+carries no row id to ack). Offline clients find the rows on their next
+poll — the inbox is the catch-up path, the push is the fast lane.
 
-The vision rejected *baking durable push into wire*. The right resolution is
-composition **shipped in the box**, and it lives in SQL so foreign-language
-callers get all of it (the engine-in-SQL rule):
+**seen / read, timestamps not statuses**: `seen_at` (rendered in the
+list; unseen count drives badges) via `MarkSeenUntil`/`MarkSeen`,
+`read_at` (opened or acted on; drives styling) via
+`MarkRead`/`MarkReadUntil`. Reading implies seeing — an opened row must
+leave the badge — and every stamp keeps its first value. **Retention**:
+explicit `expires_at` always wins, seen or not; otherwise read older than
+R, seen older than S, created older than A (defaults 30/90/365d,
+`wire.TickerOpts` arguments — wire has no retention declarations). A row
+never seen with no expiry waits to be seen, the full A.
 
-```go
-wire.NotifyDurable(ctx, conn, identity, topic, message, opts) // Opts{ExpiresAt}
-// = one call to cb_wire_notify_durable: the inbox insert + the nudge, one body.
-// Callable in the caller's transaction: the insert is atomic with the app's
-// writes, and NOTIFY fires on commit — a rollback delivers neither row nor nudge.
-// Exactly-once in the store, at-most-once on the nudge.
-```
+## 3. Watches — subscriptions into the inbox
 
-**The nudge is identity-addressed in the payload of one fixed channel**:
-`pg_notify('<schema>.cbw_inbox', identity)`. The inbox is identity-keyed, so
-its wake is too (D45) — a topic-addressed nudge would ping every holder of a
-shared topic grant (raven's durable topics are constants like
-`task.batch_edit`), and a payload-carrying nudge would double-render, because
-an SSE frame carries no row id to ack. Wire keeps an identity → connections
-map beside the topic trie and writes one `event: inbox` frame (empty data;
-`inbox` is a reserved event name) to that identity's connections; the client
-answers by re-pulling its poll endpoint — `ServePoll` or a hand-rolled read
-like raven's tray. Offline clients find the row on their next poll.
+`cb_wire_subscriptions (recipient, pattern, expires_at)`: "matching
+relayed events go to my inbox until then". Patterns are prefix-only — an
+exact topic or `prefix.#` (`p.#` covers `p` itself, as in every topic
+language here); `*` is refused. Matching inverts into a B-tree probe: the
+deliverer expands a message's topic into its covering patterns (the
+topic, `#`, every prefix + `.#`) and looks those up — cost follows the
+topic's length, never the table's size. Conditions on watches are
+deliberately absent: the conditional case is the publisher's, named as
+`recipients`. `wire.Subscribe(ctx, conn, recipient, pattern,
+SubscribeOpts{ExpiresAt})`, `Unsubscribe`; lapsed watches stop matching
+at once and the prune removes the rows.
 
-Each half remains independently usable. `wire.Notify` stays public for
-ephemeral-only pushes, and direct inbox reads stay public too. The SSE layer
-learns nothing about scheduling or messaging.
+Addressing, in one line each: **live visibility** is the token's topics
+and nothing else; **inbox addressing** is named recipients ∪ watches ∪ `Send`;
+computed fan-out with transformation stays a handler.
 
-## 5. Build checklist
+## 4. Presence — where people are (separate from messages)
 
-1. Module skeleton: `wire/migrations` + `cb_wire_migrations`,
-   `MigrateUpTo`/`MigrateDownTo` (the streams/jobs shape), `wire.Conn`, and
-   module copies of the topic trie + `matchTopic` (unexported in the root
-   package; in-process pattern dispatch — the engine's matcher stays the
-   streams SQL grammar). Channel names are built inline from
-   `current_schema()`, as in streams and jobs.
-2. Port `wire.go`/`wire_token.go` per §2: two notifier subscriptions, own
-   dispatch goroutine, opts-struct constructor; presence out.
-3. Inbox DDL + functions: `cb_wire_notify`, `cb_wire_notify_durable` (insert +
-   nudge), `cb_wire_mark_seen_until`, `cb_wire_mark_seen`, `cb_wire_mark_read`,
-   `cb_wire_mark_read_until`, `_cb_wire_prune_inbox`; port `notifications.go` —
-   `ReadAt` in, `CollapseKey` out.
-4. `wire.StartTicker`: the retention tick.
-5. Tests: port `wire_test.go` + `notifications_test.go` (presence and collapse
-   tests retire with their features); new: reading implies seeing; the
-   `MarkReadUntil` watermark; the prune tiers including unseen-survives-until-A
-   and `expires_at`-wins; a rolled-back `NotifyDurable` delivers neither row
-   nor nudge; an offline client catches up via poll after missed SSE; the
-   nudge reaches only its identity's connections; two Wires on one notifier
-   cross-deliver; dispatch overflow drops without stalling the notifier;
-   nil-notifier single-process delivery.
-6. `docs/sql-api.md` gains the wire contract.
+`cb_wire_presence (topic, recipient, payload, expires_at)`: one row per
+(topic, person), newest payload wins, gone when the heartbeat stops.
+Presence is state, not messages — nothing kept, nothing addressed — so
+none of the message machinery applies, renderers included: the renderable
+unit is the *set* ("everyone on this record, and their fields"), so the
+app owns the handler and template, and wire ships mechanism only.
+`wire.Appear(ctx, conn, topic, recipient, payload, ttl)` upserts and
+re-arms; watchers are nudged (an empty frame named after the topic) only
+when something visible changed — arrival, payload change, back from
+expired, leave — never on a bare heartbeat re-arm. `Disappear` is the
+polite leave; silence works too. `PresenceAt` returns the live rows;
+expired rows never render, and the prune nudges each topic it sweeps so
+pages drop people whose laptop closed. Presence topics are ordinary
+topics named by app convention (`record.123.presence`): token grants and
+SSE event names work unchanged, and a presence topic never collides with
+an event topic.
 
-## 6. Open — declared relays (direction agreed 2026-07-21, surface not ratified)
+Rowless presence was the old design's grave: a joining client saw an
+empty room until heartbeats trickled in, and the cross-node change signal
+never worked. Rows dissolve both — join is a refetch.
 
-The orders demo (`examples/orders`) put a number on §2's consumer-callback
-relay: the most common web case — push what was published to the browsers,
-keep a durable copy in the inbox — costs a hand-written consume loop per
-app, more code than the demo's whole job chain. Three facts say this
-deserves a built-in: every live UI writes that loop; raven already ships a
-hand-built SQL version in production (its `record_events` DB trigger calls
-`cb_notify` directly — evidence the scenario begs for a server-side home);
-and the Go loop is subtly wrong on the durable leg — `NotifyDurable` runs
-on the pool while the cursor advances separately, so a crash between them
-redelivers the batch and writes duplicate inbox rows.
+## 5. Transports and the frame contract
 
-The agreed direction: M4c's trigger machinery pointed at wire. A declared
-relay is a stream cursor (`cb_stream_define_cursor`, the IRD03 reuse path)
-plus a per-message action run by wire's tick in one transaction — read
-after the cursor, per message `cb_wire_notify(topic, payload)` or the
-inbox insert, advance the cursor, commit. That transaction is the point:
-inbox rows become exactly-once (insert and advance commit together), the
-push becomes once-per-message (NOTIFY fires only on commit), and a
-foreign-language stack gets both legs with zero Go running. Wire's ticker
-gains a `Notifier` and reads its relay-source streams once at start, the
-worker convention. The relayed message is the payload verbatim (M4c's rule
-for trigger input); renderers compose the human text at read time, so the
-inbox is literally the durable copy of the feed.
+Frames are **plain SSE, nothing htmx-flavored**: `event:` is the topic,
+`data:` is the rendered fragment — or the payload JSON when no renderer
+matches or the connection asked `?raw=1`. One renderer registry
+(`Render`, typed `Render[T]`), read-time, request-aware, serving every
+surface the same fragment. The htmx SSE extension, hand-rolled
+`EventSource` listeners (`addEventListener` + `htmx.process`), and the
+shipped glue (`wire.js`, served by `ServeScript`: SSE → DOM CustomEvents
+`wire:<topic>` + declarative `data-wire-swap` + `htmx.process`) are three
+consumers of that one contract. One recorded constraint shapes all glue:
+EventSource has no wildcard for named events, so a page names the topics
+it uses — the token already bounds what can arrive, and envelope tricks
+would break the extension's `sse-swap`.
 
-This is not §2's dead design (wire subscribing to `cbs_*` wakes and
-re-pulling): that re-invented a consumer without a cursor's guarantees.
-A declared relay *is* a cursor with an action, and D45 holds — channels
-stay fixed, coordinates ride payloads.
+The idiom split: **log events swap** (the frame carries the fragment);
+**state triggers refetch** (inbox nudge, presence nudge — the row is the
+data). Poll is the same products over plain GET: `ServePoll` renders the
+recipient's unseen rows through the registry (JSON on `Accept:
+application/json`), cursor in the `X-Wire-Cursor` header, pure read —
+acks flow only through the mark verbs, so tabs converge. An htmx page
+degrades from push to poll by adding `every 30s` to the same trigger
+list. Tokens: AES-256-GCM, claims = topics + recipient + expiry.
 
-The verbatim shape alone is too narrow. Per-recipient text, multi-identity
-fan-out and conditional inbox writes should be supported (ruled
-2026-07-21), likely carried by **message headers** — the publisher already
-controls headers per message, and the relay would read declared header
-fields. Conditions may need no new mechanism at all: the relay's cursor
-takes the D29 `Topic` + `Condition` filters. Fan-out and per-recipient
-text have no sketched grammar yet.
+## 6. What died with the model (do not re-propose without new evidence)
 
-To rule before building:
+- **`w.Notify` / `cb_wire_notify`, `Listen`, `sent_by`** — the rowless
+  bus. Its one production caller (raven's refresh ping) already writes
+  rows (`record_events`) and becomes a stream publish + relay at M6;
+  server-side Go handlers that want events are stream consumers with
+  cursors, not wire listeners — wire was being a second, worse bus.
+- **Poll serving "the relayed feed after a client position", SSE
+  `Last-Event-ID` resume, `cb_stream_read_after`** — the feed trying to
+  be a thing with positions. Log history belongs to the log's own tools
+  (a cursor, SQL) beside wire, not through it; the cursor-borrowing read
+  died with the requirement.
+- **Oversize machinery** (inline-when-fits, chunking, a buffer table,
+  forbidding big payloads) — moot once frames are addresses; the buffer
+  table was a shadow log, chunking was reassembly on an at-most-once
+  hop, and a size cap would have promoted NOTIFY's constant into the app
+  contract, measured on the storage form instead of the delivered
+  fragment.
+- **A first-class feed/filter entity** — nothing resumes a feed, so
+  nothing needs the noun.
 
-- **Identity source.** §3's ruling — inbox rows are written by handlers
-  holding the identity, no `identity_from` — killed *topic*-interpolated
-  identities, on the grounds that identities are data. A declared read of
-  payload or header data (`$.payload.customer`, the vocabulary D29's
-  `Condition` already uses) is arguably that ruling's own conclusion, but
-  it grazes its letter; needs an explicit amendment or the durable leg
-  stays handler-written.
-- **The header grammar** for recipients and per-recipient text.
-- **One verb or two** (`DefineRelay` + `DefineInboxRelay`, or one with
-  options).
-- **Oversize policy.** `cb_wire_notify` raises past NOTIFY's 8000 bytes; a
-  relay must skip-and-log rather than wedge its cursor on one fat payload.
-- **SQL names** — provisional until transcription, as always.
+## 7. Build record
 
-The handler-written relay stays documented for whatever the declared shape
-cannot say. Own chunk, after the M5 exit gates; natural neighbor of the M6
-raven cutover, which would otherwise re-create the Go loop it deletes.
+Built 2026-07-30, with the module (all pre-release, edited in place):
+recipient vocabulary throughout (token claim `r`); `cb_wire_send`
+(payload jsonb); relays + `_cb_wire_relay_deliver`; subscriptions +
+`_cb_wire_topic_patterns`; presence + its prune-with-nudge; the address
+frames and the fetch in wire's dispatch; `ServeScript`/`wire.js`;
+`ServePoll` JSON mode; `wire.TickerOpts.Notifier` + relay tick
+(fixed-at-start stream set, the worker convention). The orders demo runs
+on a declared relay, named recipients and the glue. `docs/sql-api.md`
+carries the contract.

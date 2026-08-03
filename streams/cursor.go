@@ -2,8 +2,6 @@ package streams
 
 import (
 	"context"
-
-	"github.com/jackc/pgx/v5"
 )
 
 type CursorOpts struct {
@@ -19,8 +17,9 @@ type CursorOpts struct {
 	Topic string
 	// Condition: AND-only expression over headers and payload, parsed once
 	// at creation and applied server-side after the topic pattern. MVP
-	// forms: exists($.payload.a.b), $.headers.a.b == <scalar>. Slower than
-	// topic matching: costs a per-row jsonb evaluation, never
+	// forms: exists($.payload.a.b), $.headers.a.b == <scalar>,
+	// $.recipients == "name" (a recipient the publisher named). Slower
+	// than topic matching: costs a per-row jsonb evaluation, never
 	// index-assisted.
 	Condition string
 }
@@ -40,12 +39,11 @@ func EnsureCursor(ctx context.Context, conn Conn, stream, cursor string, opts ..
 // exactly-once processing.
 func Read(ctx context.Context, conn Conn, stream, cursor string, batchSize int) ([]Message, error) {
 	rows, err := conn.Query(ctx, `
-		SELECT m.id, m.stream, m.pos, coalesce(m.topic, ''), m.payload, m.headers, m.created_at
+		SELECT m.id, m.stream, m.pos, coalesce(m.topic, ''), m.payload, m.headers, m.recipients, m.created_at
 		FROM cb_stream_read($1, $2, $3) m`,
 		stream, cursor, batchSize)
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	msgs, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Message])
-	return msgs, wrapErr(err)
+	return collectMessages(rows)
 }

@@ -91,14 +91,26 @@ stream.PublishMessages(ctx, tx, "records", []stream.BatchMessage{
 })
 ```
 
-The envelope carries the full option set (topic, headers, key, delay,
-deliver_at); refs return in input order. The SQL side takes a single `jsonb`
-array — one JSON text any client language produces natively, no
+The envelope carries the full option set (topic, headers, recipients, key,
+delay, deliver_at); refs return in input order. The SQL side takes a single
+`jsonb` array — one JSON text any client language produces natively, no
 PG-array-literal escaping. `cb_stream_publish_payloads` (batch with one shared
 topic) is retired: `PublishMessages` subsumes it, and the set-based fast path
 is a deferred optimization with a written design and a trigger (05,
 "Deferred optimizations"). The root-package `catbird.Publish` facade still
 arrives at M6.
+
+**Recipients** (`PublishOpts.Recipients`, D46) name who an event is *for*,
+at the one place that knows: the publisher. They are their own column on
+the message — publish validates non-empty names, readers get
+`Message.Recipients`, schedules carry them onto every fired message, and
+retries redeliver them untouched. The condition grammar matches them with
+`$.recipients == "name"` (every named name must be present; a message with
+no recipients never matches — compiled to a required-names array, probed
+with `@>`), and wire's relays turn them into inbox rows (04). Header keys
+starting with `cb_` stay reserved for the engine, and conditions refuse
+`$.headers.cb_*` — the namespace is kept even though nothing is stored in
+it today.
 
 ## 4. Consumers by shape
 
@@ -125,29 +137,32 @@ the dispatcher shape — one event against many subscriber patterns, in process,
 built from app rows. The engine's matcher is the SQL compiler; the trie never
 became engine code.
 
-## 5. The ephemeral path (wire)
+## 5. The web path (wire)
 
-wire never touches storage, and it does not read the log. Browser-bound events
-arrive whole on wire's own bus channel (`cbw`), sent by `cb_wire_notify` /
-`wire.Notify` — callable inside the app's transaction, and Postgres delivers
-NOTIFY on commit, so push-only-on-commit is free. The payload must fit
-NOTIFY's 8000-byte limit: send a pointer to state, not the state (the
-function's documented contract; a storage-free path has nothing to re-pull).
+Browser-bound delivery is the wire module's whole subject (04, D46). What
+this document owes it is one fact and one boundary. The fact: stream
+traffic reaches browsers through a **declared relay** — a cursor wire's
+tick walks, one transaction per batch, forwarding each matching message
+as a live frame (the message's *address* on `cbw`; receivers fetch the
+row via `cb_stream_fetch` and render it) plus exactly-once inbox rows for
+the message's `recipients` and matching watches. The boundary: wire's only
+reads of this module are its public SQL API — `cb_stream_define_cursor`
+for the relay's filter, `cb_stream_read` in the deliverer,
+`cb_stream_fetch` behind a frame — never the tables.
 
-The stream channels are wakes, not transport: `cbs_<stream>` carries only the
-topic, follows the *actual* append (a delayed publish notifies when due, a
-dedup-skipped publish not at all), and NOTIFY deduplicates identical
-(channel, payload) pairs per transaction, so batch publishes cost one
-notification per distinct topic. Stream traffic therefore reaches browsers
-through a consumer: a subscription or cursor handler holds the full message
-and calls `wire.Notify` — or `wire.NotifyDurable` for the inbox — exactly the
-vision's "a cursor plus a function". Declaring that consumer server-side — a
-relay wire's own tick walks — is agreed open work (04 §6). The earlier design
-here — wire subscribing to `cbs_*` directly and re-pulling state — is dead:
-it re-invents a consumer inside wire without a cursor's guarantees (D45, 04).
+The stream channels stay wakes, not transport: `cbs_<stream>` carries
+only the topic, follows the *actual* append (a delayed publish notifies
+when due, a dedup-skipped publish not at all), and NOTIFY deduplicates
+identical (channel, payload) pairs per transaction, so batch publishes
+cost one notification per distinct topic. Two designs died here and stay
+dead: wire subscribing to `cbs_*` directly and re-pulling state (a
+consumer without a cursor's guarantees), and the hand-written consumer
+loop calling wire per message (its durable leg was at-least-once — a
+crash between the inbox write and the cursor's commit wrote duplicate
+rows; the relay's one transaction is the fix, 04 §1).
 
-The shared notifier holds the one LISTEN connection per process and fans out
-to in-process subscribers (04); it arrives at M5 (D17).
+The shared notifier holds the one LISTEN connection per process and fans
+out to in-process subscribers (04); it arrived at M5 (D17).
 
 ## 6. What died, and what would revive it
 

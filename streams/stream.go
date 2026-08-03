@@ -45,13 +45,42 @@ type Ref struct {
 }
 
 type Message struct {
-	ID        int64
-	Stream    string
-	Pos       int64
-	Topic     string
-	Payload   json.RawMessage
-	Headers   map[string]any
-	CreatedAt time.Time
+	ID         int64
+	Stream     string
+	Pos        int64
+	Topic      string
+	Payload    json.RawMessage
+	Headers    map[string]any
+	Recipients []string // who the publisher named; matched by $.recipients
+	CreatedAt  time.Time
+}
+
+// collectMessages scans message rows (id, stream, pos, topic, payload,
+// headers, recipients, created_at).
+func collectMessages(rows pgx.Rows) ([]Message, error) {
+	msgs, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Message])
+	return msgs, wrapErr(err)
+}
+
+// Fetch returns one message by address. The log is position-addressable:
+// a live wire frame carries {stream, pos}, and the receiving node fetches
+// the row it was told about. Returns ErrNotFound when the position holds
+// nothing — pruned by retention, or never assigned.
+func Fetch(ctx context.Context, conn Conn, stream string, pos int64) (Message, error) {
+	rows, err := conn.Query(ctx, `
+		SELECT m.id, m.stream, m.pos, coalesce(m.topic, ''), m.payload, m.headers, m.recipients, m.created_at
+		FROM cb_stream_fetch($1, $2) m`, stream, pos)
+	if err != nil {
+		return Message{}, wrapErr(err)
+	}
+	msgs, err := collectMessages(rows)
+	if err != nil {
+		return Message{}, err
+	}
+	if len(msgs) == 0 {
+		return Message{}, fmt.Errorf("%w: no message at %s pos %d", ErrNotFound, stream, pos)
+	}
+	return msgs[0], nil
 }
 
 // EnsureOpts are initial values, applied only when this call creates the

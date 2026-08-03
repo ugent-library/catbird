@@ -64,16 +64,21 @@ its commit:
    payload as its input. That run fans out one `pick_item` step per
    item, and `confirm_order` runs after all of them finish — a plan
    that grows at runtime, not a pre-declared graph.
-3. The **relay cursor** holds each message and hands it to wire: a live
-   push to every connected browser.
-4. The same relay writes a **durable inbox row** for the demo user. The
-   row's commit nudges the browser to re-pull its inbox — that's the
-   red badge. If nobody is connected, the row waits; the inbox is the
-   catch-up path, the push is just the fast lane.
+3. The **relay** — one declared row, no consumer code — forwards each
+   matching message to the web: a live frame to every connected browser
+   whose token covers the topic. The frame carries only the message's
+   address; the wire fetches the row, renders it and pushes the
+   fragment.
+4. The same relay writes a **durable inbox row** for every recipient the
+   publisher named on the message — `order.placed` names `demo-user`.
+   The row carries the event itself, rendered by the same renderer as
+   the live feed, and its commit nudges the browser to re-pull — that's
+   the red badge. If nobody is connected, the row waits; the inbox is
+   the catch-up path, the push is just the fast lane.
 
 This is the integration model from `docs/vision.md` §4. The four `Bind`
-lines sketched there became: a subscription, a trigger, and one cursor
-that makes two calls. Routing didn't survive the design work — readers
+lines sketched there became: a subscription, a trigger, and a relay —
+all rows, all declared. Routing didn't survive the design work — readers
 declaring what they want did.
 
 ## Poke around
@@ -95,8 +100,8 @@ WHERE r.job = 'process_order'
 ORDER BY r.id DESC, s.id LIMIT 12;
 
 -- the inbox, with seen/read stamps moving as you click
-SELECT id, topic, message, seen_at, read_at FROM cb_wire_inbox
-WHERE identity = 'demo-user' ORDER BY id DESC LIMIT 5;
+SELECT id, topic, payload, seen_at, read_at FROM cb_wire_inbox
+WHERE recipient = 'demo-user' ORDER BY id DESC LIMIT 5;
 ```
 
 Two more things worth trying:

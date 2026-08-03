@@ -83,15 +83,21 @@ END; $$;
 -- +goose statementend
 
 -- +goose statementbegin
--- Parse a condition into per-column jsonpath predicates, once, at
--- registration. Conjuncts are joined by '&&'; each is either
--- exists($.headers.a.b) / exists($.payload.a.b), or
+-- Parse a condition into per-column predicates, once, at registration.
+-- Conjuncts are joined by '&&'; each is either
+-- exists($.headers.a.b) / exists($.payload.a.b),
 -- $.headers.a.b == <scalar> with <scalar> a "string", a number, true or
--- false. Anything else raises.
+-- false, or $.recipients == "name" — true when the recipients the
+-- publisher named contain the name. Header and payload conjuncts compile
+-- to jsonpath; recipients conjuncts collect into the array of required
+-- names, probed with @> against the recipients column. Header keys
+-- starting with cb_ are refused: that namespace is the engine's.
+-- Anything else raises.
 CREATE FUNCTION _cb_stream_compile_condition(
     condition text,
     OUT headers_condition jsonpath,
-    OUT payload_condition jsonpath
+    OUT payload_condition jsonpath,
+    OUT recipients_condition text[]
 )
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -100,6 +106,7 @@ DECLARE
     _pred text;
     _headers text[] := '{}';
     _payload text[] := '{}';
+    _recipients text[] := '{}';
 BEGIN
     IF _cb_stream_compile_condition.condition IS NULL
     OR btrim(_cb_stream_compile_condition.condition) = '' THEN
@@ -107,6 +114,14 @@ BEGIN
     END IF;
 
     FOREACH _conjunct IN ARRAY regexp_split_to_array(_cb_stream_compile_condition.condition, '\s*&&\s*') LOOP
+        -- recipient membership: $.recipients == "name". Every named name
+        -- must be present; a message with no recipients never matches.
+        _m := regexp_match(_conjunct, '^\s*\$\.recipients\s*==\s*"([^"\\]*)"\s*$');
+        IF _m IS NOT NULL THEN
+            _recipients := _recipients || _m[1];
+            CONTINUE;
+        END IF;
+
         -- nested-key existence: exists($.headers.a.b)
         _m := regexp_match(_conjunct,
             '^\s*exists\(\$\.(headers|payload)((?:\.[a-zA-Z_][a-zA-Z0-9_]*)+)\)\s*$');
@@ -117,10 +132,17 @@ BEGIN
             _m := regexp_match(_conjunct,
                 '^\s*\$\.(headers|payload)((?:\.[a-zA-Z_][a-zA-Z0-9_]*)+)\s*==\s*("[^"\\]*"|-?[0-9]+(?:\.[0-9]+)?|true|false)\s*$');
             IF _m IS NULL THEN
-                RAISE EXCEPTION 'catbird: unsupported condition near "%"; use exists($.headers.a.b) or $.payload.a.b == <scalar>, joined with &&',
+                RAISE EXCEPTION 'catbird: unsupported condition near "%"; use exists($.headers.a.b), $.payload.a.b == <scalar> or $.recipients == "name", joined with &&',
                     _conjunct USING ERRCODE = 'IRD01';
             END IF;
             _pred := '$' || _m[2] || ' == ' || _m[3];
+        END IF;
+
+        -- cb_ header keys are the engine's own storage; conditions read
+        -- them through their first-class forms.
+        IF _m[1] = 'headers' AND left(_m[2], 4) = '.cb_' THEN
+            RAISE EXCEPTION 'catbird: header keys starting with cb_ are reserved; recipients are matched with $.recipients == "name"'
+                USING ERRCODE = 'IRD01';
         END IF;
 
         IF _m[1] = 'headers' THEN
@@ -135,6 +157,9 @@ BEGIN
     END IF;
     IF array_length(_payload, 1) > 0 THEN
         payload_condition := array_to_string(_payload, ' && ')::jsonpath;
+    END IF;
+    IF array_length(_recipients, 1) > 0 THEN
+        recipients_condition := _recipients;
     END IF;
 END; $$;
 -- +goose statementend
@@ -152,9 +177,10 @@ CREATE TABLE cb_stream_cursors (
     pos bigint NOT NULL DEFAULT 0, -- how far this cursor has read: everything at or below this position is acked
     topic text,                 -- topic pattern; NULL reads every topic
     topic_regex text,           -- compiled by _cb_stream_compile_topic at ensure
-    condition text,             -- headers/payload expression; NULL reads everything
+    condition text,             -- headers/payload/recipients expression; NULL reads everything
     headers_condition jsonpath, -- disassembled by _cb_stream_compile_condition at ensure
     payload_condition jsonpath,
+    recipients_condition text[],
     PRIMARY KEY (stream, name)
 );
 
@@ -166,6 +192,7 @@ CREATE TABLE cb_stream_pending (
     topic text,
     payload jsonb NOT NULL,
     headers jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(headers) = 'object'),
+    recipients text[],
     deliver_at timestamptz NOT NULL,
     key text -- set when delayed message has a deduplication key
 );
@@ -195,6 +222,7 @@ CREATE TABLE cb_stream_messages (
     topic text,
     payload jsonb NOT NULL,
     headers jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(headers) = 'object'),
+    recipients text[], -- who the publisher named; matched by $.recipients, delivered to inboxes by relays
     created_at timestamptz NOT NULL DEFAULT now()
 )
 PARTITION BY LIST (stream);
@@ -217,9 +245,10 @@ CREATE TABLE cb_stream_subscriptions (
     on_fail cb_fail_policy NOT NULL,
     topic text,                 -- topic pattern; NULL reads every topic
     topic_regex text,           -- compiled by _cb_stream_compile_topic at ensure
-    condition text,             -- headers/payload expression; NULL reads everything
+    condition text,             -- headers/payload/recipients expression; NULL reads everything
     headers_condition jsonpath, -- disassembled by _cb_stream_compile_condition at ensure
     payload_condition jsonpath,
+    recipients_condition text[],
     PRIMARY KEY (stream, name),
     CHECK (closed_pos <= claimed_pos)
 );
@@ -249,8 +278,8 @@ CREATE TABLE cb_stream_claims (
 -- three jobs at once: a live lease holds it in the future, expiry brings it
 -- back, and a backoff pushes it out. attempt counts delivery tries consumed;
 -- one budget, max_attempts, covers both verdicts and crashes.
--- The headers are the original message's, untouched: a handler retried from
--- here sees exactly what it saw the first time.
+-- The headers and recipients are the original message's, untouched: a
+-- handler retried from here sees exactly what it saw the first time.
 CREATE TABLE cb_stream_retries (
     stream       text NOT NULL,
     subscription text NOT NULL,
@@ -258,6 +287,7 @@ CREATE TABLE cb_stream_retries (
     topic        text,
     payload      jsonb NOT NULL,
     headers      jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(headers) = 'object'),
+    recipients   text[],
     attempt      int NOT NULL,
     last_error   text,                 -- 'silence' for a crash, the handler's text for a verdict
     failed       boolean NOT NULL DEFAULT false,
@@ -284,6 +314,7 @@ CREATE TABLE cb_stream_schedules (
     topic    text,
     payload  jsonb NOT NULL DEFAULT '{}',
     headers  jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(headers) = 'object'),
+    recipients text[], -- copied onto each fired message
     next_at  timestamptz NOT NULL, -- when this schedule fires next
     PRIMARY KEY (stream, name)
 );
@@ -353,6 +384,7 @@ DECLARE
     _topic_re text;
     _headers_cond jsonpath;
     _payload_cond jsonpath;
+    _recipients_cond text[];
 BEGIN
     IF NOT cb_valid_name(cb_stream_ensure_cursor.cursor) THEN
         RAISE EXCEPTION 'catbird: invalid cursor name %; use [a-z][a-z0-9_]*, max 20 bytes',
@@ -374,15 +406,17 @@ BEGIN
         _topic_re := _cb_stream_compile_topic(cb_stream_ensure_cursor.topic);
     END IF;
     IF cb_stream_ensure_cursor.condition IS NOT NULL THEN
-        SELECT c.headers_condition, c.payload_condition INTO _headers_cond, _payload_cond
+        SELECT c.headers_condition, c.payload_condition, c.recipients_condition
+        INTO _headers_cond, _payload_cond, _recipients_cond
         FROM _cb_stream_compile_condition(cb_stream_ensure_cursor.condition) c;
     END IF;
 
     INSERT INTO cb_stream_cursors
-        (stream, name, pos, topic, topic_regex, condition, headers_condition, payload_condition)
+        (stream, name, pos, topic, topic_regex, condition,
+         headers_condition, payload_condition, recipients_condition)
     VALUES (cb_stream_ensure_cursor.stream, cb_stream_ensure_cursor.cursor, _start,
             cb_stream_ensure_cursor.topic, _topic_re,
-            cb_stream_ensure_cursor.condition, _headers_cond, _payload_cond)
+            cb_stream_ensure_cursor.condition, _headers_cond, _payload_cond, _recipients_cond)
     ON CONFLICT ON CONSTRAINT cb_stream_cursors_pkey DO NOTHING;
 END; $$;
 -- +goose statementend
@@ -408,6 +442,7 @@ DECLARE
     _topic_re text;
     _headers_cond jsonpath;
     _payload_cond jsonpath;
+    _recipients_cond text[];
 BEGIN
     IF NOT cb_valid_name(cb_stream_define_cursor.cursor) THEN
         RAISE EXCEPTION 'catbird: invalid cursor name %; use [a-z][a-z0-9_]*, max 20 bytes',
@@ -430,21 +465,24 @@ BEGIN
         _topic_re := _cb_stream_compile_topic(cb_stream_define_cursor.topic);
     END IF;
     IF cb_stream_define_cursor.condition IS NOT NULL THEN
-        SELECT c.headers_condition, c.payload_condition INTO _headers_cond, _payload_cond
+        SELECT c.headers_condition, c.payload_condition, c.recipients_condition
+        INTO _headers_cond, _payload_cond, _recipients_cond
         FROM _cb_stream_compile_condition(cb_stream_define_cursor.condition) c;
     END IF;
 
     INSERT INTO cb_stream_cursors AS c
-        (stream, name, pos, topic, topic_regex, condition, headers_condition, payload_condition)
+        (stream, name, pos, topic, topic_regex, condition,
+         headers_condition, payload_condition, recipients_condition)
     VALUES (cb_stream_define_cursor.stream, cb_stream_define_cursor.cursor, _start,
             cb_stream_define_cursor.topic, _topic_re,
-            cb_stream_define_cursor.condition, _headers_cond, _payload_cond)
+            cb_stream_define_cursor.condition, _headers_cond, _payload_cond, _recipients_cond)
     ON CONFLICT ON CONSTRAINT cb_stream_cursors_pkey DO UPDATE
-    SET topic             = excluded.topic,
-        topic_regex       = excluded.topic_regex,
-        condition         = excluded.condition,
-        headers_condition = excluded.headers_condition,
-        payload_condition = excluded.payload_condition,
+    SET topic                = excluded.topic,
+        topic_regex          = excluded.topic_regex,
+        condition            = excluded.condition,
+        headers_condition    = excluded.headers_condition,
+        payload_condition    = excluded.payload_condition,
+        recipients_condition = excluded.recipients_condition,
         pos = CASE WHEN cb_stream_define_cursor.start_pos IS NOT NULL
                    THEN cb_stream_define_cursor.start_pos
                    ELSE c.pos END
@@ -492,6 +530,7 @@ DECLARE
     _topic_re text;
     _headers_cond jsonpath;
     _payload_cond jsonpath;
+    _recipients_cond text[];
 BEGIN
     IF NOT cb_valid_name(cb_stream_ensure_subscription.subscription) THEN
         RAISE EXCEPTION 'catbird: invalid subscription name %; use [a-z][a-z0-9_]*, max 20 bytes',
@@ -515,7 +554,8 @@ BEGIN
         _topic_re := _cb_stream_compile_topic(cb_stream_ensure_subscription.topic);
     END IF;
     IF cb_stream_ensure_subscription.condition IS NOT NULL THEN
-        SELECT c.headers_condition, c.payload_condition INTO _headers_cond, _payload_cond
+        SELECT c.headers_condition, c.payload_condition, c.recipients_condition
+        INTO _headers_cond, _payload_cond, _recipients_cond
         FROM _cb_stream_compile_condition(cb_stream_ensure_subscription.condition) c;
     END IF;
 
@@ -523,7 +563,8 @@ BEGIN
         (stream, name, claimed_pos, closed_pos,
          claim_ttl, claim_batch_size, max_attempts,
          backoff_kind, backoff_base, backoff_max, on_fail,
-         topic, topic_regex, condition, headers_condition, payload_condition)
+         topic, topic_regex, condition,
+         headers_condition, payload_condition, recipients_condition)
     VALUES (
         cb_stream_ensure_subscription.stream,
         cb_stream_ensure_subscription.subscription,
@@ -539,7 +580,8 @@ BEGIN
         _topic_re,
         cb_stream_ensure_subscription.condition,
         _headers_cond,
-        _payload_cond
+        _payload_cond,
+        _recipients_cond
     )
     ON CONFLICT ON CONSTRAINT cb_stream_subscriptions_pkey DO NOTHING;
 END; $$;
@@ -547,14 +589,15 @@ END; $$;
 
 -- +goose statementbegin
 CREATE FUNCTION cb_stream_define_schedule(
-    stream   text,
-    name     text,
-    every    interval,
-    topic    text        DEFAULT NULL,
-    payload  jsonb       DEFAULT NULL,
-    headers  jsonb       DEFAULT NULL,
-    catch_up cb_catch_up_policy DEFAULT NULL,
-    start_at timestamptz DEFAULT NULL
+    stream     text,
+    name       text,
+    every      interval,
+    topic      text        DEFAULT NULL,
+    payload    jsonb       DEFAULT NULL,
+    headers    jsonb       DEFAULT NULL,
+    recipients text[]      DEFAULT NULL,
+    catch_up   cb_catch_up_policy DEFAULT NULL,
+    start_at   timestamptz DEFAULT NULL
 )
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
@@ -584,6 +627,12 @@ BEGIN
         RAISE EXCEPTION 'catbird: header keys starting with cb_ are reserved' USING ERRCODE = 'IRD01';
     END IF;
 
+    IF cb_stream_define_schedule.recipients IS NOT NULL
+       AND EXISTS (SELECT 1 FROM unnest(cb_stream_define_schedule.recipients) r
+                   WHERE r IS NULL OR r = '') THEN
+        RAISE EXCEPTION 'catbird: recipients must be non-empty strings' USING ERRCODE = 'IRD01';
+    END IF;
+
     PERFORM 1 FROM cb_streams s WHERE s.name = cb_stream_define_schedule.stream;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'catbird: stream % not defined', cb_stream_define_schedule.stream USING ERRCODE = 'IRD02';
@@ -591,7 +640,7 @@ BEGIN
 
     -- Topics are never empty; empty means none.
     INSERT INTO cb_stream_schedules AS sc
-        (stream, name, every, topic, payload, headers, catch_up, next_at)
+        (stream, name, every, topic, payload, headers, recipients, catch_up, next_at)
     VALUES (
         cb_stream_define_schedule.stream,
         cb_stream_define_schedule.name,
@@ -599,17 +648,19 @@ BEGIN
         nullif(cb_stream_define_schedule.topic, ''),
         coalesce(cb_stream_define_schedule.payload, '{}'),
         coalesce(cb_stream_define_schedule.headers, '{}'),
+        nullif(cb_stream_define_schedule.recipients, '{}'),
         coalesce(cb_stream_define_schedule.catch_up, 'skip'),
         coalesce(cb_stream_define_schedule.start_at,
                  clock_timestamp() + cb_stream_define_schedule.every)
     )
     ON CONFLICT ON CONSTRAINT cb_stream_schedules_pkey DO UPDATE
-    SET every    = excluded.every,
-        topic    = excluded.topic,
-        payload  = excluded.payload,
-        headers  = excluded.headers,
-        catch_up = excluded.catch_up,
-        next_at  = CASE
+    SET every      = excluded.every,
+        topic      = excluded.topic,
+        payload    = excluded.payload,
+        headers    = excluded.headers,
+        recipients = excluded.recipients,
+        catch_up   = excluded.catch_up,
+        next_at    = CASE
             WHEN cb_stream_define_schedule.start_at IS NOT NULL
                 THEN cb_stream_define_schedule.start_at
             WHEN sc.every IS DISTINCT FROM excluded.every
@@ -617,9 +668,9 @@ BEGIN
             ELSE sc.next_at
         END
     -- an identical declaration writes nothing and notifies nothing
-    WHERE (sc.every, sc.topic, sc.payload, sc.headers, sc.catch_up)
+    WHERE (sc.every, sc.topic, sc.payload, sc.headers, sc.recipients, sc.catch_up)
           IS DISTINCT FROM
-          (excluded.every, excluded.topic, excluded.payload, excluded.headers, excluded.catch_up)
+          (excluded.every, excluded.topic, excluded.payload, excluded.headers, excluded.recipients, excluded.catch_up)
        OR cb_stream_define_schedule.start_at IS NOT NULL
     RETURNING sc.next_at INTO _next_at;
 
@@ -651,6 +702,7 @@ CREATE FUNCTION cb_stream_publish(
     topic      text,
     payload    jsonb,
     headers    jsonb       DEFAULT '{}',
+    recipients text[]      DEFAULT NULL, -- who the message is for; matched by $.recipients
     key        text        DEFAULT NULL, -- deduplication key (keep oldest)
     delay      interval    DEFAULT NULL, -- relative delayed delivery
     deliver_at timestamptz DEFAULT NULL, -- absolute delayed delivery
@@ -669,6 +721,12 @@ BEGIN
     IF EXISTS (SELECT 1 FROM jsonb_object_keys(cb_stream_publish.headers) AS k
                WHERE left(k, 3) = 'cb_') THEN
         RAISE EXCEPTION 'catbird: header keys starting with cb_ are reserved' USING ERRCODE = 'IRD01';
+    END IF;
+
+    IF cb_stream_publish.recipients IS NOT NULL
+       AND EXISTS (SELECT 1 FROM unnest(cb_stream_publish.recipients) r
+                   WHERE r IS NULL OR r = '') THEN
+        RAISE EXCEPTION 'catbird: recipients must be non-empty strings' USING ERRCODE = 'IRD01';
     END IF;
 
     existing := false;
@@ -743,13 +801,14 @@ BEGIN
         ref_id   := coalesce(_id, nextval(pg_get_serial_sequence('cb_stream_pending', 'id')));
 
         INSERT INTO cb_stream_pending
-            (id, stream, topic, payload, headers, deliver_at, key)
+            (id, stream, topic, payload, headers, recipients, deliver_at, key)
         VALUES (
             ref_id,
             cb_stream_publish.stream,
             cb_stream_publish.topic,
             cb_stream_publish.payload,
             cb_stream_publish.headers,
+            nullif(cb_stream_publish.recipients, '{}'),
             _deliver_at,
             cb_stream_publish.key
         );
@@ -765,13 +824,14 @@ BEGIN
     ref_id   := coalesce(_id, nextval(pg_get_serial_sequence('cb_stream_messages', 'id')));
 
     -- id is GENERATED BY DEFAULT, so explicit inserts are allowed.
-    INSERT INTO cb_stream_messages (id, stream, topic, payload, headers)
+    INSERT INTO cb_stream_messages (id, stream, topic, payload, headers, recipients)
     VALUES (
         ref_id,
         cb_stream_publish.stream,
         cb_stream_publish.topic,
         cb_stream_publish.payload,
-        cb_stream_publish.headers
+        cb_stream_publish.headers,
+        nullif(cb_stream_publish.recipients, '{}')
     );
 
     -- Notify the position assigner.
@@ -782,9 +842,10 @@ $$;
 
 -- +goose statementbegin
 -- Batch publish: the equivalent of one cb_stream_publish per message, in
--- one call. messages is a jsonb array of {payload, topic?, headers?, key?,
--- delay?, deliver_at?} envelopes; delay is in seconds. Returns one row per
--- element, in input order.
+-- one call. messages is a jsonb array of {payload, topic?, headers?,
+-- recipients?, key?, delay?, deliver_at?} envelopes; delay is in seconds,
+-- recipients an array of strings. Returns one row per element, in input
+-- order.
 CREATE FUNCTION cb_stream_publish_messages(stream text, messages jsonb)
 RETURNS TABLE (ref_kind cb_ref_kind, ref_id bigint, existing boolean)
 LANGUAGE plpgsql AS $$
@@ -803,6 +864,9 @@ BEGIN
         IF _m->'payload' IS NULL THEN
             RAISE EXCEPTION 'catbird: message without payload' USING ERRCODE = 'IRD01';
         END IF;
+        IF _m ? 'recipients' AND jsonb_typeof(_m->'recipients') <> 'array' THEN
+            RAISE EXCEPTION 'catbird: recipients must be a JSON array of strings' USING ERRCODE = 'IRD01';
+        END IF;
 
         RETURN QUERY
         SELECT p.ref_kind, p.ref_id, p.existing
@@ -811,6 +875,8 @@ BEGIN
             _m->>'topic',
             _m->'payload',
             coalesce(_m->'headers', '{}'),
+            CASE WHEN _m ? 'recipients'
+                THEN (SELECT array_agg(r) FROM jsonb_array_elements_text(_m->'recipients') r) END,
             _m->>'key',
             CASE WHEN _m ? 'delay'
                 THEN make_interval(secs => (_m->>'delay')::double precision) END,
@@ -882,8 +948,8 @@ BEGIN
         DELETE FROM cb_stream_pending WHERE id = _p.id;
 
         -- Publish the message
-        INSERT INTO cb_stream_messages (stream, topic, payload, headers)
-        VALUES (_p.stream, _p.topic, _p.payload, _p.headers)
+        INSERT INTO cb_stream_messages (stream, topic, payload, headers, recipients)
+        VALUES (_p.stream, _p.topic, _p.payload, _p.headers, _p.recipients)
         RETURNING id INTO _msg_id;
         -- If the message has a key, update it.
         UPDATE cb_stream_keys k
@@ -925,8 +991,9 @@ BEGIN
                             ELSE 0 END;
 
         IF _fire_ticks > 0 THEN
-            INSERT INTO cb_stream_messages (stream, topic, payload, headers)
-            SELECT _schedule.stream, _schedule.topic, _schedule.payload, _schedule.headers
+            INSERT INTO cb_stream_messages (stream, topic, payload, headers, recipients)
+            SELECT _schedule.stream, _schedule.topic, _schedule.payload,
+                   _schedule.headers, _schedule.recipients
             FROM generate_series(1, _fire_ticks);
 
             PERFORM _cb_stream_notify(_schedule.stream, _schedule.topic);
@@ -1023,11 +1090,12 @@ DECLARE
     _regex text;
     _headers jsonpath;
     _payload jsonpath;
+    _recipients text[];
     _new_pos bigint;
 BEGIN
     -- Get current cursor position and conditions.
-    SELECT c.pos, c.topic_regex, c.headers_condition, c.payload_condition
-    INTO _pos, _regex, _headers, _payload
+    SELECT c.pos, c.topic_regex, c.headers_condition, c.payload_condition, c.recipients_condition
+    INTO _pos, _regex, _headers, _payload, _recipients
     FROM cb_stream_cursors c
     WHERE c.stream = cb_stream_read.stream AND c.name = cb_stream_read.cursor
     FOR UPDATE;
@@ -1054,11 +1122,27 @@ BEGIN
       AND (_regex IS NULL OR m.topic ~ _regex)          -- a NULL topic never matches
       AND (_headers IS NULL OR m.headers @@ _headers)   -- lax: an error means no match
       AND (_payload IS NULL OR m.payload @@ _payload)
+      AND (_recipients IS NULL OR m.recipients @> _recipients) -- no recipients never matches
     ORDER BY m.pos;
 
     UPDATE cb_stream_cursors c SET pos = _new_pos
     WHERE c.stream = cb_stream_read.stream AND c.name = cb_stream_read.cursor;
 END; $$;
+-- +goose statementend
+
+-- +goose statementbegin
+-- One message by address. The log is position-addressable: a live wire
+-- frame carries {stream, pos}, and the receiving node fetches the row it
+-- was told about, renders it and pushes it on. Returns nothing when the
+-- position holds nothing — pruned by retention, or never assigned — gone
+-- is gone, not an error.
+CREATE FUNCTION cb_stream_fetch(stream text, pos bigint)
+RETURNS SETOF cb_stream_messages
+LANGUAGE sql STABLE AS $$
+    SELECT * FROM cb_stream_messages m
+    WHERE m.stream = cb_stream_fetch.stream
+      AND m.pos = cb_stream_fetch.pos;
+$$;
 -- +goose statementend
 
 -- +goose statementbegin
@@ -1113,13 +1197,14 @@ BEGIN
     WHERE q.stream = _stream AND q.name = _subscription;
 
     INSERT INTO cb_stream_retries
-        (stream, subscription, origin_pos, topic, payload, headers, attempt, last_error, claimable_at)
-    SELECT m.stream, _subscription, m.pos, m.topic, m.payload, m.headers, 0, 'silence', clock_timestamp()
+        (stream, subscription, origin_pos, topic, payload, headers, recipients, attempt, last_error, claimable_at)
+    SELECT m.stream, _subscription, m.pos, m.topic, m.payload, m.headers, m.recipients, 0, 'silence', clock_timestamp()
     FROM cb_stream_messages m
     WHERE m.stream = _stream AND m.pos BETWEEN _from_pos AND _to_pos
       AND (_q.topic_regex IS NULL OR m.topic ~ _q.topic_regex)
       AND (_q.headers_condition IS NULL OR m.headers @@ _q.headers_condition)
       AND (_q.payload_condition IS NULL OR m.payload @@ _q.payload_condition)
+      AND (_q.recipients_condition IS NULL OR m.recipients @> _q.recipients_condition)
     ON CONFLICT ON CONSTRAINT cb_stream_retries_pkey DO NOTHING;
 END;
 $$;
@@ -1312,12 +1397,13 @@ BEGIN
           AND (q.topic_regex IS NULL OR m.topic ~ q.topic_regex)
           AND (q.headers_condition IS NULL OR m.headers @@ q.headers_condition)
           AND (q.payload_condition IS NULL OR m.payload @@ q.payload_condition)
+          AND (q.recipients_condition IS NULL OR m.recipients @> q.recipients_condition)
         ORDER BY m.pos;
         RETURN;
     END IF;
 
     RETURN QUERY
-    SELECT 0::bigint, r.stream, r.origin_pos, r.topic, r.payload, r.headers, r.created_at
+    SELECT 0::bigint, r.stream, r.origin_pos, r.topic, r.payload, r.headers, r.recipients, r.created_at
     FROM cb_stream_retries r
     WHERE r.stream = cb_stream_read_claim.stream
       AND r.subscription = cb_stream_read_claim.subscription
@@ -1551,11 +1637,11 @@ BEGIN
     END IF;
 
     INSERT INTO cb_stream_retries
-        (stream, subscription, origin_pos, topic, payload, headers,
+        (stream, subscription, origin_pos, topic, payload, headers, recipients,
          attempt, last_error, failed, claimable_at)
     VALUES (
         cb_stream_fail.stream, cb_stream_fail.subscription, cb_stream_fail.pos,
-        _m.topic, _m.payload, _m.headers,
+        _m.topic, _m.payload, _m.headers, _m.recipients,
         1, cb_stream_fail.error, _failed,
         CASE WHEN _failed THEN clock_timestamp()
              ELSE clock_timestamp() + cb_backoff(_q.backoff_kind, _q.backoff_base, _q.backoff_max, 1) END
@@ -1600,7 +1686,7 @@ DROP FUNCTION _cb_stream_deliver_schedules(int);
 DROP FUNCTION _cb_stream_prune_messages(text, int);
 DROP FUNCTION _cb_stream_prune_keys(text, int);
 DROP FUNCTION cb_stream_delete_schedule(text, text);
-DROP FUNCTION cb_stream_define_schedule(text, text, interval, text, jsonb, jsonb, cb_catch_up_policy, timestamptz);
+DROP FUNCTION cb_stream_define_schedule(text, text, interval, text, jsonb, jsonb, text[], cb_catch_up_policy, timestamptz);
 DROP TABLE cb_stream_schedules;
 DROP TYPE cb_catch_up_policy;
 
@@ -1618,12 +1704,13 @@ DROP FUNCTION cb_stream_delete_cursor(text, text);
 DROP FUNCTION cb_stream_define_cursor(text, text, bigint, text, text);
 DROP FUNCTION cb_stream_ensure_cursor(text, text, bigint, text, text);
 DROP FUNCTION cb_stream_read_claim(text, text, bigint, bigint);
+DROP FUNCTION cb_stream_fetch(text, bigint);
 DROP FUNCTION cb_stream_read(text, text, int);
 DROP TABLE cb_stream_retries;
 DROP TABLE cb_stream_claims;
 DROP TABLE cb_stream_subscriptions;
 DROP FUNCTION cb_stream_publish_messages(text, jsonb);
-DROP FUNCTION cb_stream_publish(text, text, jsonb, jsonb, text, interval, timestamptz);
+DROP FUNCTION cb_stream_publish(text, text, jsonb, jsonb, text[], text, interval, timestamptz);
 DROP FUNCTION cb_stream_ensure(text, interval);
 DROP FUNCTION _cb_stream_ensure_partition(text);
 DROP FUNCTION _cb_stream_deliver_pending(int);

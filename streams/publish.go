@@ -9,10 +9,11 @@ import (
 )
 
 type PublishOpts struct {
-	Key       string         // deduplication key: keep-oldest
-	Headers   map[string]any // cb_ keys are reserved
-	Delay     time.Duration  // relative delayed delivery
-	DeliverAt time.Time      // absolute delayed delivery
+	Key        string         // deduplication key: keep-oldest
+	Headers    map[string]any // cb_ keys are reserved
+	Recipients []string       // who the message is for; read back as Message.Recipients, matched as $.recipients
+	Delay      time.Duration  // relative delayed delivery
+	DeliverAt  time.Time      // absolute delayed delivery
 }
 
 func Publish(ctx context.Context, conn Conn, stream, topic string, payload any, opts ...PublishOpts) (Ref, error) {
@@ -33,8 +34,8 @@ func Publish(ctx context.Context, conn Conn, stream, topic string, payload any, 
 	var ref Ref
 	err = conn.QueryRow(ctx,
 		`SELECT p.ref_kind, p.ref_id, p.existing
-		 FROM cb_stream_publish($1, $2, $3, $4, $5, $6, $7) p`,
-		stream, nullText(topic), json.RawMessage(body), headers,
+		 FROM cb_stream_publish($1, $2, $3, $4, $5, $6, $7, $8) p`,
+		stream, nullText(topic), json.RawMessage(body), headers, o.Recipients,
 		nullText(o.Key), nullInterval(o.Delay), nullTime(o.DeliverAt),
 	).Scan(&ref.Kind, &ref.ID, &ref.Existing)
 	if err != nil {
@@ -45,14 +46,15 @@ func Publish(ctx context.Context, conn Conn, stream, topic string, payload any, 
 
 // BatchMessage is one element of PublishMessages. Zero fields mean the
 // same as their Publish counterparts: no topic, no headers, no
-// deduplication, immediate delivery.
+// recipients, no deduplication, immediate delivery.
 type BatchMessage struct {
-	Topic     string
-	Payload   any
-	Headers   map[string]any // cb_ keys are reserved
-	Key       string         // deduplication key: keep-oldest
-	Delay     time.Duration  // relative delayed delivery
-	DeliverAt time.Time      // absolute delayed delivery; not with Delay
+	Topic      string
+	Payload    any
+	Headers    map[string]any // cb_ keys are reserved
+	Recipients []string       // who the message is for; read back as Message.Recipients, matched as $.recipients
+	Key        string         // deduplication key: keep-oldest
+	Delay      time.Duration  // relative delayed delivery
+	DeliverAt  time.Time      // absolute delayed delivery; not with Delay
 }
 
 // PublishMessages publishes several messages in one call: the batch
@@ -65,21 +67,23 @@ func PublishMessages(ctx context.Context, conn Conn, stream string, msgs []Batch
 
 	// the envelope keys the SQL side reads; zero fields are left out
 	type envelope struct {
-		Topic     string         `json:"topic,omitempty"`
-		Payload   any            `json:"payload"`
-		Headers   map[string]any `json:"headers,omitempty"`
-		Key       string         `json:"key,omitempty"`
-		Delay     float64        `json:"delay,omitempty"` // seconds
-		DeliverAt *time.Time     `json:"deliver_at,omitempty"`
+		Topic      string         `json:"topic,omitempty"`
+		Payload    any            `json:"payload"`
+		Headers    map[string]any `json:"headers,omitempty"`
+		Recipients []string       `json:"recipients,omitempty"`
+		Key        string         `json:"key,omitempty"`
+		Delay      float64        `json:"delay,omitempty"` // seconds
+		DeliverAt  *time.Time     `json:"deliver_at,omitempty"`
 	}
 	envs := make([]envelope, len(msgs))
 	for i, m := range msgs {
 		envs[i] = envelope{
-			Topic:   m.Topic,
-			Payload: m.Payload,
-			Headers: m.Headers,
-			Key:     m.Key,
-			Delay:   m.Delay.Seconds(),
+			Topic:      m.Topic,
+			Payload:    m.Payload,
+			Headers:    m.Headers,
+			Recipients: m.Recipients,
+			Key:        m.Key,
+			Delay:      m.Delay.Seconds(),
 		}
 		if !m.DeliverAt.IsZero() {
 			envs[i].DeliverAt = &msgs[i].DeliverAt

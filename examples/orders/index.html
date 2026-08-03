@@ -18,6 +18,7 @@
   #unseen.empty { background: #ccc; }
   section { margin-top: 1.5rem; }
 </style>
+<script src="/wire.js"></script>
 </head>
 <body>
 <h1>catbird orders demo</h1>
@@ -33,7 +34,11 @@
 
 <section>
   <h2>Live feed <small>(SSE)</small></h2>
-  <ul id="feed"></ul>
+  <!-- the glue swaps each named frame straight in; the frame data is the
+       fragment the server rendered -->
+  <ul id="feed"
+      data-wire-swap="order.placed order.item_picked order.processed"
+      data-wire-into="afterbegin"></ul>
 </section>
 
 <section>
@@ -45,22 +50,23 @@
 
 <script>
   const token = "{{.Token}}";
-  const feed = document.getElementById("feed");
   const inbox = document.getElementById("inbox");
   const unseen = document.getElementById("unseen");
   const status = document.getElementById("status");
   let inboxCursor = 0;
 
-  // the live feed: each named event is one rendered fragment
-  const es = new EventSource(`/events?token=${token}`);
-  for (const topic of ["order.placed", "order.item_picked", "order.processed"]) {
-    es.addEventListener(topic, (e) => feed.insertAdjacentHTML("afterbegin", e.data));
-  }
-  // the reserved inbox frame carries no body: it means "re-pull your inbox"
-  es.addEventListener("inbox", refreshInbox);
+  // one connection; the glue dispatches every named frame as a
+  // wire:<topic> DOM event and handles the data-wire-swap inserts above
+  wire.connect(`/events?token=${token}`,
+    ["order.placed", "order.item_picked", "order.processed"]);
 
-  // the poll surface returns the unseen rows, rendered; the response
-  // header carries the cursor the mark-read watermark uses
+  // the reserved inbox frame means "re-pull your inbox": the row is the
+  // data, the frame is only the nudge
+  document.body.addEventListener("wire:inbox", refreshInbox);
+
+  // the poll surface returns the unseen rows, rendered by the same
+  // renderers as the live feed; the response header carries the cursor
+  // the mark-read watermark uses
   async function refreshInbox() {
     const resp = await fetch(`/inbox?token=${token}&after=0`);
     inbox.innerHTML = await resp.text();

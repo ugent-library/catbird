@@ -654,83 +654,129 @@ the job module starts with `cb_job_`.
 
 # SQL API — the wire module
 
-This is the SQL contract of the wire module (`wire/`): delivery of server
-events to web clients. The signatures and comments in
-`wire/migrations/00001_wire.sql` are the authority; this document is their
-reference. Everything in the module starts with `cb_wire_`; the old
+This is the SQL contract of the wire module (`wire/`): delivering events
+to people. The signatures and comments in
+`wire/migrations/00001_wire.sql` are the authority; this document is
+their reference. Everything in the module starts with `cb_wire_`; the old
 root-schema names (`cb_notify`, `cb_notifications`, the `cb_wire` channel)
 stay live beside it until the old schema is dropped, and nothing here
 reuses them.
 
-**What the module does.** Two delivery stories with independent storage.
-An **ephemeral event** is a `pg_notify` on the module's bus and nothing
-more: every wire in every process delivers it to its local SSE connections
-and Listen handlers, and a process that is down misses it — at-most-once
-by design. A **durable notification** is a row in an identity's inbox
-(`cb_wire_inbox`): the identity's clients read it by poll, ack what they
-rendered, and the module's tick deletes what the identity is done with.
-The row is a perishable pointer to a durable fact — the result it points
-at lives elsewhere; the row is only the prompt to look.
+**The model.** Every message is a row; there is no rowless delivery.
+Three row kinds, three lifecycles: a **relayed stream message** (the log
+keeps it, for the stream's retention), an **inbox row** (kept until read
+or expired — things *for* someone), and a **presence row** (newest wins,
+evaporates when the heartbeat stops — where people *are*). The NOTIFY
+channels carry addresses, never content: the receiving wire fetches the
+row, renders it, and pushes a frame. Anything a client misses is
+refetchable, because everything is a row — so there is no replay, no
+resume, and no size limit anywhere in the contract.
 
 **The two channels.** Both fixed — channels scale with the declared
 catalog, payloads carry the runtime coordinates:
 
 | Channel | Payload |
 | --- | --- |
-| `<schema>.cbw` | the whole event: JSON `{sent_by, topic, message}` |
-| `<schema>.cbw_inbox` | the identity whose inbox grew; its clients re-poll |
+| `<schema>.cbw` | a live frame: `{stream, pos, topic}` for a relayed message (the receiver fetches the row via `cb_stream_fetch`), or `{topic}` for a presence change (nothing to fetch — watchers refetch the rows) |
+| `<schema>.cbw_inbox` | the recipient whose inbox grew; its clients re-poll |
 
 **Timestamps, not statuses.** An inbox row carries three timestamps, each
 set once and never cleared: `created_at` (the row exists), `seen_at`
-(rendered in the identity's list — the unseen count drives badges),
-`read_at` (the identity opened or acted on it — drives item styling).
+(rendered in the recipient's list — the unseen count drives badges),
+`read_at` (the recipient opened or acted on it — drives item styling).
 Reading implies seeing: both mark-read functions stamp `seen_at` too, so
 an opened row leaves the badge count.
 
-### cb_wire_notify
+### cb_wire_send
 
 ```sql
-cb_wire_notify(topic text, message text DEFAULT NULL, sent_by text DEFAULT NULL)
-    RETURNS void
-```
-
-Sends an ephemeral event on the bus channel. Nothing is stored. NOTIFY
-fires on commit, so a rollback sends nothing. The payload must fit
-NOTIFY's 8000-byte limit — send a pointer to state, not the state; an
-oversized payload raises in the caller's transaction. `sent_by` names the
-sending wire so it can skip the echo of what it already delivered locally.
-
-### cb_wire_notify_durable
-
-```sql
-cb_wire_notify_durable(identity text, topic text, message text DEFAULT NULL,
-                       expires_at timestamptz DEFAULT NULL)
+cb_wire_send(recipient text, topic text, payload jsonb DEFAULT NULL,
+             expires_at timestamptz DEFAULT NULL)
     RETURNS bigint
 ```
 
-Appends a row to the identity's inbox and nudges that identity's connected
-clients (`cbw_inbox`) in one body, so a caller in any language gets both.
-Returns the row's id, the poll cursor value. Callable inside the caller's
-transaction: the row commits atomically with the app's writes and the
-nudge fires only on commit — a rollback delivers neither. Exactly-once in
-the store, at-most-once on the nudge; a client that misses the nudge finds
-the row on its next poll. `expires_at` is the relevance window and always
-wins over the retention tiers; it must lie after the insert. An empty
-`identity` raises `IRD01`: the inbox is identity-keyed, and a row no
-identity can address is meaningless.
+Wire's one write: appends an event to the recipient's inbox and nudges
+that recipient's connected clients (`cbw_inbox`) in one body, so a caller
+in any language gets both. Returns the row's id, the poll cursor value.
+Callable inside the caller's transaction: the row commits atomically with
+the app's writes and the nudge fires only on commit — a rollback delivers
+neither. Exactly-once in the store, at-most-once on the nudge; a client
+that misses the nudge finds the row on its next poll. `expires_at` is the
+relevance window and always wins over the retention tiers; it must lie
+after the insert. An empty `recipient` or `topic` raises `IRD01`: the
+inbox is recipient-keyed and rendered by topic.
 
-The caller holds the identity as a value — a handler knows which user
+The caller holds the recipient as a value — a handler knows which user
 asked for the work it just finished. Nothing is extracted from topics.
+Events nobody holds a recipient for go the other way: stamp `recipients`
+at publish and let a relay write the rows.
+
+### cb_wire_define_relay
+
+```sql
+cb_wire_define_relay(name text, stream text,
+                     topic text DEFAULT NULL, condition text DEFAULT NULL,
+                     start_pos bigint DEFAULT NULL, expires_after interval DEFAULT NULL)
+    RETURNS void
+```
+
+Declares a relay in one call: every message on `stream` that matches the
+filter is forwarded to the web — one live frame on `cbw`, plus one inbox
+row per addressed recipient. Creating and updating are the same call, and
+an identical declaration writes nothing. Needs the stream module's schema
+in the same database — without it the call raises `IRD03` (`catbird:
+stream schema required`); a broken declaration is refused here, not
+discovered by the tick.
+
+The filter — a `topic` pattern and a `condition`, the same languages
+cursors use, `$.recipients == "name"` included — is stored on the cursor
+the relay owns: the row in `cb_stream_cursors` named exactly like the
+relay, on its stream. That cursor is the filter's single home and
+remembers how far delivery got. `start_pos`, when given, sets the
+position deliberately: 0 forwards the stream from the beginning, N from
+after N; when creating, NULL starts at the tail.
+
+`expires_after` is the inbox relevance window, anchored at each message's
+`created_at`: an inbox row from this relay expires that long after the
+event happened, and a message already past its window writes no rows — a
+stalled relay catching up must not flood inboxes with stale rows granted
+fresh windows. NULL means no window; the retention tiers still apply.
+
+### cb_wire_delete_relay
+
+```sql
+cb_wire_delete_relay(name text) RETURNS boolean
+```
+
+Removes the relay and its cursor. Returns false when there was none.
+
+### cb_wire_subscribe / cb_wire_unsubscribe
+
+```sql
+cb_wire_subscribe(recipient text, pattern text, expires_at timestamptz DEFAULT NULL)
+    RETURNS void
+cb_wire_unsubscribe(recipient text, pattern text) RETURNS boolean
+```
+
+A watch: relayed messages matching the pattern land in the recipient's
+inbox until `expires_at` (NULL watches until unsubscribed). The pattern
+is prefix-only — an exact topic, or a prefix followed by `.#`
+(`order.1042.#` covers the order and everything under it; `p.#` covers
+`p` itself); there is no `*`, and anything else raises `IRD01`. Matching
+is a B-tree probe: the deliverer expands each message's topic into its
+covering patterns (`_cb_wire_topic_patterns`: the topic, `#`, and every
+prefix with `.#`) and looks those up, so cost follows the topic's length,
+never the table's size.
 
 ### cb_wire_mark_seen_until / cb_wire_mark_seen
 
 ```sql
-cb_wire_mark_seen_until(identity text, id bigint) RETURNS bigint
-cb_wire_mark_seen(identity text, ids bigint[]) RETURNS bigint
+cb_wire_mark_seen_until(recipient text, id bigint) RETURNS bigint
+cb_wire_mark_seen(recipient text, ids bigint[]) RETURNS bigint
 ```
 
 The acks. `mark_seen_until` is the bounded watermark: it marks the
-identity's unseen rows with id at or below `id` as seen and returns how
+recipient's unseen rows with id at or below `id` as seen and returns how
 many. The bound is load-bearing — it must not mark rows that arrived
 between a reader's fetch and its ack — and the watermark is whole-inbox
 scope only: one inbox holds several topic subsets whose ids interleave,
@@ -740,37 +786,99 @@ acks use `mark_seen`, which marks exactly the named ids.
 ### cb_wire_mark_read / cb_wire_mark_read_until
 
 ```sql
-cb_wire_mark_read(identity text, id bigint) RETURNS boolean
-cb_wire_mark_read_until(identity text, id bigint) RETURNS bigint
+cb_wire_mark_read(recipient text, id bigint) RETURNS boolean
+cb_wire_mark_read_until(recipient text, id bigint) RETURNS bigint
 ```
 
-The read verbs. `mark_read` marks one row the identity opened or acted
+The read verbs. `mark_read` marks one row the recipient opened or acted
 on, stamping `seen_at` too when the row was never seen; each timestamp
 keeps its first value. Returns whether the row exists — marking an
 already-read row changes nothing and still returns true.
 `mark_read_until` is "mark all as read": every unread row at or below the
 id turns read (and seen); returns how many.
 
-### Reading the inbox
-
-Rows are the truth, so the poll is a plain `SELECT` — the Go side's
-`wire.ReadUnseen`:
+### cb_wire_appear / cb_wire_disappear
 
 ```sql
-SELECT id, identity, topic, message, created_at, seen_at, read_at, expires_at
+cb_wire_appear(topic text, recipient text, payload jsonb DEFAULT NULL,
+               ttl interval DEFAULT '30 seconds')
+    RETURNS void
+cb_wire_disappear(topic text, recipient text) RETURNS boolean
+```
+
+Presence: one row per (topic, recipient) in `cb_wire_presence`, newest
+payload wins, gone when the heartbeat stops. `appear` upserts and re-arms
+`expires_at = now() + ttl` — call it on arrival, on every heartbeat, and
+on detail changes. It nudges the topic's watchers (an empty `{topic}`
+frame on `cbw`) only when something visible changed: the row is new, came
+back from expired, or changed payload — a bare heartbeat re-arm is
+silent, so heartbeats never spam refetches. `disappear` is the polite
+leave: removes the row at once and nudges; silence works too, the row
+expires on its own.
+
+Presence is not a message — nothing is kept, nothing is addressed — so
+wire never renders it: watchers answer the nudge by re-reading the
+current rows and the app renders them. Presence topics are ordinary
+topics the app names by convention (`record.123.presence`), so token
+grants and SSE event names work unchanged.
+
+### Reading the inbox and the room
+
+Rows are the truth, so both reads are plain `SELECT`s — the Go side's
+`wire.ReadUnseen` and `wire.PresenceAt`:
+
+```sql
+SELECT id, recipient, topic, payload, created_at, seen_at, read_at, expires_at
 FROM cb_wire_inbox
-WHERE identity = $1
+WHERE recipient = $1
   AND id > $2              -- the caller's cursor; 0 = from the start
   AND seen_at IS NULL
   AND (expires_at IS NULL OR expires_at > now())
 ORDER BY id
 LIMIT $3;
+
+SELECT topic, recipient, payload, expires_at
+FROM cb_wire_presence
+WHERE topic = $1 AND expires_at > now()   -- expired rows never render, pruned or not
+ORDER BY recipient;
 ```
 
-Ids are assigned at insert, not at commit, so a row from a
+Inbox ids are assigned at insert, not at commit, so a row from a
 still-uncommitted transaction can surface with an id below a cursor a
 reader already advanced past. A fresh poll (cursor 0) repairs that, and
 the badge count never uses the cursor.
+
+## The module's tick
+
+The functions below are engine-internal: the module's ticker
+(`wire.StartTicker` in Go) calls them on an interval, and a thin client
+without the Go package schedules them itself. Running the tick from
+several processes is safe: relay delivery locks per relay, and the
+deletes are independent.
+
+### _cb_wire_relay_deliver
+
+```sql
+_cb_wire_relay_deliver(relay text, batch_size int DEFAULT 100) RETURNS int
+```
+
+Delivers one relay's next batch: read the matching messages after the
+relay's cursor, send one live frame and write the addressed inbox rows
+per message, advance the cursor — one transaction, so a raise rolls the
+whole batch back and the relay stalls at its cursor with nothing
+half-done. Inbox rows are exactly-once: insert and advance share one
+commit. The live frame is the message's address, and NOTIFY fires only on
+commit, so the push is once per message. The addressed recipients are the
+union of the message's `recipients` and the matching watches; the
+nudge per recipient dedups within the transaction. A message with no
+topic is skipped — wire routes and renders by topic — and the cursor
+advances over it like over any non-match. Returns how many messages
+delivered.
+
+The tick calls it once per `cb_wire_relays` row, so a stalled relay never
+blocks the others. The relay row is locked `FOR UPDATE SKIP LOCKED`: one
+deliverer per relay, and a concurrent tick skips instead of queueing.
+Raises `IRD03` when the stream schema is absent.
 
 ### _cb_wire_prune_inbox
 
@@ -779,24 +887,36 @@ _cb_wire_prune_inbox(read_older_than interval, seen_older_than interval, max_age
     RETURNS bigint
 ```
 
-Engine-internal, on the module's tick (`wire.StartTicker` in Go; defaults
-read 30d, seen 90d, max age 365d). One `DELETE`: a row leaves when its
-explicit `expires_at` has passed — seen or not, a stale prompt is not
-worth keeping — or when the identity is done with it: read longer ago
-than `read_older_than`, seen longer ago than `seen_older_than`, or older
-than `max_age` outright. A NULL timestamp fails its age comparison, so a
-row that was never seen and has no expiry lives the full `max_age` — it
-waits to be seen. Wire has no definitions table; the windows are the
-caller's arguments, configuration per app.
+One `DELETE` (defaults read 30d, seen 90d, max age 365d): a row leaves
+when its explicit `expires_at` has passed — seen or not, a stale prompt
+is not worth keeping — or when the recipient is done with it: read longer
+ago than `read_older_than`, seen longer ago than `seen_older_than`, or
+older than `max_age` outright. A NULL timestamp fails its age comparison,
+so a row that was never seen and has no expiry lives the full `max_age` —
+it waits to be seen. Wire has no retention declarations; the windows are
+the caller's arguments, configuration per app.
+
+### _cb_wire_prune_subscriptions / _cb_wire_prune_presence
+
+```sql
+_cb_wire_prune_subscriptions() RETURNS bigint
+_cb_wire_prune_presence() RETURNS bigint
+```
+
+The other sweeps: lapsed watches leave silently; expired presence rows
+leave with a nudge per topic that lost one, so watching pages drop people
+whose heartbeat stopped.
 
 ## Old names, new names
 
 | Old | New | What changed |
 | --- | --- | --- |
-| `cb_notify` | `cb_wire_notify` | Channel `cb_wire` → `cbw`; the reserved `catbird.%` topic guard drops — no system producer publishes on this bus (engine events ride `cbs_*`/`cbj_*`). |
-| `cb_notify_durable` | `cb_wire_notify_durable` | The identity-addressed nudge rides in the same body; `collapse_key` does not port (no customer) — keep-newest collapse is a recorded deferred design. |
-| `cb_notifications` | `cb_wire_inbox` | Gains `read_at`; loses `collapse_key`. |
+| `cb_notify` | — | Rowless delivery is gone: server-side consumers read streams, browsers get relayed rows. raven's `record_events` trigger moves to a stream publish at the cutover. |
+| `cb_notify_durable` | `cb_wire_send` | Wire's one write; the payload is the event itself (jsonb), rendered at read time. The recipient-addressed nudge rides in the same body; `collapse_key` does not port (no customer). |
+| `cb_notifications` | `cb_wire_inbox` | Gains `read_at`; `identity` is now `recipient`; `message` is now `payload` jsonb. |
 | `cb_mark_seen_until`, `cb_mark_seen` | `cb_wire_mark_seen_until`, `cb_wire_mark_seen` | |
 | — | `cb_wire_mark_read`, `cb_wire_mark_read_until` | New: the seen/read distinction. |
+| — | `cb_wire_relays`, `cb_wire_define_relay`, `cb_wire_delete_relay`, `_cb_wire_relay_deliver` | New: declared forwarding from a stream, the trigger shape pointed at people. |
+| — | `cb_wire_subscriptions`, `cb_wire_subscribe`, `cb_wire_unsubscribe` | New: watches, prefix-matched into the inbox. |
 | `cb_gc` (notification sweep) | `_cb_wire_prune_inbox` | Retention tiers replace expiry-only deletion; on the module's own tick. |
-| `cb_wire_nodes`, `cb_wire_presence` | — | Presence does not port (no customer); deferred with its design slot. |
+| `cb_wire_nodes`, `cb_wire_presence` | `cb_wire_presence`, `cb_wire_appear`, `cb_wire_disappear` | Presence returns as evaporating rows with a customer (who's on this record, on which field): no node table, no cross-node machinery — the shared channel and a refetch replace both. |

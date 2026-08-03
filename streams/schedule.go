@@ -17,12 +17,13 @@ const (
 // ScheduleOpts is the whole schedule: omitted fields mean the defaults,
 // never "keep what is there".
 type ScheduleOpts struct {
-	Every   time.Duration  // required; a change re-anchors at now + Every
-	Topic   string         // "" = no topic
-	Payload any            // '{}' by default
-	Headers map[string]any // cb_ keys are reserved
-	CatchUp CatchUpPolicy  // skip by default
-	StartAt time.Time      // next fire; the one deliberate state poke
+	Every      time.Duration  // required; a change re-anchors at now + Every
+	Topic      string         // "" = no topic
+	Payload    any            // '{}' by default
+	Headers    map[string]any // cb_ keys are reserved
+	Recipients []string       // who each fired message is for; read back as Message.Recipients
+	CatchUp    CatchUpPolicy  // skip by default
+	StartAt    time.Time      // next fire; the one deliberate state poke
 }
 
 // DefineSchedule declares the schedule that publishes the template message
@@ -48,9 +49,9 @@ func DefineSchedule(ctx context.Context, conn Conn, stream, name string, opts Sc
 	}
 
 	_, err := conn.Exec(ctx,
-		`SELECT cb_stream_define_schedule($1, $2, $3, $4, $5, $6, $7, $8)`,
+		`SELECT cb_stream_define_schedule($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		stream, name, nullInterval(opts.Every), nullText(opts.Topic), payload, headers,
-		nullText(string(opts.CatchUp)), nullTime(opts.StartAt))
+		opts.Recipients, nullText(string(opts.CatchUp)), nullTime(opts.StartAt))
 	return wrapErr(err)
 }
 

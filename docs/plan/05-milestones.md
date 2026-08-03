@@ -350,15 +350,16 @@ stays polling (its audience is CLIs, scripts and tests; the latency
 customers of `cbj_*` are wire and the dashboard). Third, **wire** (04): a module —
 `cb_wire_*` SQL and its own channels, colliding with none of the old
 schema's live names — SSE onto the notifier behind wire's own dispatch
-goroutine, inbox `read_at`/`MarkRead`, retention tiers, `NotifyDurable`
-with the identity-addressed nudge; presence and `collapse_key` do not
-port, no customer (04 §2–§3). Inbox rows are written explicitly by handlers holding
-the identity (D29 confirmed the old suspicion: interpolated identities
+goroutine, inbox `read_at`/`MarkRead`, retention tiers, `wire.Send`
+with the recipient-addressed nudge; `collapse_key` does not port, no
+customer, and presence waited for its customer until D46 (04 §2–§3).
+Inbox rows are written explicitly by callers holding
+the recipient (D29 confirmed the old suspicion: interpolated identities
 were data all along) — no relay kind, no `identity_from`.
 
 *Exit:* ported `wire_test.go`/`notifications_test.go` green (presence and
 collapse tests retire with their features); new seen/read and
-retention tests; 04 §5's failure pair — a rolled-back `NotifyDurable`
+retention tests; 04's failure pair — a rolled-back `Send`
 delivers neither row nor nudge, and an offline client catches up via
 poll after missed SSE; **the M1 latency gate re-measured with the accelerator — target
 ~30–80ms publish→consume — and step-to-step re-measured (notify + claim)**
@@ -403,19 +404,40 @@ nothing outside history.
 
 ---
 
-## Open work — direction agreed, not scheduled
+## M5.5 — the wire model (D46) — DONE 2026-07-30
 
-- **Declared server-side relays (wire).** The orders demo's relay loop —
-  a cursor handler calling `wire.Notify` and `NotifyDurable` — should be
-  declarable and run by wire's tick in SQL: M4c's trigger machinery
-  pointed at wire, one transaction per batch, which makes inbox rows
-  exactly-once (the Go loop can't) and gives foreign-language stacks
-  browser push without Go. Per-recipient text, multi-identity fan-out and
-  conditional inbox writes should be supported, likely via message
-  headers. Direction agreed 2026-07-21; identity source, header grammar
-  and the surface still to rule — the full record is 04 §6. Own chunk,
-  after the M5 exit gates; neighbor of the M6 raven cutover (deletes
-  raven's hand-built `record_events` → `cb_notify` trigger).
+What began as "declared server-side relays" (direction agreed
+2026-07-21) became, under design review, a re-specification of wire
+around one rule: **every message is a row; there is no rowless
+delivery** — channel frames carry addresses, live frames are rendered
+projections of rows, refetch repairs every gap. Full spec: 04; decision
+record: README D46. Built and tested, pre-release edits in place:
+
+- **streams**: `PublishOpts.Recipients` (publish, batch, schedules),
+  `$.recipients` in the condition grammar with `$.headers.cb_*` refused,
+  `Message.Recipients` on every read, and `cb_stream_fetch(stream, pos)`
+  — one row by address, the only log read wire makes.
+  (`cb_stream_read_after` was built for poll/resume and deleted the same
+  week the model killed the requirement. Recipients were first stored as
+  an engine-stamped `cb_recipients` header and moved to a `recipients
+  text[]` column on 2026-08-03, when the relay deliverer made the engine
+  the fact's main reader — D46's amendment.)
+- **jobs**: the `cb_job_triggers` rename (table, `cb_job_define_trigger`
+  / `cb_job_delete_trigger`) — relays mirror triggers, so the trigger
+  names took the module prefix first.
+- **wire**: recipient vocabulary throughout (was identity);
+  `cb_wire_send` (was notify_durable; payload jsonb, rendered at read
+  time); relays (`cb_wire_relays`, one-transaction deliverer: address
+  frame + exactly-once inbox rows for named ∪ subscribed);
+  subscriptions (prefix-only watches, B-tree probe matching); presence
+  (`cb_wire_appear`/`disappear`/`PresenceAt`, evaporating rows,
+  change-only nudges — the raven who's-on-this-record customer);
+  `wire.js` glue + `ServeScript`; `ServePoll` JSON mode; the relay tick
+  on `TickerOpts.Notifier`. Deleted: `Notify`, `Listen`, `sent_by`, SSE
+  ids, every size rule (04 §6).
+- The orders demo runs on the declared relay, named recipients and the
+  glue; the M6 raven cutover deletes its `record_events` → `cb_notify`
+  trigger in favor of a stream publish + relay.
 
 ## Reuse map (current file → fate)
 

@@ -12,21 +12,19 @@ import (
 	"time"
 )
 
-// Fragment is a rendered projection of a (topic, message) for client delivery. Data is
-// the transport-neutral substance (e.g. an HTML fragment): ServePoll emits it directly,
-// ServeSSE puts it in data:, an HTMX-WebSocket transport would send it as the frame.
-// Event and ID are SSE-native framing hints — SSE uses them for event:/id:, poll and
-// HTMX-WebSocket ignore them, and a JSON-WebSocket or Web Push transport would re-encode
-// them (message type / dedup tag). Structured push notifications are otherwise a
-// different projection and aren't modeled here.
+// Fragment is a rendered projection of a (topic, payload) for client
+// delivery. Data is the substance — an HTML fragment: ServePoll emits it
+// directly, ServeSSE puts it in data:. Event is the SSE event name and
+// defaults to the topic; poll ignores it. There is no SSE id field
+// anywhere: an id would promise resume, and the live feed does not
+// resume — anything a client must not miss is a row it can refetch.
 //
-// The event name "inbox" is reserved: wire sends it (with empty data) when
-// the connected identity's inbox grows, and the client answers by re-pulling
-// its poll endpoint.
+// The event name "inbox" is reserved: wire sends it (with empty data)
+// when the connected recipient's inbox grows, and the client answers by
+// re-pulling its poll endpoint.
 type Fragment struct {
-	Event string // SSE event name (event:); defaults to the topic. Ignored by poll and HTMX-WebSocket.
-	Data  string // rendered content (e.g. an HTML fragment) — the transport-neutral substance
-	ID    string // SSE id (id:); optional dedup/identity hint. Informational (no Last-Event-ID replay).
+	Event string // SSE event name (event:); defaults to the topic. Ignored by poll.
+	Data  string // rendered content (an HTML fragment)
 }
 
 // Write implements io.Writer, appending p to the Data field.
@@ -36,20 +34,21 @@ func (f *Fragment) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// RenderHandler projects a wire event into a transport-neutral Fragment for client
-// delivery. It receives the client's HTTP request for access to user context
-// (auth, language, etc). Only topics with a registered renderer are delivered —
-// the renderer acts as an allowlist.
-type RenderHandler = func(r *http.Request, topic, message string) (Fragment, error)
+// RenderHandler projects a wire event into a Fragment for client
+// delivery. It receives the client's HTTP request for access to user
+// context (auth, language, etc). Only topics with a registered renderer
+// are delivered by poll — the renderer acts as an allowlist there.
+type RenderHandler = func(r *http.Request, topic, payload string) (Fragment, error)
 
 // subscriber is one SSE connection: its event channel, the token's
 // grants, and the request that opened it.
 type subscriber struct {
-	ch       chan event
-	identity string
-	topics   []string
-	cancel   func()
-	request  *http.Request // SSE client's HTTP request for Render context
+	ch        chan event
+	recipient string
+	topics    []string
+	raw       bool // ?raw=1: payloads pass through unrendered
+	cancel    func()
+	request   *http.Request // SSE client's HTTP request for Render context
 
 	mu           sync.Mutex
 	lastDelivery time.Time
@@ -70,8 +69,12 @@ func (s *subscriber) push(ev event) {
 	}
 }
 
-// ServeSSE serves an SSE connection for the given token string.
-// Invalid or expired tokens result in a 401 response.
+// ServeSSE serves an SSE connection for the given token string. Frames
+// are plain SSE — event: is the topic, data: is the rendered fragment,
+// or the payload JSON when no renderer matches or the request asked
+// ?raw=1 — so the htmx SSE extension, hand-rolled EventSource listeners
+// and the provided glue all consume the same contract. Invalid or
+// expired tokens result in a 401 response.
 func (w *Wire) ServeSSE(rw http.ResponseWriter, r *http.Request, token string) {
 	payload, err := w.verifyToken(token)
 	if err != nil {
@@ -90,8 +93,9 @@ func (w *Wire) ServeSSE(rw http.ResponseWriter, r *http.Request, token string) {
 
 	sub := &subscriber{
 		ch:           make(chan event, subscriberChannelSize),
-		identity:     payload.Identity,
+		recipient:    payload.Recipient,
 		topics:       payload.Topics,
+		raw:          r.URL.Query().Get("raw") == "1",
 		cancel:       cancel,
 		request:      r,
 		lastDelivery: time.Now(),
@@ -120,10 +124,14 @@ func (w *Wire) ServeSSE(rw http.ResponseWriter, r *http.Request, token string) {
 				continue
 			}
 
-			fragments := w.render(sub.request, ev)
+			var fragments []Fragment
+			if !sub.raw {
+				fragments = w.render(sub.request, ev)
+			}
 			if fragments == nil {
-				// No renderer for this topic: SSE passes the raw event through.
-				fragments = []Fragment{{Event: ev.topic, Data: ev.message}}
+				// No renderer, or a raw connection: the payload passes
+				// through as it is.
+				fragments = []Fragment{{Event: ev.topic, Data: ev.payload}}
 			}
 			for _, f := range fragments {
 				writeSSEEvent(rw, f)
@@ -137,26 +145,28 @@ func (w *Wire) ServeSSE(rw http.ResponseWriter, r *http.Request, token string) {
 	}
 }
 
-// ServePoll serves the durable inbox as an HTTP poll surface for the given token —
-// the sibling transport to ServeSSE, sharing the same renderers. It renders the
-// identity's unseen notifications (scoped to the token's topics) into a single HTTP
-// body and is a pure read: it never acks. Seen-tracking flows through the explicit
-// MarkSeenUntil/MarkSeen primitives, so opening the same surface in multiple tabs is
-// idempotent and convergent.
+// ServePoll serves the durable inbox as an HTTP poll surface for the given
+// token — the sibling transport to ServeSSE, sharing the same renderers. It
+// renders the recipient's unseen notifications (scoped to the token's topics)
+// into a single HTML body, or returns them as JSON rows when the request's
+// Accept header asks for application/json. It is a pure read: it never acks.
+// Seen-tracking flows through the explicit MarkSeenUntil/MarkSeen primitives,
+// so opening the same surface in multiple tabs is idempotent and convergent.
 //
-// The cursor is the "after" query param (0 = from the start); the optional "limit"
-// param caps the page. The new cursor (the max id fetched) is returned in the
-// X-Wire-Cursor response header for the client's next poll. Topics without a renderer
-// are skipped (renderer-as-allowlist). Invalid or expired tokens yield 401; a token
-// without an identity yields 400 (the inbox is identity-keyed).
+// The cursor is the "after" query param (0 = from the start); the optional
+// "limit" param caps the page. The new cursor (the max id fetched) is
+// returned in the X-Wire-Cursor response header for the client's next poll.
+// In the HTML mode, topics without a renderer are skipped
+// (renderer-as-allowlist). Invalid or expired tokens yield 401; a token
+// without a recipient yields 400 (the inbox is recipient-keyed).
 func (w *Wire) ServePoll(rw http.ResponseWriter, r *http.Request, token string) {
 	payload, err := w.verifyToken(token)
 	if err != nil {
 		http.Error(rw, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	if payload.Identity == "" {
-		http.Error(rw, "Poll requires an identity token", http.StatusBadRequest)
+	if payload.Recipient == "" {
+		http.Error(rw, "Poll requires a recipient token", http.StatusBadRequest)
 		return
 	}
 
@@ -169,36 +179,47 @@ func (w *Wire) ServePoll(rw http.ResponseWriter, r *http.Request, token string) 
 		}
 	}
 
-	rows, err := ReadUnseen(r.Context(), w.pool, payload.Identity, after, limit)
+	rows, err := ReadUnseen(r.Context(), w.pool, payload.Recipient, after, limit)
 	if err != nil {
 		w.logger.WarnContext(r.Context(), "catbird: wire poll read failed", "error", err)
 		http.Error(rw, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	var body strings.Builder
+	// Scope to the token's granted topics — the inbox is recipient-keyed, so a
+	// poller only sees the subset its token covers (the SSE per-topic
+	// equivalent) — and advance the cursor past every fetched row, even ones
+	// this poller skips: the cursor is a per-poller delivery high-water mark
+	// (seen-state is separate), and ids are monotonic, so skipping
+	// out-of-scope rows never hides future in-scope ones.
 	cursor := after
+	inScope := rows[:0]
 	for _, n := range rows {
-		// Advance the cursor past every fetched row, even ones this poller skips:
-		// the cursor is a per-poller delivery high-water mark (seen-state is separate),
-		// and ids are monotonic, so skipping out-of-scope rows never hides future
-		// in-scope ones.
 		if n.ID > cursor {
 			cursor = n.ID
 		}
-		// Scope to the token's granted topics — the inbox is identity-keyed, so a
-		// poller only sees the subset its token covers (the SSE per-topic equivalent).
-		if !payload.coversTopic(n.Topic) {
-			continue
+		if payload.coversTopic(n.Topic) {
+			inScope = append(inScope, n)
 		}
-		for _, f := range w.render(r, event{topic: n.Topic, message: n.Message}) {
+	}
+	rw.Header().Set("Cache-Control", "no-cache")
+	rw.Header().Set("X-Wire-Cursor", strconv.FormatInt(cursor, 10))
+
+	if strings.Contains(r.Header.Get("Accept"), "application/json") {
+		rw.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(rw).Encode(inScope); err != nil {
+			w.logger.WarnContext(r.Context(), "catbird: wire poll encode failed", "error", err)
+		}
+		return
+	}
+
+	var body strings.Builder
+	for _, n := range inScope {
+		for _, f := range w.render(r, event{topic: n.Topic, payload: n.Payload}) {
 			body.WriteString(f.Data)
 		}
 	}
-
 	rw.Header().Set("Content-Type", "text/html; charset=utf-8")
-	rw.Header().Set("Cache-Control", "no-cache")
-	rw.Header().Set("X-Wire-Cursor", strconv.FormatInt(cursor, 10))
 	_, _ = io.WriteString(rw, body.String())
 }
 
@@ -213,18 +234,15 @@ func writeSSEEvent(w io.Writer, ev Fragment) {
 			fmt.Fprintf(w, "data: %s\n", line)
 		}
 	}
-	if ev.ID != "" {
-		fmt.Fprintf(w, "id: %s\n", ev.ID)
-	}
 	fmt.Fprint(w, "\n")
 }
 
-// Render registers a typed render handler that unmarshals JSON messages into type T
-// and passes them to fn for full Fragment control.
+// Render registers a typed render handler that unmarshals JSON payloads into
+// type T and passes them to fn for full Fragment control.
 func Render[T any](w *Wire, pattern string, fn func(r *http.Request, topic string, data T) (Fragment, error)) {
-	w.Render(pattern, func(r *http.Request, topic, message string) (Fragment, error) {
+	w.Render(pattern, func(r *http.Request, topic, payload string) (Fragment, error) {
 		var data T
-		if err := json.Unmarshal([]byte(message), &data); err != nil {
+		if err := json.Unmarshal([]byte(payload), &data); err != nil {
 			return Fragment{}, err
 		}
 		return fn(r, topic, data)

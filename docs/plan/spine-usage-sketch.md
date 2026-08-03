@@ -231,9 +231,10 @@ retention. For blob GC either works; not interchangeable in general.)
 
 ### 6. Notifications tray (durable inbox)
 
-Today: task handlers call `NotifyDurable` with an explicit user identity;
-htmx polls `UnseenNotifications(identity)` every 3s and `MarkSeen`s on
-render (`app/backoffice_notifications.go`).
+Today: task handlers call the old `NotifyDurable` with an explicit user
+identity; htmx polls `UnseenNotifications(identity)` every 3s and
+`MarkSeen`s on render (`app/backoffice_notifications.go`). The new shape
+is `wire.Send(recipient, topic, payload)`.
 
 Wanted: the same explicit shape on the M5 inbox. The handler that finishes
 a batch edit knows exactly which user asked for it; it writes to that

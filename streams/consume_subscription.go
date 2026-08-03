@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ugent-library/catbird/internal/claimloop"
 	"github.com/ugent-library/catbird/notify"
@@ -95,15 +94,15 @@ func consumeClaim(ctx context.Context, pool *pgxpool.Pool, stream, subscription,
 	}
 
 	rows, err := pool.Query(ctx, `
-		SELECT m.id, m.stream, m.pos, coalesce(m.topic, ''), m.payload, m.headers, m.created_at
+		SELECT m.id, m.stream, m.pos, coalesce(m.topic, ''), m.payload, m.headers, m.recipients, m.created_at
 		FROM cb_stream_read_claim($1, $2, $3, $4) m`,
 		stream, subscription, *fromPos, *toPos)
 	if err != nil {
 		return true, err
 	}
-	msgs, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Message])
+	msgs, err := collectMessages(rows)
 	if err != nil {
-		return true, wrapErr(err)
+		return true, err
 	}
 
 	// keep the claim alive: extend between messages when the deadline nears,

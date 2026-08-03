@@ -39,8 +39,8 @@ const (
 	defaultDSN = "postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable"
 	// one hardcoded browser user — a real app would put its session's
 	// user id here
-	identity = "demo-user"
-	addr     = ":8080"
+	recipient = "demo-user"
+	addr      = ":8080"
 )
 
 // demo only — a real secret comes from configuration
@@ -124,16 +124,22 @@ func run() error {
 		return err
 	}
 
-	// declare the catalog: one stream, two readers on it, three jobs and
-	// the trigger that connects stream to engine. All idempotent — every
-	// boot declares the same things.
+	// declare the catalog: one stream, two readers on it, three jobs, the
+	// trigger that connects stream to engine, and the relay that connects
+	// stream to browsers. All idempotent — every boot declares the same
+	// things.
 	if err := streams.Ensure(ctx, pool, "orders"); err != nil {
 		return err
 	}
 	if err := streams.EnsureSubscription(ctx, pool, "orders", "fulfilment"); err != nil {
 		return err
 	}
-	if err := streams.EnsureCursor(ctx, pool, "orders", "relay"); err != nil {
+	// every order.* message: one live frame to connected browsers, one
+	// inbox row per named recipient, rows expiring a week after the event
+	if err := wire.DefineRelay(ctx, pool, "orders_ui", "orders", wire.RelayOpts{
+		Topic:        "order.#",
+		ExpiresAfter: 7 * 24 * time.Hour,
+	}); err != nil {
 		return err
 	}
 	// the demo's own queue: a worker must handle every job on the queues
@@ -155,6 +161,8 @@ func run() error {
 	// they share the pool
 	n := notify.New(pool)
 
+	// one renderer registry: the same fragment whether the event arrives
+	// as a live frame or is read back from the inbox
 	w := wire.New(pool, secret, wire.Opts{Notifier: n})
 	wire.Render(w, "order.placed", func(_ *http.Request, _ string, o Order) (wire.Fragment, error) {
 		return fragment("placed", "order #%d placed: %s", o.ID, html.EscapeString(strings.Join(o.Items, ", "))), nil
@@ -164,9 +172,6 @@ func run() error {
 	})
 	wire.Render(w, "order.processed", func(_ *http.Request, _ string, o Order) (wire.Fragment, error) {
 		return fragment("processed", "order #%d processed — all %d items picked", o.ID, len(o.Items)), nil
-	})
-	w.Render("inbox.order", func(_ *http.Request, _, message string) (wire.Fragment, error) {
-		return wire.Fragment{Data: "<li>" + html.EscapeString(message) + "</li>"}, nil
 	})
 
 	// the job chain: process_order fans out one pick_item per item, and
@@ -182,11 +187,14 @@ func run() error {
 	worker.Handle("pick_item", func(ctx context.Context, pick Pick) error {
 		time.Sleep(300 * time.Millisecond) // the work
 		slog.Info("picked an item", "order", pick.OrderID, "item", pick.Item)
-		return w.Notify(ctx, "order.item_picked", mustJSON(pick))
+		// a fact on the stream; the relay pushes it to the browsers
+		_, err := streams.Publish(ctx, pool, "orders", "order.item_picked", pick)
+		return err
 	})
 	worker.Handle("confirm_order", func(ctx context.Context, order Order) error {
 		slog.Info("order processed", "order", order.ID)
-		return w.Notify(ctx, "order.processed", mustJSON(order))
+		_, err := streams.Publish(ctx, pool, "orders", "order.processed", order)
+		return err
 	})
 
 	// every long-runner reports here; the first real error ends the demo
@@ -210,7 +218,7 @@ func run() error {
 		return jobs.StartTicker(ctx, pool, jobs.TickerOpts{Notifier: n})
 	})
 	start("wire ticker", func(ctx context.Context) error {
-		return wire.StartTicker(ctx, pool)
+		return wire.StartTicker(ctx, pool, wire.TickerOpts{Notifier: n})
 	})
 	start("wire", w.Start)
 	start("job worker", worker.Start)
@@ -228,33 +236,11 @@ func run() error {
 			}, streams.ConsumeSubscriptionOpts{Notifier: n})
 	})
 
-	// the browser leg: a cursor holding the full message calls wire —
-	// live push and durable inbox row, 02 §5's consumer-callback relay
-	start("relay", func(ctx context.Context) error {
-		return streams.Consume(ctx, pool, "orders", "relay",
-			func(ctx context.Context, batch []streams.Message) error {
-				for _, m := range batch {
-					if err := w.Notify(ctx, m.Topic, string(m.Payload)); err != nil {
-						return err
-					}
-					var order Order
-					if err := json.Unmarshal(m.Payload, &order); err != nil {
-						return err
-					}
-					if _, err := wire.NotifyDurable(ctx, pool, identity, "inbox.order",
-						fmt.Sprintf("Order #%d placed — %d items", order.ID, len(order.Items))); err != nil {
-						return err
-					}
-				}
-				return nil
-			}, streams.ConsumeOpts{Notifier: n})
-	})
-
 	page, err := template.ParseFS(indexFS, "index.html")
 	if err != nil {
 		return err
 	}
-	token := w.Token([]string{"order.#", "inbox.#"}, wire.TokenOpts{Identity: identity})
+	token := w.Token([]string{"order.#"}, wire.TokenOpts{Recipient: recipient})
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(rw http.ResponseWriter, r *http.Request) {
@@ -262,6 +248,7 @@ func run() error {
 			slog.Warn("page render failed", "error", err)
 		}
 	})
+	mux.HandleFunc("GET /wire.js", w.ServeScript)
 	mux.HandleFunc("GET /events", func(rw http.ResponseWriter, r *http.Request) {
 		w.ServeSSE(rw, r, r.URL.Query().Get("token"))
 	})
@@ -274,7 +261,7 @@ func run() error {
 			http.Error(rw, "until must be an inbox cursor", http.StatusBadRequest)
 			return
 		}
-		if _, err := wire.MarkReadUntil(r.Context(), pool, identity, until); err != nil {
+		if _, err := wire.MarkReadUntil(r.Context(), pool, recipient, until); err != nil {
 			http.Error(rw, "Internal Server Error", http.StatusInternalServerError)
 		}
 	})
@@ -338,7 +325,10 @@ func placeOrder(ctx context.Context, pool *pgxpool.Pool, rollBack bool) (Order, 
 		mustJSON(items)).Scan(&order.ID); err != nil {
 		return Order{}, err
 	}
-	if _, err := streams.Publish(ctx, tx, "orders", "order.placed", order); err != nil {
+	// naming the recipient is what turns the relay's live push into an
+	// inbox row too: this order is for demo-user
+	if _, err := streams.Publish(ctx, tx, "orders", "order.placed", order,
+		streams.PublishOpts{Recipients: []string{recipient}}); err != nil {
 		return Order{}, err
 	}
 	if rollBack {

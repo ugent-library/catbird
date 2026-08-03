@@ -2536,6 +2536,47 @@ func TestCompileCondition(t *testing.T) {
 			headersNull, payloadNull)
 	}
 
+	// recipient membership compiles to the required-names array, probed
+	// with @> against the recipients column: every named name must be
+	// present, and a message with no recipients never matches
+	evalRecipients := func(condition string, recipients []string) bool {
+		t.Helper()
+		var got bool
+		if err := pool.QueryRow(ctx, `
+			SELECT coalesce($2::text[] @> c.recipients_condition, false)
+			FROM _cb_stream_compile_condition($1) c`,
+			condition, recipients).Scan(&got); err != nil {
+			t.Fatalf("%q: %v", condition, err)
+		}
+		return got
+	}
+	recipientCases := []struct {
+		condition  string
+		recipients []string
+		want       bool
+	}{
+		{`$.recipients == "alice"`, []string{"alice", "bob"}, true},
+		{`$.recipients == "alice"`, []string{"bob"}, false},
+		{`$.recipients == "alice"`, nil, false},
+		{`$.recipients == "a" && $.recipients == "b"`, []string{"a", "b"}, true},
+		{`$.recipients == "a" && $.recipients == "b"`, []string{"a"}, false},
+	}
+	for _, c := range recipientCases {
+		if got := evalRecipients(c.condition, c.recipients); got != c.want {
+			t.Errorf("%q on recipients=%v = %v, want %v", c.condition, c.recipients, got, c.want)
+		}
+	}
+	// a recipients-only condition leaves the jsonpath columns NULL
+	var rcpt []string
+	if err := pool.QueryRow(ctx, `
+		SELECT c.recipients_condition
+		FROM _cb_stream_compile_condition('$.recipients == "x"') c`).Scan(&rcpt); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(rcpt, []string{"x"}) {
+		t.Fatalf("recipients_condition = %v, want [x]", rcpt)
+	}
+
 	for _, bad := range []string{
 		"",
 		`$.payload.a`,     // bare path, no operator
@@ -2551,6 +2592,11 @@ func TestCompileCondition(t *testing.T) {
 		`payload.a == 1`,                  // missing $.
 		`$.body.a == 1`,                   // unknown namespace
 		`exists($.payload.a) && && exists($.payload.b)`,
+		`$.headers.cb_recipients == "x"`, // the cb_ namespace is the engine's
+		`exists($.headers.cb_recipients)`,
+		`$.headers.cb_anything == 1`,
+		`$.recipients == 5`,    // recipients are names, only strings compare
+		`exists($.recipients)`, // only membership is grammar
 	} {
 		_, err := pool.Exec(ctx, `SELECT * FROM _cb_stream_compile_condition($1)`, bad)
 		if !errors.Is(wrapErr(err), ErrInvalid) {
@@ -2838,5 +2884,284 @@ func TestConsumeSubscriptionFiltered(t *testing.T) {
 	defer mu.Unlock()
 	if want := map[int]int{1: 1, 4: 2, 5: 1}; !maps.Equal(deliveries, want) {
 		t.Fatalf("deliveries = %v, want %v: the loop must deliver exactly the matches", deliveries, want)
+	}
+}
+
+// recipients: named at publish, surfaced as Message.Recipients, kept
+// through the pending sweep and batch publish, refused where invalid
+func TestPublishRecipients(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	if err := Ensure(ctx, pool, "go_rcpt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Publish(ctx, pool, "go_rcpt", "order.placed", 1, PublishOpts{
+		Recipients: []string{"alice", "bob"},
+		Headers:    map[string]any{"trace_id": "t1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Publish(ctx, pool, "go_rcpt", "order.placed", 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_rcpt')"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureCursor(ctx, pool, "go_rcpt", "all", CursorOpts{StartPos: At(0)}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := Read(ctx, pool, "go_rcpt", "all", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("read %d messages, want 2", len(msgs))
+	}
+	if !slices.Equal(msgs[0].Recipients, []string{"alice", "bob"}) {
+		t.Fatalf("Recipients = %v, want the published names", msgs[0].Recipients)
+	}
+	if _, ok := msgs[0].Headers["cb_recipients"]; ok {
+		t.Fatal("a cb_recipients key leaked into Headers")
+	}
+	if msgs[0].Headers["trace_id"] != "t1" {
+		t.Fatalf("Headers = %v, want the app header kept", msgs[0].Headers)
+	}
+	if msgs[1].Recipients != nil {
+		t.Fatalf("Recipients = %v on a message nobody was named on, want nil", msgs[1].Recipients)
+	}
+
+	// recipients are their own column, plainly readable in SQL
+	var stored []string
+	if err := pool.QueryRow(ctx, `
+		SELECT m.recipients FROM cb_stream_messages m
+		WHERE m.stream = 'go_rcpt' AND m.pos = 1`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(stored, []string{"alice", "bob"}) {
+		t.Fatalf("stored recipients = %v", stored)
+	}
+
+	// the cb_ header namespace stays refused, and so are empty names
+	if _, err := Publish(ctx, pool, "go_rcpt", "t", 3, PublishOpts{
+		Headers: map[string]any{"cb_recipients": []string{"mallory"}},
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cb_ header write: err = %v, want ErrInvalid", err)
+	}
+	if _, err := Publish(ctx, pool, "go_rcpt", "t", 3, PublishOpts{
+		Recipients: []string{"alice", ""},
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("empty recipient: err = %v, want ErrInvalid", err)
+	}
+
+	// a delayed message keeps its recipients through the pending sweep
+	if _, err := Publish(ctx, pool, "go_rcpt", "order.delayed", 4, PublishOpts{
+		Recipients: []string{"carol"},
+		Delay:      time.Hour,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE cb_stream_pending SET deliver_at = clock_timestamp() WHERE stream = 'go_rcpt'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "SELECT _cb_stream_deliver_pending()"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_rcpt')"); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err = Read(ctx, pool, "go_rcpt", "all", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || !slices.Equal(msgs[0].Recipients, []string{"carol"}) {
+		t.Fatalf("read after the pending sweep = %+v, want carol's message", msgs)
+	}
+
+	// batch publish carries recipients per message
+	if _, err := PublishMessages(ctx, pool, "go_rcpt", []BatchMessage{
+		{Topic: "batch.a", Payload: 5, Recipients: []string{"dave"}},
+		{Topic: "batch.b", Payload: 6},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_rcpt')"); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err = Read(ctx, pool, "go_rcpt", "all", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 || !slices.Equal(msgs[0].Recipients, []string{"dave"}) || msgs[1].Recipients != nil {
+		t.Fatalf("batch read = %+v", msgs)
+	}
+}
+
+// $.recipients conditions on cursors: membership delivery, composition
+// with other conjuncts, and the storage path staying closed at ensure
+func TestRecipientsCondition(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	if err := Ensure(ctx, pool, "go_rc"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PublishMessages(ctx, pool, "go_rc", []BatchMessage{
+		{Topic: "n.a", Payload: map[string]any{"n": 1}, Recipients: []string{"alice", "bob"}},
+		{Topic: "n.b", Payload: map[string]any{"n": 2}, Recipients: []string{"bob"}},
+		{Topic: "n.c", Payload: map[string]any{"n": 3}}, // nobody named
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_rc')"); err != nil {
+		t.Fatal(err)
+	}
+
+	readTopics := func(cursor, condition string) []string {
+		t.Helper()
+		if err := EnsureCursor(ctx, pool, "go_rc", cursor, CursorOpts{
+			StartPos: At(0), Condition: condition,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		msgs, err := Read(ctx, pool, "go_rc", cursor, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		topics := make([]string, len(msgs))
+		for i, m := range msgs {
+			topics[i] = m.Topic
+		}
+		return topics
+	}
+
+	if got := readTopics("forali", `$.recipients == "alice"`); !slices.Equal(got, []string{"n.a"}) {
+		t.Fatalf("alice's read = %v", got)
+	}
+	if got := readTopics("combo", `$.recipients == "bob" && $.payload.n == 2`); !slices.Equal(got, []string{"n.b"}) {
+		t.Fatalf("combined read = %v", got)
+	}
+
+	// the cb_ header namespace stays the engine's: reading it is refused
+	// at ensure, while cb_-prefixed payload fields stay the app's own
+	err := EnsureCursor(ctx, pool, "go_rc", "sneaky", CursorOpts{
+		StartPos: At(0), Condition: `$.headers.cb_recipients == "alice"`,
+	})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("raw stamp read: err = %v, want ErrInvalid", err)
+	}
+	if err := EnsureCursor(ctx, pool, "go_rc", "okpay", CursorOpts{
+		StartPos: At(0), Condition: `exists($.payload.cb_x)`,
+	}); err != nil {
+		t.Fatalf("payload cb_ field: err = %v, want nil", err)
+	}
+}
+
+// Fetch: one message by address; gone is gone
+func TestFetch(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	if err := Ensure(ctx, pool, "go_fetch"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PublishMessages(ctx, pool, "go_fetch", []BatchMessage{
+		{Topic: "f.a", Payload: map[string]any{"n": 1},
+			Recipients: []string{"alice"}, Headers: map[string]any{"trace_id": "t1"}},
+		{Topic: "f.b", Payload: map[string]any{"n": 2}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_fetch')"); err != nil {
+		t.Fatal(err)
+	}
+
+	// the addressed row, recipients surfaced
+	m, err := Fetch(ctx, pool, "go_fetch", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Topic != "f.a" || m.Pos != 1 {
+		t.Fatalf("Fetch(1) = %+v", m)
+	}
+	if !slices.Equal(m.Recipients, []string{"alice"}) {
+		t.Fatalf("Recipients = %v", m.Recipients)
+	}
+	if _, ok := m.Headers["cb_recipients"]; ok {
+		t.Fatal("a cb_recipients key leaked into Headers")
+	}
+	if m.Headers["trace_id"] != "t1" {
+		t.Fatalf("Headers = %v, want the app header kept", m.Headers)
+	}
+
+	// an empty position and an unknown stream are the same answer: not found
+	if _, err := Fetch(ctx, pool, "go_fetch", 99); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("empty position: err = %v, want ErrNotFound", err)
+	}
+	if _, err := Fetch(ctx, pool, "go_fetch_nope", 1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown stream: err = %v, want ErrNotFound", err)
+	}
+}
+
+// schedules: declared recipients ride every fired message
+func TestScheduleRecipients(t *testing.T) {
+	pool := setupTest(t)
+	ctx := t.Context()
+
+	if err := Ensure(ctx, pool, "go_schr"); err != nil {
+		t.Fatal(err)
+	}
+	if err := DefineSchedule(ctx, pool, "go_schr", "beat", ScheduleOpts{
+		Every:      time.Hour,
+		Topic:      "beat",
+		Payload:    map[string]any{"k": 1},
+		Recipients: []string{"ops"},
+		StartAt:    time.Now().Add(-30 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "SELECT _cb_stream_deliver_schedules()"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_schr')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureCursor(ctx, pool, "go_schr", "all", CursorOpts{StartPos: At(0)}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := Read(ctx, pool, "go_schr", "all", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || !slices.Equal(msgs[0].Recipients, []string{"ops"}) {
+		t.Fatalf("fired message = %+v, want recipients [ops]", msgs)
+	}
+	if _, ok := msgs[0].Headers["cb_recipients"]; ok {
+		t.Fatal("a cb_recipients key leaked into Headers")
+	}
+
+	// empty names are refused at define; a recipients change lands on redeclare
+	if err := DefineSchedule(ctx, pool, "go_schr", "bad", ScheduleOpts{
+		Every: time.Hour, Recipients: []string{""},
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("empty recipient at define: err = %v, want ErrInvalid", err)
+	}
+	if err := DefineSchedule(ctx, pool, "go_schr", "beat", ScheduleOpts{
+		Every:      time.Hour,
+		Topic:      "beat",
+		Payload:    map[string]any{"k": 1},
+		Recipients: []string{"ops", "dev"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var declared []string
+	if err := pool.QueryRow(ctx,
+		"SELECT recipients FROM cb_stream_schedules WHERE stream = 'go_schr' AND name = 'beat'").Scan(&declared); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(declared, []string{"ops", "dev"}) {
+		t.Fatalf("declared recipients after redeclare = %v", declared)
 	}
 }

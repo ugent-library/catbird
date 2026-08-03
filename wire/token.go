@@ -14,18 +14,18 @@ import (
 
 // TokenOpts configures token minting.
 type TokenOpts struct {
-	Identity string
-	ValidFor time.Duration
+	Recipient string
+	ValidFor  time.Duration
 }
 
 type tokenPayload struct {
-	Topics   []string `json:"t"`
-	Identity string   `json:"i,omitempty"`
-	Expiry   int64    `json:"e,omitempty"`
+	Topics    []string `json:"t"`
+	Recipient string   `json:"r,omitempty"`
+	Expiry    int64    `json:"e,omitempty"`
 }
 
 // coversTopic reports whether any of the token's granted topic patterns matches the
-// concrete topic. Used by ServePoll to scope an identity's inbox to the token's reach.
+// concrete topic. Used by ServePoll to scope a recipient's inbox to the token's reach.
 func (p *tokenPayload) coversTopic(topic string) bool {
 	for _, pattern := range p.Topics {
 		if matchTopic(pattern, topic) {
@@ -44,7 +44,7 @@ func (w *Wire) Token(topics []string, opts ...TokenOpts) string {
 		resolved = opts[0]
 	}
 
-	p := tokenPayload{Topics: topics, Identity: resolved.Identity}
+	p := tokenPayload{Topics: topics, Recipient: resolved.Recipient}
 	if resolved.ValidFor > 0 {
 		p.Expiry = time.Now().Add(resolved.ValidFor).Unix()
 	}

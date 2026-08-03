@@ -10,30 +10,29 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// testIdentity returns a unique gw_-prefixed identity: the inbox table is
+// testRecipient returns a unique gw_-prefixed recipient: the inbox table is
 // shared across suite runs and the setup wipe targets the prefix.
-func testIdentity(name string) string {
+func testRecipient(name string) string {
 	return "gw_" + name + "_" + uuid.NewString()[:8]
 }
 
-// TestNotifyDurableAndUnseen verifies a basic append → unseen read round-trip:
-// fields are persisted, rows come back in cursor order, and inboxes are isolated
-// per identity.
-func TestNotifyDurableAndUnseen(t *testing.T) {
+// TestSendAndUnseen verifies a basic append → unseen read round-trip:
+// fields are persisted, rows come back in cursor order, and inboxes are
+// isolated per recipient.
+func TestSendAndUnseen(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
-	alice := testIdentity("alice")
-	bob := testIdentity("bob")
+	alice := testRecipient("alice")
+	bob := testRecipient("bob")
 
-	id1, err := NotifyDurable(ctx, pool, alice, "import.started", "started")
+	id1, err := Send(ctx, pool, alice, "import.started", "started")
 	if err != nil {
 		t.Fatal(err)
 	}
-	id2, err := NotifyDurable(ctx, pool, alice, "import.done", "done")
+	id2, err := Send(ctx, pool, alice, "import.done", "done")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +41,7 @@ func TestNotifyDurableAndUnseen(t *testing.T) {
 	}
 
 	// Bob's notification must not leak into Alice's inbox.
-	if _, err := NotifyDurable(ctx, pool, bob, "other", "nope"); err != nil {
+	if _, err := Send(ctx, pool, bob, "other", "nope"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -56,27 +55,28 @@ func TestNotifyDurableAndUnseen(t *testing.T) {
 	if got[0].ID != id1 || got[1].ID != id2 {
 		t.Fatalf("expected cursor order [%d %d], got [%d %d]", id1, id2, got[0].ID, got[1].ID)
 	}
-	if got[0].Topic != "import.started" || got[0].Message != "started" {
+	if got[0].Topic != "import.started" || got[0].Payload != `"started"` {
 		t.Fatalf("unexpected first row: %+v", got[0])
 	}
-	if got[0].Identity != alice {
-		t.Fatalf("expected identity %q, got %q", alice, got[0].Identity)
+	if got[0].Recipient != alice {
+		t.Fatalf("expected recipient %q, got %q", alice, got[0].Recipient)
 	}
 	if !got[0].SeenAt.IsZero() || !got[0].ReadAt.IsZero() {
 		t.Fatalf("expected a fresh row to be unseen and unread, got %+v", got[0])
 	}
 }
 
-// TestNotifyDurableEmptyIdentity verifies the guard: the inbox is
-// identity-keyed, so an empty identity raises instead of inserting a row
-// nobody can address.
-func TestNotifyDurableEmptyIdentity(t *testing.T) {
+// TestSendEmptyRecipient verifies the guard: the inbox is recipient-keyed,
+// so an empty recipient is refused instead of inserting a row nobody can
+// address.
+func TestSendEmptyRecipient(t *testing.T) {
 	pool := setupTest(t)
 
-	_, err := NotifyDurable(t.Context(), pool, "", "evt", "orphan")
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) || pgErr.Code != "IRD01" {
-		t.Fatalf("expected an IRD01 raise, got %v", err)
+	if _, err := Send(t.Context(), pool, "", "evt", "orphan"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("empty recipient: err = %v, want ErrInvalid", err)
+	}
+	if _, err := Send(t.Context(), pool, testRecipient("topicless"), "", "orphan"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("empty topic: err = %v, want ErrInvalid", err)
 	}
 }
 
@@ -86,10 +86,10 @@ func TestReadUnseenPaging(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
-	identity := testIdentity("paging")
+	recipient := testRecipient("paging")
 	var ids []int64
 	for i := range 5 {
-		id, err := NotifyDurable(ctx, pool, identity, "evt", fmt.Sprintf("msg-%d", i))
+		id, err := Send(ctx, pool, recipient, "evt", fmt.Sprintf("msg-%d", i))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -97,7 +97,7 @@ func TestReadUnseenPaging(t *testing.T) {
 	}
 
 	// First page of 2.
-	page1, err := ReadUnseen(ctx, pool, identity, 0, 2)
+	page1, err := ReadUnseen(ctx, pool, recipient, 0, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestReadUnseenPaging(t *testing.T) {
 
 	// Second page resumes after the last id of the first page.
 	cursor := page1[len(page1)-1].ID
-	page2, err := ReadUnseen(ctx, pool, identity, cursor, 2)
+	page2, err := ReadUnseen(ctx, pool, recipient, cursor, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestReadUnseenPaging(t *testing.T) {
 
 	// Final page has the remaining single row.
 	cursor = page2[len(page2)-1].ID
-	page3, err := ReadUnseen(ctx, pool, identity, cursor, 2)
+	page3, err := ReadUnseen(ctx, pool, recipient, cursor, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,16 +126,17 @@ func TestReadUnseenPaging(t *testing.T) {
 	}
 }
 
-// TestMarkSeenUntil verifies the bounded watermark ack: marking through a mid-inbox
-// id leaves only later rows unseen and reports the number of rows marked.
+// TestMarkSeenUntil verifies the bounded watermark ack: marking through a
+// mid-inbox id leaves only later rows unseen and reports the number of rows
+// marked.
 func TestMarkSeenUntil(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
-	identity := testIdentity("seenuntil")
+	recipient := testRecipient("seenuntil")
 	var ids []int64
 	for i := range 4 {
-		id, err := NotifyDurable(ctx, pool, identity, "evt", fmt.Sprintf("msg-%d", i))
+		id, err := Send(ctx, pool, recipient, "evt", fmt.Sprintf("msg-%d", i))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -143,7 +144,7 @@ func TestMarkSeenUntil(t *testing.T) {
 	}
 
 	// Mark seen through the second notification.
-	marked, err := MarkSeenUntil(ctx, pool, identity, ids[1])
+	marked, err := MarkSeenUntil(ctx, pool, recipient, ids[1])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +152,7 @@ func TestMarkSeenUntil(t *testing.T) {
 		t.Fatalf("expected 2 rows marked, got %d", marked)
 	}
 
-	got, err := ReadUnseen(ctx, pool, identity, 0, 10)
+	got, err := ReadUnseen(ctx, pool, recipient, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +161,7 @@ func TestMarkSeenUntil(t *testing.T) {
 	}
 
 	// Re-acking the same cursor is a no-op (rows already seen).
-	marked, err = MarkSeenUntil(ctx, pool, identity, ids[1])
+	marked, err = MarkSeenUntil(ctx, pool, recipient, ids[1])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,17 +170,17 @@ func TestMarkSeenUntil(t *testing.T) {
 	}
 }
 
-// TestMarkSeen verifies the precise ack: only the explicitly named ids are marked,
-// leaving interleaved siblings untouched (the subset-scoped ack semantics a watermark
-// can't express).
+// TestMarkSeen verifies the precise ack: only the explicitly named ids are
+// marked, leaving interleaved siblings untouched (the subset-scoped ack
+// semantics a watermark can't express).
 func TestMarkSeen(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
-	identity := testIdentity("seen")
+	recipient := testRecipient("seen")
 	var ids []int64
 	for i := range 5 {
-		id, err := NotifyDurable(ctx, pool, identity, "evt", fmt.Sprintf("msg-%d", i))
+		id, err := Send(ctx, pool, recipient, "evt", fmt.Sprintf("msg-%d", i))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -187,7 +188,7 @@ func TestMarkSeen(t *testing.T) {
 	}
 
 	// Ack a non-contiguous subset, skipping interleaved siblings.
-	marked, err := MarkSeen(ctx, pool, identity, []int64{ids[0], ids[2], ids[4]})
+	marked, err := MarkSeen(ctx, pool, recipient, []int64{ids[0], ids[2], ids[4]})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +196,7 @@ func TestMarkSeen(t *testing.T) {
 		t.Fatalf("expected 3 rows marked, got %d", marked)
 	}
 
-	got, err := ReadUnseen(ctx, pool, identity, 0, 10)
+	got, err := ReadUnseen(ctx, pool, recipient, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +205,7 @@ func TestMarkSeen(t *testing.T) {
 	}
 
 	// Re-acking already-seen ids is a no-op; only the still-unseen id counts.
-	marked, err = MarkSeen(ctx, pool, identity, []int64{ids[0], ids[1]})
+	marked, err = MarkSeen(ctx, pool, recipient, []int64{ids[0], ids[1]})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,13 +221,13 @@ func TestMarkReadImpliesSeen(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
-	identity := testIdentity("read")
-	id, err := NotifyDurable(ctx, pool, identity, "evt", "open me")
+	recipient := testRecipient("read")
+	id, err := Send(ctx, pool, recipient, "evt", "open me")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	found, err := MarkRead(ctx, pool, identity, id)
+	found, err := MarkRead(ctx, pool, recipient, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +245,7 @@ func TestMarkReadImpliesSeen(t *testing.T) {
 	}
 
 	// The read row left the unseen set: the badge count drops.
-	unseen, err := ReadUnseen(ctx, pool, identity, 0, 10)
+	unseen, err := ReadUnseen(ctx, pool, recipient, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +255,7 @@ func TestMarkReadImpliesSeen(t *testing.T) {
 
 	// Marking an already-read row changes nothing and still returns true;
 	// each stamp keeps its first value.
-	found, err = MarkRead(ctx, pool, identity, id)
+	found, err = MarkRead(ctx, pool, recipient, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +272,7 @@ func TestMarkReadImpliesSeen(t *testing.T) {
 	}
 
 	// A missing row reports false.
-	found, err = MarkRead(ctx, pool, identity, id+1_000_000)
+	found, err = MarkRead(ctx, pool, recipient, id+1_000_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,10 +288,10 @@ func TestMarkReadUntil(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
-	identity := testIdentity("readuntil")
+	recipient := testRecipient("readuntil")
 	var ids []int64
 	for i := range 4 {
-		id, err := NotifyDurable(ctx, pool, identity, "evt", fmt.Sprintf("msg-%d", i))
+		id, err := Send(ctx, pool, recipient, "evt", fmt.Sprintf("msg-%d", i))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -298,7 +299,7 @@ func TestMarkReadUntil(t *testing.T) {
 	}
 
 	// The second row was already seen before the mark-all.
-	if _, err := MarkSeen(ctx, pool, identity, []int64{ids[1]}); err != nil {
+	if _, err := MarkSeen(ctx, pool, recipient, []int64{ids[1]}); err != nil {
 		t.Fatal(err)
 	}
 	var firstSeen time.Time
@@ -307,7 +308,7 @@ func TestMarkReadUntil(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	marked, err := MarkReadUntil(ctx, pool, identity, ids[2])
+	marked, err := MarkReadUntil(ctx, pool, recipient, ids[2])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +327,7 @@ func TestMarkReadUntil(t *testing.T) {
 	}
 
 	// The row above the watermark is still unseen and unread.
-	unseen, err := ReadUnseen(ctx, pool, identity, 0, 10)
+	unseen, err := ReadUnseen(ctx, pool, recipient, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,7 +336,7 @@ func TestMarkReadUntil(t *testing.T) {
 	}
 
 	// Re-marking is a no-op: everything at or below is already read.
-	marked, err = MarkReadUntil(ctx, pool, identity, ids[2])
+	marked, err = MarkReadUntil(ctx, pool, recipient, ids[2])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,26 +345,26 @@ func TestMarkReadUntil(t *testing.T) {
 	}
 }
 
-// TestUnseenFiltersStale verifies that notifications past their relevance window
-// are filtered from the unseen read even though they still physically exist.
-// The expires_at > created_at constraint forbids inserting an already-stale row
-// through cb_wire_notify_durable, so the stale row is seeded directly with a past
-// created_at.
+// TestUnseenFiltersStale verifies that notifications past their relevance
+// window are filtered from the unseen read even though they still physically
+// exist. The expires_at > created_at constraint forbids inserting an
+// already-stale row through cb_wire_send, so the stale row is seeded
+// directly with a past created_at.
 func TestUnseenFiltersStale(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
-	identity := testIdentity("stale")
+	recipient := testRecipient("stale")
 
-	seedInboxRow(t, ctx, identity, "stale", "created_at = now() - interval '1 hour', expires_at = now() - interval '1 minute'")
+	seedInboxRow(t, ctx, recipient, "stale", "created_at = now() - interval '1 hour', expires_at = now() - interval '1 minute'")
 
 	// A fresh, still-relevant notification alongside it.
-	fresh, err := NotifyDurable(ctx, pool, identity, "fresh", "live", NotifyDurableOpts{ExpiresAt: time.Now().Add(time.Hour)})
+	fresh, err := Send(ctx, pool, recipient, "fresh", "live", SendOpts{ExpiresAt: time.Now().Add(time.Hour)})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := ReadUnseen(ctx, pool, identity, 0, 10)
+	got, err := ReadUnseen(ctx, pool, recipient, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,44 +373,44 @@ func TestUnseenFiltersStale(t *testing.T) {
 	}
 
 	// The stale row is still physically present until the prune tick.
-	if n := countInboxRows(t, ctx, identity); n != 2 {
+	if n := countInboxRows(t, ctx, recipient); n != 2 {
 		t.Fatalf("expected 2 physical rows before the prune, got %d", n)
 	}
 }
 
-// TestPruneTiers verifies _cb_wire_prune_inbox's whole contract with windows of
-// read 1h / seen 2h / max age 3h: an explicit expiry always wins, each
+// TestPruneTiers verifies _cb_wire_prune_inbox's whole contract with windows
+// of read 1h / seen 2h / max age 3h: an explicit expiry always wins, each
 // tier deletes only what its timestamp dates, and a row that was never
 // seen and has no expiry survives until max age.
 func TestPruneTiers(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
-	identity := testIdentity("prune")
+	recipient := testRecipient("prune")
 
 	// Kept: read recently, seen recently, young.
-	keptRead := seedInboxRow(t, ctx, identity, "kept-read",
+	keptRead := seedInboxRow(t, ctx, recipient, "kept-read",
 		"created_at = now() - interval '150 minutes', seen_at = now() - interval '30 minutes', read_at = now() - interval '30 minutes'")
 	// Deleted by the read tier: read longer than 1h ago.
-	seedInboxRow(t, ctx, identity, "old-read",
+	seedInboxRow(t, ctx, recipient, "old-read",
 		"created_at = now() - interval '150 minutes', seen_at = now() - interval '90 minutes', read_at = now() - interval '90 minutes'")
 	// Kept: seen 90 minutes ago is within the 2h seen window, never read.
-	keptSeen := seedInboxRow(t, ctx, identity, "kept-seen",
+	keptSeen := seedInboxRow(t, ctx, recipient, "kept-seen",
 		"created_at = now() - interval '150 minutes', seen_at = now() - interval '90 minutes'")
 	// Deleted by the seen tier: seen longer than 2h ago, never read.
-	seedInboxRow(t, ctx, identity, "old-seen",
+	seedInboxRow(t, ctx, recipient, "old-seen",
 		"created_at = now() - interval '170 minutes', seen_at = now() - interval '130 minutes'")
 	// Kept: never seen, no expiry, younger than the 3h max age — it waits to be seen.
-	keptUnseen := seedInboxRow(t, ctx, identity, "kept-unseen",
+	keptUnseen := seedInboxRow(t, ctx, recipient, "kept-unseen",
 		"created_at = now() - interval '170 minutes'")
 	// Deleted by max age: never seen, no expiry, but older than 3h.
-	seedInboxRow(t, ctx, identity, "too-old",
+	seedInboxRow(t, ctx, recipient, "too-old",
 		"created_at = now() - interval '4 hours'")
 	// Deleted by expiry, though young and unseen: an explicit expires_at always wins.
-	seedInboxRow(t, ctx, identity, "expired",
+	seedInboxRow(t, ctx, recipient, "expired",
 		"created_at = now() - interval '30 minutes', expires_at = now() - interval '10 minutes'")
 	// Kept: expiry still ahead.
-	keptExpiring := seedInboxRow(t, ctx, identity, "kept-expiring",
+	keptExpiring := seedInboxRow(t, ctx, recipient, "kept-expiring",
 		"created_at = now() - interval '30 minutes', expires_at = now() + interval '1 hour'")
 
 	var deleted int64
@@ -423,7 +424,7 @@ func TestPruneTiers(t *testing.T) {
 	}
 
 	rows, err := pool.Query(ctx,
-		`SELECT id FROM cb_wire_inbox WHERE identity = $1 ORDER BY id`, identity)
+		`SELECT id FROM cb_wire_inbox WHERE recipient = $1 ORDER BY id`, recipient)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,13 +442,13 @@ func TestPruneTiers(t *testing.T) {
 	}
 }
 
-// TestNotifyDurableConcurrentCursorOrdering verifies that concurrent inserts get
+// TestSendConcurrentCursorOrdering verifies that concurrent inserts get
 // distinct, monotonically increasing cursor ids and read back in id order.
-func TestNotifyDurableConcurrentCursorOrdering(t *testing.T) {
+func TestSendConcurrentCursorOrdering(t *testing.T) {
 	pool := setupTest(t)
 	ctx := t.Context()
 
-	identity := testIdentity("concurrent")
+	recipient := testRecipient("concurrent")
 	const n = 25
 
 	var wg sync.WaitGroup
@@ -457,7 +458,7 @@ func TestNotifyDurableConcurrentCursorOrdering(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			ids[i], errs[i] = NotifyDurable(ctx, pool, identity, "evt", fmt.Sprintf("msg-%d", i))
+			ids[i], errs[i] = Send(ctx, pool, recipient, "evt", fmt.Sprintf("msg-%d", i))
 		}(i)
 	}
 	wg.Wait()
@@ -473,7 +474,7 @@ func TestNotifyDurableConcurrentCursorOrdering(t *testing.T) {
 		seen[ids[i]] = struct{}{}
 	}
 
-	got, err := ReadUnseen(ctx, pool, identity, 0, n)
+	got, err := ReadUnseen(ctx, pool, recipient, 0, n)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -486,14 +487,14 @@ func TestNotifyDurableConcurrentCursorOrdering(t *testing.T) {
 }
 
 // seedInboxRow inserts a row directly with hand-set timestamps — the way
-// to build the aged rows the retention tests need, which
-// cb_wire_notify_durable's now() defaults cannot produce.
-func seedInboxRow(t *testing.T, ctx context.Context, identity, message, timestamps string) int64 {
+// to build the aged rows the retention tests need, which cb_wire_send's
+// now() defaults cannot produce.
+func seedInboxRow(t *testing.T, ctx context.Context, recipient, payload, timestamps string) int64 {
 	t.Helper()
 	var id int64
 	if err := testPool.QueryRow(ctx,
-		`INSERT INTO cb_wire_inbox (identity, topic, message) VALUES ($1, 'seed.topic', $2) RETURNING id`,
-		identity, message).Scan(&id); err != nil {
+		`INSERT INTO cb_wire_inbox (recipient, topic, payload) VALUES ($1, 'seed.topic', to_jsonb($2::text)) RETURNING id`,
+		recipient, payload).Scan(&id); err != nil {
 		t.Fatalf("seeding inbox row: %v", err)
 	}
 	if _, err := testPool.Exec(ctx,
@@ -503,10 +504,10 @@ func seedInboxRow(t *testing.T, ctx context.Context, identity, message, timestam
 	return id
 }
 
-func countInboxRows(t *testing.T, ctx context.Context, identity string) int {
+func countInboxRows(t *testing.T, ctx context.Context, recipient string) int {
 	t.Helper()
 	var n int
-	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM cb_wire_inbox WHERE identity = $1`, identity).Scan(&n); err != nil {
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM cb_wire_inbox WHERE recipient = $1`, recipient).Scan(&n); err != nil {
 		t.Fatalf("counting inbox rows: %v", err)
 	}
 	return n
