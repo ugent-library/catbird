@@ -517,7 +517,7 @@ record: README D46. Built and tested, pre-release edits in place:
   porting pressure. The plan documents exist precisely so you notice when you're
   crossing them.
 - **One stalled schedule stalls them all** (M4a as built, noticed while ruling
-  M4c): `_cb_job_run_scheduled` fires every due schedule in one transaction, so
+  M4c): `cb_job_run_scheduled` fires every due schedule in one transaction, so
   a raise from one fire — reachable only by a raw `DELETE` of a still-scheduled
   job, there is no delete API — rolls back the whole sweep, and every schedule
   retries and fails each tick until the job is defined again. The failure is

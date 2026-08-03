@@ -107,7 +107,7 @@ func StartTicker(ctx context.Context, pool *pgxpool.Pool, opts ...TickerOpts) er
 		Run: func(ctx context.Context) (int, error) {
 			var inbox, watches, presence int64
 			err := pool.QueryRow(ctx,
-				`SELECT _cb_wire_prune_inbox($1, $2, $3), _cb_wire_prune_subscriptions(), _cb_wire_prune_presence()`,
+				`SELECT cb_wire_prune_inbox($1, $2, $3), cb_wire_prune_subscriptions(), cb_wire_prune_presence()`,
 				interval(o.ReadRetention), interval(o.SeenRetention), interval(o.MaxAge)).
 				Scan(&inbox, &watches, &presence)
 			return int(inbox + watches + presence), err
@@ -134,7 +134,7 @@ func deliverRelays(ctx context.Context, pool *pgxpool.Pool) (int, error) {
 	for _, name := range relays {
 		var delivered int
 		if err := pool.QueryRow(ctx,
-			`SELECT _cb_wire_relay_deliver($1)`, name).Scan(&delivered); err != nil {
+			`SELECT cb_wire_relay_deliver($1)`, name).Scan(&delivered); err != nil {
 			errs = append(errs, fmt.Errorf("relay %s: %w", name, wrapErr(err)))
 			continue
 		}

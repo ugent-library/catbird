@@ -784,7 +784,7 @@ the same-database design's front door.
 - **Delivery is a tick on the module's ticker**, per trigger, one
   transaction: read the cursor's next batch of matching messages, call
   `cb_job_run(job, payload, key)` per message, advance the cursor
-  (`_cb_job_run_triggered`; the Go tick calls it once per trigger row, so
+  (`cb_job_run_triggered`; the Go tick calls it once per trigger row, so
   a stalled trigger never blocks the others). Exactly-once event→job
   creation by cursor semantics — the composition rule made mechanical. No
   deployed consumer code, and cross-language by construction: a
@@ -924,7 +924,7 @@ new steps, barriers, signals, `on_fail`; M4c = triggers). The build items:
    (`cb_job_triggers` — name, stream, job; the filter lives on the trigger's
    cursor), `cb_job_define_trigger` / `cb_job_delete_trigger` — define-time
    validation plus the loud stream-schema-required check (IRD03) — the
-   delivery tick `_cb_job_run_triggered` on the module's ticker, one call
+   delivery tick `cb_job_run_triggered` on the module's ticker, one call
    per trigger; `jobs.DefineTrigger` / `jobs.DeleteTrigger`, per-call like
    the other declarations. The stream layer gains
    `cb_stream_define_cursor` and `cb_stream_delete_cursor` in the same

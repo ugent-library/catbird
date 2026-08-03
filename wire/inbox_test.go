@@ -378,7 +378,7 @@ func TestUnseenFiltersStale(t *testing.T) {
 	}
 }
 
-// TestPruneTiers verifies _cb_wire_prune_inbox's whole contract with windows
+// TestPruneTiers verifies cb_wire_prune_inbox's whole contract with windows
 // of read 1h / seen 2h / max age 3h: an explicit expiry always wins, each
 // tier deletes only what its timestamp dates, and a row that was never
 // seen and has no expiry survives until max age.
@@ -415,7 +415,7 @@ func TestPruneTiers(t *testing.T) {
 
 	var deleted int64
 	if err := pool.QueryRow(ctx,
-		`SELECT _cb_wire_prune_inbox('1 hour'::interval, '2 hours'::interval, '3 hours'::interval)`).Scan(&deleted); err != nil {
+		`SELECT cb_wire_prune_inbox('1 hour'::interval, '2 hours'::interval, '3 hours'::interval)`).Scan(&deleted); err != nil {
 		t.Fatal(err)
 	}
 	// Other tests' rows may be pruned in the same call, so check at least.

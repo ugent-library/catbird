@@ -81,7 +81,7 @@ func StartTicker(ctx context.Context, pool *pgxpool.Pool, opts ...TickerOpts) er
 	t.Add(ticker.Tick{Name: "job.run_scheduled", Every: o.ScheduleInterval,
 		Run: func(ctx context.Context) (int, error) {
 			var n int
-			err := pool.QueryRow(ctx, `SELECT _cb_job_run_scheduled()`).Scan(&n)
+			err := pool.QueryRow(ctx, `SELECT cb_job_run_scheduled()`).Scan(&n)
 			return n, err
 		}})
 	t.Add(ticker.Tick{Name: "job.run_triggered", Every: o.TriggerInterval, Wake: triggerWake,
@@ -89,7 +89,7 @@ func StartTicker(ctx context.Context, pool *pgxpool.Pool, opts ...TickerOpts) er
 	t.Add(ticker.Tick{Name: "job.prune_runs", Every: o.PruneInterval,
 		Run: func(ctx context.Context) (int, error) {
 			var n int64
-			err := pool.QueryRow(ctx, `SELECT _cb_job_prune_runs()`).Scan(&n)
+			err := pool.QueryRow(ctx, `SELECT cb_job_prune_runs()`).Scan(&n)
 			return int(n), err
 		}})
 	return t.Start(ctx)
@@ -114,7 +114,7 @@ func runTriggered(ctx context.Context, pool *pgxpool.Pool) (int, error) {
 	for _, name := range triggers {
 		var delivered int
 		if err := pool.QueryRow(ctx,
-			`SELECT _cb_job_run_triggered($1)`, name).Scan(&delivered); err != nil {
+			`SELECT cb_job_run_triggered($1)`, name).Scan(&delivered); err != nil {
 			errs = append(errs, fmt.Errorf("trigger %s: %w", name, wrapErr(err)))
 			continue
 		}

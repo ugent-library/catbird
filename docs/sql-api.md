@@ -492,17 +492,17 @@ start no longer counts.
 
 ## The module's tick
 
-The functions below are engine-internal (the underscore prefix): the
+The functions below belong on the tick, not the request path: the
 module's ticker (`jobs.StartTicker` in Go) calls them on an interval, and a
 thin client without the Go package schedules them itself — pg_cron, a cron
 job, any loop. Running the tick from several processes is safe: `FOR
 UPDATE SKIP LOCKED` decides who does the work. Without a tick, on-demand
 runs keep working; only scheduled runs, triggers and pruning pause.
 
-### _cb_job_run_scheduled
+### cb_job_run_scheduled
 
 ```sql
-_cb_job_run_scheduled(batch_size int DEFAULT 500) RETURNS int
+cb_job_run_scheduled(batch_size int DEFAULT 500) RETURNS int
 ```
 
 Fires due schedules: each due row creates runs via `cb_job_run` and
@@ -510,10 +510,10 @@ re-arms, in this one transaction — so a slot fires exactly once no matter
 how many processes tick. Runs are created without a key: every fired slot
 is its own run. Returns the number of runs created.
 
-### _cb_job_run_triggered
+### cb_job_run_triggered
 
 ```sql
-_cb_job_run_triggered(trigger text, batch_size int DEFAULT 100) RETURNS int
+cb_job_run_triggered(trigger text, batch_size int DEFAULT 100) RETURNS int
 ```
 
 Delivers one trigger's next batch: read the matching messages after the
@@ -530,10 +530,10 @@ blocks the others. The trigger row is locked `FOR UPDATE SKIP LOCKED`: one
 deliverer per trigger, and a concurrent tick skips instead of queueing.
 Raises `IRD03` when the stream schema is absent.
 
-### _cb_job_prune_runs
+### cb_job_prune_runs
 
 ```sql
-_cb_job_prune_runs(batch_size int DEFAULT 1000) RETURNS bigint
+cb_job_prune_runs(batch_size int DEFAULT 1000) RETURNS bigint
 ```
 
 Deletes terminal runs older than their birth job's `retention`, together
@@ -646,8 +646,8 @@ the job module starts with `cb_job_`.
 | `cb_claim_task_on_fail`, `cb_complete_task_on_fail`, `cb_fail_task_on_fail` (and the flow trio) | — | `on_fail` is an ordinary step the engine adds at give-up; no separate machinery. |
 | `cb_create_task_schedule`, `cb_create_flow_schedule` | `cb_job_define_schedule` | Interval schedules; cron specs return later. |
 | `cb_delete_task_schedule`, `cb_delete_flow_schedule` | `cb_job_delete_schedule` | |
-| `cb_execute_due_task_schedules`, `cb_execute_due_flow_schedules` | `_cb_job_run_scheduled` | On the module's tick. |
-| `cb_gc`, `cb_purge_task_runs`, `cb_purge_flow_runs` | `_cb_job_prune_runs` | On the module's tick; retention is per job, set at define. |
+| `cb_execute_due_task_schedules`, `cb_execute_due_flow_schedules` | `cb_job_run_scheduled` | On the module's tick. |
+| `cb_gc`, `cb_purge_task_runs`, `cb_purge_flow_runs` | `cb_job_prune_runs` | On the module's tick; retention is per job, set at define. |
 | `cb_bind_task`, `cb_bind_flow` | — | Triggers (M4c): a declared crossing from a stream to `cb_job_run`. |
 
 ---
@@ -850,16 +850,16 @@ the badge count never uses the cursor.
 
 ## The module's tick
 
-The functions below are engine-internal: the module's ticker
-(`wire.StartTicker` in Go) calls them on an interval, and a thin client
-without the Go package schedules them itself. Running the tick from
+The functions below belong on the tick, not the request path: the
+module's ticker (`wire.StartTicker` in Go) calls them on an interval, and
+a thin client without the Go package schedules them itself. Running the tick from
 several processes is safe: relay delivery locks per relay, and the
 deletes are independent.
 
-### _cb_wire_relay_deliver
+### cb_wire_relay_deliver
 
 ```sql
-_cb_wire_relay_deliver(relay text, batch_size int DEFAULT 100) RETURNS int
+cb_wire_relay_deliver(relay text, batch_size int DEFAULT 100) RETURNS int
 ```
 
 Delivers one relay's next batch: read the matching messages after the
@@ -880,10 +880,10 @@ blocks the others. The relay row is locked `FOR UPDATE SKIP LOCKED`: one
 deliverer per relay, and a concurrent tick skips instead of queueing.
 Raises `IRD03` when the stream schema is absent.
 
-### _cb_wire_prune_inbox
+### cb_wire_prune_inbox
 
 ```sql
-_cb_wire_prune_inbox(read_older_than interval, seen_older_than interval, max_age interval)
+cb_wire_prune_inbox(read_older_than interval, seen_older_than interval, max_age interval)
     RETURNS bigint
 ```
 
@@ -896,11 +896,11 @@ so a row that was never seen and has no expiry lives the full `max_age` —
 it waits to be seen. Wire has no retention declarations; the windows are
 the caller's arguments, configuration per app.
 
-### _cb_wire_prune_subscriptions / _cb_wire_prune_presence
+### cb_wire_prune_subscriptions / cb_wire_prune_presence
 
 ```sql
-_cb_wire_prune_subscriptions() RETURNS bigint
-_cb_wire_prune_presence() RETURNS bigint
+cb_wire_prune_subscriptions() RETURNS bigint
+cb_wire_prune_presence() RETURNS bigint
 ```
 
 The other sweeps: lapsed watches leave silently; expired presence rows
@@ -916,7 +916,7 @@ whose heartbeat stopped.
 | `cb_notifications` | `cb_wire_inbox` | Gains `read_at`; `identity` is now `recipient`; `message` is now `payload` jsonb. |
 | `cb_mark_seen_until`, `cb_mark_seen` | `cb_wire_mark_seen_until`, `cb_wire_mark_seen` | |
 | — | `cb_wire_mark_read`, `cb_wire_mark_read_until` | New: the seen/read distinction. |
-| — | `cb_wire_relays`, `cb_wire_define_relay`, `cb_wire_delete_relay`, `_cb_wire_relay_deliver` | New: declared forwarding from a stream, the trigger shape pointed at people. |
+| — | `cb_wire_relays`, `cb_wire_define_relay`, `cb_wire_delete_relay`, `cb_wire_relay_deliver` | New: declared forwarding from a stream, the trigger shape pointed at people. |
 | — | `cb_wire_subscriptions`, `cb_wire_subscribe`, `cb_wire_unsubscribe` | New: watches, prefix-matched into the inbox. |
-| `cb_gc` (notification sweep) | `_cb_wire_prune_inbox` | Retention tiers replace expiry-only deletion; on the module's own tick. |
+| `cb_gc` (notification sweep) | `cb_wire_prune_inbox` | Retention tiers replace expiry-only deletion; on the module's own tick. |
 | `cb_wire_nodes`, `cb_wire_presence` | `cb_wire_presence`, `cb_wire_appear`, `cb_wire_disappear` | Presence returns as evaporating rows with a customer (who's on this record, on which field): no node table, no cross-node machinery — the shared channel and a refetch replace both. |

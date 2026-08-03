@@ -90,7 +90,7 @@ CREATE TABLE cb_job_runs (
     CONSTRAINT cb_job_runs_job_key_key UNIQUE (job, key)
 );
 
--- _cb_job_prune_runs reads terminal runs oldest first; finished_at is set
+-- cb_job_prune_runs reads terminal runs oldest first; finished_at is set
 -- exactly when a run turns terminal, so live runs stay out of the index.
 CREATE INDEX cb_job_runs_finished_idx ON cb_job_runs (finished_at)
     WHERE finished_at IS NOT NULL;
@@ -1242,7 +1242,7 @@ END; $$;
 -- missed slot, 'skip' drops the backlog and fires only an on-time slot.
 -- Runs are created without a key: every fired slot is its own run.
 -- Returns the number of runs created.
-CREATE FUNCTION _cb_job_run_scheduled(batch_size int DEFAULT 500)
+CREATE FUNCTION cb_job_run_scheduled(batch_size int DEFAULT 500)
 RETURNS int LANGUAGE plpgsql AS $$
 DECLARE
     _schedule cb_job_schedules;
@@ -1254,7 +1254,7 @@ BEGIN
     FOR _schedule IN
         SELECT * FROM cb_job_schedules
         WHERE next_at <= clock_timestamp()
-        ORDER BY next_at LIMIT _cb_job_run_scheduled.batch_size
+        ORDER BY next_at LIMIT cb_job_run_scheduled.batch_size
         FOR UPDATE SKIP LOCKED
     LOOP
         _due_slots := floor(extract(epoch FROM clock_timestamp() - _schedule.next_at)
@@ -1291,7 +1291,7 @@ END; $$;
 -- every finished run when the retention is negative. Locked runs are
 -- skipped: a run an engine call holds right now is not old, it can wait
 -- for the next tick. Returns the number of runs deleted.
-CREATE FUNCTION _cb_job_prune_runs(batch_size int DEFAULT 1000)
+CREATE FUNCTION cb_job_prune_runs(batch_size int DEFAULT 1000)
 RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
     _run_ids bigint[];
@@ -1304,7 +1304,7 @@ BEGIN
         WHERE j.retention <> cb_forever()
           AND r.finished_at < clock_timestamp() - j.retention
         ORDER BY r.finished_at
-        LIMIT _cb_job_prune_runs.batch_size
+        LIMIT cb_job_prune_runs.batch_size
         FOR UPDATE OF r SKIP LOCKED
     ) old_run;
 
@@ -1324,8 +1324,8 @@ END; $$;
 
 -- +goose down
 
-DROP FUNCTION _cb_job_prune_runs(int);
-DROP FUNCTION _cb_job_run_scheduled(int);
+DROP FUNCTION cb_job_prune_runs(int);
+DROP FUNCTION cb_job_run_scheduled(int);
 DROP FUNCTION cb_job_cancel(bigint, text);
 DROP FUNCTION cb_job_signal(bigint, text, jsonb);
 DROP FUNCTION cb_job_fail(bigint, bigint, int, text);

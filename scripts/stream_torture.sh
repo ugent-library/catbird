@@ -40,7 +40,7 @@ EOF
 assigner() {
   while [ -e /tmp/cb_torture_running ]; do
     docker exec catbird-postgres psql -U postgres -q -d "$DB" -tA \
-      -c "SELECT _cb_stream_assign_positions('torture', 1000);" >/dev/null 2>&1 || true
+      -c "SELECT cb_stream_assign_positions('torture', 1000);" >/dev/null 2>&1 || true
     sleep 0.05
   done
 }
@@ -58,7 +58,7 @@ wait "$A1" "$A2" 2>/dev/null || true
 
 # drain: everything published must end up assigned
 while [ "$(docker exec catbird-postgres psql -U postgres -d "$DB" -tA \
-  -c "SELECT _cb_stream_assign_positions('torture', 10000);")" != "0" ]; do :; done
+  -c "SELECT cb_stream_assign_positions('torture', 10000);")" != "0" ]; do :; done
 
 echo "== invariants =="
 "${PSQL[@]}" <<'EOF'

@@ -94,7 +94,7 @@ func TestPresence(t *testing.T) {
 		t.Fatalf("expired rows rendered: %+v", rows)
 	}
 	var pruned int64
-	if err := pool.QueryRow(ctx, `SELECT _cb_wire_prune_presence()`).Scan(&pruned); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT cb_wire_prune_presence()`).Scan(&pruned); err != nil {
 		t.Fatal(err)
 	}
 	if pruned < 1 {

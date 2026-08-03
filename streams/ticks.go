@@ -116,7 +116,7 @@ func assignPositions(ctx context.Context, pool *pgxpool.Pool) (int, error) {
 	for _, s := range streams {
 		var assigned int
 		if err := pool.QueryRow(ctx,
-			`SELECT _cb_stream_assign_positions($1)`, s).Scan(&assigned); err != nil {
+			`SELECT cb_stream_assign_positions($1)`, s).Scan(&assigned); err != nil {
 			return n, err
 		}
 		n += assigned
@@ -127,11 +127,11 @@ func assignPositions(ctx context.Context, pool *pgxpool.Pool) (int, error) {
 func deliver(ctx context.Context, pool *pgxpool.Pool) (int, error) {
 	var pending, schedules int
 	if err := pool.QueryRow(ctx,
-		`SELECT _cb_stream_deliver_pending()`).Scan(&pending); err != nil {
+		`SELECT cb_stream_deliver_pending()`).Scan(&pending); err != nil {
 		return 0, err
 	}
 	if err := pool.QueryRow(ctx,
-		`SELECT _cb_stream_deliver_schedules()`).Scan(&schedules); err != nil {
+		`SELECT cb_stream_deliver_schedules()`).Scan(&schedules); err != nil {
 		return pending, err
 	}
 	return pending + schedules, nil
@@ -151,11 +151,11 @@ func prune(ctx context.Context, pool *pgxpool.Pool) (int, error) {
 	for _, s := range streams {
 		var messages, keys int
 		if err := pool.QueryRow(ctx,
-			`SELECT _cb_stream_prune_messages($1)`, s).Scan(&messages); err != nil {
+			`SELECT cb_stream_prune_messages($1)`, s).Scan(&messages); err != nil {
 			return n, err
 		}
 		if err := pool.QueryRow(ctx,
-			`SELECT _cb_stream_prune_keys($1)`, s).Scan(&keys); err != nil {
+			`SELECT cb_stream_prune_keys($1)`, s).Scan(&keys); err != nil {
 			return n + messages, err
 		}
 		n += messages + keys

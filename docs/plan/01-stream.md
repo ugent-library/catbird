@@ -83,7 +83,7 @@ depends on a notification arriving; the tick remains the safety net:
 -- pool and get reused by unrelated code, so the lock would leak — held
 -- forever by a connection nobody remembers — and every later call here
 -- would find the stream "busy" and assign nothing, permanently.
-CREATE FUNCTION _cb_stream_assign_positions(stream text, batch int DEFAULT 5000)
+CREATE FUNCTION cb_stream_assign_positions(stream text, batch int DEFAULT 5000)
 RETURNS int   -- rows assigned; 0 = caught up, or another node holds the lock
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -96,19 +96,19 @@ BEGIN
     WITH todo AS (
         SELECT m.id, row_number() OVER (ORDER BY m.id) AS rn
         FROM cb_stream_messages m
-        WHERE m.stream = _cb_stream_assign_positions.stream AND m.position IS NULL
+        WHERE m.stream = cb_stream_assign_positions.stream AND m.position IS NULL
         ORDER BY m.id
         LIMIT batch
     ), bump AS (
         UPDATE cb_streams s
         SET last_position = s.last_position + (SELECT count(*) FROM todo)
-        WHERE s.name = _cb_stream_assign_positions.stream
+        WHERE s.name = cb_stream_assign_positions.stream
         RETURNING s.last_position - (SELECT count(*) FROM todo) AS base
     ), stamped AS (
         UPDATE cb_stream_messages m
         SET position = bump.base + todo.rn
         FROM todo, bump
-        WHERE m.stream = _cb_stream_assign_positions.stream
+        WHERE m.stream = cb_stream_assign_positions.stream
           AND m.id = todo.id
           AND m.position IS NULL
         -- the trailing "position IS NULL" is a seatbelt: if lock discipline is
@@ -783,7 +783,7 @@ microseconds. A stuck row (say, a poisoned retry) is removed by hand:
 -- kernel-ticker job on every node — no leadership; SKIP LOCKED below divides
 -- the work. Wakes on min(deliver_at) and on the '.cb_tick' notify that
 -- publish fires for new earlier rows
-CREATE FUNCTION _cb_stream_deliver_pending(batch int DEFAULT 500)
+CREATE FUNCTION cb_stream_deliver_pending(batch int DEFAULT 500)
 RETURNS int LANGUAGE plpgsql AS $$
 DECLARE
     _p cb_stream_pending; _mid bigint; _n int := 0;
@@ -1068,7 +1068,7 @@ exactly one row → OUT params; zero-or-more rows → RETURNS TABLE**.
 `cb_stream_claim` follows the OUT form: it always returns one row, and "nothing
 to claim" is NULLs, so callers do a null check instead of handling zero rows.
 The batch variant is the same shape over `unnest()`, with one assigner notify
-per touched stream. `_cb_stream_deliver_pending` owes three things per delivered
+per touched stream. `cb_stream_deliver_pending` owes three things per delivered
 message: swap the dedup ref from `pending` to the delivered message, notify the
 assigner, and fire the stream's wire notify. Delivery *is* the append, so the
 notifies move with it.
@@ -1084,7 +1084,7 @@ on `(stream, key)` (legal on the partitioned table: the partition key is
 among the index columns) would be the whole dedup mechanism:
 one uniqueness home, a window that is exactly the row's lifetime so the
 key-row/message-row prune skew dies, and `cb_stream_keys`,
-`_cb_stream_prune_keys`, the `ref_kind` flip and the `ref_created_at` bump
+`cb_stream_prune_keys`, the `ref_kind` flip and the `ref_created_at` bump
 all deleted. An investigation, not a design — what it must answer first:
 
 - the assigner scans `pos IS NULL`; every waiting message would sit in that
@@ -1142,7 +1142,7 @@ forever. There is no granularity or partition knob — the user says how
 long to keep, never how it is stored.
 
 **MVP mechanism: a batched delete, not a partition drop.**
-`_cb_stream_prune_messages(stream, retention?, batch)` deletes messages past the
+`cb_stream_prune_messages(stream, retention?, batch)` deletes messages past the
 cutoff in bounded `FOR UPDATE SKIP LOCKED` batches; the retention argument is
 optional and overrides the column, and NULL either way means forever, so the call
 is a no-op. The message table is partitioned **by stream only** (`LIST`) — one
@@ -1247,7 +1247,7 @@ not an omission.
    the same claim call as solo pseudo-claims, minted at hand-out, lapsed
    leases repaired there too.
 6. `cb_stream_fail` + policy columns (one budget — no `max_crashes`);
-   `_cb_stream_deliver_pending` + the schedule scan (cron re-arm) — user
+   `cb_stream_deliver_pending` + the schedule scan (cron re-arm) — user
    delays only, no retry traffic.
 7. Dedup table + prune janitor; the retry table with dead rows,
    redrive-as-reset, dismiss-as-delete.

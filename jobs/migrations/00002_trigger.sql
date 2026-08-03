@@ -127,7 +127,7 @@ END; $$;
 -- and delivery resumes when a define or a deploy fixes the cause. The run
 -- key makes even a replayed batch idempotent. Returns how many messages
 -- delivered.
-CREATE FUNCTION _cb_job_run_triggered(trigger text, batch_size int DEFAULT 100)
+CREATE FUNCTION cb_job_run_triggered(trigger text, batch_size int DEFAULT 100)
 RETURNS int LANGUAGE plpgsql AS $$
 DECLARE
     _trigger cb_job_triggers;
@@ -143,7 +143,7 @@ BEGIN
     -- One deliverer per trigger: a concurrent tick skips instead of
     -- queueing, and a redeclare waits for the in-flight batch to commit.
     SELECT t.* INTO _trigger FROM cb_job_triggers t
-    WHERE t.name = _cb_job_run_triggered.trigger
+    WHERE t.name = cb_job_run_triggered.trigger
     FOR UPDATE SKIP LOCKED;
     IF NOT FOUND THEN
         RETURN 0;
@@ -151,7 +151,7 @@ BEGIN
 
     FOR _message IN
         SELECT * FROM cb_stream_read(_trigger.stream, _trigger.name,
-                                     _cb_job_run_triggered.batch_size)
+                                     cb_job_run_triggered.batch_size)
     LOOP
         -- The payload is the run's input, exactly as published: a job has
         -- one input shape no matter who creates the run. The key — the
@@ -170,7 +170,7 @@ END; $$;
 
 -- +goose down
 
-DROP FUNCTION _cb_job_run_triggered(text, int);
+DROP FUNCTION cb_job_run_triggered(text, int);
 DROP FUNCTION cb_job_delete_trigger(text);
 DROP FUNCTION cb_job_define_trigger(text, text, text, text, text, bigint);
 DROP TABLE cb_job_triggers;

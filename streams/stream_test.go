@@ -144,7 +144,7 @@ func TestPublishAssignRead(t *testing.T) {
 	}
 
 	var n int
-	if err := pool.QueryRow(ctx, "SELECT _cb_stream_assign_positions('go_a')").Scan(&n); err != nil {
+	if err := pool.QueryRow(ctx, "SELECT cb_stream_assign_positions('go_a')").Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 5 {
@@ -270,7 +270,7 @@ func TestConsume(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_c')"); err != nil {
+		if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_c')"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1070,7 +1070,7 @@ func TestConsumeSubscriptionSlowHandler(t *testing.T) {
 	if _, err := Publish(ctx, pool, "go_slow", "t", 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_slow')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_slow')"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1140,7 +1140,7 @@ func TestClaims(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_b')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_b')"); err != nil {
 		t.Fatal(err)
 	}
 	// batch size is subscription policy: three per claim
@@ -1284,7 +1284,7 @@ func TestFail(t *testing.T) {
 	if _, err := Publish(ctx, pool, "go_fail", "t", 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_fail')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_fail')"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1373,7 +1373,7 @@ func TestFail(t *testing.T) {
 	if _, err := Publish(ctx, pool, "go_drop", "t", 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_drop')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_drop')"); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, ok := claimRange(t, ctx, pool, "go_drop", "binman", "c1"); !ok {
@@ -1410,7 +1410,7 @@ func TestQuarantine(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_ladder')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_ladder')"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1538,7 +1538,7 @@ func TestFailThenQuarantine(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_fq')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_fq')"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1683,7 +1683,7 @@ func TestPublishMessages(t *testing.T) {
 	}
 
 	// positions cover exactly the immediate messages
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_batch')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_batch')"); err != nil {
 		t.Fatal(err)
 	}
 	var lastPos int64
@@ -1712,7 +1712,7 @@ func TestPruneMessages(t *testing.T) {
 	}
 	prune := func(stream string) (n int) {
 		t.Helper()
-		if err := pool.QueryRow(ctx, `SELECT _cb_stream_prune_messages($1)`, stream).Scan(&n); err != nil {
+		if err := pool.QueryRow(ctx, `SELECT cb_stream_prune_messages($1)`, stream).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		return n
@@ -1727,7 +1727,7 @@ func TestPruneMessages(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_ret')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_ret')"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE cb_stream_messages
@@ -1748,7 +1748,7 @@ func TestPruneMessages(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_ret_keep')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_ret_keep')"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE cb_stream_messages
@@ -1878,7 +1878,7 @@ func TestPruneKeys(t *testing.T) {
 	}
 	prune := func(stream string) (n int) {
 		t.Helper()
-		if err := pool.QueryRow(ctx, `SELECT _cb_stream_prune_keys($1)`, stream).Scan(&n); err != nil {
+		if err := pool.QueryRow(ctx, `SELECT cb_stream_prune_keys($1)`, stream).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		return n
@@ -1905,7 +1905,7 @@ func TestPruneKeys(t *testing.T) {
 	if _, err := Publish(ctx, pool, "go_keys", "t", 3, PublishOpts{Key: "stuck", Delay: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_keys')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_keys')"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE cb_stream_keys
@@ -1962,7 +1962,7 @@ func TestPruneKeys(t *testing.T) {
 
 	// an undefined stream raises
 	if _, err := pool.Exec(ctx,
-		`SELECT _cb_stream_prune_keys('go_ghost')`); !errors.Is(wrapErr(err), ErrNotDefined) {
+		`SELECT cb_stream_prune_keys('go_ghost')`); !errors.Is(wrapErr(err), ErrNotDefined) {
 		t.Fatalf("prune on undefined stream returned %v, want ErrNotDefined", err)
 	}
 
@@ -1979,7 +1979,7 @@ func TestPruneKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(50 * time.Millisecond)
-	if _, err := pool.Exec(ctx, `SELECT _cb_stream_deliver_pending()`); err != nil {
+	if _, err := pool.Exec(ctx, `SELECT cb_stream_deliver_pending()`); err != nil {
 		t.Fatal(err)
 	}
 	if n := prune("go_keys"); n != 0 {
@@ -2003,7 +2003,7 @@ func TestDeliverSchedules(t *testing.T) {
 
 	deliver := func() (n int) {
 		t.Helper()
-		if err := pool.QueryRow(ctx, `SELECT _cb_stream_deliver_schedules()`).Scan(&n); err != nil {
+		if err := pool.QueryRow(ctx, `SELECT cb_stream_deliver_schedules()`).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		return n
@@ -2223,7 +2223,7 @@ func TestConsumeSubscriptionCompeting(t *testing.T) {
 	if _, err := PublishMessages(ctx, pool, "go_pool", msgs); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_pool')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_pool')"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2296,7 +2296,7 @@ func TestConsumeSubscriptionClaimLost(t *testing.T) {
 	if _, err := Publish(ctx, pool, "go_zombie", "t", 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_zombie')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_zombie')"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2391,7 +2391,7 @@ func TestRetryBackoffTiming(t *testing.T) {
 	if _, err := Publish(ctx, pool, "go_wait", "t", 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_wait')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_wait')"); err != nil {
 		t.Fatal(err)
 	}
 	if from, to, ok := claimRange(t, ctx, pool, "go_wait", "r", "c1"); !ok || from != 1 || to != 1 {
@@ -2622,7 +2622,7 @@ func TestFilteredCursor(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_fcur')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_fcur')"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2692,7 +2692,7 @@ func TestFilteredSubscription(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_fqt')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_fqt')"); err != nil {
 		t.Fatal(err)
 	}
 	if err := EnsureSubscription(ctx, pool, "go_fqt", "orcid", SubscriptionOpts{
@@ -2905,7 +2905,7 @@ func TestPublishRecipients(t *testing.T) {
 	if _, err := Publish(ctx, pool, "go_rcpt", "order.placed", 2); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_rcpt')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_rcpt')"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2966,10 +2966,10 @@ func TestPublishRecipients(t *testing.T) {
 		`UPDATE cb_stream_pending SET deliver_at = clock_timestamp() WHERE stream = 'go_rcpt'`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_deliver_pending()"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_deliver_pending()"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_rcpt')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_rcpt')"); err != nil {
 		t.Fatal(err)
 	}
 	msgs, err = Read(ctx, pool, "go_rcpt", "all", 10)
@@ -2987,7 +2987,7 @@ func TestPublishRecipients(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_rcpt')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_rcpt')"); err != nil {
 		t.Fatal(err)
 	}
 	msgs, err = Read(ctx, pool, "go_rcpt", "all", 10)
@@ -3015,7 +3015,7 @@ func TestRecipientsCondition(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_rc')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_rc')"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3074,7 +3074,7 @@ func TestFetch(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_fetch')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_fetch')"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3122,10 +3122,10 @@ func TestScheduleRecipients(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_deliver_schedules()"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_deliver_schedules()"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT _cb_stream_assign_positions('go_schr')"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT cb_stream_assign_positions('go_schr')"); err != nil {
 		t.Fatal(err)
 	}
 	if err := EnsureCursor(ctx, pool, "go_schr", "all", CursorOpts{StartPos: At(0)}); err != nil {

@@ -53,7 +53,7 @@ func publish(t *testing.T, pool *pgxpool.Pool, stream, topic string, payload any
 	if _, err := streams.Publish(t.Context(), pool, stream, topic, payload, opts...); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(t.Context(), `SELECT _cb_stream_assign_positions($1)`, stream); err != nil {
+	if _, err := pool.Exec(t.Context(), `SELECT cb_stream_assign_positions($1)`, stream); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -63,7 +63,7 @@ func publish(t *testing.T, pool *pgxpool.Pool, stream, topic string, payload any
 func deliver(t *testing.T, pool *pgxpool.Pool, relay string) int {
 	t.Helper()
 	var n int
-	if err := pool.QueryRow(t.Context(), `SELECT _cb_wire_relay_deliver($1)`, relay).Scan(&n); err != nil {
+	if err := pool.QueryRow(t.Context(), `SELECT cb_wire_relay_deliver($1)`, relay).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	return n
@@ -441,7 +441,7 @@ func TestSubscriptionExpiry(t *testing.T) {
 	}
 
 	var pruned int64
-	if err := pool.QueryRow(ctx, `SELECT _cb_wire_prune_subscriptions()`).Scan(&pruned); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT cb_wire_prune_subscriptions()`).Scan(&pruned); err != nil {
 		t.Fatal(err)
 	}
 	if pruned < 1 {

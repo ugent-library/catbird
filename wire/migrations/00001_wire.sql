@@ -390,7 +390,7 @@ $$;
 -- A message with no topic is skipped: wire routes and renders by topic,
 -- so there is nothing to deliver it as. The cursor advances over it like
 -- over any non-match.
-CREATE FUNCTION _cb_wire_relay_deliver(relay text, batch_size int DEFAULT 100)
+CREATE FUNCTION cb_wire_relay_deliver(relay text, batch_size int DEFAULT 100)
 RETURNS int LANGUAGE plpgsql AS $$
 DECLARE
     _relay cb_wire_relays;
@@ -408,7 +408,7 @@ BEGIN
     -- One deliverer per relay: a concurrent tick skips instead of
     -- queueing, and a redeclare waits for the in-flight batch to commit.
     SELECT r.* INTO _relay FROM cb_wire_relays r
-    WHERE r.name = _cb_wire_relay_deliver.relay
+    WHERE r.name = cb_wire_relay_deliver.relay
     FOR UPDATE SKIP LOCKED;
     IF NOT FOUND THEN
         RETURN 0;
@@ -416,7 +416,7 @@ BEGIN
 
     FOR _message IN
         SELECT * FROM cb_stream_read(_relay.stream, _relay.name,
-                                     _cb_wire_relay_deliver.batch_size)
+                                     cb_wire_relay_deliver.batch_size)
     LOOP
         IF _message.topic IS NULL THEN
             CONTINUE;
@@ -544,7 +544,7 @@ END; $$;
 -- tier and unseen rows pass the seen tier by construction: a row that
 -- was never seen and has no expires_at lives the full max_age.
 -- Returns the number of rows deleted.
-CREATE FUNCTION _cb_wire_prune_inbox(
+CREATE FUNCTION cb_wire_prune_inbox(
     read_older_than interval,
     seen_older_than interval,
     max_age interval
@@ -555,9 +555,9 @@ DECLARE
 BEGIN
     DELETE FROM cb_wire_inbox i
     WHERE (i.expires_at IS NOT NULL AND i.expires_at <= now())
-       OR i.read_at < now() - _cb_wire_prune_inbox.read_older_than
-       OR i.seen_at < now() - _cb_wire_prune_inbox.seen_older_than
-       OR i.created_at < now() - _cb_wire_prune_inbox.max_age;
+       OR i.read_at < now() - cb_wire_prune_inbox.read_older_than
+       OR i.seen_at < now() - cb_wire_prune_inbox.seen_older_than
+       OR i.created_at < now() - cb_wire_prune_inbox.max_age;
 
     GET DIAGNOSTICS _deleted = ROW_COUNT;
     RETURN _deleted;
@@ -566,7 +566,7 @@ END; $$;
 
 -- +goose statementbegin
 -- Deletes lapsed watches. Returns the number of rows deleted.
-CREATE FUNCTION _cb_wire_prune_subscriptions()
+CREATE FUNCTION cb_wire_prune_subscriptions()
 RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
     _deleted bigint;
@@ -585,7 +585,7 @@ END; $$;
 -- render anyway — reads filter on expires_at — the nudge is what turns
 -- the silent expiry into a visible refetch. Returns the number of rows
 -- deleted.
-CREATE FUNCTION _cb_wire_prune_presence()
+CREATE FUNCTION cb_wire_prune_presence()
 RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
     _topics text[];
@@ -612,12 +612,12 @@ END; $$;
 
 -- +goose down
 
-DROP FUNCTION _cb_wire_prune_presence();
-DROP FUNCTION _cb_wire_prune_subscriptions();
-DROP FUNCTION _cb_wire_prune_inbox(interval, interval, interval);
+DROP FUNCTION cb_wire_prune_presence();
+DROP FUNCTION cb_wire_prune_subscriptions();
+DROP FUNCTION cb_wire_prune_inbox(interval, interval, interval);
 DROP FUNCTION cb_wire_disappear(text, text);
 DROP FUNCTION cb_wire_appear(text, text, jsonb, interval);
-DROP FUNCTION _cb_wire_relay_deliver(text, int);
+DROP FUNCTION cb_wire_relay_deliver(text, int);
 DROP FUNCTION _cb_wire_topic_patterns(text);
 DROP FUNCTION cb_wire_unsubscribe(text, text);
 DROP FUNCTION cb_wire_subscribe(text, text, timestamptz);

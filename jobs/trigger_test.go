@@ -77,7 +77,7 @@ func publish(t *testing.T, ctx context.Context, pool *pgxpool.Pool, stream, topi
 func assignPositions(t *testing.T, ctx context.Context, pool *pgxpool.Pool, stream string) {
 	t.Helper()
 	if _, err := pool.Exec(ctx,
-		`SELECT _cb_stream_assign_positions($1)`, stream); err != nil {
+		`SELECT cb_stream_assign_positions($1)`, stream); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -88,7 +88,7 @@ func deliverTrigger(t *testing.T, ctx context.Context, pool *pgxpool.Pool, trigg
 	t.Helper()
 	var n int
 	if err := pool.QueryRow(ctx,
-		`SELECT _cb_job_run_triggered($1)`, trigger).Scan(&n); err != nil {
+		`SELECT cb_job_run_triggered($1)`, trigger).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	return n
@@ -438,7 +438,7 @@ func TestTriggerExactlyOnce(t *testing.T) {
 	}
 	var n int
 	if err := tx.QueryRow(ctx,
-		`SELECT _cb_job_run_triggered('gj_once_t')`).Scan(&n); err != nil {
+		`SELECT cb_job_run_triggered('gj_once_t')`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 2 {

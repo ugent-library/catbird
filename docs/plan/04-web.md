@@ -213,7 +213,7 @@ list. Tokens: AES-256-GCM, claims = topics + recipient + expiry.
 
 Built 2026-07-30, with the module (all pre-release, edited in place):
 recipient vocabulary throughout (token claim `r`); `cb_wire_send`
-(payload jsonb); relays + `_cb_wire_relay_deliver`; subscriptions +
+(payload jsonb); relays + `cb_wire_relay_deliver`; subscriptions +
 `_cb_wire_topic_patterns`; presence + its prune-with-nudge; the address
 frames and the fetch in wire's dispatch; `ServeScript`/`wire.js`;
 `ServePoll` JSON mode; `wire.TickerOpts.Notifier` + relay tick
