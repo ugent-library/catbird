@@ -3,6 +3,7 @@ package catbird
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -12,8 +13,8 @@ type Message struct {
 	ID            int64
 	Topic         string
 	Payload       []byte
-	Signals       map[string]json.RawMessage
-	Attempts      int
+	Signals       map[string]json.RawMessage 
+	Attempts      int                        
 	CorrelationID *string // Natively tracks workflow clusters for auto-cleanup
 }
 
@@ -40,7 +41,7 @@ func (t *txWrapper) Exec(ctx context.Context, sql string, args ...any) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	type stringer interface{ String() string }
+	type stringer interface { String() string }
 	if s, ok := tag.(stringer); ok {
 		return []byte(s.String()), nil
 	}
@@ -79,9 +80,9 @@ func (c *Client) Enqueue(ctx context.Context, runner DBRunner, topic, queue stri
 			RETURNING id
 		)
 		INSERT INTO cb_claims (message_id, queue, visible_at, correlation_id)
-		SELECT id, $4, now() + make_interval(secs => $5), $6 FROM msg;
+		SELECT id, $4, now() + ($5 || ' seconds')::interval, $6 FROM msg;
 	`, topic, b, dedupKey, queue, delaySeconds, correlationID)
-
+	
 	if err == nil {
 		runner.Exec(ctx, `SELECT pg_notify('cb_queue_' || $1, '')`, queue)
 	}

@@ -3,24 +3,22 @@ package catbird
 import (
 	"context"
 	"encoding/json"
-	"sync"
 	"time"
+	"sync"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // JobHandler is the function signature users implement.
-// By accepting DBRunner (a transaction), all application side-effects and the framework's claim cleanup
-// are perfectly fenced into a single atomic PostgreSQL commit.
-type JobHandler func(ctx context.Context, tx DBRunner, msg Message) error
+type JobHandler func(ctx context.Context, pool *pgxpool.Pool, msg Message) error
 
 type Worker struct {
-	pool     *pgxpool.Pool
-	queue    string
-	handler  JobHandler
-	cleanup  JobHandler // Optional fallback execution
-	lease    time.Duration
-	wakeChan chan struct{}
+	pool       *pgxpool.Pool
+	queue      string
+	handler    JobHandler
+	cleanup    JobHandler // Optional fallback execution
+	lease      time.Duration
+	wakeChan   chan struct{}
 }
 
 func NewWorker(pool *pgxpool.Pool, queue string, handler JobHandler) *Worker {
@@ -47,8 +45,8 @@ func (w *Worker) Start(ctx context.Context) {
 			return
 		}
 		defer conn.Release()
-
-		conn.Exec(ctx, "LISTEN cb_queue_"+w.queue)
+		
+		conn.Exec(ctx, "LISTEN cb_queue_" + w.queue)
 		for {
 			_, err := conn.Conn().WaitForNotification(ctx)
 			if err != nil {
@@ -63,9 +61,9 @@ func (w *Worker) Start(ctx context.Context) {
 	}()
 
 	for {
-		// Claim up to 50 jobs at once using standard SKIP LOCKED
+		// Claim up to 50 jobs at once using standard SKIP LOCKED highly efficiently
 		msgs, err := w.claimBatch(ctx, 50)
-
+		
 		if err == nil && len(msgs) > 0 {
 			// Process the batch concurrently
 			var wg sync.WaitGroup
@@ -73,29 +71,10 @@ func (w *Worker) Start(ctx context.Context) {
 				wg.Add(1)
 				go func(m Message) {
 					defer wg.Done()
-
-					// FENCING: Wrap both the user's handler and the cleanup in a single transaction
-					tx, err := w.pool.Begin(ctx)
-					if err != nil {
-						return // Cannot process without a transaction
-					}
-
-					err = w.handler(ctx, WrapDBRunner(tx), m)
-
+					err := w.handler(ctx, w.pool, m)
 					if err == nil {
-						// The Bloat Killer: Deleting the claim inside the SAME context
-						tx.Exec(ctx, `DELETE FROM cb_claims WHERE message_id = $1`, m.ID)
-						tx.Exec(ctx, `DELETE FROM cb_signals WHERE message_id = $1`, m.ID)
-
-						// Commit perfectly fences both the user's DB updates and our claim deletions
-						err = tx.Commit(ctx)
-						if err != nil {
-							// If commit fails, the connection dropped. Postgres drops everything safely.
-							return
-						}
+						w.complete(ctx, m.ID)
 					} else {
-						tx.Rollback(ctx)
-
 						if m.Attempts >= 5 {
 							w.dead(ctx, m.ID)
 							if m.CorrelationID != nil {
@@ -103,8 +82,7 @@ func (w *Worker) Start(ctx context.Context) {
 								client.CancelCascade(ctx, w.pool, *m.CorrelationID)
 							}
 							if w.cleanup != nil {
-								// Note: Cleanup runs outside the primary fencing TX boundary since it initiates fallback chains
-								w.cleanup(ctx, WrapDBRunner(w.pool), m)
+								w.cleanup(ctx, w.pool, m) // Run final failure hooks
 							}
 						} else {
 							w.fail(ctx, m.ID, 1*time.Minute)
@@ -113,6 +91,7 @@ func (w *Worker) Start(ctx context.Context) {
 				}(msg)
 			}
 			wg.Wait() // Wait for batch to finish before claiming next batch
+			continue // Check instantly again without yielding to selection
 		}
 
 		// Nothing to do. Sleep or Wait for INSTANT wake.
@@ -143,7 +122,7 @@ func (w *Worker) claimBatch(ctx context.Context, limit int) ([]Message, error) {
 		FROM cb_messages m 
 		JOIN leased l ON m.id = l.message_id;
 	`, w.queue, w.lease, limit)
-
+	
 	if err != nil {
 		return nil, err
 	}
@@ -163,10 +142,25 @@ func (w *Worker) claimBatch(ctx context.Context, limit int) ([]Message, error) {
 	return msgs, rows.Err()
 }
 
+func (w *Worker) complete(ctx context.Context, id int64) {
+	// The Bloat Killer: Deleting the claim and its ephemeral signals
+	_, _ = w.pool.Exec(ctx, `
+ttDELETE FROM cb_claims WHERE message_id = $1;
+ttDELETE FROM cb_signals WHERE message_id = $1;
+
+	`, id)
+}
+
 func (w *Worker) fail(ctx context.Context, id int64, backoff time.Duration) {
-	w.pool.Exec(ctx, `UPDATE cb_claims SET status = 0, visible_at = now() + $2 WHERE message_id = $1`, id, backoff)
+	// Reset status and set future visibility without blocking the queue
+	_, _ = w.pool.Exec(ctx, `
+		UPDATE cb_claims 
+		SET status = 0, visible_at = now() + $2 
+		WHERE message_id = $1
+	`, id, backoff)
 }
 
 func (w *Worker) dead(ctx context.Context, id int64) {
-	w.pool.Exec(ctx, `UPDATE cb_claims SET status = 3 WHERE message_id = $1`, id)
+	// Dead Letters: Automatically drops from the partial idx_cb_claims_ready index
+	_, _ = w.pool.Exec(ctx, `UPDATE cb_claims SET status = 3 WHERE message_id = $1`, id)
 }
