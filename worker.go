@@ -3,147 +3,204 @@ package catbird
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// JobHandler is the function signature users implement.
-// By accepting DBRunner (a transaction), all application side-effects and the framework's claim cleanup
-// are perfectly fenced into a single atomic PostgreSQL commit.
-type JobHandler func(ctx context.Context, tx DBRunner, msg Message) error
+// JobHandler runs one job. tx is the worker's transaction: writes made through it
+// commit together with the completion of the job, or not at all.
+type JobHandler func(ctx context.Context, tx Conn, msg Message) error
 
-type Worker struct {
-	pool     *pgxpool.Pool
-	queue    string
-	handler  JobHandler
-	cleanup  JobHandler // Optional fallback execution
-	lease    time.Duration
-	wakeChan chan struct{}
+// WorkerOptions are the optional parts of NewWorker. Zero values take the defaults.
+type WorkerOptions struct {
+	Lease        time.Duration // how long one attempt may run; default 5 minutes
+	MaxAttempts  int           // attempts before the job is dead; default 5
+	Backoff      time.Duration // wait after a failed attempt; default 1 minute
+	BatchSize    int           // jobs claimed per round; default 50
+	PollInterval time.Duration // wake-up interval when no notification arrives; default 5 seconds
+	OnDead       JobHandler    // runs once, outside the job transaction, after the last failed attempt
+	Logger       *slog.Logger  // default slog.Default()
 }
 
-func NewWorker(pool *pgxpool.Pool, queue string, handler JobHandler) *Worker {
+func (o WorkerOptions) withDefaults() WorkerOptions {
+	if o.Lease <= 0 {
+		o.Lease = 5 * time.Minute
+	}
+	if o.MaxAttempts <= 0 {
+		o.MaxAttempts = 5
+	}
+	if o.Backoff <= 0 {
+		o.Backoff = time.Minute
+	}
+	if o.BatchSize <= 0 {
+		o.BatchSize = 50
+	}
+	if o.PollInterval <= 0 {
+		o.PollInterval = 5 * time.Second
+	}
+	if o.Logger == nil {
+		o.Logger = slog.Default()
+	}
+	return o
+}
+
+// errLeaseExpired: another worker claimed the job after our lease ran out.
+var errLeaseExpired = errors.New("catbird: lease expired before completion")
+
+type Worker struct {
+	pool    *pgxpool.Pool
+	queue   string
+	handler JobHandler
+	opts    WorkerOptions
+	wake    chan struct{}
+}
+
+func NewWorker(pool *pgxpool.Pool, queue string, handler JobHandler, opts WorkerOptions) *Worker {
 	return &Worker{
-		pool:     pool,
-		queue:    queue,
-		handler:  handler,
-		lease:    5 * time.Minute,
-		wakeChan: make(chan struct{}, 1),
+		pool:    pool,
+		queue:   queue,
+		handler: handler,
+		opts:    opts.withDefaults(),
+		wake:    make(chan struct{}, 1),
 	}
 }
 
-// WithCleanup defines an explicit failure handler
-func (w *Worker) WithCleanup(fn JobHandler) *Worker {
-	w.cleanup = fn
-	return w
-}
-
+// Start claims batches of jobs and runs each batch concurrently, until ctx is
+// canceled. Between batches it waits for a NOTIFY or for PollInterval.
 func (w *Worker) Start(ctx context.Context) {
-	// Sub-millisecond Latency Lowering via LISTEN/NOTIFY bridging to a Go channel
-	go func() {
-		conn, err := w.pool.Acquire(ctx)
-		if err != nil {
-			return
-		}
-		defer conn.Release()
-
-		conn.Exec(ctx, "LISTEN cb_queue_"+w.queue)
-		for {
-			_, err := conn.Conn().WaitForNotification(ctx)
-			if err != nil {
-				return
-			}
-			select {
-			case w.wakeChan <- struct{}{}:
-			default:
-				// Channel already has a wake signal, safe to ignore
-			}
-		}
-	}()
+	go w.listen(ctx)
 
 	for {
-		// Claim up to 50 jobs at once using standard SKIP LOCKED
-		msgs, err := w.claimBatch(ctx, 50)
-
-		if err == nil && len(msgs) > 0 {
-			// Process the batch concurrently
-			var wg sync.WaitGroup
-			for _, msg := range msgs {
-				wg.Add(1)
-				go func(m Message) {
-					defer wg.Done()
-
-					// FENCING: Wrap both the user's handler and the cleanup in a single transaction
-					tx, err := w.pool.Begin(ctx)
-					if err != nil {
-						return // Cannot process without a transaction
-					}
-
-					err = w.handler(ctx, WrapDBRunner(tx), m)
-
-					if err == nil {
-						// The Bloat Killer: Deleting the claim inside the SAME context
-						tx.Exec(ctx, `DELETE FROM cb_claims WHERE message_id = $1`, m.ID)
-						tx.Exec(ctx, `DELETE FROM cb_signals WHERE message_id = $1`, m.ID)
-
-						// Commit perfectly fences both the user's DB updates and our claim deletions
-						err = tx.Commit(ctx)
-						if err != nil {
-							// If commit fails, the connection dropped. Postgres drops everything safely.
-							return
-						}
-					} else {
-						tx.Rollback(ctx)
-
-						if m.Attempts >= 5 {
-							w.dead(ctx, m.ID)
-							if m.CorrelationID != nil {
-								client := NewClient()
-								client.CancelCascade(ctx, w.pool, *m.CorrelationID)
-							}
-							if w.cleanup != nil {
-								// Note: Cleanup runs outside the primary fencing TX boundary since it initiates fallback chains
-								w.cleanup(ctx, WrapDBRunner(w.pool), m)
-							}
-						} else {
-							w.fail(ctx, m.ID, 1*time.Minute)
-						}
-					}
-				}(msg)
-			}
-			wg.Wait() // Wait for batch to finish before claiming next batch
+		msgs, err := w.claimBatch(ctx)
+		if err != nil && ctx.Err() == nil {
+			w.opts.Logger.Error("catbird: claim failed", "queue", w.queue, "err", err)
 		}
 
-		// Nothing to do. Sleep or Wait for INSTANT wake.
+		var wg sync.WaitGroup
+		for _, m := range msgs {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				w.run(ctx, m)
+			}()
+		}
+		wg.Wait()
+
+		if len(msgs) == w.opts.BatchSize {
+			continue // the queue may hold more
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-w.wakeChan:
-			// Instantly wakes up upon enqueue
-		case <-time.After(5 * time.Second):
-			// Fallback poll unblocks delayed executions that just hit their `visible_at` window
+		case <-w.wake:
+		case <-time.After(w.opts.PollInterval):
 		}
 	}
 }
 
-func (w *Worker) claimBatch(ctx context.Context, limit int) ([]Message, error) {
+// run executes one job: handler, then completion, in one transaction.
+// Any error schedules a retry or marks the job dead.
+func (w *Worker) run(ctx context.Context, m Message) {
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		w.opts.Logger.Error("catbird: begin failed", "queue", w.queue, "message_id", m.ID, "err", err)
+		return
+	}
+	defer tx.Rollback(ctx) // no-op after a successful commit
+
+	err = w.handler(ctx, tx, m)
+	if err == nil {
+		err = w.complete(ctx, tx, m)
+	}
+	switch {
+	case err == nil:
+	case errors.Is(err, errLeaseExpired):
+		w.opts.Logger.Warn("catbird: lease expired before completion, work discarded", "queue", w.queue, "message_id", m.ID, "attempt", m.Attempts)
+	default:
+		w.failed(ctx, m, err)
+	}
+}
+
+// complete deletes the claim and its signals and commits, all in the handler's
+// transaction. attempts is the lease token: if another worker claimed the job
+// after our lease expired, attempts moved on and the delete finds nothing.
+func (w *Worker) complete(ctx context.Context, tx pgx.Tx, m Message) error {
+	tag, err := tx.Exec(ctx, `
+		DELETE FROM cb_claims WHERE message_id = $1 AND attempts = $2
+	`, m.ID, m.Attempts)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return errLeaseExpired
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM cb_signals WHERE message_id = $1`, m.ID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// failed schedules a retry, or after the last attempt marks the job dead,
+// cancels its correlation group, and runs OnDead.
+func (w *Worker) failed(ctx context.Context, m Message, cause error) {
+	log := w.opts.Logger.With("queue", w.queue, "message_id", m.ID, "attempt", m.Attempts)
+
+	if m.Attempts < w.opts.MaxAttempts {
+		log.Warn("catbird: job failed, will retry", "err", cause)
+		_, err := w.pool.Exec(ctx, `
+			UPDATE cb_claims SET visible_at = now() + $3::interval
+			WHERE message_id = $1 AND attempts = $2 AND status = $4
+		`, m.ID, m.Attempts, w.opts.Backoff, statusLive)
+		if err != nil {
+			log.Error("catbird: scheduling retry failed", "err", err)
+		}
+		return
+	}
+
+	log.Error("catbird: job dead", "err", cause)
+	_, err := w.pool.Exec(ctx, `
+		UPDATE cb_claims SET status = $3 WHERE message_id = $1 AND attempts = $2
+	`, m.ID, m.Attempts, statusDead)
+	if err != nil {
+		log.Error("catbird: marking dead failed", "err", err)
+	}
+	if m.CorrelationID != "" {
+		if err := NewClient().Cancel(ctx, w.pool, m.CorrelationID); err != nil {
+			log.Error("catbird: cancel failed", "correlation_id", m.CorrelationID, "err", err)
+		}
+	}
+	if w.opts.OnDead != nil {
+		if err := w.opts.OnDead(ctx, w.pool, m); err != nil {
+			log.Error("catbird: OnDead failed", "err", err)
+		}
+	}
+}
+
+// claimBatch leases up to BatchSize ready jobs by moving visible_at past the
+// lease, and returns them with their payloads and delivered signals.
+func (w *Worker) claimBatch(ctx context.Context) ([]Message, error) {
 	rows, err := w.pool.Query(ctx, `
 		WITH leased AS (
 			UPDATE cb_claims
-			SET status = 1, visible_at = now() + $2, attempts = attempts + 1
+			SET visible_at = now() + $2::interval, attempts = attempts + 1
 			WHERE message_id IN (
 				SELECT message_id FROM cb_claims
-				WHERE queue = $1 AND status = 0 AND visible_at <= now() AND dependencies = 0
-				ORDER BY visible_at ASC LIMIT $3 FOR UPDATE SKIP LOCKED
-			) RETURNING message_id, attempts, correlation_id
+				WHERE queue = $1 AND status = $4 AND dependencies = 0 AND visible_at <= now()
+				ORDER BY visible_at ASC LIMIT $3
+				FOR UPDATE SKIP LOCKED
+			)
+			RETURNING message_id, attempts, correlation_id
 		)
 		SELECT m.id, m.topic, m.payload, l.attempts, l.correlation_id,
-		       (SELECT jsonb_object_agg(name, payload) FROM cb_signals s WHERE s.message_id = m.id) as signals
-		FROM cb_messages m
-		JOIN leased l ON m.id = l.message_id;
-	`, w.queue, w.lease, limit)
-
+		       (SELECT jsonb_object_agg(name, payload) FROM cb_signals s WHERE s.message_id = m.id)
+		FROM leased l
+		JOIN cb_messages m ON m.id = l.message_id
+	`, w.queue, w.opts.Lease, w.opts.BatchSize, statusLive)
 	if err != nil {
 		return nil, err
 	}
@@ -152,21 +209,54 @@ func (w *Worker) claimBatch(ctx context.Context, limit int) ([]Message, error) {
 	var msgs []Message
 	for rows.Next() {
 		var m Message
-		var sigs []byte
-		if err := rows.Scan(&m.ID, &m.Topic, &m.Payload, &m.Attempts, &m.CorrelationID, &sigs); err == nil {
-			if len(sigs) > 0 {
-				json.Unmarshal(sigs, &m.Signals)
-			}
-			msgs = append(msgs, m)
+		var correlation *string
+		var signals []byte
+		if err := rows.Scan(&m.ID, &m.Topic, &m.Payload, &m.Attempts, &correlation, &signals); err != nil {
+			return nil, err
 		}
+		if correlation != nil {
+			m.CorrelationID = *correlation
+		}
+		if len(signals) > 0 {
+			if err := json.Unmarshal(signals, &m.Signals); err != nil {
+				return nil, err
+			}
+		}
+		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()
 }
 
-func (w *Worker) fail(ctx context.Context, id int64, backoff time.Duration) {
-	w.pool.Exec(ctx, `UPDATE cb_claims SET status = 0, visible_at = now() + $2 WHERE message_id = $1`, id, backoff)
-}
-
-func (w *Worker) dead(ctx context.Context, id int64) {
-	w.pool.Exec(ctx, `UPDATE cb_claims SET status = 3 WHERE message_id = $1`, id)
+// listen forwards NOTIFY on the queue's channel to w.wake. It reconnects when
+// the connection drops; until then the worker runs on PollInterval alone.
+func (w *Worker) listen(ctx context.Context) {
+	channel := pgx.Identifier{"cb_queue_" + w.queue}.Sanitize()
+	for ctx.Err() == nil {
+		err := func() error {
+			conn, err := w.pool.Acquire(ctx)
+			if err != nil {
+				return err
+			}
+			defer conn.Release()
+			if _, err := conn.Exec(ctx, "LISTEN "+channel); err != nil {
+				return err
+			}
+			for {
+				if _, err := conn.Conn().WaitForNotification(ctx); err != nil {
+					return err
+				}
+				select {
+				case w.wake <- struct{}{}:
+				default: // a wake-up is already pending
+				}
+			}
+		}()
+		if ctx.Err() == nil {
+			w.opts.Logger.Error("catbird: listen failed, reconnecting", "queue", w.queue, "err", err)
+			select {
+			case <-ctx.Done():
+			case <-time.After(w.opts.PollInterval):
+			}
+		}
+	}
 }

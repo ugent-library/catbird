@@ -1,79 +1,65 @@
-# Catbird Lite: Architectural Design Blueprint
+# Catbird Lite
 
-Catbird Lite is a PostgreSQL-backed message queue and workflow engine designed for high concurrency and exact guarantees, without requiring database tuning, background daemons, or procedural SQL (PL/pgSQL).
+A PostgreSQL-backed job queue, stream, and small workflow engine. Four tables, plain SQL, no PL/pgSQL, no extensions. All logic lives in a thin client (Go today; other languages follow the same statements), so the whole system is the schema in `migrations/00001_lite.sql` plus the statements in `client.go`, `worker.go`, and `stream.go`.
 
-It is built as an extremely lightweight "Dumb SQL / Thick Client" toolkit. The database manages atomic locks and persistence natively via B-Trees, while the language clients (Go, TypeScript, etc.) manage the loop orchestration.
+## Tables
 
-## Core Philosophy: The Iron Triangle of Database Queues
-Building queues on relational databases usually hits an "Iron Triangle". You can only pick two:
-1.  **Code Simplicity** (No sweepers, state machines, or daemons).
-2.  **Concurrency** (Thousands of workers, zero deadlocks).
-3.  **Low Database Wear** (Virtually zero WAL generation or Vacuum bloat).
+- `cb_messages` — every job input and every stream event is one row. Rows are never updated, so large payloads never produce dead tuples.
+- `cb_claims` — one narrow row per job that still has to run. Updated on every claim and retry, deleted on completion. Aggressive autovacuum settings on the table keep it small.
+- `cb_stream_pending` / `cb_stream` — narrow rows that give published messages their place in the stream (see Streams). Job inputs never appear here, so a job created from an event is not itself an event and a trigger cannot feed on its own output.
+- `cb_cursors` — one row per stream consumer: the highest position it processed.
+- `cb_signals` — payloads delivered to a job that waits for them.
 
-Traditional `SKIP LOCKED` implementations sacrifice #3—updating heavy JSON payload rows millions of times fills the database with dead tuples, crashing shared DBaaS instances due to MVCC bloat.
+A partial index on `cb_claims (queue, visible_at) WHERE status = 0 AND dependencies = 0` holds only claimable rows. Dead rows and rows waiting on dependencies are not in it.
 
-Catbird breaks the triangle by strictly separating **Immutable Facts** from **Mutable Leases**.
+## Jobs
 
-## 1. The Schema (Three Primitives)
+`Enqueue` inserts the message and its claim in one statement and sends `NOTIFY` on the queue's channel. Workers `LISTEN` and also poll on an interval, so a lost notification delays a job, never loses it.
 
-The entire system is backed by exactly three static tables. There is no dynamic table generation and zero PL/pgSQL functions.
+**Claiming.** A worker takes up to `BatchSize` rows with `FOR UPDATE SKIP LOCKED`, sets `visible_at = now() + Lease`, and increments `attempts`. There is no "running" status: a job with `visible_at` in the future is either delayed, backing off after a failure, or claimed. Once `visible_at` passes, any worker may claim it again. That is how a crashed worker's job comes back.
 
-### `cb_messages` (The Immutable Stream)
-This table acts as the unified payload store for both Jobs and Streams. It is strictly append-only.
-Because massive JSON payloads are never `UPDATE`d, Postgres never creates dead tuples around them, completely eliminating the primary source of autovacuum bloat.
+**Completing.** The worker opens a transaction, passes it to the handler, and in the same transaction runs `DELETE FROM cb_claims WHERE message_id = $1 AND attempts = $2`. The handler's writes and the job's completion commit together. `attempts` is the lease token: if the lease expired and another worker claimed the job, `attempts` moved on, the delete finds nothing, and the late worker rolls back. Two workers may execute the same job; only the one holding the lease commits. Side effects outside the database (emails, HTTP calls) are not covered by this, so handlers that must not repeat them need their own idempotency key — `Message.ID` works.
 
-### `cb_cursors` (Stream Consumption)
-A simple key-value table tracking the `last_id` a given stream consumer has successfully processed.
+**Lease rule.** A handler must finish within `Lease` or its work is discarded and the job runs again. Set `Lease` above your longest handler.
 
-### `cb_claims` (Job Lifecycle & Routing)
-The high-volatility table. When a message needs to be processed as a Job, a "Claim" row is inserted here. It tracks the lease timeout (`visible_at`) and retry attempts.
+**Failing.** A handler error sets `visible_at = now() + Backoff`. After `MaxAttempts` the claim is marked dead (`status = 1`), `Cancel` runs for its correlation id, and `OnDead` runs once outside the job transaction. A crash counts as a failed attempt like any other, so `OnDead` also fires for jobs that repeatedly crashed a worker.
 
-*MVCC Defense*: We enforce a microscopic autovacuum target (`autovacuum_vacuum_scale_factor = 0.01`) directly in the DDL of this specific table. Because the table is incredibly narrow (only a few integers and a timestamp), updates occur directly on disk pages and Postgres aggressively recycles dead Index/Heap blocks dynamically. When a job completes, the claim is deleted. A partial index (`status = 0 AND dependencies = 0`) guarantees that completed or paused jobs gracefully eject from the working B-Tree instantly.
+**Cancel rule.** `Cancel(correlationID)` marks live claims dead. It stops jobs from starting; a job that is already running finishes and commits. Cancel does not undo anything.
 
-## 2. The Client Toolkit Contract
+## Dependencies and signals
 
-All language implementations (Go, Python, TypeScript) conform to the exact same behavioral contract, relying purely on executing parameterized SQL statements.
+`EnqueueOptions.Dependencies = n` creates a job that stays out of the ready index until `n` events arrive. Two kinds of event count:
 
-### Exactly-Once Fencing (Atomic Handlers)
-A primary challenge of external queue engines is Fencing. If a worker commits application logic but crashes before ACKing the queue, the job reruns and causes data corruption.
-Catbird Lite solves this seamlessly: The Go framework manages a database `pgx.Tx` transaction, passes it *into* the User's Job Handler, and upon success executes the `DELETE LIMIT` of the claim in the *exact same transaction*. If the pod crashes, Postgres natively rolls back both the Application's modifications and the job claim perfectly.
+- `ResolveDependency(childID)` — a parent step completed. Call it inside the parent's handler transaction so it commits with the parent's completion.
+- `DeliverSignal(childID, name, payload)` — an external input arrived. The payload is stored in `cb_signals` and handed to the handler as `Message.Signals[name]` at claim time. Delivering the same name twice is a no-op.
 
-### Subscriptions & Bridging (Fan-out on Read)
-We do not copy payloads to route them. A message published to `payment.success` is written exactly once to `cb_messages`.
-To bridge a Stream to a Job (e.g., "Run this job every time a payment succeeds"), the client runs a Subscription loop that reads the stream (safely avoiding commit-order stalling via Postgres `pg_snapshot_xmin`) and calls `Enqueue()` for every matching row, using the `message_id` as the Deduplication Key to survive Bridger crashes.
+The decrement is `UPDATE ... SET dependencies = dependencies - 1 WHERE dependencies > 0`, so concurrent parents cannot lose an update. When the counter reaches 0 the statement also sends `NOTIFY`.
 
-### Leaderless Cron
-All client instances wake at `X:00` and generate identical deterministic strings (`cron:hourly:2026-08-27:00:00`). The database's `cb_messages.dedup_key` constraint guarantees only exactly one instance applies. Zero leader-election tracking required.
+**Signal rule.** A signal must be counted in `Dependencies` before it is delivered. Delivering to a job that is not waiting returns `ErrNotFound`; nothing is stored. Signals that arrive before the job exists are the caller's problem to retry.
 
-### DAGs and Joins (`dependencies` counter)
-Workflows are achieved natively without PL/pgSQL generation. `cb_claims` has a `dependencies` integer column.
-The partial index excludes any claim where `dependencies > 0`. When upstream steps complete, the client simply issues `UPDATE cb_claims SET dependencies = dependencies - 1`. When it hits 0, it automatically slides into the 'ready' index. (And if an upstream step fails permanently, an automatic `client.CancelCascade(correlation_id)` is invoked to clean up sibling nodes safely).
+A permanently failed step cancels its siblings and children through the shared correlation id. Children then stay dead with `dependencies > 0` until `GC` removes them.
 
-### Signals (External Payloads)
-When a paused job is waiting for external human input (e.g., an approval payload), delivering the payload directly onto the `cb_messages` or `cb_claims` table breaks either their immutability or MVCC updatability patterns.
-Catbird Lite solves this explicitly with an append-only sidecar table: `cb_signals`. The worker natively parses these aggregates from Postgres via `jsonb_object_agg` right at checkout.
+## Streams
 
-## 4. Pending Implementations (Locked-in Requirements)
-While the core architecture is proven, a few "Quality of Life" toolkit features remain functionally sketched in tests but lack standard library implementations in `client.go`:
+`Publish` inserts a message with no claim. `StreamConsumer.FetchBatch(pattern)` reads messages after the cursor whose topic matches a `LIKE` pattern (`order.%`), in position order. `Ack(position)` moves the cursor; it uses `GREATEST`, so the cursor never moves backwards even when two consumers share it.
 
-*   **Managed Client-Side Cron:** The `example_test.go` proves exactly-once leaderless cron execution via `ON CONFLICT (dedup_key)`, but a first-class `CronWorker` abstraction needs to be added to the Go/TS SDK. This object must handle the loop, truncation alignment (waking precisely at the top of the minute), and explicit drift validation (`if time.Since(scheduled) > 30s { skip }`) to enforce distributed safety.
-*   **Wait-For-Output (Persistent RPC):** As sketched, synchronous RPC execution requires the caller doing `LISTEN cb_rpc_{id}` combined with a targeted query to the `cb_signals` key-value store to retrieve the final execution payload. A `client.RunTaskSync()` wrapper needs to be implemented.
-*   **Job & Queue Definitions (Config Tables):** The `streams` branch forces operators to define queues and assign maximum capacity/cleanup logic in table schemas statically. Catbird Lite implicitly creates queues using whatever behavior the calling Client opts into.
-*   **Web: SSE, Presence, and Inbox (`cb_wire_*`):** `streams` explicitly embedded Server-Sent Events, distributed message routing, and read-receipts into raw PG `LISTEN/NOTIFY`. Lite completely abandons this infrastructure logic; developers must utilize standard WebSockets or SSE architecture on top of normal API routes.
-*   **Global Concurrency Limits:** The `streams` branch allows declarative global rate limiting per queue. Our `Worker` toolkit currently hardcodes raw claims. To solve this, a `max_inflight` override could be handled dynamically via a dedicated limit table or application-layer rate limiting APIs.
+**Positions.** Message ids are handed out at `INSERT` time, so a message from a transaction that is still open can have a lower id than messages that already committed; a reader going by id would move past it and never see it. Readers therefore go by `position`. `Publish` writes the message and a `cb_stream_pending` row in one statement; both appear when the transaction commits. The assigner moves pending rows into `cb_stream`, each with the next position, in the order it sees them — commit order. A message from a long transaction gets its position when it commits; it arrives late, after messages published after it, but it arrives, once. This is the rule a plain `SELECT` follows: you see a row when its transaction commits.
 
-## 5. Adversarial Concurrency Protections (Lessons from the `streams` Implementation)
+The assigner is one statement under an advisory lock, run every `AssignEvery` (250 ms) by every `StreamConsumer` and every trigger. The lock makes one of them do the work; the rest do nothing. Nothing has to be deployed or configured; a message is readable within one tick of its commit. `cb_messages` is never updated: the churn is an insert and a delete on `cb_stream_pending` and an insert on `cb_stream`, all narrow rows.
 
-By abandoning complex PL/pgSQL databases engines, Catbird Lite shifts significant responsibility into the thick Go/TS client SDK. To ensure `Catbird Lite` remains completely production safe at high scale, the toolkit applies pure SQL constraints to resolve distributed vulnerabilities:
+**Triggers.** `RegisterTrigger(name, pattern, queue)` runs a loop: fetch a batch, `Enqueue` each message on the target queue with dedup key `trigger:<name>:<message id>`, `Ack`, commit — all in one transaction. A crash before commit redoes the batch; the dedup keys make the redo a no-op. Several processes may run the same trigger: each only wastes reads, the cursor is monotone, and the dedup keys keep the output single. Run a trigger in one process if the extra reads matter; there is no leader election.
 
-### Solved Race Conditions & Vulnerabilities
-*   **The Double-Execute Fencing Hole:** In naive Client SDKs, a worker executes local app logic, commits, and then sends `DELETE claim`. If it OOMs between those two steps, the job is double executed on retry. **Solved** by injecting the `pgx.Tx` interface deep into the Job Handler function. The user mutates their local application state *inside* the framework's transaction. `Complete()` happens perfectly atomically.
-*   **Lost Updates on DAG Resolution:** If multiple upstream steps complete simultaneously, multiple workers fire `UPDATE cb_claims SET dependencies = dependencies - 1`. Normal read/modify/write loops would drop updates, permanently hanging child nodes. **Solved** by leveraging instantaneous atomic bounds checks: `WHERE dependencies > 0`.
-*   **Signal Double-Decrements:** If webhooks are delivered dynamically on duplicate retries, blind updates would falsely trigger jobs before all input arrives. **Solved** explicitly by a unified CTE: `WITH sig AS (INSERT... ON CONFLICT DO NOTHING RETURNING id) UPDATE... WHERE message_id IN (sig)`.
-*   **Leaderless Cron Drift:** Clients wake up to bridge Cron jobs, submitting unique determinist keys. **Mitigated** locally via the Client rejecting its own execution if the OS paused/suspended it past an acceptable time-horizon padding.
-*   **Hot-Loop Index Bloat (MVCC Wear):** Updating `visible_at` constantly modifies a partial B-Tree. **Solved/Mitigated** cleanly via `autovacuum_vacuum_scale_factor = 0.01` and Postgres 14+ "Bottom-Up Index Deletion", maintaining index size trivially in memory without massive IO spikes on steady workloads.
-*   **Subscription Re-processing Storms (Data Corruption):** If a Fan-Out-On-Read bridge crashes before moving the cursor, it reads historical messages again. **Solved** natively—not by arbitrary memory caching—but because the `Ack()` and the `Enqueue()`s are bound to the identical transaction span. If the pod crashes, all `ON CONFLICT` bridging rollbacks safely together. No corruption possible.
+## Cron without a leader
 
-### Unsolved Vulnerabilities / Compromised Paradigms
-*   **Commit-Order vs Insert-Order Gap (`xmin < pg_snapshot_xmin`):** Standard Postgres transactions assign IDs upon `INSERT`, but don't flush to readers globally until `COMMIT`. This breaks sequence-ordered reads. `streams` fixed this via a procedural `Assigner` daemon processing logical locks. Catbird Lite mitigates this by assigning an explicit `position` column updated by an asynchronous lock-secured SQL query (`SET position = nextval(...)`) driven by a background goroutine in the SDK. This completely isolates Stream Readers from stalling against the globally oldest open transaction.
-*   **Subscription Leader Contention (Write Amplification):** High Availability deployments (e.g. 5x microservice replicas) will all race to `RegisterTrigger()` reading the stream simultaneously. While the DB prevents duplicate output via `dedup_key`, multiple bridger pods will hit `ON CONFLICT DO NOTHING` logic dynamically constantly, amplifying WAL and secondary-index evaluations heavily. **Solved natively** by wrapping the SDK's `FetchBatch` Bridger loop inside a `pg_try_advisory_lock('trigger_name')` call. Because it uses shared database memory (bypassing disk completely), it provides flawless, zero-latency distributed Leader Election across all your Pods. When a Pod crashes, the TCP DB connection evaporates and the lock instantly frees for a fallback Pod.
+Every process enqueues `cron:<name>:<minute>` as the dedup key when the minute starts. Exactly one insert goes through. A process that wakes late (suspended, paused) should compare the scheduled minute with the clock and skip if it is too far behind.
+
+## Retention
+
+`GC(retention)` deletes dead claims older than `retention` and then messages older than `retention` that have no claim. A delayed or waiting job keeps its message however old it is. `cb_signals` and `cb_claims` reference `cb_messages` with `ON DELETE CASCADE`, so nothing is orphaned.
+
+## Known limits
+
+- The `LIKE` pattern treats `_` as a single-character wildcard. Avoid `_` in topic names or escape it.
+- A worker processes one batch to completion before claiming the next, so one slow job holds up the other jobs of its batch.
+- Rate limits, per-queue configuration, and a web/SSE layer are out of scope. Applications build them on their own tables and routes.
+- Without a `Logger`, failures are reported through `slog.Default()`. The library never swallows an error silently.

@@ -2,6 +2,8 @@ package catbird_test
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"sync"
@@ -13,238 +15,392 @@ import (
 	"github.com/ugent-library/catbird"
 )
 
-// setupTestDB connects to the testing database and ensures a clean schema.
-func setupTestDB(t *testing.T) *pgxpool.Pool {
-	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, "postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable")
-	if err != nil {
-		t.Fatalf("Failed to connect to database: %v", err)
-	}
+const testDSN = "postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable"
 
-	// Read the schema file to initialize tests dynamically
+// setupTestDB connects and recreates the schema from the migration file.
+func setupTestDB(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, testDSN)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
 	b, err := os.ReadFile("migrations/00001_lite.sql")
 	if err != nil {
-		t.Fatalf("Failed to read schema: %v", err)
+		t.Fatalf("read schema: %v", err)
 	}
+	up := strings.Split(string(b), "-- +goose down")[0]
 
-	// Very simple extraction of the Up migration for testing
-	schema := string(b)
-	upParts := strings.Split(schema, "-- +goose down")
-
-	// Drop tables first just to be clean
-	pool.Exec(ctx, `
-		DROP TABLE IF EXISTS cb_signals CASCADE;
-		DROP TABLE IF EXISTS cb_claims CASCADE;
-		DROP TABLE IF EXISTS cb_cursors CASCADE;
-		DROP TABLE IF EXISTS cb_messages CASCADE;
-		DROP SEQUENCE IF EXISTS cb_position_seq CASCADE;
+	_, err = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS cb_signals, cb_stream, cb_stream_pending, cb_claims, cb_cursors, cb_messages CASCADE;
+		DROP SEQUENCE IF EXISTS cb_position_seq;
 	`)
-
-	// Execute up migrations
-	_, err = pool.Exec(ctx, upParts[0])
 	if err != nil {
-		t.Fatalf("Failed to execute schema: %v", err)
+		t.Fatalf("drop: %v", err)
 	}
-
+	if _, err = pool.Exec(ctx, up); err != nil {
+		t.Fatalf("schema: %v", err)
+	}
 	return pool
+}
+
+func count(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(), sql, args...).Scan(&n); err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
+	return n
 }
 
 func TestTortureThroughput(t *testing.T) {
 	pool := setupTestDB(t)
-	defer pool.Close()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
 	client := catbird.NewClient()
 
 	const numProducers = 10
 	const msgsPerProducer = 1000
 	const totalMsgs = numProducers * msgsPerProducer
 
-	t.Logf("Starting Torture Test: %d total messages", totalMsgs)
-
 	start := time.Now()
-
-	// 1. Concurrent Producers
 	var prodWg sync.WaitGroup
 	for i := 0; i < numProducers; i++ {
 		prodWg.Add(1)
 		go func(prodID int) {
 			defer prodWg.Done()
 			for j := 0; j < msgsPerProducer; j++ {
-				topic := "torture.task"
-				queue := "torture_queue"
-				payload := map[string]int{"prod": prodID, "task": j}
-
-				// Using DBRunner wrapper trick to pass the pool
-				err := client.Enqueue(ctx, catbird.WrapDBRunner(pool), topic, queue, payload, nil, nil, 0)
+				_, err := client.Enqueue(ctx, pool, "torture.task", "torture_queue", map[string]int{"prod": prodID, "task": j}, catbird.EnqueueOptions{})
 				if err != nil {
-					t.Errorf("Enqueue failed: %v", err)
+					t.Errorf("enqueue: %v", err)
 					return
 				}
 			}
 		}(i)
 	}
-
-	// Wait for writers to blast the DB
 	prodWg.Wait()
 	writeDur := time.Since(start)
-	t.Logf("Write Phase Complete: %d msgs in %v (%.0f msgs/sec)", totalMsgs, writeDur, float64(totalMsgs)/writeDur.Seconds())
+	t.Logf("wrote %d messages in %v (%.0f/s)", totalMsgs, writeDur, float64(totalMsgs)/writeDur.Seconds())
 
-	// 2. Concurrent Workers
-	var processedCnt int32
-	var workerWg sync.WaitGroup
-
-	handler := func(ctx context.Context, tx catbird.DBRunner, msg catbird.Message) error {
-		atomic.AddInt32(&processedCnt, 1)
-		// We purposefully do almost nothing to test the sheer speed of DB mutations and locks
+	var processed int32
+	handler := func(ctx context.Context, tx catbird.Conn, msg catbird.Message) error {
+		// Use the transaction so the Conn path is exercised.
+		if _, err := tx.Exec(ctx, "SELECT 1"); err != nil {
+			return err
+		}
+		atomic.AddInt32(&processed, 1)
 		return nil
 	}
 
 	workStart := time.Now()
-
-	// Spin up 5 concurrent worker processes (each internally processing batches of 50 concurrently!)
-	// This generates massive contention on the SKIP LOCKED query to test for planner/lock exhaustion.
+	var workerWg sync.WaitGroup
 	for i := 0; i < 5; i++ {
 		workerWg.Add(1)
 		go func() {
 			defer workerWg.Done()
-			w := catbird.NewWorker(pool, "torture_queue", handler)
-			w.Start(ctx)
+			catbird.NewWorker(pool, "torture_queue", handler, catbird.WorkerOptions{}).Start(ctx)
 		}()
 	}
 
-	// Watcher to signal success
-	successChan := make(chan struct{})
-	go func() {
-		for {
-			if atomic.LoadInt32(&processedCnt) >= int32(totalMsgs) {
-				close(successChan)
-				return
-			}
-			time.Sleep(50 * time.Millisecond)
+	for atomic.LoadInt32(&processed) < totalMsgs {
+		if ctx.Err() != nil {
+			t.Fatalf("timed out: processed %d of %d", atomic.LoadInt32(&processed), totalMsgs)
 		}
-	}()
-
-	select {
-	case <-successChan:
-		workDur := time.Since(workStart)
-		t.Logf("Read/Process Phase Complete: %d msgs in %v (%.0f msgs/sec)", totalMsgs, workDur, float64(totalMsgs)/workDur.Seconds())
-		// DO NOT CANCEL THE WRITERS IMMEDIATELY!
-		// Give the workers literally 10ms to let exactly the last row hit the database `w.complete(ctx, m.ID)` execution
-		// because of the fact that the atomic wait counter updates immediately inside the handler BEFORE the complete goes through.
-		time.Sleep(1000 * time.Millisecond)
-		cancel() // Shut down workers
-	case <-ctx.Done():
-		t.Fatalf("Test timed out! Processed only %d of %d messages", atomic.LoadInt32(&processedCnt), totalMsgs)
+		time.Sleep(50 * time.Millisecond)
 	}
+	workDur := time.Since(workStart)
+	t.Logf("processed %d messages in %v (%.0f/s)", totalMsgs, workDur, float64(totalMsgs)/workDur.Seconds())
 
+	// The counter moves inside the handler, before the commit; give the last commits a moment.
+	time.Sleep(time.Second)
+	cancel()
 	workerWg.Wait()
 
-	// Verify Database State (Zero Bloat check)
-	var finalClaimCount int
-	err := pool.QueryRow(context.Background(), "SELECT count(*) FROM cb_claims").Scan(&finalClaimCount)
-	if err != nil {
-		t.Fatalf("Failed to query cb_claims: %v", err)
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims"); n != 0 {
+		t.Errorf("expected 0 claims left, got %d", n)
 	}
-
-	if finalClaimCount != 0 {
-		t.Errorf("Expected 0 rows in cb_claims after processing, got %d", finalClaimCount)
-	}
-
-	t.Log("Torture test passed flawlessly. No orphan claims, no deadlocks.")
 }
 
 func TestExactlyOnceDedup(t *testing.T) {
 	pool := setupTestDB(t)
-	defer pool.Close()
 	ctx := context.Background()
 	client := catbird.NewClient()
+	opts := catbird.EnqueueOptions{DedupKey: "deterministic-hash-12345"}
 
-	dedupKey := "deterministic-hash-12345"
-	queue := "dedup_queue"
-
-	// Insert once
-	err := client.Enqueue(ctx, catbird.WrapDBRunner(pool), "task", queue, nil, &dedupKey, nil, 0)
-	if err != nil {
-		t.Fatalf("First insert failed: %v", err)
+	id, err := client.Enqueue(ctx, pool, "task", "dedup_queue", nil, opts)
+	if err != nil || id == 0 {
+		t.Fatalf("first enqueue: id=%d err=%v", id, err)
 	}
 
-	// Try inserting same payload 10 times concurrently
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := client.Enqueue(ctx, catbird.WrapDBRunner(pool), "task", queue, nil, &dedupKey, nil, 0)
+			id, err := client.Enqueue(ctx, pool, "task", "dedup_queue", nil, opts)
 			if err != nil {
-				t.Errorf("Duplicate insert returned err instead of silently swallowing ON CONFLICT: %v", err)
+				t.Errorf("duplicate enqueue: %v", err)
+			}
+			if id != 0 {
+				t.Errorf("duplicate enqueue returned id %d, want 0", id)
 			}
 		}()
 	}
 	wg.Wait()
 
-	// Verify only 1 claim exists
-	var count int
-	pool.QueryRow(ctx, "SELECT count(*) FROM cb_claims WHERE queue = $1", queue).Scan(&count)
-	if count != 1 {
-		t.Fatalf("Expected exactly 1 claim due to dedup_key, got %d", count)
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'dedup_queue'"); n != 1 {
+		t.Fatalf("expected 1 claim, got %d", n)
 	}
 }
 
-func TestDAGDependenciesAndSignals(t *testing.T) {
+func TestDependenciesAndSignals(t *testing.T) {
 	pool := setupTestDB(t)
-	defer pool.Close()
 	ctx := context.Background()
 	client := catbird.NewClient()
 
-	// Create a job that depends on 2 parents and 1 external signal
-	// We mimic how enqueue is called manually with delay=0 but we hack dependencies for test
-
-	_, err := pool.Exec(ctx, `
-		WITH msg AS (INSERT INTO cb_messages (topic, payload) VALUES ('join_task', '{}') RETURNING id)
-		INSERT INTO cb_claims (message_id, queue, visible_at, dependencies)
-		SELECT id, 'dag_queue', now(), 3 FROM msg RETURNING message_id;
-	`)
+	// Two parent steps and one external signal.
+	childID, err := client.Enqueue(ctx, pool, "join_task", "dag_queue", nil, catbird.EnqueueOptions{Dependencies: 3})
 	if err != nil {
-		t.Fatalf("Failed setup: %v", err)
+		t.Fatalf("enqueue: %v", err)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE status = 0 AND dependencies = 0"); n != 0 {
+		t.Fatalf("expected 0 ready claims, got %d", n)
 	}
 
-	var childID int64
-	pool.QueryRow(ctx, "SELECT message_id FROM cb_claims WHERE queue='dag_queue' LIMIT 1").Scan(&childID)
-
-	// Confirm invisible
-	var count int
-	pool.QueryRow(ctx, "SELECT count(*) FROM cb_claims WHERE status=0 AND dependencies=0").Scan(&count)
-	if count != 0 {
-		t.Fatalf("Expected 0 ready claims, got %d", count)
+	if err := client.ResolveDependency(ctx, pool, childID); err != nil {
+		t.Fatalf("resolve 1: %v", err)
+	}
+	if err := client.ResolveDependency(ctx, pool, childID); err != nil {
+		t.Fatalf("resolve 2: %v", err)
+	}
+	if err := client.DeliverSignal(ctx, pool, childID, "human_approval", map[string]bool{"ok": true}); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+	// The same signal again is a no-op, not an error.
+	if err := client.DeliverSignal(ctx, pool, childID, "human_approval", map[string]bool{"ok": false}); err != nil {
+		t.Fatalf("duplicate signal: %v", err)
+	}
+	// The job no longer waits: another signal or resolution is refused.
+	if err := client.DeliverSignal(ctx, pool, childID, "other", nil); !errors.Is(err, catbird.ErrNotFound) {
+		t.Fatalf("signal to non-waiting job: got %v, want ErrNotFound", err)
+	}
+	if err := client.ResolveDependency(ctx, pool, childID); !errors.Is(err, catbird.ErrNotFound) {
+		t.Fatalf("resolve on non-waiting job: got %v, want ErrNotFound", err)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_signals"); n != 1 {
+		t.Fatalf("expected 1 signal row, got %d", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE status = 0 AND dependencies = 0"); n != 1 {
+		t.Fatalf("expected 1 ready claim, got %d", n)
 	}
 
-	// Resolve Parent 1
-	client.ResolveDependency(ctx, catbird.WrapDBRunner(pool), childID)
-	// Resolve Parent 2
-	client.ResolveDependency(ctx, catbird.WrapDBRunner(pool), childID)
-	// Deliver Signal 1
-	client.DeliverSignal(ctx, catbird.WrapDBRunner(pool), childID, "human_approval", map[string]bool{"ok": true})
-
-	// Confirm visible
-	pool.QueryRow(ctx, "SELECT count(*) FROM cb_claims WHERE status=0 AND dependencies=0").Scan(&count)
-	if count != 1 {
-		t.Fatalf("Expected 1 ready claim after dependencies resolved, got %d", count)
-	}
-
-	// Claim it and assert signal exists
-	worker := catbird.NewWorker(pool, "dag_queue", func(ctx context.Context, tx catbird.DBRunner, m catbird.Message) error {
-		if _, ok := m.Signals["human_approval"]; !ok {
-			t.Errorf("Expected signal 'human_approval' to be aggregated into message")
-		}
+	ran := make(chan catbird.Message, 1)
+	worker := catbird.NewWorker(pool, "dag_queue", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
+		ran <- m
 		return nil
-	})
-
-	waitCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond})
+	runCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	worker.Start(waitCtx)
+	go worker.Start(runCtx)
 
-	// Worker processes instantly because it's available.
+	select {
+	case m := <-ran:
+		var ok struct {
+			OK bool `json:"ok"`
+		}
+		if err := json.Unmarshal(m.Signals["human_approval"], &ok); err != nil || !ok.OK {
+			t.Fatalf("signal payload: %s (%v)", m.Signals["human_approval"], err)
+		}
+	case <-runCtx.Done():
+		t.Fatal("job did not run")
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := count(t, pool, "SELECT count(*) FROM cb_signals"); n != 0 {
+		t.Fatalf("expected signals deleted on completion, got %d", n)
+	}
+}
+
+// A handler that outlives its lease loses its work; the attempt that holds the
+// lease commits.
+func TestLeaseExpiryFence(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := catbird.NewClient()
+
+	if _, err := pool.Exec(ctx, "CREATE TABLE IF NOT EXISTS lease_test (attempt INT)"); err != nil {
+		t.Fatal(err)
+	}
+	pool.Exec(ctx, "TRUNCATE lease_test")
+
+	if _, err := client.Enqueue(ctx, pool, "slow", "lease_queue", nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int32
+	handler := func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
+		atomic.AddInt32(&calls, 1)
+		if m.Attempts == 1 {
+			time.Sleep(800 * time.Millisecond) // past the lease
+		}
+		_, err := tx.Exec(ctx, "INSERT INTO lease_test (attempt) VALUES ($1)", m.Attempts)
+		return err
+	}
+	opts := catbird.WorkerOptions{Lease: 200 * time.Millisecond, PollInterval: 50 * time.Millisecond}
+	go catbird.NewWorker(pool, "lease_queue", handler, opts).Start(ctx)
+	go catbird.NewWorker(pool, "lease_queue", handler, opts).Start(ctx)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for count(t, pool, "SELECT count(*) FROM cb_claims") != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("claim was not completed")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(time.Second) // let the late first attempt finish and be discarded
+
+	if n := atomic.LoadInt32(&calls); n != 2 {
+		t.Errorf("expected 2 handler calls, got %d", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM lease_test"); n != 1 {
+		t.Errorf("expected exactly one committed attempt, got %d", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM lease_test WHERE attempt = 2"); n != 1 {
+		t.Errorf("expected attempt 2 to be the one committed")
+	}
+}
+
+func TestTriggerBridgesPayloadUnchanged(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := catbird.NewClient()
+
+	if _, err := client.Publish(ctx, pool, "image.uploaded", map[string]string{"url": "https://example.com/a.png"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Publish(ctx, pool, "other.topic", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	client.RegisterTrigger(ctx, pool, "img", "image.%", "image_processing", catbird.StreamOptions{AssignEvery: 20 * time.Millisecond, PollInterval: 50 * time.Millisecond})
+
+	got := make(chan catbird.Message, 16)
+	go catbird.NewWorker(pool, "image_processing", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
+		got <- m
+		return nil
+	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond}).Start(ctx)
+
+	select {
+	case m := <-got:
+		var p struct {
+			URL string `json:"url"`
+		}
+		if err := json.Unmarshal(m.Payload, &p); err != nil || p.URL != "https://example.com/a.png" {
+			t.Fatalf("payload arrived as %s (%v)", m.Payload, err)
+		}
+		if m.Topic != "image.uploaded" {
+			t.Fatalf("topic %q", m.Topic)
+		}
+	case <-ctx.Done():
+		t.Fatal("trigger did not bridge the message")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims"); n != 0 {
+		t.Errorf("expected only the matching message bridged and completed, %d claims left", n)
+	}
+	if n := count(t, pool, "SELECT last_position FROM cb_cursors WHERE name = 'trigger:img'"); n != 1 {
+		t.Errorf("cursor at %d, want 1", n)
+	}
+}
+
+func TestGCKeepsLiveClaims(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	client := catbird.NewClient()
+
+	if _, err := client.Enqueue(ctx, pool, "later", "gc_queue", nil, catbird.EnqueueOptions{Delay: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Enqueue(ctx, pool, "doomed", "gc_queue", nil, catbird.EnqueueOptions{CorrelationID: "wf1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Publish(ctx, pool, "event", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Cancel(ctx, pool, "wf1"); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE status = 0 AND dependencies = 0 AND visible_at <= now()"); n != 0 {
+		t.Fatalf("canceled job still claimable")
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	if err := client.GC(ctx, pool, 10*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims"); n != 1 {
+		t.Errorf("expected the delayed claim to survive GC, got %d claims", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_messages"); n != 1 {
+		t.Errorf("expected only the delayed job's message to survive, got %d", n)
+	}
+}
+
+// A message published in a transaction that commits late is read after the
+// messages that committed before it — never skipped.
+func TestStreamLateCommitIsNotSkipped(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := catbird.NewClient()
+
+	consumer := catbird.NewStreamConsumer(ctx, pool, "late", catbird.StreamOptions{AssignEvery: 20 * time.Millisecond})
+
+	// Message 1 is inserted first but its transaction stays open.
+	slow, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Publish(ctx, slow, "ev", "first inserted, last committed", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Messages 2 and 3 commit right away.
+	for _, p := range []string{"second", "third"} {
+		if _, err := client.Publish(ctx, pool, "ev", p, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	read := func(want []string) {
+		t.Helper()
+		var got []string
+		deadline := time.Now().Add(2 * time.Second)
+		for len(got) < len(want) && time.Now().Before(deadline) {
+			msgs, err := consumer.FetchBatch(ctx, "ev")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, m := range msgs {
+				var s string
+				json.Unmarshal(m.Payload, &s)
+				got = append(got, s)
+				if err := consumer.Ack(ctx, pool, m.Position); err != nil {
+					t.Fatal(err)
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("read %v, want %v", got, want)
+		}
+	}
+
+	read([]string{"second", "third"}) // the open transaction's message is not there yet
+	if err := slow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	read([]string{"first inserted, last committed"}) // and it shows up once it commits
 }

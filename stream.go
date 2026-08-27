@@ -2,62 +2,106 @@ package catbird
 
 import (
 	"context"
+	"log/slog"
 	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// StreamOptions are the optional parts of NewStreamConsumer and RegisterTrigger.
+// Zero values take the defaults.
+type StreamOptions struct {
+	BatchSize    int           // default 50
+	PollInterval time.Duration // wait when the stream is empty; default 2 seconds
+	AssignEvery  time.Duration // how often the assigner runs; default 250 milliseconds
+	Logger       *slog.Logger  // default slog.Default()
+}
+
+func (o StreamOptions) withDefaults() StreamOptions {
+	if o.BatchSize <= 0 {
+		o.BatchSize = 50
+	}
+	if o.PollInterval <= 0 {
+		o.PollInterval = 2 * time.Second
+	}
+	if o.AssignEvery <= 0 {
+		o.AssignEvery = 250 * time.Millisecond
+	}
+	if o.Logger == nil {
+		o.Logger = slog.Default()
+	}
+	return o
+}
+
+// StreamConsumer reads published messages in position order from a named cursor.
 type StreamConsumer struct {
 	pool   *pgxpool.Pool
 	cursor string
+	opts   StreamOptions
 }
 
-func NewStreamConsumer(pool *pgxpool.Pool, cursorName string) *StreamConsumer {
-	return &StreamConsumer{pool: pool, cursor: cursorName}
+// NewStreamConsumer creates a consumer and starts the position assigner for as
+// long as ctx lives. Every consumer starts one; a database lock makes sure only
+// one of them does the work, so any number of processes may run consumers.
+func NewStreamConsumer(ctx context.Context, pool *pgxpool.Pool, cursorName string, opts StreamOptions) *StreamConsumer {
+	opts = opts.withDefaults()
+	go assignPositions(ctx, pool, opts)
+	return &StreamConsumer{pool: pool, cursor: cursorName, opts: opts}
 }
 
-// StartAssigner runs a background daemon in the client that continuously assigns
-// gapless, commit-ordered positions to raw messages safely. Only one assigning worker
-// cluster-wide will hold the lock at a time.
-func StartAssigner(ctx context.Context, pool *pgxpool.Pool) {
-	go func() {
-		ticker := time.NewTicker(250 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				_, _ = pool.Exec(ctx, `
-					WITH lock AS (
-						SELECT pg_try_advisory_xact_lock(hashtext('cb_assigner_lock')) as locked
-					),
-					unassigned AS (
-						SELECT id FROM cb_messages
-						WHERE position IS NULL
-						  AND xmin::text::bigint < pg_snapshot_xmin(pg_current_snapshot())::text::bigint
-						ORDER BY id ASC LIMIT 5000
-					)
-					UPDATE cb_messages m
-					SET position = nextval('cb_position_seq')
-					FROM unassigned u
-					WHERE m.id = u.id AND (SELECT locked FROM lock);
-				`)
-			}
+// assignPositions moves published messages from cb_stream_pending to cb_stream,
+// giving each the next position, every AssignEvery. A pending row is visible
+// only once its transaction committed, so positions follow commit order: a
+// message from a transaction that is still open is picked up on a later tick.
+// Readers order by position and a batch of positions becomes readable when
+// this statement commits, so no reader can pass a message that has no position yet.
+//
+// The advisory lock is taken for the statement only. When another assigner
+// holds it, the DELETE matches nothing and the statement is a no-op.
+func assignPositions(ctx context.Context, pool *pgxpool.Pool, opts StreamOptions) {
+	ticker := time.NewTicker(opts.AssignEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
-	}()
+		_, err := pool.Exec(ctx, `
+			WITH lock AS (
+				SELECT pg_try_advisory_xact_lock(hashtext('catbird'), 1) AS held
+			),
+			moved AS (
+				DELETE FROM cb_stream_pending
+				WHERE (SELECT held FROM lock)
+				RETURNING message_id
+			)
+			INSERT INTO cb_stream (position, message_id, topic)
+			SELECT nextval('cb_position_seq'), m.id, m.topic
+			FROM moved
+			JOIN cb_messages m ON m.id = moved.message_id
+			ORDER BY m.id
+		`)
+		if err != nil && ctx.Err() == nil {
+			opts.Logger.Error("catbird: assigning stream positions failed", "err", err)
+		}
+	}
 }
 
-func (s *StreamConsumer) FetchBatch(ctx context.Context, pattern string, limit int) ([]Message, error) {
-	// The complex pg_snapshot_xmin logic is completely removed from the Consumer.
-	// Stream consumers now enjoy flawless gapless ordered reads natively using the Assigner's "position" column!
+// FetchBatch returns the next published messages after the cursor whose topic
+// matches pattern (a LIKE pattern, e.g. 'order.%'). Job inputs written by
+// Enqueue are not stream messages and are never returned.
+func (s *StreamConsumer) FetchBatch(ctx context.Context, pattern string) ([]Message, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, topic, payload FROM cb_messages
-		WHERE position > COALESCE((SELECT last_message_id FROM cb_cursors WHERE name = $1), 0)
-		  AND topic LIKE $2
-		ORDER BY position ASC LIMIT $3
-	`, s.cursor, pattern, limit)
+		SELECT m.id, s.position, m.topic, m.payload
+		FROM cb_stream s
+		JOIN cb_messages m ON m.id = s.message_id
+		WHERE s.position > COALESCE((SELECT last_position FROM cb_cursors WHERE name = $1), 0)
+		  AND s.topic LIKE $2
+		ORDER BY s.position ASC
+		LIMIT $3
+	`, s.cursor, pattern, s.opts.BatchSize)
 	if err != nil {
 		return nil, err
 	}
@@ -66,47 +110,71 @@ func (s *StreamConsumer) FetchBatch(ctx context.Context, pattern string, limit i
 	var msgs []Message
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.Topic, &m.Payload); err == nil {
-			msgs = append(msgs, m)
+		if err := rows.Scan(&m.ID, &m.Position, &m.Topic, &m.Payload); err != nil {
+			return nil, err
 		}
+		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()
 }
 
-func (s *StreamConsumer) Ack(ctx context.Context, tx DBRunner, lastID int64) error {
-	_, err := tx.Exec(ctx, `
-		INSERT INTO cb_cursors (name, last_message_id) VALUES ($1, $2)
-		ON CONFLICT (name) DO UPDATE SET last_message_id = EXCLUDED.last_message_id
-	`, s.cursor, lastID)
+// Ack moves the cursor to position. The cursor never moves backwards, so
+// several consumers on one cursor cannot undo each other's progress.
+func (s *StreamConsumer) Ack(ctx context.Context, db Conn, position int64) error {
+	_, err := db.Exec(ctx, `
+		INSERT INTO cb_cursors (name, last_position) VALUES ($1, $2)
+		ON CONFLICT (name) DO UPDATE SET last_position = GREATEST(cb_cursors.last_position, EXCLUDED.last_position)
+	`, s.cursor, position)
 	return err
 }
 
-// RegisterTrigger binds a stream natively by performing Fan-out on Read
-func (c *Client) RegisterTrigger(ctx context.Context, pool *pgxpool.Pool, name, topicPattern, targetQueue string) {
+// RegisterTrigger enqueues a job on targetQueue for every message whose topic
+// matches topicPattern, until ctx is canceled. The enqueues and the cursor
+// advance commit in one transaction, and each job carries a dedup key derived
+// from the message id, so a crash or a second process running the same trigger
+// cannot produce a second job for the same message.
+func (c *Client) RegisterTrigger(ctx context.Context, pool *pgxpool.Pool, name, topicPattern, targetQueue string, opts StreamOptions) {
+	consumer := NewStreamConsumer(ctx, pool, "trigger:"+name, opts)
 	go func() {
-		consumer := NewStreamConsumer(pool, "trigger_"+name)
-		for {
-			msgs, err := consumer.FetchBatch(ctx, topicPattern, 50)
-			if err != nil || len(msgs) == 0 {
-				time.Sleep(2 * time.Second)
-				continue
+		for ctx.Err() == nil {
+			n, err := c.enqueueNextBatch(ctx, pool, consumer, name, topicPattern, targetQueue)
+			if err != nil && ctx.Err() == nil {
+				consumer.opts.Logger.Error("catbird: trigger failed", "trigger", name, "err", err)
 			}
-
-			// Bridge exactly-once using the Message ID as the dedup key
-			tx, _ := pool.Begin(ctx)
-
-			var lastID int64
-			for _, m := range msgs {
-				dedup := "trigger_" + name + ":" + strconv.FormatInt(m.ID, 10)
-				correlation := "wf_" + dedup
-
-				c.Enqueue(ctx, WrapDBRunner(tx), m.Topic, targetQueue, m.Payload, &dedup, &correlation, 0)
-				lastID = m.ID
+			if err == nil && n == consumer.opts.BatchSize {
+				continue // the stream may hold more
 			}
-
-			// Commit the Cursor advance along with the bridged payloads
-			consumer.Ack(ctx, WrapDBRunner(tx), lastID)
-			tx.Commit(ctx)
+			select {
+			case <-ctx.Done():
+			case <-time.After(consumer.opts.PollInterval):
+			}
 		}
 	}()
+}
+
+// enqueueNextBatch reads the next batch of matching stream messages, enqueues a
+// job for each, advances the cursor, and commits — all in one transaction.
+// Returns how many messages it handled.
+func (c *Client) enqueueNextBatch(ctx context.Context, pool *pgxpool.Pool, consumer *StreamConsumer, name, topicPattern, targetQueue string) (int, error) {
+	msgs, err := consumer.FetchBatch(ctx, topicPattern)
+	if err != nil || len(msgs) == 0 {
+		return 0, err
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	for _, m := range msgs {
+		dedup := "trigger:" + name + ":" + strconv.FormatInt(m.ID, 10)
+		if _, err := c.Enqueue(ctx, tx, m.Topic, targetQueue, m.Payload, EnqueueOptions{DedupKey: dedup}); err != nil {
+			return 0, err
+		}
+	}
+	if err := consumer.Ack(ctx, tx, msgs[len(msgs)-1].Position); err != nil {
+		return 0, err
+	}
+	return len(msgs), tx.Commit(ctx)
 }
