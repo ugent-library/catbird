@@ -37,6 +37,7 @@ func setupTestDB(t *testing.T) *pgxpool.Pool {
 		DROP TABLE IF EXISTS cb_claims CASCADE;
 		DROP TABLE IF EXISTS cb_cursors CASCADE;
 		DROP TABLE IF EXISTS cb_messages CASCADE;
+		DROP SEQUENCE IF EXISTS cb_position_seq CASCADE;
 	`)
 
 	// Execute up migrations

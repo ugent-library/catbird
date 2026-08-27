@@ -1,16 +1,21 @@
 -- +goose up
 -- The unified, pure SQL schema for Catbird Lite. No PL/pgSQL required.
 
+CREATE SEQUENCE cb_position_seq;
+
 -- 1. Immutable Facts & Payloads
 CREATE TABLE cb_messages (
     id BIGSERIAL PRIMARY KEY,
+    position BIGINT UNIQUE, -- Assigned asynchronously to guarantee gapless, commit-ordered reads
     topic TEXT NOT NULL,
     payload JSONB,
     dedup_key TEXT UNIQUE, -- Enforces exactly-once step generation & Leaderless Cron
     created_at TIMESTAMPTZ DEFAULT now() -- Enables cheap bulk GC retention
 );
 -- Makes reading sparse/rare events via Fan-Out-On-Read subscriptions incredibly fast (O(log N))
-CREATE INDEX idx_cb_messages_topic_id ON cb_messages (topic text_pattern_ops, id);
+CREATE INDEX idx_cb_messages_topic_pos ON cb_messages (topic text_pattern_ops, position);
+-- Crucial for the background Assigner to quickly find committed but unsequenced rows
+CREATE INDEX idx_cb_messages_unassigned ON cb_messages (id) WHERE position IS NULL;
 
 -- 2. Stream Pointers (For pure log consumption)
 CREATE TABLE cb_cursors (
@@ -52,3 +57,4 @@ DROP TABLE cb_signals;
 DROP TABLE cb_claims;
 DROP TABLE cb_cursors;
 DROP TABLE cb_messages;
+DROP SEQUENCE cb_position_seq;

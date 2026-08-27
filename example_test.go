@@ -24,6 +24,9 @@ func Example_basicWorkflow() {
 	// 2. Initialize Client
 	client := catbird.NewClient()
 
+	// Start the Background Assigner (Guarantees Stream Consumers never skip uncommitted transactions)
+	catbird.StartAssigner(ctx, pool)
+
 	// 3. Define the Handler (The user's code, absolutely no PL/pgSQL or DAG schemas needed)
 	handler := func(ctx context.Context, tx catbird.DBRunner, msg catbird.Message) error {
 		log.Printf("Processing Job ID: %d, Topic: %s", msg.ID, msg.Topic)

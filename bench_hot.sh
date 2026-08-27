@@ -12,9 +12,9 @@ INDEX_NAME="idx_claims_queue_visible"
 
 # We want enough rows and churn to force Postgres to allocate new B-Tree pages
 # if it is unable to recycle dead tuples internally.
-INITIAL_ROWS=10000 
+INITIAL_ROWS=10000
 CHURN_ITERATIONS=200
-UPDATES_PER_ITERATION=2000 
+UPDATES_PER_ITERATION=2000
 MEASURE_INTERVAL=20
 
 log_info() {
@@ -56,7 +56,7 @@ SQL
 log_info "Inserting $INITIAL_ROWS initial rows..."
 psql "$DB_URL" << SQL >/dev/null
 INSERT INTO cb_claims_test (queue, visible_at, status, payload)
-SELECT 
+SELECT
     'default',
     NOW() + (random() * interval '60 seconds'),
     0,
@@ -77,7 +77,7 @@ printf "%-12d %-15s %-15s\n" "$iter" "$start_idx_size" "$(measure_table_size)"
 for iter in $(seq 1 $CHURN_ITERATIONS); do
     # 1. Lease rows (status 0 -> 1)
     psql "$DB_URL" -q << SQL
-    UPDATE cb_claims_test 
+    UPDATE cb_claims_test
     SET status = 1, visible_at = NOW() + interval '5 minutes'
     WHERE id IN (
         SELECT id FROM cb_claims_test WHERE status = 0 LIMIT $UPDATES_PER_ITERATION
@@ -86,7 +86,7 @@ SQL
 
     # 2. Fail and backoff (status 1 -> 0, advance visible_at)
     psql "$DB_URL" -q << SQL
-    UPDATE cb_claims_test 
+    UPDATE cb_claims_test
     SET status = 0, visible_at = NOW() + (random() * interval '30 seconds')
     WHERE status = 1;
 SQL

@@ -73,8 +73,8 @@ func (c *Client) Enqueue(ctx context.Context, runner DBRunner, topic, queue stri
 
 	_, err = runner.Exec(ctx, `
 		WITH msg AS (
-			INSERT INTO cb_messages (topic, payload, dedup_key) 
-			VALUES ($1, $2, $3) 
+			INSERT INTO cb_messages (topic, payload, dedup_key)
+			VALUES ($1, $2, $3)
 			ON CONFLICT (dedup_key) DO NOTHING
 			RETURNING id
 		)
@@ -107,13 +107,19 @@ func (c *Client) GC(ctx context.Context, pool *pgxpool.Pool, retentionDays int) 
 	return err
 }
 
-// ResolveDependency marks an upstream dependency as completed for a child job
+// ResolveDependency marks an upstream dependency as completed for a child job.
+// Atomically safe against lost updates on concurrent sibling completion.
 func (c *Client) ResolveDependency(ctx context.Context, runner DBRunner, childMessageID int64) error {
-	_, err := runner.Exec(ctx, `UPDATE cb_claims SET dependencies = dependencies - 1 WHERE message_id = $1`, childMessageID)
+	_, err := runner.Exec(ctx, `
+		UPDATE cb_claims
+		SET dependencies = dependencies - 1
+		WHERE message_id = $1 AND dependencies > 0
+	`, childMessageID)
 	return err
 }
 
-// DeliverSignal delivers an external payload to a waiting job and decrements its dependency counter
+// DeliverSignal delivers an external payload to a waiting job and decrements its dependency counter.
+// Returns early if the signal was already delivered, preventing multi-decrement races.
 func (c *Client) DeliverSignal(ctx context.Context, runner DBRunner, targetMessageID int64, signalName string, payload any) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -121,14 +127,16 @@ func (c *Client) DeliverSignal(ctx context.Context, runner DBRunner, targetMessa
 	}
 
 	_, err = runner.Exec(ctx, `
-		INSERT INTO cb_signals (message_id, name, payload) 
-		VALUES ($1, $2, $3) 
-		ON CONFLICT DO NOTHING;
+		WITH sig AS (
+			INSERT INTO cb_signals (message_id, name, payload)
+			VALUES ($1, $2, $3)
+			ON CONFLICT DO NOTHING
+			RETURNING message_id
+		)
+		UPDATE cb_claims
+		SET dependencies = dependencies - 1
+		WHERE message_id IN (SELECT message_id FROM sig) AND dependencies > 0
 	`, targetMessageID, signalName, b)
-
-	if err == nil {
-		_, err = runner.Exec(ctx, `UPDATE cb_claims SET dependencies = dependencies - 1 WHERE message_id = $1`, targetMessageID)
-	}
 
 	return err
 }

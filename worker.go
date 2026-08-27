@@ -130,17 +130,17 @@ func (w *Worker) Start(ctx context.Context) {
 func (w *Worker) claimBatch(ctx context.Context, limit int) ([]Message, error) {
 	rows, err := w.pool.Query(ctx, `
 		WITH leased AS (
-			UPDATE cb_claims 
+			UPDATE cb_claims
 			SET status = 1, visible_at = now() + $2, attempts = attempts + 1
 			WHERE message_id IN (
-				SELECT message_id FROM cb_claims 
+				SELECT message_id FROM cb_claims
 				WHERE queue = $1 AND status = 0 AND visible_at <= now() AND dependencies = 0
 				ORDER BY visible_at ASC LIMIT $3 FOR UPDATE SKIP LOCKED
 			) RETURNING message_id, attempts, correlation_id
 		)
 		SELECT m.id, m.topic, m.payload, l.attempts, l.correlation_id,
 		       (SELECT jsonb_object_agg(name, payload) FROM cb_signals s WHERE s.message_id = m.id) as signals
-		FROM cb_messages m 
+		FROM cb_messages m
 		JOIN leased l ON m.id = l.message_id;
 	`, w.queue, w.lease, limit)
 
