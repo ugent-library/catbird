@@ -1,115 +1,108 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) working in this repository.
 
-## What is Catbird?
+## What is Catbird Lite?
 
-Catbird is a PostgreSQL-backed message queue with task and workflow (DAG) execution engine written in Go. PostgreSQL is the sole coordinator — no external services needed. Workers scale horizontally; the database handles message distribution and state management.
+A PostgreSQL-backed job queue, stream, and small workflow engine. Five tables,
+plain SQL, no PL/pgSQL, no extensions, one dependency (pgx). Postgres is the
+only coordinator; workers scale by starting more processes.
 
-## Rewrite in progress
+`DESIGN.md` is the specification and the first thing to read. It describes what
+is built and, under "Planned additions", what is not — do not treat anything in
+that section as existing code.
 
-New code lives in `streams/`, `jobs/`, `wire/`, `notify/`, `internal/ticker/`, `internal/claimloop/`, and `internal/migrate/` per `docs/plan/`. The top-level API is **frozen**: bugfixes only, no improvements — everything here is scheduled for replacement. The new stream schema is goose-managed in `streams/migrations/` with its own version table (`cb_stream_migrations`), separate from the old `migrations/`. Shared pure SQL (`cb_backoff`, `cb_valid_name`, `cb_forever`) lives in the kernel unit `internal/migrate/migrations/`, applied automatically before any module's migrations. Scenario tests live in the Go suite (`streams/stream_test.go`); `scripts/stream_torture.sh` stress-tests the assigner separately.
+## The earlier design
 
-## Development Commands
+Catbird was rewritten. The previous version — `streams/`, `jobs/`, `wire/`,
+`notify/`, the PL/pgSQL SQL API, the dashboard, the TUI, the `cmd/cb` CLI, and
+about six thousand lines of plan and decision-log documents — lives on the
+`streams` branch and is reachable from there:
 
 ```bash
-# Start test PostgreSQL (required before running tests)
-docker compose up -d
-
-# Run all tests
-./scripts/test.sh
-
-# Run specific test(s)
-./scripts/test.sh -run TestQueueCreate
-./scripts/test.sh -run "TestBind.*"
-
-# Slow/stress tests
-CB_SLOW_TESTS=1 ./scripts/test.sh
-
-# Benchmarks
-go test -run '^$' -bench 'Benchmark(QueueThroughput|TaskThroughput|FlowThroughput)$' -benchtime=10s .
-
-# Reset database completely
-docker compose down -v && docker compose up -d
+git show origin/streams:docs/plan/03-job.md
 ```
 
-There is no Makefile. Tests use a hardcoded DSN (`postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable`) with no env vars needed.
+Keep that branch. It is where the reasoning behind rulings this code still
+follows is written down. Nothing on it is being built any more, so read it for
+history and never as instructions.
+
+## Development
+
+```bash
+docker compose up -d                          # postgres 16 on 5432
+psql postgres://postgres:postgres@localhost:5432/postgres -c 'CREATE DATABASE cb_tst'
+go test ./...
+go test ./... -run TestEnqueueBatch
+```
+
+Tests use a hardcoded DSN, `postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable`,
+and no env vars. The compose file creates no database, so `cb_tst` is made once
+by hand. `setupTestDB` drops the five tables and applies
+`migrations/00001_lite.sql` on every test, so tests do not share state.
+
+`bench_hot.sh` measures index bloat on `cb_claims` under sustained update churn.
+It talks to the same database directly and needs no Go build.
+
+## Layout
+
+Five files, one migration, no packages:
+
+- `client.go` — every statement a caller runs: `Publish`, `PublishBatch`,
+  `Enqueue`, `EnqueueBatch`, `Cancel`, `GC`, `ResolveDependency`,
+  `DeliverSignal`, `SetOutput`, `Output`. `Client` holds no state and works on
+  any `Conn` — a pool, a connection, or a transaction.
+- `runtime.go` — `New` and `Start`. One `Runtime` per process owns the pool, one
+  `LISTEN` connection for every channel its loops need, the position assigner,
+  and one goroutine per declared worker, trigger and consumer.
+- `worker.go` — the claim loop, the job transaction, retries, `OnDead`.
+- `stream.go` — the position assigner, `Consumer` (cursor plus `FetchBatch` and
+  `Ack`), and `Trigger`.
+- `migrations/00001_lite.sql` — the whole schema. Goose markers, no goose
+  dependency; the tests split the file on `-- +goose down`.
 
 ## Architecture
 
-**Two independent systems:**
+**Tables.** `cb_messages` holds every job input and every published message, one
+row, written once. `cb_claims` holds one narrow row per job that still has to
+run, rewritten on every claim and retry, deleted on completion. `cb_cursors`,
+`cb_signals` and `cb_outputs` are one row each per consumer, per delivered
+signal, per job result.
 
-1. **Generic Message Queues** — `Send()`, `Publish()`, `Read()` operations (SQS-like). Topic routing via bindings with wildcard support (`*` single token, `#` multi-token tail). In the rewrite (`streams/`) routing is replaced by server-side read filters: queues and cursors take a topic pattern plus a condition (D29 in `docs/plan/README.md`).
-2. **Task & Flow Execution** — Tasks are single handlers; Flows are DAGs of steps with dependencies. `RunTask()`/`RunFlow()` create run entries; workers claim and execute handlers via NOTIFY-driven scheduling.
+**Statements live in Go, not in the database.** There are no SQL functions and
+no PL/pgSQL. A client in another language reimplements the same statements
+against the same schema; the schema plus `client.go` is the whole contract. The
+cross-client contract is not written down yet and will not be until a second
+client exists.
 
-**Key components:**
-- `client.go` — Public API facade; uses `Conn` interface (pool, conn, or tx)
-- `worker.go` — Claims and executes task/flow handlers; requires `*pgxpool.Pool`
-- `worker_notifier.go` — Internal NOTIFY listener; manages dedicated LISTEN connection and timed wakeups
-- `flow.go` — Flow DSL, step construction, dependency validation
-- `task.go` — Task builder and handler reflection
-- `queue.go` — Queue send/read/publish/bind operations
-- `scheduler.go` — Cron-based scheduling
-- `dashboard/` — Web UI for monitoring/management
-- `tui/` — Terminal UI (Bubble Tea) for operational visibility
-- `cmd/cb/` — CLI entry point (Cobra)
+**Invariants that edits must not break:**
 
-**Dynamic table naming:** Runtime tables are created per queue/task/flow:
-- `cb_q_{name}` (queues), `cb_t_{name}` (tasks), `cb_f_{name}` (flows), `cb_s_{name}` (steps), `cb_m_{name}` (map tasks)
+- A job's completion is `DELETE FROM cb_claims WHERE message_id = $1 AND attempts = $2`
+  inside the handler's own transaction. `attempts` is the lease token. Two
+  workers may run the same job; only the lease holder commits.
+- Stream readers go by `position`, never by `id`. Positions are set after commit
+  by the assigner, so they follow commit order.
+- The assigner only sets positions that are still empty, so two assigners
+  running at once cannot move a position a reader may already have passed.
+- `Lease`, `MaxAttempts` and `Backoff` are worker settings, not job settings.
+  All workers on one queue must agree on them.
+- Hot-path SQL takes no joins, no advisory locks (the assigner's is the one
+  exception), and no N+1 loops.
+- The unique indexes on `dedup_key` and `position` are partial. Deduplicating
+  inserts must name the predicate — `ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING`
+  — or they stop matching the index.
 
-## Worker Architecture
+## Conventions
 
-- **`NewWorker(pool *pgxpool.Pool)`** — workers require a pool, not the `Conn` interface. The pool is used for normal operations; one dedicated connection is acquired for `LISTEN`.
-- **Client and Worker are separate** — `Client` wraps `Conn` for client operations (send, run, read). Workers are created directly via `catbird.NewWorker(pool)`, not through the client.
-- **NOTIFY-driven scheduling** — SQL functions fire `pg_notify` with `visible_at` timestamps on insert, retry, and cancel. The Go notifier parses the timestamp and either signals immediately or schedules a single timer per target for the earliest future `visible_at`. Fallback polling (2s claim, 5s cancel) is a safety net for missed notifications only.
-- **Engine logic stays in SQL** — claim semantics (`FOR UPDATE SKIP LOCKED`), state transitions, cascading cancels, and finalization live in SQL functions for cross-client reuse. Only trivial reads (e.g., `SELECT status WHERE id = $1`) are inlined in Go.
+**SQL.** Four spaces, no tabs. A primary key is `id`; a reference is
+`<thing>_id`; no abbreviations. Every migration's `down` section drops
+everything its `up` created.
 
-## Design Constraints
+**Names and comments.** Plain language, no metaphors, no coined vocabulary. Name
+what a thing does in the sentence a reader would use for it. A comment states
+the rule and then, when it earns its place, the concrete failure it prevents —
+with the measurement when there is one. Comments never narrate history: what
+changed belongs in the commit message, not in the file.
 
-- **No PostgreSQL extensions** — only standard SQL and PL/pgSQL
-- **Concurrent-safe SQL** — advisory locks for setup; `SKIP LOCKED`, atomic CTEs for hot paths
-- **Hot path SQL must avoid** joins, advisory locks, and N+1 queries
-- **Reflection-based handlers** — no type parameters; input/output types discovered at runtime. Handler signature: `func(ctx context.Context, input T) (output U, error)`
-- **Builder pattern** for all public APIs: `NewTask(name).WithCondition(...).Do(fn, opts...)`
-- **Idempotent API semantics** — if the requested effect is already true, return success (no-op)
-
-## Deduplication Pattern (Critical)
-
-Task/flow deduplication uses an atomic `ON CONFLICT DO UPDATE WHERE FALSE` + `UNION ALL` pattern. **Do not simplify this.** The `WHERE FALSE` prevents mutation on conflict; the `UNION ALL` fallback returns the existing row's ID. Without both parts, you get NULL returns or race conditions. See `.github/copilot-instructions.md` for the full SQL pattern.
-
-## Migrations
-
-Goose-managed in `migrations/` with version table `cb_goose_db_version`. Current schema version tracked by `SchemaVersion` constant in `migrate.go`.
-
-When adding migrations:
-1. Create `migrations/00NNN_description.sql` with `-- +goose up` / `-- +goose down` sections
-2. Update `SchemaVersion` in `migrate.go`
-3. Wrap multi-line PL/pgSQL in `-- +goose statementbegin` / `-- +goose statementend`
-4. Use `LANGUAGE plpgsql AS $$` in CREATE, terminate with `$$;` (not `$$ LANGUAGE plpgsql;`)
-5. SQL indentation: 4 spaces, no tabs
-6. The `down` section must clean up everything the `up` section created
-7. Update `docs/sql-api.md` for any SQL function changes
-
-## Flow Patterns
-
-- **Conditions**: Tasks use `input.field` prefix; flow steps use `step_name.field` or `signal.field`
-- **Optional dependencies**: When depending on conditional steps, use `Optional[T]` parameter type + `.OptionalDependency()`. Flow construction panics if violated.
-- **Signals**: Steps with `.WithSignal()` wait for external input via `client.SignalFlow()`
-- **Map steps**: `.MapFlowInput()` or `.MapStepOutput("step")` for array processing
-- **Flow output**: The unwrapped output of the final step (not an aggregated object)
-
-## Testing Notes
-
-- Test harness uses `sync.Once` for one-time DB setup per suite (`catbird_test.go`)
-- `./scripts/test.sh` drops and recreates the `cb_tst` database each run
-- Dynamic tables persist across tests within a run — use unique identifiers to avoid stale data
-- Use `startTestWorker()` helper with automatic cleanup
-- `requireSlowTests()` gates stress tests behind `CB_SLOW_TESTS=1`
-
-## Status Constants
-
-Use Go constants (`StatusQueued`, `StatusStarted`, `StatusCompleted`, `StatusFailed`, `StatusSkipped`, `StatusCanceled`, `StatusExpired`, etc.) — not raw string literals.
-
-## Error Sentinels
-
-All sentinel errors are prefixed with `catbird:` for log grep-ability. Key errors: `ErrRunFailed`, `ErrRunCanceled`, `ErrNotFound`, `ErrNotDefined`, `ErrRunSkipped`, `ErrRunNotCompleted`, `ErrSignalNotDelivered`. Use `errors.Is()` for checking — do not match on string content.
+**Errors.** Sentinels are prefixed with `catbird:` and checked with
+`errors.Is`.

@@ -38,11 +38,13 @@ func Example_basicWorkflow() {
 	})
 
 	// Cron without leader election: every process enqueues the same key each
-	// minute; the dedup key lets exactly one insert through.
+	// minute; the dedup key lets exactly one insert through. The minute is
+	// formatted in UTC and in this exact layout, because every process has to
+	// produce the same key for the minute it is in.
 	go func() {
 		for {
 			time.Sleep(time.Minute)
-			key := "cron:heartbeat:" + time.Now().Format("2006-01-02-15-04")
+			key := "cron:heartbeat:" + time.Now().UTC().Format("2006-01-02T15:04Z")
 			client.Enqueue(ctx, pool, "cron.minutely", "cron_workers", nil, catbird.EnqueueOptions{DedupKey: key})
 		}
 	}()
