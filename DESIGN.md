@@ -12,9 +12,15 @@ A PostgreSQL-backed job queue, stream, and small workflow engine. Four tables, p
 
 A partial index on `cb_claims (queue, visible_at) WHERE status = 0 AND dependencies = 0` holds only claimable rows. Dead rows and rows waiting on dependencies are not in it.
 
+## Runtime
+
+`catbird.New(pool, opts)` returns the process's `Runtime`. Workers, triggers and consumers are declared on it — `NewWorker(runtime, …)`, `NewTrigger(runtime, …)`, `NewConsumer(runtime, …)`, or the methods of the same names — and `Start(ctx)` runs them all: one `LISTEN` connection for every channel they need, the position assigner, and one goroutine per declared loop, until `ctx` ends and every loop has stopped. A process holds one connection for notifications however many workers and triggers it runs. Declaring after `Start` panics: the connection's channel set is fixed when it connects. A dropped connection is reconnected after `ReconnectAfter`; until then the loops run on their poll intervals, and after each connect every loop is woken once, because notifications sent in between are gone.
+
+`Client` is the exception: it is a plain helper that works on any connection or transaction, so it is not created from the runtime.
+
 ## Jobs
 
-`Enqueue` inserts the message and its claim in one statement and sends `NOTIFY` on the queue's channel. Workers `LISTEN` and also poll on an interval, so a lost notification delays a job rather than losing it.
+`Enqueue` inserts the message and its claim in one statement and sends `NOTIFY` on the queue's channel. The runtime's connection listens on it and wakes the queue's workers, which also poll on an interval, so a lost notification delays a job rather than losing it.
 
 **Claiming.** A worker takes up to `BatchSize` rows with `FOR UPDATE SKIP LOCKED`, sets `visible_at = now() + Lease`, and increments `attempts`. There is no "running" status: a job with `visible_at` in the future is either delayed, backing off after a failure, or claimed. Once `visible_at` passes, any worker may claim it again. That is how a crashed worker's job comes back.
 
@@ -43,13 +49,13 @@ A permanently failed step cancels its siblings and children through the shared c
 
 ## Streams
 
-`Publish` inserts a message with no claim. `StreamConsumer.FetchBatch(pattern)` reads messages after the cursor on a topic and every topic under it (`order` covers `order.paid` and `order.paid.refund`; `""` covers everything), in position order. Topic names are literal; there is no pattern syntax. Finer selection is the consumer's code, or an optional payload filter added later as an extra clause. `Ack(position)` moves the cursor; it uses `GREATEST`, so the cursor does not move backwards when two consumers share it.
+`Publish` inserts a message with no claim. `NewConsumer(runtime, name, opts).FetchBatch(topic)` reads messages after the cursor on a topic and every topic under it (`order` covers `order.paid` and `order.paid.refund`; `""` covers everything), in position order. Topic names are literal; there is no pattern syntax. Finer selection is the consumer's code, or an optional payload filter added later as an extra clause. `Ack(position)` moves the cursor; it uses `GREATEST`, so the cursor does not move backwards when two consumers share it.
 
 **Positions.** Message ids are handed out at `INSERT` time, so a message from a transaction that is still open can have a lower id than messages that already committed; a reader going by id would move past it and miss it. Readers therefore go by `position`, which the assigner sets on published messages in the order it sees them — commit order. A `stream` flag marks published messages; job inputs get no position, so a job created from an event is not itself an event and a trigger does not feed on its own output. A message from a long transaction gets its position when it commits; it arrives late, after messages published after it, but it arrives, once. This is the rule a plain `SELECT` follows: you see a row when its transaction commits.
 
-The assigner is one statement under an advisory lock, run every `AssignEvery` (250 ms) by every `StreamConsumer` and every trigger. The lock makes one of them do the work; the rest do nothing. The statement only sets positions that are still empty, so even two assigners running at once cannot move a position a reader may already have passed. Nothing has to be deployed or configured; a message is readable within one tick of its commit. When the assigner assigned anything it sends `NOTIFY cb_stream` with the highest new position, so readers that `LISTEN` fetch on arrival instead of polling. The cost is one update per published message. Against a variant with positions in a separate narrow table (measured, 200k × 500 B): the column writes ~45% more WAL and ~60% more heap, but publishes and reads ~65% faster, deletes 2× faster (no FK cascade), and needs one table and one index fewer. Vacuum time was under 0.3 s per 200k messages for both.
+The assigner is one statement under an advisory lock, run every `AssignEvery` (250 ms) by every process's `Runtime`. The lock makes one of them do the work; the rest do nothing. The statement only sets positions that are still empty, so even two assigners running at once cannot move a position a reader may already have passed. Nothing has to be deployed or configured; a message is readable within one tick of its commit. When the assigner assigned anything it sends `NOTIFY cb_stream` with the highest new position; the runtime's connection listens on that channel and wakes the triggers, so they fetch on arrival instead of polling. The cost is one update per published message. Against a variant with positions in a separate narrow table (measured, 200k × 500 B): the column writes ~45% more WAL and ~60% more heap, but publishes and reads ~65% faster, deletes 2× faster (no FK cascade), and needs one table and one index fewer. Vacuum time was under 0.3 s per 200k messages for both.
 
-**Triggers.** `RegisterTrigger(name, topic, queue)` runs a loop: fetch a batch, `Enqueue` each message on the target queue with dedup key `trigger:<name>:<message id>`, `Ack`, commit — all in one transaction. A crash before commit redoes the batch; the dedup keys make the redo a no-op. Several processes may run the same trigger: each only wastes reads, the cursor is monotone, and the dedup keys keep the output single. Run a trigger in one process if the extra reads matter; there is no leader election.
+**Triggers.** `NewTrigger(runtime, name, topic, queue, opts)` declares a loop that runs from `Start`: fetch a batch, `Enqueue` each message on the target queue with dedup key `trigger:<name>:<message id>`, `Ack`, commit — all in one transaction. A crash before commit redoes the batch; the dedup keys make the redo a no-op. Several processes may run the same trigger: each only wastes reads, the cursor is monotone, and the dedup keys keep the output single. Run a trigger in one process if the extra reads matter; there is no leader election.
 
 ## Cron without a leader
 
@@ -71,11 +77,9 @@ These come from moving raven, the first application, onto catbird: its own event
 
 ### Streams
 
-**One `Stream` per process.** Today every `NewStreamConsumer` and every trigger starts its own assigner. Instead a process creates one `Stream` that runs the assigner and holds one `LISTEN cb_stream` connection; consumers, triggers and the wire hang off it and share the wake-up. Same work, fewer connections, and one place to look.
-
 **Cursor lease.** `cb_cursors` gets `locked_until TIMESTAMPTZ NOT NULL DEFAULT '-infinity'`. A consumer claims a cursor with `UPDATE cb_cursors SET locked_until = now() + lease WHERE name = $1 AND locked_until <= now() RETURNING last_position`; when the row is already leased the claim returns nothing and the consumer waits for the next wake-up. `Ack` keeps `GREATEST` and clears the lease; acking the unchanged position releases without advancing. Reason: an application runs several processes, and a consumer that indexes documents or calls an external API would otherwise do every batch once per process. A lease with a deadline also covers a process that is alive but stuck: when the deadline passes another process takes the cursor. Triggers did not need this because their dedup keys make a repeated batch harmless; a general handler has no such key.
 
-**`StreamConsumer.Run(ctx, topic, handle func(ctx, []Message) error)`.** Claim the cursor, fetch a batch, call the handler, ack; wake on `NOTIFY cb_stream`, poll on `PollInterval` as the fallback, and keep going while batches come back full. A handler error releases the cursor without advancing, so the batch is retried. Triggers become a `Run` whose handler enqueues the batch and acks in one transaction.
+**`Consumer.Handle(topic, handle func(ctx, []Message) error)`.** Declares a loop that `Start` runs: claim the cursor, fetch a batch, call the handler, ack; wake on `NOTIFY cb_stream`, poll on `PollInterval` as the fallback, and keep going while batches come back full. A handler error releases the cursor without advancing, so the batch is retried. Triggers become a handler that enqueues the batch and acks in one transaction.
 
 **`PublishMany(ctx, db, topics, payloads)`.** One `INSERT … SELECT FROM unnest(...)`, so a transaction that changed 10,000 records publishes 10,000 signals in one statement instead of 10,000 round trips.
 
@@ -85,7 +89,7 @@ These come from moving raven, the first application, onto catbird: its own event
 
 ### Wire
 
-The browser layer: stream messages pushed to browsers over SSE. One type, no tables of its own, no token machinery.
+The browser layer: stream messages pushed to browsers over SSE. One type, created from the runtime, no tables of its own, no token machinery.
 
 ```go
 type WireOptions struct {
@@ -107,13 +111,13 @@ type Fragment struct {
     Data  string
 }
 
-func NewWire(stream *Stream, opts WireOptions) *Wire
+func NewWire(r *Runtime, opts WireOptions) *Wire
 func (w *Wire) Serve(rw http.ResponseWriter, r *http.Request, opts ServeOptions)
 ```
 
 **Who may read what** is the application's decision, made before it calls `Serve`: the route knows the user and passes the subtrees. Same-origin `EventSource` sends cookies, so a session cookie is enough; an application that wants grants in the URL signs them itself.
 
-**One goroutine per connection.** After every wake-up from the process's `Stream` — the assigner's `NOTIFY cb_stream` — the connection runs `Read(topics, after, BatchSize)` and writes each row as a frame. The database does the topic matching, per connection. A slow browser slows only its own goroutine and catches up by position; there is no queue between the listener and the connections, so nothing is dropped and no slow-consumer policy is needed. Every `PollInterval` the connection reads anyway and sends `: ping`, which keeps a proxy from closing an idle stream.
+**One goroutine per connection.** After every wake-up from the runtime's connection — the assigner's `NOTIFY cb_stream` — the SSE connection runs `Read(topics, after, BatchSize)` and writes each row as a frame. The database does the topic matching, per connection. A slow browser slows only its own goroutine and catches up by position; there is no queue between the listener and the connections, so nothing is dropped and no slow-consumer policy is needed. Every `PollInterval` the connection reads anyway and sends `: ping`, which keeps a proxy from closing an idle stream.
 
 **Where a connection starts.**
 

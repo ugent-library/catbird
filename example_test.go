@@ -29,7 +29,8 @@ func Example_basicWorkflow() {
 		return nil
 	}
 
-	worker := catbird.NewWorker(pool, "image_processing", handler, catbird.WorkerOptions{
+	rt := catbird.New(pool, catbird.Options{})
+	catbird.NewWorker(rt, "image_processing", handler, catbird.WorkerOptions{
 		OnDead: func(ctx context.Context, db catbird.Conn, msg catbird.Message) error {
 			log.Printf("job %d failed permanently", msg.ID)
 			return nil
@@ -47,13 +48,13 @@ func Example_basicWorkflow() {
 	}()
 
 	// Every message on image.* becomes a job on image_processing.
-	client.RegisterTrigger(ctx, pool, "img_processor", "image", "image_processing", catbird.StreamOptions{})
+	catbird.NewTrigger(rt, "img_processor", "image", "image_processing", catbird.StreamOptions{})
 
 	go func() {
 		time.Sleep(time.Second)
 		client.Publish(ctx, pool, "image.uploaded", map[string]string{"url": "https://example.com/img.png"}, "")
 	}()
 
-	go worker.Start(ctx)
+	go rt.Start(ctx)
 	time.Sleep(7 * time.Second)
 }

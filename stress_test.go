@@ -96,13 +96,15 @@ func TestTortureThroughput(t *testing.T) {
 
 	workStart := time.Now()
 	var workerWg sync.WaitGroup
+	rt := catbird.New(pool, catbird.Options{})
 	for i := 0; i < 5; i++ {
-		workerWg.Add(1)
-		go func() {
-			defer workerWg.Done()
-			catbird.NewWorker(pool, "torture_queue", handler, catbird.WorkerOptions{}).Start(ctx)
-		}()
+		catbird.NewWorker(rt, "torture_queue", handler, catbird.WorkerOptions{})
 	}
+	workerWg.Add(1)
+	go func() {
+		defer workerWg.Done()
+		rt.Start(ctx)
+	}()
 
 	for atomic.LoadInt32(&processed) < totalMsgs {
 		if ctx.Err() != nil {
@@ -197,13 +199,14 @@ func TestDependenciesAndSignals(t *testing.T) {
 	}
 
 	ran := make(chan catbird.Message, 1)
-	worker := catbird.NewWorker(pool, "dag_queue", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
+	rt := catbird.New(pool, catbird.Options{})
+	catbird.NewWorker(rt, "dag_queue", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
 		ran <- m
 		return nil
 	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond})
 	runCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	go worker.Start(runCtx)
+	go rt.Start(runCtx)
 
 	select {
 	case m := <-ran:
@@ -249,8 +252,10 @@ func TestLeaseExpiryFence(t *testing.T) {
 		return err
 	}
 	opts := catbird.WorkerOptions{Lease: 200 * time.Millisecond, PollInterval: 50 * time.Millisecond}
-	go catbird.NewWorker(pool, "lease_queue", handler, opts).Start(ctx)
-	go catbird.NewWorker(pool, "lease_queue", handler, opts).Start(ctx)
+	rt := catbird.New(pool, catbird.Options{})
+	catbird.NewWorker(rt, "lease_queue", handler, opts)
+	catbird.NewWorker(rt, "lease_queue", handler, opts)
+	go rt.Start(ctx)
 
 	deadline := time.Now().Add(3 * time.Second)
 	for count(t, pool, "SELECT count(*) FROM cb_claims") != 0 {
@@ -285,13 +290,15 @@ func TestTriggerBridgesPayloadUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	client.RegisterTrigger(ctx, pool, "img", "image", "image_processing", catbird.StreamOptions{AssignEvery: 20 * time.Millisecond, PollInterval: 50 * time.Millisecond})
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	catbird.NewTrigger(rt, "img", "image", "image_processing", catbird.StreamOptions{PollInterval: 50 * time.Millisecond})
 
 	got := make(chan catbird.Message, 16)
-	go catbird.NewWorker(pool, "image_processing", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
+	catbird.NewWorker(rt, "image_processing", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
 		got <- m
 		return nil
-	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond}).Start(ctx)
+	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond})
+	go rt.Start(ctx)
 
 	select {
 	case m := <-got:
@@ -357,7 +364,9 @@ func TestStreamLateCommitIsNotSkipped(t *testing.T) {
 	defer cancel()
 	client := catbird.NewClient()
 
-	consumer := catbird.NewStreamConsumer(ctx, pool, "late", catbird.StreamOptions{AssignEvery: 20 * time.Millisecond})
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	go rt.Start(ctx)
+	consumer := catbird.NewConsumer(rt, "late", catbird.StreamOptions{})
 
 	// Message 1 is inserted first but its transaction stays open.
 	slow, err := pool.Begin(ctx)
@@ -418,7 +427,8 @@ func TestOutputAndStreamNotify(t *testing.T) {
 	if _, err := client.Output(ctx, pool, id); !errors.Is(err, catbird.ErrNotFound) {
 		t.Fatalf("output before completion: %v", err)
 	}
-	go catbird.NewWorker(pool, "out_queue", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	catbird.NewWorker(rt, "out_queue", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
 		var in []int
 		json.Unmarshal(m.Payload, &in)
 		sum := 0
@@ -426,7 +436,8 @@ func TestOutputAndStreamNotify(t *testing.T) {
 			sum += n
 		}
 		return client.SetOutput(ctx, tx, m.ID, sum)
-	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond}).Start(ctx)
+	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond})
+	go rt.Start(ctx)
 
 	for {
 		out, err := client.Output(ctx, pool, id)
@@ -451,7 +462,6 @@ func TestOutputAndStreamNotify(t *testing.T) {
 	if _, err := conn.Exec(ctx, "LISTEN cb_stream"); err != nil {
 		t.Fatal(err)
 	}
-	catbird.NewStreamConsumer(ctx, pool, "notify", catbird.StreamOptions{AssignEvery: 20 * time.Millisecond})
 	if _, err := client.Publish(ctx, pool, "ev", nil, ""); err != nil {
 		t.Fatal(err)
 	}

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // JobHandler runs one job. tx is the worker's transaction: writes made through it
@@ -24,7 +23,7 @@ type WorkerOptions struct {
 	BatchSize    int           // jobs claimed per round; default 50
 	PollInterval time.Duration // wake-up interval when no notification arrives; default 5 seconds
 	OnDead       JobHandler    // runs once, outside the job transaction, after the last failed attempt
-	Logger       *slog.Logger  // default slog.Default()
+	Logger       *slog.Logger  // default: the runtime's logger
 }
 
 func (o WorkerOptions) withDefaults() WorkerOptions {
@@ -43,9 +42,6 @@ func (o WorkerOptions) withDefaults() WorkerOptions {
 	if o.PollInterval <= 0 {
 		o.PollInterval = 5 * time.Second
 	}
-	if o.Logger == nil {
-		o.Logger = slog.Default()
-	}
 	return o
 }
 
@@ -53,27 +49,34 @@ func (o WorkerOptions) withDefaults() WorkerOptions {
 var errLeaseExpired = errors.New("catbird: lease expired before completion")
 
 type Worker struct {
-	pool    *pgxpool.Pool
+	runtime *Runtime
 	queue   string
 	handler JobHandler
 	opts    WorkerOptions
-	wake    chan struct{}
 }
 
-func NewWorker(pool *pgxpool.Pool, queue string, handler JobHandler, opts WorkerOptions) *Worker {
-	return &Worker{
-		pool:    pool,
-		queue:   queue,
-		handler: handler,
-		opts:    opts.withDefaults(),
-		wake:    make(chan struct{}, 1),
+// NewWorker declares a worker on the runtime: once the runtime is started, it
+// claims jobs on queue in batches and runs handler for each.
+func NewWorker(r *Runtime, queue string, handler JobHandler, opts WorkerOptions) *Worker {
+	opts = opts.withDefaults()
+	if opts.Logger == nil {
+		opts.Logger = r.opts.Logger
 	}
+	w := &Worker{runtime: r, queue: queue, handler: handler, opts: opts}
+	r.declare("cb_queue_"+queue, w.start)
+	return w
 }
 
-// Start claims batches of jobs and runs each batch concurrently, until ctx is
+// Worker is NewWorker(r, queue, handler, opts).
+func (r *Runtime) Worker(queue string, handler JobHandler, opts WorkerOptions) *Worker {
+	return NewWorker(r, queue, handler, opts)
+}
+
+// start claims batches of jobs and runs each batch concurrently, until ctx is
 // canceled. Between batches it waits for a NOTIFY or for PollInterval.
-func (w *Worker) Start(ctx context.Context) {
-	go w.listen(ctx)
+func (w *Worker) start(ctx context.Context) {
+	wake, unsubscribe := w.runtime.subscribe("cb_queue_" + w.queue)
+	defer unsubscribe()
 
 	for {
 		msgs, err := w.claimBatch(ctx)
@@ -97,7 +100,7 @@ func (w *Worker) Start(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-w.wake:
+		case <-wake:
 		case <-time.After(w.opts.PollInterval):
 		}
 	}
@@ -106,7 +109,7 @@ func (w *Worker) Start(ctx context.Context) {
 // run executes one job: handler, then completion, in one transaction.
 // Any error schedules a retry or marks the job dead.
 func (w *Worker) run(ctx context.Context, m Message) {
-	tx, err := w.pool.Begin(ctx)
+	tx, err := w.runtime.pool.Begin(ctx)
 	if err != nil {
 		w.opts.Logger.Error("catbird: begin failed", "queue", w.queue, "message_id", m.ID, "err", err)
 		return
@@ -152,7 +155,7 @@ func (w *Worker) failed(ctx context.Context, m Message, cause error) {
 
 	if m.Attempts < w.opts.MaxAttempts {
 		log.Warn("catbird: job failed, will retry", "err", cause)
-		_, err := w.pool.Exec(ctx, `
+		_, err := w.runtime.pool.Exec(ctx, `
 			UPDATE cb_claims SET visible_at = now() + $3::interval
 			WHERE message_id = $1 AND attempts = $2 AND status = $4
 		`, m.ID, m.Attempts, w.opts.Backoff, statusLive)
@@ -163,19 +166,19 @@ func (w *Worker) failed(ctx context.Context, m Message, cause error) {
 	}
 
 	log.Error("catbird: job dead", "err", cause)
-	_, err := w.pool.Exec(ctx, `
+	_, err := w.runtime.pool.Exec(ctx, `
 		UPDATE cb_claims SET status = $3 WHERE message_id = $1 AND attempts = $2
 	`, m.ID, m.Attempts, statusDead)
 	if err != nil {
 		log.Error("catbird: marking dead failed", "err", err)
 	}
 	if m.CorrelationID != "" {
-		if err := NewClient().Cancel(ctx, w.pool, m.CorrelationID); err != nil {
+		if err := NewClient().Cancel(ctx, w.runtime.pool, m.CorrelationID); err != nil {
 			log.Error("catbird: cancel failed", "correlation_id", m.CorrelationID, "err", err)
 		}
 	}
 	if w.opts.OnDead != nil {
-		if err := w.opts.OnDead(ctx, w.pool, m); err != nil {
+		if err := w.opts.OnDead(ctx, w.runtime.pool, m); err != nil {
 			log.Error("catbird: OnDead failed", "err", err)
 		}
 	}
@@ -184,7 +187,7 @@ func (w *Worker) failed(ctx context.Context, m Message, cause error) {
 // claimBatch leases up to BatchSize ready jobs by moving visible_at past the
 // lease, and returns them with their payloads and delivered signals.
 func (w *Worker) claimBatch(ctx context.Context) ([]Message, error) {
-	rows, err := w.pool.Query(ctx, `
+	rows, err := w.runtime.pool.Query(ctx, `
 		WITH leased AS (
 			UPDATE cb_claims
 			SET visible_at = now() + $2::interval, attempts = attempts + 1
@@ -225,38 +228,4 @@ func (w *Worker) claimBatch(ctx context.Context) ([]Message, error) {
 		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()
-}
-
-// listen forwards NOTIFY on the queue's channel to w.wake. It reconnects when
-// the connection drops; until then the worker runs on PollInterval alone.
-func (w *Worker) listen(ctx context.Context) {
-	channel := pgx.Identifier{"cb_queue_" + w.queue}.Sanitize()
-	for ctx.Err() == nil {
-		err := func() error {
-			conn, err := w.pool.Acquire(ctx)
-			if err != nil {
-				return err
-			}
-			defer conn.Release()
-			if _, err := conn.Exec(ctx, "LISTEN "+channel); err != nil {
-				return err
-			}
-			for {
-				if _, err := conn.Conn().WaitForNotification(ctx); err != nil {
-					return err
-				}
-				select {
-				case w.wake <- struct{}{}:
-				default: // a wake-up is already pending
-				}
-			}
-		}()
-		if ctx.Err() == nil {
-			w.opts.Logger.Error("catbird: listen failed, reconnecting", "queue", w.queue, "err", err)
-			select {
-			case <-ctx.Done():
-			case <-time.After(w.opts.PollInterval):
-			}
-		}
-	}
 }

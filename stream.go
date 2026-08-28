@@ -2,7 +2,6 @@ package catbird
 
 import (
 	"context"
-	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -10,13 +9,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// StreamOptions are the optional parts of NewStreamConsumer and RegisterTrigger.
+// StreamOptions are the optional parts of NewConsumer and NewTrigger.
 // Zero values take the defaults.
 type StreamOptions struct {
 	BatchSize    int           // default 50
 	PollInterval time.Duration // wait when the stream is empty; default 2 seconds
-	AssignEvery  time.Duration // how often the assigner runs; default 250 milliseconds
-	Logger       *slog.Logger  // default slog.Default()
 }
 
 func (o StreamOptions) withDefaults() StreamOptions {
@@ -26,29 +23,26 @@ func (o StreamOptions) withDefaults() StreamOptions {
 	if o.PollInterval <= 0 {
 		o.PollInterval = 2 * time.Second
 	}
-	if o.AssignEvery <= 0 {
-		o.AssignEvery = 250 * time.Millisecond
-	}
-	if o.Logger == nil {
-		o.Logger = slog.Default()
-	}
 	return o
 }
 
-// StreamConsumer reads published messages in position order from a named cursor.
-type StreamConsumer struct {
-	pool   *pgxpool.Pool
-	cursor string
-	opts   StreamOptions
+// Consumer reads published messages in position order from a named cursor.
+type Consumer struct {
+	runtime *Runtime
+	cursor  string
+	opts    StreamOptions
 }
 
-// NewStreamConsumer creates a consumer and starts the position assigner for as
-// long as ctx lives. Every consumer starts one; a database lock makes sure only
-// one of them does the work, so any number of processes may run consumers.
-func NewStreamConsumer(ctx context.Context, pool *pgxpool.Pool, cursorName string, opts StreamOptions) *StreamConsumer {
-	opts = opts.withDefaults()
-	go assignPositions(ctx, pool, opts)
-	return &StreamConsumer{pool: pool, cursor: cursorName, opts: opts}
+// NewConsumer returns a consumer that reads from the named cursor. A cursor
+// that does not exist yet starts at position 0. FetchBatch and Ack work whether
+// or not the runtime is started; positions are only assigned while it runs.
+func NewConsumer(r *Runtime, cursor string, opts StreamOptions) *Consumer {
+	return &Consumer{runtime: r, cursor: cursor, opts: opts.withDefaults()}
+}
+
+// Consumer is NewConsumer(r, cursor, opts).
+func (r *Runtime) Consumer(cursor string, opts StreamOptions) *Consumer {
+	return NewConsumer(r, cursor, opts)
 }
 
 // assignPositions gives every published message that has none the next
@@ -66,7 +60,7 @@ func NewStreamConsumer(ctx context.Context, pool *pgxpool.Pool, cursorName strin
 //
 // When it assigned anything it sends NOTIFY on channel cb_stream with the
 // highest new position, so a LISTENing reader can fetch instead of polling.
-func assignPositions(ctx context.Context, pool *pgxpool.Pool, opts StreamOptions) {
+func assignPositions(ctx context.Context, pool *pgxpool.Pool, opts Options) {
 	ticker := time.NewTicker(opts.AssignEvery)
 	defer ticker.Stop()
 	for {
@@ -105,15 +99,15 @@ func assignPositions(ctx context.Context, pool *pgxpool.Pool, opts StreamOptions
 // "order.paid.refund"; "" matches everything. Topic names are literal; there is
 // no pattern syntax. Job inputs written by Enqueue have no position and are
 // not returned.
-func (s *StreamConsumer) FetchBatch(ctx context.Context, topic string) ([]Message, error) {
-	rows, err := s.pool.Query(ctx, `
+func (c *Consumer) FetchBatch(ctx context.Context, topic string) ([]Message, error) {
+	rows, err := c.runtime.pool.Query(ctx, `
 		SELECT id, position, topic, payload
 		FROM cb_messages
 		WHERE position > COALESCE((SELECT last_position FROM cb_cursors WHERE name = $1), 0)
 		  AND ($2 = '' OR topic = $2 OR topic LIKE $3)
 		ORDER BY position ASC
 		LIMIT $4
-	`, s.cursor, topic, subtopics(topic), s.opts.BatchSize)
+	`, c.cursor, topic, subtopics(topic), c.opts.BatchSize)
 	if err != nil {
 		return nil, err
 	}
@@ -138,60 +132,94 @@ func subtopics(topic string) string {
 
 // Ack moves the cursor to position. The cursor never moves backwards, so
 // several consumers on one cursor cannot undo each other's progress.
-func (s *StreamConsumer) Ack(ctx context.Context, db Conn, position int64) error {
+func (c *Consumer) Ack(ctx context.Context, db Conn, position int64) error {
 	_, err := db.Exec(ctx, `
 		INSERT INTO cb_cursors (name, last_position) VALUES ($1, $2)
 		ON CONFLICT (name) DO UPDATE SET last_position = GREATEST(cb_cursors.last_position, EXCLUDED.last_position)
-	`, s.cursor, position)
+	`, c.cursor, position)
 	return err
 }
 
-// RegisterTrigger enqueues a job on targetQueue for every message on topic or
-// a topic under it (see FetchBatch), until ctx is canceled. The enqueues and the cursor
-// advance commit in one transaction, and each job carries a dedup key derived
-// from the message id, so a crash or a second process running the same trigger
-// cannot produce a second job for the same message.
-func (c *Client) RegisterTrigger(ctx context.Context, pool *pgxpool.Pool, name, topic, targetQueue string, opts StreamOptions) {
-	consumer := NewStreamConsumer(ctx, pool, "trigger:"+name, opts)
-	go func() {
-		for ctx.Err() == nil {
-			n, err := c.enqueueNextBatch(ctx, pool, consumer, name, topic, targetQueue)
-			if err != nil && ctx.Err() == nil {
-				consumer.opts.Logger.Error("catbird: trigger failed", "trigger", name, "err", err)
-			}
-			if err == nil && n == consumer.opts.BatchSize {
-				continue // the stream may hold more
-			}
-			select {
-			case <-ctx.Done():
-			case <-time.After(consumer.opts.PollInterval):
-			}
+// Trigger turns stream messages into jobs.
+type Trigger struct {
+	runtime  *Runtime
+	name     string
+	topic    string
+	queue    string
+	consumer *Consumer
+	opts     StreamOptions
+}
+
+// NewTrigger declares a trigger on the runtime: once the runtime is started,
+// every message on topic or a topic under it (see FetchBatch) becomes a job on
+// targetQueue. The enqueues and the cursor advance commit in one transaction,
+// and each job carries a dedup key derived from the message id, so a crash or a
+// second process running the same trigger cannot produce a second job for the
+// same message.
+func NewTrigger(r *Runtime, name, topic, targetQueue string, opts StreamOptions) *Trigger {
+	t := &Trigger{
+		runtime:  r,
+		name:     name,
+		topic:    topic,
+		queue:    targetQueue,
+		consumer: NewConsumer(r, "trigger:"+name, opts),
+		opts:     opts.withDefaults(),
+	}
+	r.declare("cb_stream", t.start)
+	return t
+}
+
+// Trigger is NewTrigger(r, name, topic, targetQueue, opts).
+func (r *Runtime) Trigger(name, topic, targetQueue string, opts StreamOptions) *Trigger {
+	return NewTrigger(r, name, topic, targetQueue, opts)
+}
+
+// start runs the trigger until ctx is canceled: a batch whenever the assigner
+// announces new positions, and every PollInterval in case a notification was
+// lost.
+func (t *Trigger) start(ctx context.Context) {
+	wake, unsubscribe := t.runtime.subscribe("cb_stream")
+	defer unsubscribe()
+
+	for ctx.Err() == nil {
+		n, err := t.enqueueNextBatch(ctx)
+		if err != nil && ctx.Err() == nil {
+			t.runtime.opts.Logger.Error("catbird: trigger failed", "trigger", t.name, "err", err)
 		}
-	}()
+		if err == nil && n == t.opts.BatchSize {
+			continue // the stream may hold more
+		}
+		select {
+		case <-ctx.Done():
+		case <-wake:
+		case <-time.After(t.opts.PollInterval):
+		}
+	}
 }
 
 // enqueueNextBatch reads the next batch of matching stream messages, enqueues a
 // job for each, advances the cursor, and commits — all in one transaction.
 // Returns how many messages it handled.
-func (c *Client) enqueueNextBatch(ctx context.Context, pool *pgxpool.Pool, consumer *StreamConsumer, name, topic, targetQueue string) (int, error) {
-	msgs, err := consumer.FetchBatch(ctx, topic)
+func (t *Trigger) enqueueNextBatch(ctx context.Context) (int, error) {
+	msgs, err := t.consumer.FetchBatch(ctx, t.topic)
 	if err != nil || len(msgs) == 0 {
 		return 0, err
 	}
 
-	tx, err := pool.Begin(ctx)
+	tx, err := t.runtime.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
 
+	client := NewClient()
 	for _, m := range msgs {
-		dedup := "trigger:" + name + ":" + strconv.FormatInt(m.ID, 10)
-		if _, err := c.Enqueue(ctx, tx, m.Topic, targetQueue, m.Payload, EnqueueOptions{DedupKey: dedup}); err != nil {
+		dedup := "trigger:" + t.name + ":" + strconv.FormatInt(m.ID, 10)
+		if _, err := client.Enqueue(ctx, tx, m.Topic, t.queue, m.Payload, EnqueueOptions{DedupKey: dedup}); err != nil {
 			return 0, err
 		}
 	}
-	if err := consumer.Ack(ctx, tx, msgs[len(msgs)-1].Position); err != nil {
+	if err := t.consumer.Ack(ctx, tx, msgs[len(msgs)-1].Position); err != nil {
 		return 0, err
 	}
 	return len(msgs), tx.Commit(ctx)
