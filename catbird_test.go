@@ -639,3 +639,68 @@ func TestTriggerBatchIsEnqueuedOnce(t *testing.T) {
 		t.Errorf("%d jobs for 20 messages", n)
 	}
 }
+
+// CreatedAt is the message row's insert time, filled in both on a stream read
+// and on a claimed job. The window is read from the database, so the test does
+// not depend on the test process and the server agreeing on the clock.
+func TestCreatedAtIsSetOnStreamAndJobMessages(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := catbird.NewClient()
+
+	dbNow := func() time.Time {
+		t.Helper()
+		var now time.Time
+		if err := pool.QueryRow(ctx, "SELECT now()").Scan(&now); err != nil {
+			t.Fatal(err)
+		}
+		return now
+	}
+	start := dbNow()
+
+	if _, err := client.Publish(ctx, pool, "age", "published", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Enqueue(ctx, pool, "age", "age_queue", "enqueued", catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	jobCreatedAt := make(chan time.Time, 1)
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	catbird.NewWorker(rt, "age_queue", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
+		jobCreatedAt <- m.CreatedAt
+		return nil
+	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond})
+	consumer := catbird.NewConsumer(rt, "age", catbird.StreamOptions{})
+	go rt.Start(ctx)
+
+	var streamCreatedAt time.Time
+	for streamCreatedAt.IsZero() {
+		msgs, err := consumer.FetchBatch(ctx, "age")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(msgs) > 0 {
+			streamCreatedAt = msgs[0].CreatedAt
+		} else if ctx.Err() != nil {
+			t.Fatal("message never got a position")
+		} else {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	var jobCreated time.Time
+	select {
+	case <-ctx.Done():
+		t.Fatal("job never ran")
+	case jobCreated = <-jobCreatedAt:
+	}
+	end := dbNow()
+
+	for name, got := range map[string]time.Time{"stream": streamCreatedAt, "job": jobCreated} {
+		if got.Before(start) || got.After(end) {
+			t.Fatalf("%s message CreatedAt %v, want between %v and %v", name, got, start, end)
+		}
+	}
+}

@@ -26,6 +26,7 @@ type Message struct {
 	Position      int64 // place in the stream; 0 for job inputs
 	Topic         string
 	Payload       json.RawMessage
+	CreatedAt     time.Time                  // insert time, not commit time: it does not follow position order
 	Signals       map[string]json.RawMessage // payloads delivered with DeliverSignal; nil when none
 	Attempts      int                        // 1 on the first run
 	CorrelationID string

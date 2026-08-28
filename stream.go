@@ -101,7 +101,7 @@ func assignPositions(ctx context.Context, pool *pgxpool.Pool, opts Options) {
 // not returned.
 func (c *Consumer) FetchBatch(ctx context.Context, topic string) ([]Message, error) {
 	rows, err := c.runtime.pool.Query(ctx, `
-		SELECT id, position, topic, payload
+		SELECT id, position, topic, payload, created_at
 		FROM cb_messages
 		WHERE position > COALESCE((SELECT last_position FROM cb_cursors WHERE name = $1), 0)
 		  AND ($2 = '' OR topic = $2 OR topic LIKE $3)
@@ -116,7 +116,7 @@ func (c *Consumer) FetchBatch(ctx context.Context, topic string) ([]Message, err
 	var msgs []Message
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.Position, &m.Topic, &m.Payload); err != nil {
+		if err := rows.Scan(&m.ID, &m.Position, &m.Topic, &m.Payload, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		msgs = append(msgs, m)

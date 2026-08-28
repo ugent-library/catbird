@@ -199,7 +199,7 @@ func (w *Worker) claimBatch(ctx context.Context) ([]Message, error) {
 			)
 			RETURNING message_id, attempts, correlation_id
 		)
-		SELECT m.id, m.topic, m.payload, l.attempts, l.correlation_id,
+		SELECT m.id, m.topic, m.payload, m.created_at, l.attempts, l.correlation_id,
 		       (SELECT jsonb_object_agg(name, payload) FROM cb_signals s WHERE s.message_id = m.id)
 		FROM leased l
 		JOIN cb_messages m ON m.id = l.message_id
@@ -214,7 +214,7 @@ func (w *Worker) claimBatch(ctx context.Context) ([]Message, error) {
 		var m Message
 		var correlation *string
 		var signals []byte
-		if err := rows.Scan(&m.ID, &m.Topic, &m.Payload, &m.Attempts, &correlation, &signals); err != nil {
+		if err := rows.Scan(&m.ID, &m.Topic, &m.Payload, &m.CreatedAt, &m.Attempts, &correlation, &signals); err != nil {
 			return nil, err
 		}
 		if correlation != nil {

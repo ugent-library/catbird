@@ -93,8 +93,6 @@ These come from moving raven, the first application, onto catbird: its own event
 
 **`Read(ctx, pool, topics, after, limit)` and `LastPosition(ctx, db)`.** The read for a caller that holds its own position instead of a cursor: the wire, or a poll endpoint. `topics` is a list of subtrees; the query walks the position index from `after`. `LastPosition` is the current end of the stream, so a page can embed it and start its connection from there.
 
-**`Message.CreatedAt`.** The column exists; the field lets a consumer or renderer skip messages that are too old to matter to it.
-
 ### Wire
 
 The browser layer: stream messages pushed to browsers over SSE. One type, created from the runtime, no tables of its own, no token machinery.
