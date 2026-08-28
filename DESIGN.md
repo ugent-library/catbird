@@ -62,5 +62,127 @@ Every process enqueues `cron:<name>:<minute>` as the dedup key when the minute s
 ## Known limits
 
 - A worker processes one batch to completion before claiming the next, so one slow job holds up the other jobs of its batch.
-- Rate limits, per-queue configuration, and a web/SSE layer are out of scope. Applications build them on their own tables and routes.
+- Rate limits and per-queue configuration are out of scope. Applications build them on their own tables. The browser layer is planned; see below.
 - Without a `Logger`, failures are reported through `slog.Default()`. Errors the library cannot return to the caller are logged.
+
+## Planned additions
+
+These come from moving raven, the first application, onto catbird: its own event log stays its own table, and everything that moves data — change signals, cursors, jobs, browser delivery — comes from here. Each item says what it is and why it is needed.
+
+### Streams
+
+**One `Stream` per process.** Today every `NewStreamConsumer` and every trigger starts its own assigner. Instead a process creates one `Stream` that runs the assigner and holds one `LISTEN cb_stream` connection; consumers, triggers and the wire hang off it and share the wake-up. Same work, fewer connections, and one place to look.
+
+**Cursor lease.** `cb_cursors` gets `locked_until TIMESTAMPTZ NOT NULL DEFAULT '-infinity'`. A consumer claims a cursor with `UPDATE cb_cursors SET locked_until = now() + lease WHERE name = $1 AND locked_until <= now() RETURNING last_position`; when the row is already leased the claim returns nothing and the consumer waits for the next wake-up. `Ack` keeps `GREATEST` and clears the lease; acking the unchanged position releases without advancing. Reason: an application runs several processes, and a consumer that indexes documents or calls an external API would otherwise do every batch once per process. A lease with a deadline also covers a process that is alive but stuck: when the deadline passes another process takes the cursor. Triggers did not need this because their dedup keys make a repeated batch harmless; a general handler has no such key.
+
+**`StreamConsumer.Run(ctx, topic, handle func(ctx, []Message) error)`.** Claim the cursor, fetch a batch, call the handler, ack; wake on `NOTIFY cb_stream`, poll on `PollInterval` as the fallback, and keep going while batches come back full. A handler error releases the cursor without advancing, so the batch is retried. Triggers become a `Run` whose handler enqueues the batch and acks in one transaction.
+
+**`PublishMany(ctx, db, topics, payloads)`.** One `INSERT … SELECT FROM unnest(...)`, so a transaction that changed 10,000 records publishes 10,000 signals in one statement instead of 10,000 round trips.
+
+**`Read(ctx, pool, topics, after, limit)` and `LastPosition(ctx, db)`.** The read for a caller that holds its own position instead of a cursor: the wire, or a poll endpoint. `topics` is a list of subtrees; the query walks the position index from `after`. `LastPosition` is the current end of the stream, so a page can embed it and start its connection from there.
+
+**`Message.CreatedAt`.** The column exists; the field lets a consumer or renderer skip messages that are too old to matter to it.
+
+### Wire
+
+The browser layer: stream messages pushed to browsers over SSE. One type, no tables of its own, no token machinery.
+
+```go
+type WireOptions struct {
+    BatchSize    int           // messages read per round; default 50
+    PollInterval time.Duration // read anyway and send an SSE comment so proxies keep the connection open; default 15 s
+    Logger       *slog.Logger
+}
+
+type ServeOptions struct {
+    Topics []string // topic subtrees this connection may read
+    Cursor string   // when set: start at this cb_cursors row and ack every position sent
+    Render func(topic string, payload json.RawMessage) (Fragment, error) // nil sends the payload JSON
+}
+
+// Fragment is one frame's content. Event defaults to the topic; empty Data
+// sends nothing. Write lets a template component render straight into it.
+type Fragment struct {
+    Event string
+    Data  string
+}
+
+func NewWire(stream *Stream, opts WireOptions) *Wire
+func (w *Wire) Serve(rw http.ResponseWriter, r *http.Request, opts ServeOptions)
+```
+
+**Who may read what** is the application's decision, made before it calls `Serve`: the route knows the user and passes the subtrees. Same-origin `EventSource` sends cookies, so a session cookie is enough; an application that wants grants in the URL signs them itself.
+
+**One goroutine per connection.** After every wake-up from the process's `Stream` — the assigner's `NOTIFY cb_stream` — the connection runs `Read(topics, after, BatchSize)` and writes each row as a frame. The database does the topic matching, per connection. A slow browser slows only its own goroutine and catches up by position; there is no queue between the listener and the connections, so nothing is dropped and no slow-consumer policy is needed. Every `PollInterval` the connection reads anyway and sends `: ping`, which keeps a proxy from closing an idle stream.
+
+**Where a connection starts.**
+
+- With `Cursor`: at the `cb_cursors` row, created at 0 if missing. After a batch is written and flushed the connection acks the last position, so a message is shown once across page loads and tabs. Sent is seen. A crash between the flush and the ack shows the same message once more; nothing is lost. `Last-Event-ID` is ignored here: acks follow sends, so a reconnecting tab's id is not ahead of the cursor. This is the durable inbox: a notification is `Publish("user.<id>.<kind>", payload)`, the tray is `Serve` on `user.<id>` with cursor `user:<id>`, and retention is `GC`. Two tabs open at once may both show a message that arrived before either acked; per-tab cursors (`user:<id>:<tab>`) would avoid that at the price of showing everything in every tab.
+- Without `Cursor`: at `Last-Event-ID` when the browser reconnects (checked first, because `EventSource` reconnects with the original URL and `?after=` is stale by then), else at `?after=`, else at `LastPosition`. The browser holds the position; a dropped connection resumes where it stopped for as long as `GC` still holds the rows. A page embeds `LastPosition` at render time so the messages between rendering and connecting are not missed. For a `Last-Event-ID` older than retention the connection simply gets what is left; a page that cannot afford the gap refetches its state.
+
+**The frame.** Plain SSE, nothing framework-specific:
+
+```
+id: 4183
+event: user.7f3a.batch_edit
+data: <div class="alert">…</div>
+
+```
+
+`id:` is the position, `event:` is the topic unless `Render` set `Fragment.Event`, `data:` is `Fragment.Data` split into one `data:` line per line of text. When `Render` is nil the payload JSON is the data. A render error is logged and the message skipped; the position still advances, and a skipped message is read and skipped again after a reconnect, which is harmless.
+
+**Rendering** is a closure the route builds, so it has the request's user, language and view context in hand without the library knowing about any of them:
+
+```go
+app.wire.Serve(w, r, catbird.ServeOptions{
+    Topics: []string{"user." + user},
+    Cursor: "user:" + user,
+    Render: func(topic string, payload json.RawMessage) (catbird.Fragment, error) {
+        f := catbird.Fragment{Event: "notification"}
+        switch kind := topic[strings.LastIndex(topic, ".")+1:]; kind {
+        case "batch_edit":
+            var out BatchOutput
+            if err := json.Unmarshal(payload, &out); err != nil {
+                return f, err
+            }
+            return f, views.BatchEditNotification(vc, out).Render(r.Context(), &f)
+        default:
+            return catbird.Fragment{}, nil // unknown kind: nothing sent
+        }
+    },
+})
+```
+
+**The browser side.** The htmx SSE extension and a plain `EventSource` both resend `Last-Event-ID` on reconnect by themselves:
+
+```html
+<div id="notifications" hx-ext="sse" sse-connect="/notifications/stream"
+     sse-swap="notification" hx-swap="afterbegin"></div>
+
+<div hx-ext="sse" sse-connect="/events?after={{ .LastPosition }}"
+     sse-swap="record.work.0193…" hx-swap="innerHTML"></div>
+```
+
+`wire.js`, served by `ServeScript`, is the glue for pages without htmx: it connects an `EventSource` and re-dispatches each named event as a DOM event `wire:<topic>`, optionally swapping the data into elements whose `data-wire-swap` lists the topic. `EventSource` has no wildcard for event names, so a page names the topics it uses.
+
+**Not in it, on purpose.**
+
+- Inbox, watches and presence tables: the inbox is a cursor (above); "who is on this record" is an application table with a heartbeat column and a message on the record's topic when it changes.
+- Poll transport: `Read(topics, after)` behind a GET is the whole thing.
+- A shared read per process with in-memory fan-out. Every connection runs its own `Read` per wake-up, so hundreds of open tabs on a busy stream mean hundreds of small index reads per assigner tick. If that ever matters, one read per process with matching in memory can be added behind the same frame contract.
+
+### Jobs
+
+**Run status.** `Status(ctx, db, id)` returns queued, scheduled, running, dead or completed, with the attempt count: completed means the message exists and its claim is gone; a live claim with `visible_at` in the future is running or waiting to retry, which `attempts` and the worker's `MaxAttempts` tell apart. `cb_claims` gets a nullable `last_error TEXT`, written on every failed attempt, so an application can show why a run failed or is retrying.
+
+**Cancelling a running job.** Today `Cancel` stops jobs from starting and a running job finishes. The addition: `Cancel` also sends `pg_notify('cb_queue_<queue>', 'cancel:<message id>')`, and a worker that is running that job cancels the handler's context. The handler decides what a cancelled context means — stop at the next safe point, or finish — so the database still does not interrupt a running job; it only tells the handler that a cancel arrived. Open decision: keep the weak cancel and have handlers that must stop early poll `cb_claims.status` at their own boundaries, or add the notification.
+
+**Head-of-line blocking.** A worker finishes its whole batch before claiming again, so one long job holds up the others in its batch. The fix is a worker that keeps `BatchSize` jobs running and claims a new one whenever one finishes, instead of claiming in rounds. Until then, run long-running kinds on their own queue with `BatchSize: 1`.
+
+**`Worker.RunOnce(ctx)`.** Claim one batch, run it, return. Tests run jobs deterministically without a background worker.
+
+**Cron helper.** `RunCron(ctx, pool, name, every, queue, topic)` enqueues on the interval and once at start, so applications do not each rebuild the key format, which every client must produce identically. It sets both keys: `DedupKey` `cron:<name>:<minute>`, so several processes ticking in the same minute produce one job, and `UniqueKey` `cron:<name>`, so a run that takes longer than its interval does not pile up — while the previous run is still live the tick's enqueue does nothing and that tick is skipped, not queued.
+
+**One live job per key.** `EnqueueOptions.UniqueKey`: a second `Enqueue` with the same key does nothing while a job with that key is still live — queued, delayed, running, or waiting to retry — and goes through again once that job completed or died. The key is a column on `cb_claims` with a partial unique index, `CREATE UNIQUE INDEX ... ON cb_claims (unique_key) WHERE status = 0`. Completion deletes the claim and a dead claim leaves the index, so the key frees itself in both cases; a retry keeps the claim live, so the key stays taken. `Enqueue` inserts the message only when no live claim holds the key, and the claim insert carries `ON CONFLICT (unique_key) WHERE status = 0 DO NOTHING`, so two enqueues at the same instant both return 0 for the loser. The loser may leave a message row without a claim; `GC` removes it with the other old messages.
+
+This is a second key next to `DedupKey`, and both are needed. `DedupKey` lives as long as the message and is for keys that must not come back: a cron key, where a process that wakes late in the same minute would otherwise start the job again after the first run finished; a trigger key, where a redone batch would otherwise create a second job for a message whose first job already ran. `UniqueKey` is for "at most one of these at a time": a purge, a sync, a rebuild, which should run again later but not twice at once. Cron jobs need both, see the cron helper.
