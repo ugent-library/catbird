@@ -8,7 +8,7 @@ CREATE TABLE cb_messages (
     id BIGSERIAL PRIMARY KEY,
     topic TEXT NOT NULL,
     payload JSONB,
-    dedup_key TEXT UNIQUE, -- a second insert with the same key does nothing
+    dedup_key TEXT, -- a second insert with the same key does nothing
     -- true for Publish, false for Enqueue. Only published messages get a position.
     stream BOOLEAN NOT NULL DEFAULT false,
     -- Place in the stream, set once by the assigner (see stream.go) after the
@@ -16,9 +16,17 @@ CREATE TABLE cb_messages (
     -- long transaction gets its position when it commits. Readers go by
     -- position, never by id, so no message is skipped. This is the one update
     -- cb_messages rows receive.
-    position BIGINT UNIQUE,
+    position BIGINT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now() -- for GC retention
 );
+
+-- Both unique indexes are partial, over the rows that have a value. A job input
+-- has neither a position nor usually a dedup key, and a full unique index stores
+-- an entry for every NULL: 1272 kB per index per 200k job inputs, probed by
+-- nothing. The deduplicating inserts name the predicate:
+-- ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING.
+CREATE UNIQUE INDEX cb_messages_position_idx ON cb_messages (position) WHERE position IS NOT NULL;
+CREATE UNIQUE INDEX cb_messages_dedup_key_idx ON cb_messages (dedup_key) WHERE dedup_key IS NOT NULL;
 
 -- Stream reads: topic prefix (LIKE 'a.%') in position order. Job inputs have
 -- no position and are not in this index.

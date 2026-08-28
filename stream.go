@@ -198,12 +198,23 @@ func (t *Trigger) start(ctx context.Context) {
 }
 
 // enqueueNextBatch reads the next batch of matching stream messages, enqueues a
-// job for each, advances the cursor, and commits — all in one transaction.
-// Returns how many messages it handled.
+// job for each, advances the cursor, and commits — all in one transaction. The
+// whole batch is one EnqueueBatch statement, so a trigger costs one round trip
+// per batch and wakes the target queue once. Returns how many messages it
+// handled.
 func (t *Trigger) enqueueNextBatch(ctx context.Context) (int, error) {
 	msgs, err := t.consumer.FetchBatch(ctx, t.topic)
 	if err != nil || len(msgs) == 0 {
 		return 0, err
+	}
+
+	jobs := make([]BatchMessage, len(msgs))
+	for i, m := range msgs {
+		jobs[i] = BatchMessage{
+			Topic:    m.Topic,
+			Payload:  m.Payload,
+			DedupKey: "trigger:" + t.name + ":" + strconv.FormatInt(m.ID, 10),
+		}
 	}
 
 	tx, err := t.runtime.pool.Begin(ctx)
@@ -213,11 +224,8 @@ func (t *Trigger) enqueueNextBatch(ctx context.Context) (int, error) {
 	defer tx.Rollback(ctx)
 
 	client := NewClient()
-	for _, m := range msgs {
-		dedup := "trigger:" + t.name + ":" + strconv.FormatInt(m.ID, 10)
-		if _, err := client.Enqueue(ctx, tx, m.Topic, t.queue, m.Payload, EnqueueOptions{DedupKey: dedup}); err != nil {
-			return 0, err
-		}
+	if _, err := client.EnqueueBatch(ctx, tx, t.queue, jobs, EnqueueOptions{}); err != nil {
+		return 0, err
 	}
 	if err := t.consumer.Ack(ctx, tx, msgs[len(msgs)-1].Position); err != nil {
 		return 0, err

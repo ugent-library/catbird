@@ -473,3 +473,169 @@ func TestOutputAndStreamNotify(t *testing.T) {
 		t.Fatalf("notified position %q, want 1", n.Payload)
 	}
 }
+
+// PublishBatch writes one row per message in a single statement, skips the keys
+// that are already taken, and the batch is read in position order like any
+// other published message.
+func TestPublishBatchSkipsTakenKeys(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := catbird.NewClient()
+
+	if _, err := client.Publish(ctx, pool, "record.work.1", "first", "taken"); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := client.PublishBatch(ctx, pool, []catbird.BatchMessage{
+		{Topic: "record.work.2", Payload: "second"},
+		{Topic: "record.work.3", Payload: "skipped", DedupKey: "taken"}, // published above
+		{Topic: "record.work.4", Payload: "third", DedupKey: "once"},
+		{Topic: "record.work.5", Payload: "skipped", DedupKey: "once"}, // repeats a key from this batch
+		{Topic: "other", Payload: "not on this topic"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("wrote %d messages, want 3", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_messages"); n != 4 {
+		t.Errorf("%d messages in the table, want 4 with the one published before the batch", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims"); n != 0 {
+		t.Errorf("published messages got %d claims, want none", n)
+	}
+
+	// An empty batch is a no-op.
+	if n, err := client.PublishBatch(ctx, pool, nil); err != nil || n != 0 {
+		t.Fatalf("empty batch wrote %d (%v)", n, err)
+	}
+
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	go rt.Start(ctx)
+	consumer := catbird.NewConsumer(rt, "batch", catbird.StreamOptions{})
+
+	var got []string
+	deadline := time.Now().Add(2 * time.Second)
+	for len(got) < 3 && time.Now().Before(deadline) {
+		msgs, err := consumer.FetchBatch(ctx, "record.work")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range msgs {
+			var s string
+			json.Unmarshal(m.Payload, &s)
+			got = append(got, s)
+			if err := consumer.Ack(ctx, pool, m.Position); err != nil {
+				t.Fatal(err)
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if want := "first,second,third"; strings.Join(got, ",") != want {
+		t.Fatalf("read %v, want %v", got, want)
+	}
+}
+
+// EnqueueBatch creates one job per message that survives deduplication, and
+// wakes the queue once for the whole batch — never once per job, and not at all
+// while the jobs are still waiting on dependencies.
+func TestEnqueueBatchWakesTheQueueOnce(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := catbird.NewClient()
+
+	// This job's key is taken before the listener starts, so its notification
+	// is not delivered here.
+	if _, err := client.Enqueue(ctx, pool, "resize", "images", nil, catbird.EnqueueOptions{DedupKey: "taken"}); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, "LISTEN cb_queue_images"); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := client.EnqueueBatch(ctx, pool, "images", []catbird.BatchMessage{
+		{Topic: "resize", Payload: 1, DedupKey: "taken"}, // enqueued above
+		{Topic: "resize", Payload: 2, DedupKey: "once"},
+		{Topic: "resize", Payload: 3, DedupKey: "once"}, // repeats a key from this batch
+		{Topic: "resize", Payload: 4},
+	}, catbird.EnqueueOptions{CorrelationID: "batch1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("created %d jobs, want 2", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'images'"); n != 3 {
+		t.Errorf("%d claims, want 3 with the job enqueued before the batch", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE correlation_id = 'batch1'"); n != 2 {
+		t.Errorf("%d claims carry the batch's correlation id, want 2", n)
+	}
+
+	// A batch that still waits on a dependency stays out of the ready index and
+	// sends nothing.
+	if n, err := client.EnqueueBatch(ctx, pool, "images", []catbird.BatchMessage{
+		{Topic: "resize", Payload: 5},
+		{Topic: "resize", Payload: 6},
+	}, catbird.EnqueueOptions{Dependencies: 1}); err != nil || n != 2 {
+		t.Fatalf("waiting batch created %d jobs (%v)", n, err)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE dependencies = 1"); n != 2 {
+		t.Errorf("%d claims waiting on a dependency, want 2", n)
+	}
+
+	// The ready batch wakes the queue; the waiting batch, in its own
+	// transaction, must not.
+	first, stop := context.WithTimeout(ctx, time.Second)
+	defer stop()
+	if _, err := conn.Conn().WaitForNotification(first); err != nil {
+		t.Fatalf("the batch did not wake the queue: %v", err)
+	}
+	second, stop := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer stop()
+	if _, err := conn.Conn().WaitForNotification(second); err == nil {
+		t.Error("the batch waiting on a dependency woke the queue")
+	}
+}
+
+// A trigger enqueues its whole batch in one statement, and a redone batch still
+// produces one job per message.
+func TestTriggerBatchIsEnqueuedOnce(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := catbird.NewClient()
+
+	msgs := make([]catbird.BatchMessage, 20)
+	for i := range msgs {
+		msgs[i] = catbird.BatchMessage{Topic: "record.work", Payload: i}
+	}
+	if n, err := client.PublishBatch(ctx, pool, msgs); err != nil || n != 20 {
+		t.Fatalf("published %d messages (%v)", n, err)
+	}
+
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	catbird.NewTrigger(rt, "indexer", "record", "index_queue", catbird.StreamOptions{PollInterval: 50 * time.Millisecond})
+	go rt.Start(ctx)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'index_queue'") < 20 {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d jobs arrived", count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'index_queue'"))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond) // let the trigger run again on its cursor
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'index_queue'"); n != 20 {
+		t.Errorf("%d jobs for 20 messages", n)
+	}
+}

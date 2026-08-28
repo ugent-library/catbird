@@ -65,13 +65,52 @@ func (c *Client) Publish(ctx context.Context, db Conn, topic string, payload any
 	err = db.QueryRow(ctx, `
 		INSERT INTO cb_messages (topic, payload, stream, dedup_key)
 		VALUES ($1, $2, true, $3)
-		ON CONFLICT (dedup_key) DO NOTHING
+		ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
 		RETURNING id
 	`, topic, body, nullString(dedupKey)).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil
 	}
 	return id, err
+}
+
+// BatchMessage is one message for PublishBatch.
+type BatchMessage struct {
+	Topic    string
+	Payload  any    // marshalled to JSON; a json.RawMessage is written as it is
+	DedupKey string // when set, a second message with the same key is not written
+}
+
+// PublishBatch appends messages to the stream in one statement, so a
+// transaction that changed ten thousand records announces them in one round
+// trip. Returns how many were written: a message whose DedupKey already exists,
+// or that repeats a key from its own batch, is skipped and not counted.
+//
+// The messages travel as three arrays that are unnested into rows, so the
+// number of messages is not limited by the number of statement parameters. Like
+// Publish it sends no notification: the assigner announces the messages when it
+// gives them their positions.
+func (c *Client) PublishBatch(ctx context.Context, db Conn, msgs []BatchMessage) (int, error) {
+	if len(msgs) == 0 {
+		return 0, nil
+	}
+	topics := make([]string, len(msgs))
+	payloads := make([][]byte, len(msgs))
+	dedupKeys := make([]*string, len(msgs))
+	for i, msg := range msgs {
+		body, err := json.Marshal(msg.Payload)
+		if err != nil {
+			return 0, err
+		}
+		topics[i], payloads[i], dedupKeys[i] = msg.Topic, body, nullString(msg.DedupKey)
+	}
+	tag, err := db.Exec(ctx, `
+		INSERT INTO cb_messages (topic, payload, stream, dedup_key)
+		SELECT topic, payload, true, dedup_key
+		FROM unnest($1::text[], $2::jsonb[], $3::text[]) AS message (topic, payload, dedup_key)
+		ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
+	`, topics, payloads, dedupKeys)
+	return int(tag.RowsAffected()), err
 }
 
 // Enqueue appends a message and a claim for it, and wakes the queue's workers
@@ -92,7 +131,7 @@ func (c *Client) Enqueue(ctx context.Context, db Conn, topic, queue string, payl
 		WITH message AS (
 			INSERT INTO cb_messages (topic, payload, dedup_key)
 			VALUES ($1, $2, $3)
-			ON CONFLICT (dedup_key) DO NOTHING
+			ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
 			RETURNING id
 		),
 		claim AS (
@@ -109,6 +148,61 @@ func (c *Client) Enqueue(ctx context.Context, db Conn, topic, queue string, payl
 		return 0, nil
 	}
 	return id, err
+}
+
+// EnqueueBatch appends messages and their claims on one queue in one statement
+// and wakes the queue's workers. Returns how many jobs it created: a message
+// whose DedupKey is already taken, or that repeats a key from its own batch,
+// gets neither a message nor a claim and is not counted.
+//
+// opts applies to every job in the batch — one delay, one correlation id, one
+// dependency count. Each message brings its own dedup key, so opts.DedupKey is
+// not used. Jobs that need different options, or another queue, go in separate
+// calls.
+//
+// The claims come from the messages that were written, so a deduplicated
+// message produces no job. The wake CTE reads the claims through LIMIT 1, which
+// does two things: the join at the end sees one wake row, so it cannot multiply
+// the count, and pg_notify runs once instead of once per job. It saves the calls
+// rather than the wake-ups — Postgres delivers identical notifications from one
+// transaction once whatever we do. Reading the claim CTE through a LIMIT does
+// not cut the insert short; a data-modifying CTE always runs in full.
+func (c *Client) EnqueueBatch(ctx context.Context, db Conn, queue string, msgs []BatchMessage, opts EnqueueOptions) (int, error) {
+	if len(msgs) == 0 {
+		return 0, nil
+	}
+	topics := make([]string, len(msgs))
+	payloads := make([][]byte, len(msgs))
+	dedupKeys := make([]*string, len(msgs))
+	for i, msg := range msgs {
+		body, err := json.Marshal(msg.Payload)
+		if err != nil {
+			return 0, err
+		}
+		topics[i], payloads[i], dedupKeys[i] = msg.Topic, body, nullString(msg.DedupKey)
+	}
+	var created int
+	err := db.QueryRow(ctx, `
+		WITH input AS (
+			SELECT * FROM unnest($1::text[], $2::jsonb[], $3::text[]) AS message (topic, payload, dedup_key)
+		),
+		message AS (
+			INSERT INTO cb_messages (topic, payload, dedup_key)
+			SELECT topic, payload, dedup_key FROM input
+			ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
+			RETURNING id
+		),
+		claim AS (
+			INSERT INTO cb_claims (message_id, queue, visible_at, correlation_id, dependencies)
+			SELECT id, $4, now() + $5::interval, $6, $7 FROM message
+			RETURNING message_id
+		),
+		wake AS (
+			SELECT pg_notify('cb_queue_' || $4, '') FROM (SELECT 1 FROM claim LIMIT 1) one WHERE $7 = 0
+		)
+		SELECT count(*) FROM claim LEFT JOIN wake ON true
+	`, topics, payloads, dedupKeys, queue, opts.Delay, nullString(opts.CorrelationID), opts.Dependencies).Scan(&created)
+	return created, err
 }
 
 // Cancel marks every live job with this correlation id dead. A job that is
