@@ -184,6 +184,22 @@ app.wire.Serve(w, r, catbird.ServeOptions{
 
 ### Jobs
 
+**Exponential backoff.** `Backoff` becomes the delay after the first failed attempt rather than after every one, and `WorkerOptions.MaxBackoff` caps how far it grows. The wait after attempt n is a random duration below `min(Backoff * 2^(n-1), MaxBackoff)`, computed in the retry statement itself:
+
+```sql
+UPDATE cb_claims
+SET visible_at = now() + least($3::interval * 2 ^ least(attempts - 1, 20), $4::interval) * random()
+WHERE message_id = $1 AND attempts = $2 AND status = 0
+```
+
+Defaults change with it: `Backoff` one second and `MaxBackoff` one minute, instead of a flat minute. Both are worker settings under the settings rule, so all workers on a queue must use the same values.
+
+Two reasons for growing the wait. A handler that fails because a service it calls is down retries at a fixed minute for as long as `MaxAttempts` allows, so five attempts cover five minutes of outage; doubling spends the same five attempts over half an hour. And an outage fails every job on the queue at once: with a fixed delay all of them come back in the same second, hit the service that is still down, and come back together again a minute later. The random draw spreads them, which is why the delay is drawn below the cap instead of being the cap. It also means the setting names a ceiling and not an average: a `Backoff` of one second retries after half a second on average.
+
+The exponent is clamped at 20 so that a job which somehow reaches a high attempt count does not overflow the interval multiplication before `MaxBackoff` bounds it.
+
+A queue that wants the old fixed pacing sets `Backoff` and `MaxBackoff` to the same value; the draw still spreads the retries below it, which is the part no queue benefits from losing.
+
 **Run status.** `Status(ctx, db, id)` returns queued, scheduled, running, dead or completed, with the attempt count: completed means the message exists and its claim is gone; a live claim with `visible_at` in the future is running or waiting to retry, which `attempts` and the worker's `MaxAttempts` tell apart. `cb_claims` gets a nullable `last_error TEXT`, written on every failed attempt, so an application can show why a run failed or is retrying.
 
 **Cancelling a running job.** Today `Cancel` stops jobs from starting and a running job finishes. The addition: `Cancel` also sends `pg_notify('cb_queue_<queue>', 'cancel:<message id>')`, and a worker that is running that job cancels the handler's context. The handler decides what a cancelled context means — stop at the next safe point, or finish — so the database still does not interrupt a running job; it only tells the handler that a cancel arrived. Open decision: keep the weak cancel and have handlers that must stop early poll `cb_claims.status` at their own boundaries, or add the notification.
