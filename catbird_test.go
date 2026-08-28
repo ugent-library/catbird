@@ -125,6 +125,78 @@ func TestTortureThroughput(t *testing.T) {
 	}
 }
 
+// One long job does not hold up the jobs beside it: the worker keeps BatchSize
+// jobs running and claims a new one whenever a slot frees.
+func TestLongJobDoesNotHoldUpTheQueue(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client := catbird.NewClient()
+
+	// The long job is enqueued first, so the worker claims it first.
+	release := make(chan struct{})
+	if _, err := client.Enqueue(ctx, pool, "long", "mixed", nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	const short = 20
+	batch := make([]catbird.BatchMessage, short)
+	for i := range batch {
+		batch[i] = catbird.BatchMessage{Topic: "short", Payload: i}
+	}
+	if _, err := client.EnqueueBatch(ctx, pool, "mixed", batch, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan string, short+1)
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Worker("mixed", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
+		if m.Topic == "long" {
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		done <- m.Topic
+		return nil
+	}, catbird.WorkerOptions{BatchSize: 4, PollInterval: 100 * time.Millisecond})
+
+	workers, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(workers)
+
+	// Every short job finishes while the long one is still running.
+	for range short {
+		select {
+		case topic := <-done:
+			if topic != "short" {
+				t.Fatalf("finished %q before the long job was released", topic)
+			}
+		case <-ctx.Done():
+			t.Fatalf("the short jobs waited for the long job: %d of %d done",
+				len(done), short)
+		}
+	}
+	// A job reports itself inside its handler, before its transaction commits,
+	// so wait for the claims to go: only the long job's may remain.
+	for count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'mixed'") > 1 {
+		if ctx.Err() != nil {
+			t.Fatal("short jobs finished but their claims stayed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	close(release)
+	select {
+	case topic := <-done:
+		if topic != "long" {
+			t.Fatalf("finished %q, want the long job", topic)
+		}
+	case <-ctx.Done():
+		t.Fatal("the long job did not finish after release")
+	}
+}
+
 func TestExactlyOnceDedup(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx := context.Background()

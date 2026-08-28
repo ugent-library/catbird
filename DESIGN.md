@@ -30,7 +30,9 @@ Job inputs and stream messages share `cb_messages` because a payload has to live
 
 It returns how many jobs it created, not their ids, for the same reason `PublishBatch` does. A caller that has to resolve these jobs' dependencies later needs their ids, so it either enqueues them one at a time or gives each a dedup key and reads the ids back with `SELECT id, dedup_key FROM cb_messages WHERE dedup_key = ANY($1)`, which answers with the existing job's id when a key was already taken.
 
-**Claiming.** A worker takes up to `BatchSize` rows with `FOR UPDATE SKIP LOCKED`, sets `visible_at = now() + Lease`, and increments `attempts`. There is no "running" status: a job with `visible_at` in the future is either delayed, backing off after a failure, or claimed. Once `visible_at` passes, any worker may claim it again. That is how a crashed worker's job comes back.
+**Running jobs.** A worker keeps up to `BatchSize` jobs running at once. It claims as many jobs as it has free slots, runs each in its own goroutine, and claims again as soon as a slot frees, so one long job does not hold up the jobs beside it. While jobs are still waiting it gives slots 5 milliseconds to free before claiming, so a queue of short jobs is claimed by one bigger statement instead of one statement per finished job; on an empty queue nothing is delayed and the loop waits for a `NOTIFY` or for `PollInterval`.
+
+**Claiming.** A worker takes up to as many rows as it has free slots with `FOR UPDATE SKIP LOCKED`, sets `visible_at = now() + Lease`, and increments `attempts`. There is no "running" status: a job with `visible_at` in the future is either delayed, backing off after a failure, or claimed. Once `visible_at` passes, any worker may claim it again. That is how a crashed worker's job comes back.
 
 **Completing.** The worker opens a transaction, passes it to the handler, and in the same transaction runs `DELETE FROM cb_claims WHERE message_id = $1 AND attempts = $2`. The handler's writes and the job's completion commit together. `attempts` is the lease token: if the lease expired and another worker claimed the job, `attempts` moved on, the delete finds nothing, and the late worker rolls back. Two workers may execute the same job; only the one holding the lease commits. Side effects outside the database (emails, HTTP calls) are not covered by this, so handlers that must not repeat them need their own idempotency key — `Message.ID` works.
 
@@ -77,7 +79,6 @@ Every process enqueues `cron:<name>:<minute>` as the dedup key when the minute s
 
 ## Known limits
 
-- A worker processes one batch to completion before claiming the next, so one slow job holds up the other jobs of its batch.
 - Rate limits and per-queue configuration are out of scope. Applications build them on their own tables. The browser layer is planned; see below.
 - Without a `Logger`, failures are reported through `slog.Default()`. Errors the library cannot return to the caller are logged.
 
@@ -193,7 +194,11 @@ Call it where the handler finished a piece of work — between two records of a 
 
 With extension, `Lease` bounds one step of a handler instead of the whole handler. A queue whose jobs run for an hour can keep a lease of minutes, so a crashed worker's job comes back in minutes; without it the lease has to cover the longest handler, and every crash on that queue costs that long.
 
-**Head-of-line blocking.** A worker finishes its whole batch before claiming again, so one long job holds up the others in its batch. The fix is a worker that keeps `BatchSize` jobs running and claims a new one whenever one finishes, instead of claiming in rounds. Until then, run long-running kinds on their own queue with `BatchSize: 1`.
+**Job timeout.** `WorkerOptions.Timeout` bounds one attempt: the handler and its completion run on a context with that deadline, and when it passes the context is cancelled, the transaction rolls back, and the attempt counts as failed — retry after `Backoff`, dead after `MaxAttempts`. The default is `Lease`, and `ExtendLease` moves the deadline out together with the lease, so the two never disagree. A `Timeout` above `Lease` is a mistake: past the lease another worker may claim the job and the first worker's transaction cannot commit any more. Like `Lease` and `MaxAttempts` it is a worker setting, so all workers on a queue must use the same value.
+
+Without it, a handler that waits on a socket with no deadline of its own keeps its slot and its pool connection until the process restarts. The lease brings the job back for another worker but nothing stops the first attempt, so a queue can end up with every slot held by attempts nobody is waiting for.
+
+A cancelled context stops the handler only where the handler looks at it. Database calls do — pgx cancels the running query — but a computation that never checks `ctx.Err()` runs on and keeps its slot; the timeout ends the attempt's bookkeeping, not the goroutine.
 
 **`Worker.RunOnce(ctx)`.** Claim one batch, run it, return. Tests run jobs deterministically without a background worker.
 

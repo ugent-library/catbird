@@ -20,7 +20,7 @@ type WorkerOptions struct {
 	Lease        time.Duration // how long one attempt may run; default 5 minutes
 	MaxAttempts  int           // attempts before the job is dead; default 5
 	Backoff      time.Duration // wait after a failed attempt; default 1 minute
-	BatchSize    int           // jobs claimed per round; default 50
+	BatchSize    int           // jobs running at once; default 50
 	PollInterval time.Duration // wake-up interval when no notification arrives; default 5 seconds
 	OnDead       JobHandler    // runs once, outside the job transaction, after the last failed attempt
 	Logger       *slog.Logger  // default: the runtime's logger
@@ -56,7 +56,7 @@ type Worker struct {
 }
 
 // NewWorker declares a worker on the runtime: once the runtime is started, it
-// claims jobs on queue in batches and runs handler for each.
+// claims jobs on queue and runs handler for each, up to BatchSize at a time.
 func NewWorker(r *Runtime, queue string, handler JobHandler, opts WorkerOptions) *Worker {
 	opts = opts.withDefaults()
 	if opts.Logger == nil {
@@ -72,30 +72,54 @@ func (r *Runtime) Worker(queue string, handler JobHandler, opts WorkerOptions) *
 	return NewWorker(r, queue, handler, opts)
 }
 
-// start claims batches of jobs and runs each batch concurrently, until ctx is
-// canceled. Between batches it waits for a NOTIFY or for PollInterval.
+// waitForSlots is how long the claim loop waits for more slots to free before
+// it claims, while jobs are still waiting. Without the wait a worker running
+// short jobs claims one or two of them per statement instead of a full batch.
+const waitForSlots = 5 * time.Millisecond
+
+// start keeps up to BatchSize jobs running at once: it claims as many jobs as it
+// has free slots, hands each to a goroutine, and claims again as soon as a slot
+// frees, so one long job does not hold up the jobs beside it. When a claim comes
+// back short the queue is empty and it waits for a NOTIFY or for PollInterval.
 func (w *Worker) start(ctx context.Context) {
 	wake, unsubscribe := w.runtime.subscribe("cb_queue_" + w.queue)
 	defer unsubscribe()
 
+	// One token per job that may run at the same time: a claim takes a token per
+	// job it claims, a finished job puts its token back.
+	free := make(chan struct{}, w.opts.BatchSize)
+	for range w.opts.BatchSize {
+		free <- struct{}{}
+	}
+	var running sync.WaitGroup
+	defer running.Wait() // on shutdown, return when the jobs in flight are done
+
+	backlog := false // the last claim came back full, so jobs are still waiting
 	for {
-		msgs, err := w.claimBatch(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-free:
+		}
+		slots := 1 + w.takeFreeSlots(free, backlog)
+
+		msgs, err := w.claimBatch(ctx, slots)
 		if err != nil && ctx.Err() == nil {
 			w.opts.Logger.Error("catbird: claim failed", "queue", w.queue, "err", err)
 		}
-
-		var wg sync.WaitGroup
 		for _, m := range msgs {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			running.Go(func() {
+				defer func() { free <- struct{}{} }()
 				w.run(ctx, m)
-			}()
+			})
 		}
-		wg.Wait()
+		for range slots - len(msgs) { // the slots the queue could not fill
+			free <- struct{}{}
+		}
 
-		if len(msgs) == w.opts.BatchSize {
-			continue // the queue may hold more
+		backlog = len(msgs) == slots
+		if backlog {
+			continue // claim again; the loop above waits for the next free slot
 		}
 		select {
 		case <-ctx.Done():
@@ -104,6 +128,37 @@ func (w *Worker) start(ctx context.Context) {
 		case <-time.After(w.opts.PollInterval):
 		}
 	}
+}
+
+// takeFreeSlots takes the slots that are free besides the one the caller holds,
+// and returns how many. With jobs still waiting it gives slots waitForSlots to
+// free, so a busy queue is claimed by one bigger statement instead of one
+// statement per finished job; with an empty queue it takes what is free now and
+// leaves the claim undelayed.
+func (w *Worker) takeFreeSlots(free chan struct{}, backlog bool) int {
+	taken := 0
+	if !backlog {
+		for taken < w.opts.BatchSize-1 {
+			select {
+			case <-free:
+				taken++
+			default:
+				return taken
+			}
+		}
+		return taken
+	}
+	wait := time.NewTimer(waitForSlots)
+	defer wait.Stop()
+	for taken < w.opts.BatchSize-1 {
+		select {
+		case <-free:
+			taken++
+		case <-wait.C:
+			return taken
+		}
+	}
+	return taken
 }
 
 // run executes one job: handler, then completion, in one transaction.
@@ -184,9 +239,9 @@ func (w *Worker) failed(ctx context.Context, m Message, cause error) {
 	}
 }
 
-// claimBatch leases up to BatchSize ready jobs by moving visible_at past the
-// lease, and returns them with their payloads and delivered signals.
-func (w *Worker) claimBatch(ctx context.Context) ([]Message, error) {
+// claimBatch leases up to limit ready jobs by moving visible_at past the lease,
+// and returns them with their payloads and delivered signals.
+func (w *Worker) claimBatch(ctx context.Context, limit int) ([]Message, error) {
 	rows, err := w.runtime.pool.Query(ctx, `
 		WITH leased AS (
 			UPDATE cb_claims
@@ -203,7 +258,7 @@ func (w *Worker) claimBatch(ctx context.Context) ([]Message, error) {
 		       (SELECT jsonb_object_agg(name, payload) FROM cb_signals s WHERE s.message_id = m.id)
 		FROM leased l
 		JOIN cb_messages m ON m.id = l.message_id
-	`, w.queue, w.opts.Lease, w.opts.BatchSize, statusLive)
+	`, w.queue, w.opts.Lease, limit, statusLive)
 	if err != nil {
 		return nil, err
 	}
