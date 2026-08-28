@@ -59,7 +59,10 @@ func NewStreamConsumer(ctx context.Context, pool *pgxpool.Pool, cursorName strin
 // commits, so a reader does not pass a message that has no position yet.
 //
 // The advisory lock is taken for the statement only. When another assigner
-// holds it, the one-time filter on the UPDATE skips the scan.
+// holds it, the one-time filter on the UPDATE skips the scan. The UPDATE also
+// requires position IS NULL, checked again on the committed row when it had to
+// wait for a lock, so two assigners that run at the same time cannot move a
+// position that is already set.
 //
 // When it assigned anything it sends NOTIFY on channel cb_stream with the
 // highest new position, so a LISTENing reader can fetch instead of polling.
@@ -86,7 +89,7 @@ func assignPositions(ctx context.Context, pool *pgxpool.Pool, opts StreamOptions
 				UPDATE cb_messages m
 				SET position = nextval('cb_position_seq')
 				FROM unassigned u
-				WHERE m.id = u.id AND (SELECT held FROM lock)
+				WHERE m.id = u.id AND m.position IS NULL AND (SELECT held FROM lock)
 				RETURNING position
 			)
 			SELECT pg_notify('cb_stream', max(position)::text) FROM assigned HAVING count(*) > 0

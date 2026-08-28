@@ -22,6 +22,8 @@ A partial index on `cb_claims (queue, visible_at) WHERE status = 0 AND dependenc
 
 **Lease rule.** A handler must finish within `Lease` or its work is discarded and the job runs again. Set `Lease` above your longest handler.
 
+**Settings rule.** `Lease`, `MaxAttempts` and `Backoff` are worker settings; nothing about them is stored with the job. All workers on one queue must use the same values, otherwise how long a job may run and how often it is retried depend on which worker took the attempt.
+
 **Failing.** A handler error sets `visible_at = now() + Backoff`. After `MaxAttempts` the claim is marked dead (`status = 1`), `Cancel` runs for its correlation id, and `OnDead` runs once outside the job transaction. A crash counts as a failed attempt like any other, so `OnDead` also fires for jobs that repeatedly crashed a worker.
 
 **Cancel rule.** `Cancel(correlationID)` marks live claims dead. It stops jobs from starting; a job that is already running finishes and commits. Cancel does not undo anything.
@@ -45,13 +47,13 @@ A permanently failed step cancels its siblings and children through the shared c
 
 **Positions.** Message ids are handed out at `INSERT` time, so a message from a transaction that is still open can have a lower id than messages that already committed; a reader going by id would move past it and miss it. Readers therefore go by `position`, which the assigner sets on published messages in the order it sees them — commit order. A `stream` flag marks published messages; job inputs get no position, so a job created from an event is not itself an event and a trigger does not feed on its own output. A message from a long transaction gets its position when it commits; it arrives late, after messages published after it, but it arrives, once. This is the rule a plain `SELECT` follows: you see a row when its transaction commits.
 
-The assigner is one statement under an advisory lock, run every `AssignEvery` (250 ms) by every `StreamConsumer` and every trigger. The lock makes one of them do the work; the rest do nothing. Nothing has to be deployed or configured; a message is readable within one tick of its commit. When the assigner assigned anything it sends `NOTIFY cb_stream` with the highest new position, so readers that `LISTEN` fetch on arrival instead of polling. The cost is one update per published message. Against a variant with positions in a separate narrow table (measured, 200k × 500 B): the column writes ~45% more WAL and ~60% more heap, but publishes and reads ~65% faster, deletes 2× faster (no FK cascade), and needs one table and one index fewer. Vacuum time was under 0.3 s per 200k messages for both.
+The assigner is one statement under an advisory lock, run every `AssignEvery` (250 ms) by every `StreamConsumer` and every trigger. The lock makes one of them do the work; the rest do nothing. The statement only sets positions that are still empty, so even two assigners running at once cannot move a position a reader may already have passed. Nothing has to be deployed or configured; a message is readable within one tick of its commit. When the assigner assigned anything it sends `NOTIFY cb_stream` with the highest new position, so readers that `LISTEN` fetch on arrival instead of polling. The cost is one update per published message. Against a variant with positions in a separate narrow table (measured, 200k × 500 B): the column writes ~45% more WAL and ~60% more heap, but publishes and reads ~65% faster, deletes 2× faster (no FK cascade), and needs one table and one index fewer. Vacuum time was under 0.3 s per 200k messages for both.
 
 **Triggers.** `RegisterTrigger(name, topic, queue)` runs a loop: fetch a batch, `Enqueue` each message on the target queue with dedup key `trigger:<name>:<message id>`, `Ack`, commit — all in one transaction. A crash before commit redoes the batch; the dedup keys make the redo a no-op. Several processes may run the same trigger: each only wastes reads, the cursor is monotone, and the dedup keys keep the output single. Run a trigger in one process if the extra reads matter; there is no leader election.
 
 ## Cron without a leader
 
-Every process enqueues `cron:<name>:<minute>` as the dedup key when the minute starts. Exactly one insert goes through. A process that wakes late (suspended, paused) should compare the scheduled minute with the clock and skip if it is too far behind.
+Every process enqueues `cron:<name>:<minute>` as the dedup key when the minute starts, with the minute in UTC as `YYYY-MM-DDTHH:MMZ` (`cron:report:2026-08-28T09:30Z`). Exactly one insert goes through; the format is fixed because every process must produce the same key. A process that wakes late (suspended, paused) should compare the scheduled minute with the clock and skip if it is too far behind.
 
 ## Retention
 
