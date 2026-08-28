@@ -1,7 +1,7 @@
 -- +goose up
 -- Catbird Lite schema. Plain SQL, no PL/pgSQL.
 
--- Every job input and every published message is one row here. Rows are never updated.
+-- Every job input and every published message is one row here.
 CREATE SEQUENCE cb_position_seq;
 
 CREATE TABLE cb_messages (
@@ -9,27 +9,22 @@ CREATE TABLE cb_messages (
     topic TEXT NOT NULL,
     payload JSONB,
     dedup_key TEXT UNIQUE, -- a second insert with the same key does nothing
+    -- true for Publish, false for Enqueue. Only published messages get a position.
+    stream BOOLEAN NOT NULL DEFAULT false,
+    -- Place in the stream, set once by the assigner (see stream.go) after the
+    -- message committed, so positions follow commit order. A message from a
+    -- long transaction gets its position when it commits. Readers go by
+    -- position, never by id, so no message is skipped. This is the one update
+    -- cb_messages rows receive.
+    position BIGINT UNIQUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now() -- for GC retention
 );
 
--- Published messages waiting for a position. Publish inserts here in the same
--- statement as the message; the row becomes visible when that transaction
--- commits, which makes this the assigner's commit-ordered work list.
-CREATE TABLE cb_stream_pending (
-    message_id BIGINT PRIMARY KEY REFERENCES cb_messages (id) ON DELETE CASCADE
-);
-
--- The stream: one row per published message, in commit order. The assigner
--- moves rows from cb_stream_pending here (see stream.go). Job inputs written by
--- Enqueue never appear. Readers go by position, never by message id, so a
--- message from a long transaction is read when it commits, not skipped.
-CREATE TABLE cb_stream (
-    position BIGINT PRIMARY KEY,
-    message_id BIGINT NOT NULL REFERENCES cb_messages (id) ON DELETE CASCADE,
-    topic TEXT NOT NULL
-);
--- Stream reads: topic prefix (LIKE 'a.%') in position order.
-CREATE INDEX cb_stream_topic_position_idx ON cb_stream (topic text_pattern_ops, position);
+-- Stream reads: topic prefix (LIKE 'a.%') in position order. Job inputs have
+-- no position and are not in this index.
+CREATE INDEX cb_messages_topic_position_idx ON cb_messages (topic text_pattern_ops, position) WHERE position IS NOT NULL;
+-- The assigner's work list: published messages that have no position yet.
+CREATE INDEX cb_messages_unassigned_idx ON cb_messages (id) WHERE stream AND position IS NULL;
 
 -- One row per stream consumer: the highest position it has processed.
 CREATE TABLE cb_cursors (
@@ -64,10 +59,16 @@ CREATE TABLE cb_signals (
     PRIMARY KEY (message_id, name)
 );
 
+-- Optional result of a job, written by its handler with SetOutput in the job's
+-- transaction and read with Output. Deleted with the message.
+CREATE TABLE cb_outputs (
+    message_id BIGINT PRIMARY KEY REFERENCES cb_messages (id) ON DELETE CASCADE,
+    output JSONB
+);
+
 -- +goose down
+DROP TABLE cb_outputs;
 DROP TABLE cb_signals;
-DROP TABLE cb_stream;
-DROP TABLE cb_stream_pending;
 DROP TABLE cb_claims;
 DROP TABLE cb_cursors;
 DROP TABLE cb_messages;

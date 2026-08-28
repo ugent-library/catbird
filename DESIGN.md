@@ -4,17 +4,17 @@ A PostgreSQL-backed job queue, stream, and small workflow engine. Four tables, p
 
 ## Tables
 
-- `cb_messages` — every job input and every stream event is one row. Rows are never updated, so large payloads never produce dead tuples.
+- `cb_messages` — every job input and every stream event is one row. Job inputs are written once; published messages are updated once, when the assigner sets their `position`. Measured: one dead tuple per published message, cleaned by a routine vacuum; see the position benchmark note below.
 - `cb_claims` — one narrow row per job that still has to run. Updated on every claim and retry, deleted on completion. Aggressive autovacuum settings on the table keep it small.
-- `cb_stream_pending` / `cb_stream` — narrow rows that give published messages their place in the stream (see Streams). Job inputs never appear here, so a job created from an event is not itself an event and a trigger cannot feed on its own output.
 - `cb_cursors` — one row per stream consumer: the highest position it processed.
 - `cb_signals` — payloads delivered to a job that waits for them.
+- `cb_outputs` — optional job results, written by the handler with `SetOutput` in its transaction, read with `Output`.
 
 A partial index on `cb_claims (queue, visible_at) WHERE status = 0 AND dependencies = 0` holds only claimable rows. Dead rows and rows waiting on dependencies are not in it.
 
 ## Jobs
 
-`Enqueue` inserts the message and its claim in one statement and sends `NOTIFY` on the queue's channel. Workers `LISTEN` and also poll on an interval, so a lost notification delays a job, never loses it.
+`Enqueue` inserts the message and its claim in one statement and sends `NOTIFY` on the queue's channel. Workers `LISTEN` and also poll on an interval, so a lost notification delays a job rather than losing it.
 
 **Claiming.** A worker takes up to `BatchSize` rows with `FOR UPDATE SKIP LOCKED`, sets `visible_at = now() + Lease`, and increments `attempts`. There is no "running" status: a job with `visible_at` in the future is either delayed, backing off after a failure, or claimed. Once `visible_at` passes, any worker may claim it again. That is how a crashed worker's job comes back.
 
@@ -33,7 +33,7 @@ A partial index on `cb_claims (queue, visible_at) WHERE status = 0 AND dependenc
 - `ResolveDependency(childID)` — a parent step completed. Call it inside the parent's handler transaction so it commits with the parent's completion.
 - `DeliverSignal(childID, name, payload)` — an external input arrived. The payload is stored in `cb_signals` and handed to the handler as `Message.Signals[name]` at claim time. Delivering the same name twice is a no-op.
 
-The decrement is `UPDATE ... SET dependencies = dependencies - 1 WHERE dependencies > 0`, so concurrent parents cannot lose an update. When the counter reaches 0 the statement also sends `NOTIFY`.
+The decrement is `UPDATE ... SET dependencies = dependencies - 1 WHERE dependencies > 0`, so concurrent parents do not lose an update. When the counter reaches 0 the statement also sends `NOTIFY`.
 
 **Signal rule.** A signal must be counted in `Dependencies` before it is delivered. Delivering to a job that is not waiting returns `ErrNotFound`; nothing is stored. Signals that arrive before the job exists are the caller's problem to retry.
 
@@ -41,11 +41,11 @@ A permanently failed step cancels its siblings and children through the shared c
 
 ## Streams
 
-`Publish` inserts a message with no claim. `StreamConsumer.FetchBatch(pattern)` reads messages after the cursor whose topic matches a `LIKE` pattern (`order.%`), in position order. `Ack(position)` moves the cursor; it uses `GREATEST`, so the cursor never moves backwards even when two consumers share it.
+`Publish` inserts a message with no claim. `StreamConsumer.FetchBatch(pattern)` reads messages after the cursor whose topic matches a `LIKE` pattern (`order.%`), in position order. `Ack(position)` moves the cursor; it uses `GREATEST`, so the cursor does not move backwards when two consumers share it.
 
-**Positions.** Message ids are handed out at `INSERT` time, so a message from a transaction that is still open can have a lower id than messages that already committed; a reader going by id would move past it and never see it. Readers therefore go by `position`. `Publish` writes the message and a `cb_stream_pending` row in one statement; both appear when the transaction commits. The assigner moves pending rows into `cb_stream`, each with the next position, in the order it sees them — commit order. A message from a long transaction gets its position when it commits; it arrives late, after messages published after it, but it arrives, once. This is the rule a plain `SELECT` follows: you see a row when its transaction commits.
+**Positions.** Message ids are handed out at `INSERT` time, so a message from a transaction that is still open can have a lower id than messages that already committed; a reader going by id would move past it and miss it. Readers therefore go by `position`, which the assigner sets on published messages in the order it sees them — commit order. A `stream` flag marks published messages; job inputs get no position, so a job created from an event is not itself an event and a trigger does not feed on its own output. A message from a long transaction gets its position when it commits; it arrives late, after messages published after it, but it arrives, once. This is the rule a plain `SELECT` follows: you see a row when its transaction commits.
 
-The assigner is one statement under an advisory lock, run every `AssignEvery` (250 ms) by every `StreamConsumer` and every trigger. The lock makes one of them do the work; the rest do nothing. Nothing has to be deployed or configured; a message is readable within one tick of its commit. `cb_messages` is never updated: the churn is an insert and a delete on `cb_stream_pending` and an insert on `cb_stream`, all narrow rows.
+The assigner is one statement under an advisory lock, run every `AssignEvery` (250 ms) by every `StreamConsumer` and every trigger. The lock makes one of them do the work; the rest do nothing. Nothing has to be deployed or configured; a message is readable within one tick of its commit. When the assigner assigned anything it sends `NOTIFY cb_stream` with the highest new position, so readers that `LISTEN` fetch on arrival instead of polling. The cost is one update per published message. Against a variant with positions in a separate narrow table (measured, 200k × 500 B): the column writes ~45% more WAL and ~60% more heap, but publishes and reads ~65% faster, deletes 2× faster (no FK cascade), and needs one table and one index fewer. Vacuum time was under 0.3 s per 200k messages for both.
 
 **Triggers.** `RegisterTrigger(name, pattern, queue)` runs a loop: fetch a batch, `Enqueue` each message on the target queue with dedup key `trigger:<name>:<message id>`, `Ack`, commit — all in one transaction. A crash before commit redoes the batch; the dedup keys make the redo a no-op. Several processes may run the same trigger: each only wastes reads, the cursor is monotone, and the dedup keys keep the output single. Run a trigger in one process if the extra reads matter; there is no leader election.
 
@@ -62,4 +62,4 @@ Every process enqueues `cron:<name>:<minute>` as the dedup key when the minute s
 - The `LIKE` pattern treats `_` as a single-character wildcard. Avoid `_` in topic names or escape it.
 - A worker processes one batch to completion before claiming the next, so one slow job holds up the other jobs of its batch.
 - Rate limits, per-queue configuration, and a web/SSE layer are out of scope. Applications build them on their own tables and routes.
-- Without a `Logger`, failures are reported through `slog.Default()`. The library never swallows an error silently.
+- Without a `Logger`, failures are reported through `slog.Default()`. Errors the library cannot return to the caller are logged.

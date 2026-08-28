@@ -50,15 +50,18 @@ func NewStreamConsumer(ctx context.Context, pool *pgxpool.Pool, cursorName strin
 	return &StreamConsumer{pool: pool, cursor: cursorName, opts: opts}
 }
 
-// assignPositions moves published messages from cb_stream_pending to cb_stream,
-// giving each the next position, every AssignEvery. A pending row is visible
-// only once its transaction committed, so positions follow commit order: a
-// message from a transaction that is still open is picked up on a later tick.
-// Readers order by position and a batch of positions becomes readable when
-// this statement commits, so no reader can pass a message that has no position yet.
+// assignPositions gives every published message that has none the next
+// position, every AssignEvery. A message is visible to the assigner only once
+// its transaction committed, so positions follow commit order: a message from a
+// transaction that is still open is picked up on a later tick. Readers order by
+// position and a batch of positions becomes readable when this statement
+// commits, so a reader does not pass a message that has no position yet.
 //
 // The advisory lock is taken for the statement only. When another assigner
-// holds it, the DELETE matches nothing and the statement is a no-op.
+// holds it, the one-time filter on the UPDATE skips the scan.
+//
+// When it assigned anything it sends NOTIFY on channel cb_stream with the
+// highest new position, so a LISTENing reader can fetch instead of polling.
 func assignPositions(ctx context.Context, pool *pgxpool.Pool, opts StreamOptions) {
 	ticker := time.NewTicker(opts.AssignEvery)
 	defer ticker.Stop()
@@ -72,16 +75,20 @@ func assignPositions(ctx context.Context, pool *pgxpool.Pool, opts StreamOptions
 			WITH lock AS (
 				SELECT pg_try_advisory_xact_lock(hashtext('catbird'), 1) AS held
 			),
-			moved AS (
-				DELETE FROM cb_stream_pending
-				WHERE (SELECT held FROM lock)
-				RETURNING message_id
+			unassigned AS (
+				SELECT id FROM cb_messages
+				WHERE stream AND position IS NULL
+				ORDER BY id
+				LIMIT 5000
+			),
+			assigned AS (
+				UPDATE cb_messages m
+				SET position = nextval('cb_position_seq')
+				FROM unassigned u
+				WHERE m.id = u.id AND (SELECT held FROM lock)
+				RETURNING position
 			)
-			INSERT INTO cb_stream (position, message_id, topic)
-			SELECT nextval('cb_position_seq'), m.id, m.topic
-			FROM moved
-			JOIN cb_messages m ON m.id = moved.message_id
-			ORDER BY m.id
+			SELECT pg_notify('cb_stream', max(position)::text) FROM assigned HAVING count(*) > 0
 		`)
 		if err != nil && ctx.Err() == nil {
 			opts.Logger.Error("catbird: assigning stream positions failed", "err", err)
@@ -94,12 +101,11 @@ func assignPositions(ctx context.Context, pool *pgxpool.Pool, opts StreamOptions
 // Enqueue are not stream messages and are never returned.
 func (s *StreamConsumer) FetchBatch(ctx context.Context, pattern string) ([]Message, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT m.id, s.position, m.topic, m.payload
-		FROM cb_stream s
-		JOIN cb_messages m ON m.id = s.message_id
-		WHERE s.position > COALESCE((SELECT last_position FROM cb_cursors WHERE name = $1), 0)
-		  AND s.topic LIKE $2
-		ORDER BY s.position ASC
+		SELECT id, position, topic, payload
+		FROM cb_messages
+		WHERE position > COALESCE((SELECT last_position FROM cb_cursors WHERE name = $1), 0)
+		  AND topic LIKE $2
+		ORDER BY position ASC
 		LIMIT $3
 	`, s.cursor, pattern, s.opts.BatchSize)
 	if err != nil {

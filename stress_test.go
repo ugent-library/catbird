@@ -34,7 +34,7 @@ func setupTestDB(t *testing.T) *pgxpool.Pool {
 	up := strings.Split(string(b), "-- +goose down")[0]
 
 	_, err = pool.Exec(ctx, `
-		DROP TABLE IF EXISTS cb_signals, cb_stream, cb_stream_pending, cb_claims, cb_cursors, cb_messages CASCADE;
+		DROP TABLE IF EXISTS cb_outputs, cb_signals, cb_claims, cb_cursors, cb_messages CASCADE;
 		DROP SEQUENCE IF EXISTS cb_position_seq;
 	`)
 	if err != nil {
@@ -403,4 +403,63 @@ func TestStreamLateCommitIsNotSkipped(t *testing.T) {
 		t.Fatal(err)
 	}
 	read([]string{"first inserted, last committed"}) // and it shows up once it commits
+}
+
+func TestOutputAndStreamNotify(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := catbird.NewClient()
+
+	id, err := client.Enqueue(ctx, pool, "sum", "out_queue", []int{1, 2, 3}, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Output(ctx, pool, id); !errors.Is(err, catbird.ErrNotFound) {
+		t.Fatalf("output before completion: %v", err)
+	}
+	go catbird.NewWorker(pool, "out_queue", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
+		var in []int
+		json.Unmarshal(m.Payload, &in)
+		sum := 0
+		for _, n := range in {
+			sum += n
+		}
+		return client.SetOutput(ctx, tx, m.ID, sum)
+	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond}).Start(ctx)
+
+	for {
+		out, err := client.Output(ctx, pool, id)
+		if err == nil {
+			if string(out) != "6" {
+				t.Fatalf("output %s, want 6", out)
+			}
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatal("no output")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// The assigner announces new positions on channel cb_stream.
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, "LISTEN cb_stream"); err != nil {
+		t.Fatal(err)
+	}
+	catbird.NewStreamConsumer(ctx, pool, "notify", catbird.StreamOptions{AssignEvery: 20 * time.Millisecond})
+	if _, err := client.Publish(ctx, pool, "ev", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	n, err := conn.Conn().WaitForNotification(ctx)
+	if err != nil {
+		t.Fatalf("no notification: %v", err)
+	}
+	if n.Payload != "1" {
+		t.Fatalf("notified position %q, want 1", n.Payload)
+	}
 }

@@ -55,9 +55,7 @@ type EnqueueOptions struct {
 }
 
 // Publish appends a message to the stream: consumers see it, no worker runs it.
-// The message and its cb_stream_pending row are one statement, so the assigner
-// sees the message exactly when it commits. Returns the message id, or 0 when
-// dedupKey already exists.
+// Returns the message id, or 0 when dedupKey already exists.
 func (c *Client) Publish(ctx context.Context, db Conn, topic string, payload any, dedupKey string) (int64, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -65,16 +63,10 @@ func (c *Client) Publish(ctx context.Context, db Conn, topic string, payload any
 	}
 	var id int64
 	err = db.QueryRow(ctx, `
-		WITH message AS (
-			INSERT INTO cb_messages (topic, payload, dedup_key)
-			VALUES ($1, $2, $3)
-			ON CONFLICT (dedup_key) DO NOTHING
-			RETURNING id
-		),
-		pending AS (
-			INSERT INTO cb_stream_pending (message_id) SELECT id FROM message
-		)
-		SELECT id FROM message
+		INSERT INTO cb_messages (topic, payload, stream, dedup_key)
+		VALUES ($1, $2, true, $3)
+		ON CONFLICT (dedup_key) DO NOTHING
+		RETURNING id
 	`, topic, body, nullString(dedupKey)).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil
@@ -224,6 +216,31 @@ func (c *Client) DeliverSignal(ctx context.Context, db Conn, messageID int64, na
 		return ErrNotFound
 	}
 	return nil
+}
+
+// SetOutput stores the job's result. Call it from the handler with the
+// handler's tx so the result commits with the job's completion. A second call
+// replaces the first.
+func (c *Client) SetOutput(ctx context.Context, db Conn, messageID int64, output any) error {
+	body, err := json.Marshal(output)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(ctx, `
+		INSERT INTO cb_outputs (message_id, output) VALUES ($1, $2)
+		ON CONFLICT (message_id) DO UPDATE SET output = EXCLUDED.output
+	`, messageID, body)
+	return err
+}
+
+// Output returns the result a job stored with SetOutput, or ErrNotFound.
+func (c *Client) Output(ctx context.Context, db Conn, messageID int64) (json.RawMessage, error) {
+	var out json.RawMessage
+	err := db.QueryRow(ctx, `SELECT output FROM cb_outputs WHERE message_id = $1`, messageID).Scan(&out)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return out, err
 }
 
 func nullString(s string) *string {
