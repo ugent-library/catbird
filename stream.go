@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -96,18 +97,20 @@ func assignPositions(ctx context.Context, pool *pgxpool.Pool, opts StreamOptions
 	}
 }
 
-// FetchBatch returns the next published messages after the cursor whose topic
-// matches pattern (a LIKE pattern, e.g. 'order.%'). Job inputs written by
-// Enqueue are not stream messages and are never returned.
-func (s *StreamConsumer) FetchBatch(ctx context.Context, pattern string) ([]Message, error) {
+// FetchBatch returns the next published messages after the cursor on topic and
+// on every topic under it: "order" matches "order", "order.paid" and
+// "order.paid.refund"; "" matches everything. Topic names are literal; there is
+// no pattern syntax. Job inputs written by Enqueue have no position and are
+// not returned.
+func (s *StreamConsumer) FetchBatch(ctx context.Context, topic string) ([]Message, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, position, topic, payload
 		FROM cb_messages
 		WHERE position > COALESCE((SELECT last_position FROM cb_cursors WHERE name = $1), 0)
-		  AND topic LIKE $2
+		  AND ($2 = '' OR topic = $2 OR topic LIKE $3)
 		ORDER BY position ASC
-		LIMIT $3
-	`, s.cursor, pattern, s.opts.BatchSize)
+		LIMIT $4
+	`, s.cursor, topic, subtopics(topic), s.opts.BatchSize)
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +127,12 @@ func (s *StreamConsumer) FetchBatch(ctx context.Context, pattern string) ([]Mess
 	return msgs, rows.Err()
 }
 
+// subtopics builds the LIKE pattern for everything under topic, with LIKE's
+// own wildcard characters in the topic name escaped so they match literally.
+func subtopics(topic string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(topic) + ".%"
+}
+
 // Ack moves the cursor to position. The cursor never moves backwards, so
 // several consumers on one cursor cannot undo each other's progress.
 func (s *StreamConsumer) Ack(ctx context.Context, db Conn, position int64) error {
@@ -134,16 +143,16 @@ func (s *StreamConsumer) Ack(ctx context.Context, db Conn, position int64) error
 	return err
 }
 
-// RegisterTrigger enqueues a job on targetQueue for every message whose topic
-// matches topicPattern, until ctx is canceled. The enqueues and the cursor
+// RegisterTrigger enqueues a job on targetQueue for every message on topic or
+// a topic under it (see FetchBatch), until ctx is canceled. The enqueues and the cursor
 // advance commit in one transaction, and each job carries a dedup key derived
 // from the message id, so a crash or a second process running the same trigger
 // cannot produce a second job for the same message.
-func (c *Client) RegisterTrigger(ctx context.Context, pool *pgxpool.Pool, name, topicPattern, targetQueue string, opts StreamOptions) {
+func (c *Client) RegisterTrigger(ctx context.Context, pool *pgxpool.Pool, name, topic, targetQueue string, opts StreamOptions) {
 	consumer := NewStreamConsumer(ctx, pool, "trigger:"+name, opts)
 	go func() {
 		for ctx.Err() == nil {
-			n, err := c.enqueueNextBatch(ctx, pool, consumer, name, topicPattern, targetQueue)
+			n, err := c.enqueueNextBatch(ctx, pool, consumer, name, topic, targetQueue)
 			if err != nil && ctx.Err() == nil {
 				consumer.opts.Logger.Error("catbird: trigger failed", "trigger", name, "err", err)
 			}
@@ -161,8 +170,8 @@ func (c *Client) RegisterTrigger(ctx context.Context, pool *pgxpool.Pool, name, 
 // enqueueNextBatch reads the next batch of matching stream messages, enqueues a
 // job for each, advances the cursor, and commits — all in one transaction.
 // Returns how many messages it handled.
-func (c *Client) enqueueNextBatch(ctx context.Context, pool *pgxpool.Pool, consumer *StreamConsumer, name, topicPattern, targetQueue string) (int, error) {
-	msgs, err := consumer.FetchBatch(ctx, topicPattern)
+func (c *Client) enqueueNextBatch(ctx context.Context, pool *pgxpool.Pool, consumer *StreamConsumer, name, topic, targetQueue string) (int, error) {
+	msgs, err := consumer.FetchBatch(ctx, topic)
 	if err != nil || len(msgs) == 0 {
 		return 0, err
 	}

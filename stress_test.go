@@ -281,11 +281,11 @@ func TestTriggerBridgesPayloadUnchanged(t *testing.T) {
 	if _, err := client.Publish(ctx, pool, "image.uploaded", map[string]string{"url": "https://example.com/a.png"}, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Publish(ctx, pool, "other.topic", nil, ""); err != nil {
+	if _, err := client.Publish(ctx, pool, "image_x", nil, ""); err != nil {
 		t.Fatal(err)
 	}
 
-	client.RegisterTrigger(ctx, pool, "img", "image.%", "image_processing", catbird.StreamOptions{AssignEvery: 20 * time.Millisecond, PollInterval: 50 * time.Millisecond})
+	client.RegisterTrigger(ctx, pool, "img", "image", "image_processing", catbird.StreamOptions{AssignEvery: 20 * time.Millisecond, PollInterval: 50 * time.Millisecond})
 
 	got := make(chan catbird.Message, 16)
 	go catbird.NewWorker(pool, "image_processing", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
