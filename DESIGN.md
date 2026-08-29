@@ -61,6 +61,19 @@ A permanently failed step cancels its siblings and children through the shared c
 
 `Publish` inserts a message with no claim. `NewConsumer(runtime, name, opts).FetchBatch(topic)` reads messages after the cursor on a topic and every topic under it (`order` covers `order.paid` and `order.paid.refund`; `""` covers everything), in position order. Topic names are literal; there is no pattern syntax. Finer selection is the consumer's code, or an optional payload filter added later as an extra clause. `Ack(position)` moves the cursor; it uses `GREATEST`, so the cursor does not move backwards when two consumers share it.
 
+**What a read costs.** A fetch is cheap for a consumer that keeps up whatever plan it gets: the first rows after the cursor are the rows it wants. The case that separates the plans is a consumer that has fallen behind on a topic that is a small share of traffic. Measured with a topic at 0.3% of a 300k-message stream and a cursor 15k messages behind, returning 50 rows:
+
+| plan | buffers | time |
+|---|---|---|
+| BitmapOr on `cb_messages_topic_position_idx`, then sort | 60 | 0.07 ms |
+| walk `cb_messages_position_idx`, filter on topic | 982 | 2.2 ms |
+
+`(topic text_pattern_ops, position)` cannot produce position order across topic values on its own, but the planner does not need it to: it reads the two arms of the match — `topic = $2`, and the prefix range from `topic LIKE $3` — as a BitmapOr and sorts the result. The second plan walks everything published since the cursor and throws away 14950 rows, so it gets more expensive exactly while a consumer is trying to catch up.
+
+Which one the planner picks is decided by whether it knows the topic when it plans, so **`FetchBatch` has to reach a custom plan**. Two things would take it off one, and neither is visible in the query: a server-side prepared statement that PostgreSQL keeps long enough to switch to a generic plan, which cannot fold `LIKE $3` into a range; and the `$2 = ''` arm, which a generic plan cannot fold away either. Under pgx's default `QueryExecModeCacheStatement` the statement is prepared, and PostgreSQL keeps the custom plan only while it estimates it cheaper than the generic one. Checking this is part of changing `FetchBatch`: `EXPLAIN` it under `plan_cache_mode = force_generic_plan` and see which plan comes back. Measured on PostgreSQL 18; the rest of the numbers here are from 16.
+
+The scale limit past that is the width of the subtree, not the plan. If one is ever reached, the ways out are a `topic_id` column with a `(topic_id, position)` index for consumers that want one exact topic, or a table of `(prefix, position)` maintained on publish.
+
 **Publishing many at once.** `PublishBatch` takes a slice of `BatchMessage` — topic, payload, dedup key — and writes them with one `INSERT ... SELECT FROM unnest(...)`: a transaction that changed ten thousand records announces them in one round trip. The messages travel as three arrays, so the number of messages is not limited by the number of statement parameters. It returns how many rows it wrote, not their ids: a message whose dedup key is already taken, or that repeats a key from its own batch, is skipped, and `RETURNING` cannot say which ones — it reads columns of `cb_messages`, and nothing there carries the input's place in the slice. A caller that needs an id per message calls `Publish` for each of them in one transaction. The assigner gives a batch its positions like any other publish, 5000 per tick, so ten thousand messages are readable after two ticks.
 
 **Positions.** Message ids are handed out at `INSERT` time, so a message from a transaction that is still open can have a lower id than messages that already committed; a reader going by id would move past it and miss it. Readers therefore go by `position`, which the assigner sets on published messages in the order it sees them — commit order. A `stream` flag marks published messages; job inputs get no position, so a job created from an event is not itself an event and a trigger does not feed on its own output. A message from a long transaction gets its position when it commits; it arrives late, after messages published after it, but it arrives, once. This is the rule a plain `SELECT` follows: you see a row when its transaction commits.
@@ -77,7 +90,55 @@ Every process enqueues `cron:<name>:<minute>` as the dedup key when the minute s
 
 `GC(retention)` deletes dead claims older than `retention` and then messages older than `retention` that have no claim. A delayed or waiting job keeps its message however old it is. `cb_signals` and `cb_claims` reference `cb_messages` with `ON DELETE CASCADE`, so nothing is orphaned.
 
+## Bugs
+
+Wrong today, each with a fix that is known and small. In the order they would hurt.
+
+**`Cancel` scans `cb_claims`.** There is no index on `correlation_id`, and `Worker.failed` calls `Cancel` for every job that dies with one. So the case the design is built for — a downstream outage failing a whole correlated group — is the case that runs one full scan per dead job. Measured at 100k live claims: 834 buffers and 4.9 ms per call, against 6 buffers with an index. The fix is `CREATE INDEX cb_claims_correlation_idx ON cb_claims (correlation_id) WHERE status = 0 AND correlation_id IS NOT NULL`; the `IS NOT NULL` half keeps jobs with no correlation id out of a structure that can never match them, measured at 2128 kB against 112 kB with 1% of jobs correlated.
+
+**Shutdown burns an attempt and does not write the retry.** A claim writes `attempts = attempts + 1` and `visible_at = now() + Lease` before the handler runs, so the attempt is charged up front and the row is corrected afterwards. `Worker.failed` runs that correction on the job's context, which at shutdown is already canceled by the time the handler returns, so pgx rejects every statement locally and nothing is written. The job keeps the lease deadline its claim set — five minutes at the defaults — instead of coming back after `Backoff`, with the attempt already spent. Three rolling deploys spend three of five attempts and 15 minutes on a job that never failed. The fix is to run those statements on `context.WithoutCancel` with a few seconds of their own; `OnDead` belongs on the same short budget, because `Start` waits for the jobs in flight and a longer one would hold a stopping process. The job's transaction has to be rolled back, on a context of its own, before they run: otherwise each failing job holds its own connection while asking the pool for a second, and a rollback on a canceled context never reaches the server, so pgxpool destroys the connection instead of returning it.
+
+**The default `BatchSize` does not fit a default pool.** Every running job holds a pool connection for its transaction. `BatchSize` defaults to 50 and pgxpool defaults `MaxConns` to `max(4, NumCPU)`, so the shipped defaults put about 40 goroutines in `Begin` with their leases already running — and a job that waits there long enough is claimed by another worker while the first still holds a slot for it. `example_test.go` ships that combination. The fix is to bound `BatchSize` by `MaxConns - 1`: silently when it was not set, with a warning when the caller asked for more. Several workers can each pass that bound and together exceed the pool, which only `Start` can see, so that is where to say it.
+
+**The `LISTEN` connection comes from the pool.** It is held for the life of the process, so it is a connection the workers never get back — and when the workers hold every connection there is, it cannot be opened at all and the process falls back to polling with a reconnect error every `ReconnectAfter`. The fix is to open it from the pool's configuration with `pgx.ConnectConfig` instead of `pool.Acquire`, running the pool's `BeforeConnect` and `AfterConnect` so a caller's setup is not skipped, and closing it on a context shutdown does not cancel.
+
+**The assigner has a ceiling and no drain loop.** `assignPositions` runs one `LIMIT 5000` statement per `AssignEvery` tick and then sleeps the rest of the tick whether or not it filled the batch. That caps the whole database at 5000 per tick — 20k published messages a second at the defaults — and above that rate the unassigned backlog grows without bound, silently, taking stream latency with it. `PublishBatch` is built for batches well above one statement's worth, so a single batch reaches it. `Trigger.start` already does the right thing and continues while its batch came back full. The fix is the same loop, with a bound on the rounds per tick and a warning when it is still behind after them.
+
+**The failure path is untested.** Nothing in the suite fails a handler: no test for a handler error scheduling a retry, for `Backoff` timing, for `MaxAttempts` marking a job dead, for `OnDead` firing, for the cancel cascade `failed` triggers, for worker shutdown, or for `listen` reconnecting. `Cancel` appears once, as setup for a GC test. This is the least exercised part of the system and it is where the two bugs above live.
+
 ## Known limits
+
+Not bugs — what this design does not do, or does at a price. A caller has to know about these now.
+
+**A wrong dependency count is silent and permanent.** `EnqueueOptions.Dependencies` is a number the caller supplies and `ResolveDependency` counts down. One too high and the job never runs: no error, no status, and nothing that distinguishes it from a job that is legitimately waiting. One too low and it runs before its parents finish. A second `ResolveDependency` for the same dependency returns `ErrNotFound`, but a missing one cannot be detected at all, because nothing knows what the count was supposed to be. Nothing validates the graph because nothing has the graph — the flow DSL this replaced validated it at construction. This is the most serious of these. Until something checks it, an application that builds flows should watch `SELECT * FROM cb_claims WHERE dependencies > 0 AND visible_at < now() - interval '1 hour'` itself.
+
+**A trigger does not preserve stream order.** It reads a position-ordered batch and enqueues it onto a queue that runs `BatchSize` jobs at once, so the jobs start in order and finish in any order. A consumer that needs ordering handles the batch itself instead of fanning it out.
+
+**`Consumer` is not safe in more than one process.** `FetchBatch` and `Ack` are two statements with nothing between them, so two processes on the same cursor both handle every batch. Triggers survive this because their dedup keys make a repeated batch a no-op; a general consumer has no such key. Run one until the cursor lease lands, and say so on `NewConsumer` until then.
+
+**A publish costs two writes and two tuples.** The assigner's `UPDATE` is never a HOT update — `position` is covered by three indexes — so it writes a second tuple and, measured over 50k messages of ~450 bytes, more WAL and more time than the `INSERT` it annotates: 42.8 MB and 592 ms against 33.1 MB and 385 ms. This is the price of the position column, and the alternative measured worse on reads. It is the number a capacity plan needs.
+
+**`status = 1` does not say why.** A job that failed permanently and a job that `Cancel` stopped are the same row. There is no run history and no dead-letter table, and `OnDead` is a callback with nothing durable behind it: if the process is down or the callback returns an error, the fact is logged and gone. There is nothing to re-drive from. "Run status" below adds `last_error`; it does not add the distinction or the dead letter.
+
+**One dedup-key namespace for both worlds.** `cb_messages.dedup_key` is unique across the table, so a `Publish` key and an `Enqueue` key collide. Prefix them if both are in use.
+
+**A dedup key lives as long as its message, and so does an output.** `GC` deletes messages by age and frees their keys with them, so a key stops deduplicating once its message ages out — fine for `cron:<name>:<minute>`, but retention has to exceed the window for any key used for idempotency. `cb_outputs` cascades from `cb_messages` the same way, so retention also has to exceed the longest flow or a late step cannot read an early step's output.
+
+**A delayed `Enqueue` still wakes the queue.** The wake checks only `dependencies = 0`, not `visible_at`, so every scheduled job wakes every worker on its queue for work none of them can claim yet.
+
+**`Enqueue` returns `(0, nil)` when the dedup key was taken** and gives no way to get the existing id, so a caller that needs it makes a second round trip.
+
+**`GC` scans `cb_messages`** — no index on `created_at`, measured at 18,750 buffers over 300k rows — and the runtime does not schedule it. The application has to call it.
+
+**No partitioning.** `cb_messages` is one table for the whole database, and retention is a row-by-row `DELETE` with the index churn that implies rather than dropping a partition.
+
+**No schema versioning and no migration path.** One `.sql` file with goose markers, no runner, no version table, and no route from an installation of the earlier catbird. The second schema change has to invent all of it.
+
+**Positions follow insert order inside a tick.** The assigner orders its batch by `id`, so two messages that commit within one window can get positions in insert order rather than commit order. Commit order is what holds across ticks, which is what a reader depends on.
+
+**`hashtext` is undocumented.** The assigner's advisory lock key is `hashtext('catbird')`, an internal function with no stability guarantee across major versions. A client in another language has to produce the same number.
+
+**The assigner's statement depends on a referenced CTE running.** `pg_notify` fires from a CTE that the final `SELECT` has to reference, which is planner behaviour rather than anything the SQL states. A client in another language has to reproduce it exactly, and "the schema plus `client.go` is the whole contract" rests on it.
 
 - Rate limits and per-queue configuration are out of scope. Applications build them on their own tables. The browser layer is planned; see below.
 - Without a `Logger`, failures are reported through `slog.Default()`. Errors the library cannot return to the caller are logged.
@@ -85,6 +146,8 @@ Every process enqueues `cron:<name>:<minute>` as the dedup key when the minute s
 ## Planned additions
 
 These come from moving raven, the first application, onto catbird: its own event log stays its own table, and everything that moves data — change signals, cursors, jobs, browser delivery — comes from here. Each item says what it is and why it is needed.
+
+Three of them are not additions to a working system but the safety the shipped API already assumes: the cursor lease, which `Consumer` needs to be run in more than one process; `Timeout`, without which "a queue can end up with every slot held by attempts nobody is waiting for"; and `UniqueKey`, which the cron helper is written against. Until they land the shipped surface is larger than the safe surface, and that is what the limits above describe.
 
 ### Streams
 
