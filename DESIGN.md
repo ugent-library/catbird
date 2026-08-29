@@ -114,7 +114,7 @@ Not bugs — what this design does not do, or does at a price. A caller has to k
 
 **A trigger does not preserve stream order.** It reads a position-ordered batch and enqueues it onto a queue that runs `BatchSize` jobs at once, so the jobs start in order and finish in any order. A consumer that needs ordering handles the batch itself instead of fanning it out.
 
-**`Consumer` is not safe in more than one process.** `FetchBatch` and `Ack` are two statements with nothing between them, so two processes on the same cursor both handle every batch. Triggers survive this because their dedup keys make a repeated batch a no-op; a general consumer has no such key. Run one until the cursor lease lands, and say so on `NewConsumer` until then.
+**`Consumer` is not safe in more than one process.** `FetchBatch` and `Ack` are two statements with nothing between them, so two processes on the same cursor both handle every batch. Triggers survive this because their dedup keys make a repeated batch a no-op; a general consumer has no such key. Run one, and say so on `NewConsumer`. The cursor lease that would fix it is not being built: work that has to happen once per message across processes is a trigger and a worker, which have leases and retries already.
 
 **A publish costs two writes and two tuples.** The assigner's `UPDATE` is never a HOT update — `position` is covered by three indexes — so it writes a second tuple and, measured over 50k messages of ~450 bytes, more WAL and more time than the `INSERT` it annotates: 42.8 MB and 592 ms against 33.1 MB and 385 ms. This is the price of the position column, and the alternative measured worse on reads. It is the number a capacity plan needs.
 
@@ -143,23 +143,42 @@ Not bugs — what this design does not do, or does at a price. A caller has to k
 - Rate limits and per-queue configuration are out of scope. Applications build them on their own tables. The browser layer is planned; see below.
 - Without a `Logger`, failures are reported through `slog.Default()`. Errors the library cannot return to the caller are logged.
 
+## What to build, in order
+
+The rule for everything below: a change leaves the core easier to read than it found it, or leaves it alone. Moderate growth is fine. A second version of a concept the reader already holds is not, however few lines it takes — that is what makes a small system stop being one. The core is about a thousand lines across four files, and that is the property worth protecting.
+
+1. **The bugs above**, in the order they are listed there. Two of them are wrong behaviour rather than missing behaviour, and the failure path they live in has no tests at all.
+2. **`Read` and `LastPosition`, with `FetchBatch` rewritten on top of them.** The only item that makes the tree smaller: the subtree predicate and its custom-plan requirement end up in one place instead of two.
+3. **`Timeout`.** A `context.WithTimeout` around the handler in `run`. It bounds the attempt's bookkeeping, not the goroutine — a handler that never checks `ctx.Err()` keeps its slot either way — so it is a partial fix, worth its three lines.
+4. **`RunOnce` and `Status`.** Both leaves. `RunOnce` is what makes a job test deterministic instead of a background worker and a sleep. `Status` is built without `last_error`; see below.
+5. **Exponential backoff.** One dense line in `failed`, replacing a real failure: an outage fails every job on a queue at once and a fixed delay brings all of them back in the same second, at a service that is still down. The comment on it states that failure, not the arithmetic.
+6. **The cron helper**, on `DedupKey` alone.
+7. **`ExtendLease`**, as a function rather than a field on `Message`.
+8. **Wire**, in a file of its own. It calls `Read` and touches nothing else, so however long it gets, the four core files do not get harder to read.
+
+Four items below are not being built: the **cursor lease**, **`Consumer.Handle`**, **`UniqueKey`** and **cancelling a running job**. Each stays in this document because the problem it names is real; what changed is the answer. Each carries its ruling in place, with what to watch for that would bring it back. One more is undecided rather than ruled: the **`last_error` column** on `cb_claims`, which costs nothing to read and widens the row this design keeps narrow.
+
 ## Planned additions
 
-These come from moving raven, the first application, onto catbird: its own event log stays its own table, and everything that moves data — change signals, cursors, jobs, browser delivery — comes from here. Each item says what it is and why it is needed.
-
-Three of them are not additions to a working system but the safety the shipped API already assumes: the cursor lease, which `Consumer` needs to be run in more than one process; `Timeout`, without which "a queue can end up with every slot held by attempts nobody is waiting for"; and `UniqueKey`, which the cron helper is written against. Until they land the shipped surface is larger than the safe surface, and that is what the limits above describe.
+These come from moving raven, the first application, onto catbird: its own event log stays its own table, and everything that moves data — change signals, cursors, jobs, browser delivery — comes from here. Each item says what it is and why it is needed. Read them with the rulings above and the ones in place below.
 
 ### Streams
 
 **Cursor lease.** `cb_cursors` gets `locked_until TIMESTAMPTZ NOT NULL DEFAULT '-infinity'`. A consumer claims a cursor with `UPDATE cb_cursors SET locked_until = now() + lease WHERE name = $1 AND locked_until <= now() RETURNING last_position`; when the row is already leased the claim returns nothing and the consumer waits for the next wake-up. `Ack` keeps `GREATEST` and clears the lease; acking the unchanged position releases without advancing. Reason: an application runs several processes, and a consumer that indexes documents or calls an external API would otherwise do every batch once per process. A lease with a deadline also covers a process that is alive but stuck: when the deadline passes another process takes the cursor. Triggers did not need this because their dedup keys make a repeated batch harmless; a general handler has no such key.
 
+**Not building this.** A trigger plus a worker already handles each message once across processes, with leases, retries, `MaxAttempts` and exactly-once completion that all exist and that a reader of this system already holds. A cursor lease would be a second kind of lease beside the job lease, claim-then-do in both stream loops, and a new failure mode when the process holding a cursor dies. What trigger-plus-worker gives up is ordered handling: a worker runs `BatchSize` jobs at once, so the messages start in order and finish in any order. Neither reason above — indexing documents, calling an external API — needs ordering. Build this if something does.
+
 **`Consumer.Handle(topic, handle func(ctx, []Message) error)`.** Declares a loop that `Start` runs: claim the cursor, fetch a batch, call the handler, ack; wake on `NOTIFY cb_stream`, poll on `PollInterval` as the fallback, and keep going while batches come back full. A handler error releases the cursor without advancing, so the batch is retried. Triggers become a handler that enqueues the batch and acks in one transaction.
+
+**Not building this.** It needs the cursor lease, which is not being built, and it adds a fourth kind of declared loop for work a trigger and a worker already do. Same condition to revisit: something that needs the batch handled in order.
 
 **`Read(ctx, pool, topics, after, limit)` and `LastPosition(ctx, db)`.** The read for a caller that holds its own position instead of a cursor: the wire, or a poll endpoint. `topics` is a list of subtrees; the query walks the position index from `after`. `LastPosition` is the current end of the stream, so a page can embed it and start its connection from there.
 
+**Build this first, and put `FetchBatch` on top of it.** `FetchBatch` becomes a cursor lookup and a call to `Read`. Otherwise the subtree predicate exists twice, and so does the custom-plan requirement that decides what it costs — and a change to one copy would not show up in the other.
+
 ### Wire
 
-The browser layer: stream messages pushed to browsers over SSE. One type, created from the runtime, no tables of its own, no token machinery.
+The browser layer: stream messages pushed to browsers over SSE. One type, created from the runtime, no tables of its own, no token machinery. **It goes in a file of its own**: it calls `Read` and touches nothing else, so its length costs the core nothing.
 
 ```go
 type WireOptions struct {
@@ -265,9 +284,13 @@ A queue that wants the old fixed pacing sets `Backoff` and `MaxBackoff` to the s
 
 **Run status.** `Status(ctx, db, id)` returns queued, scheduled, running, dead or completed, with the attempt count: completed means the message exists and its claim is gone; a live claim with `visible_at` in the future is running or waiting to retry, which `attempts` and the worker's `MaxAttempts` tell apart. `cb_claims` gets a nullable `last_error TEXT`, written on every failed attempt, so an application can show why a run failed or is retrying.
 
+**`Status` yes, `last_error` undecided.** `Status` reads columns that already exist, so it is a leaf query and costs nothing. The column is two lines in `failed` and nothing harder to read, but it puts error text in the one row that is rewritten on every claim and every retry, which is the row this design keeps narrow on purpose. Decide it on that, and if the answer is no, decide where a failed job's error text lives instead.
+
 **Cancelling a running job.** Today `Cancel` stops jobs from starting and a running job finishes. The addition: `Cancel` also sends `pg_notify('cb_queue_<queue>', 'cancel:<message id>')`, and a worker that is running that job cancels the handler's context. The handler decides what a cancelled context means — stop at the next safe point, or finish — so the database still does not interrupt a running job; it only tells the handler that a cancel arrived. Open decision: keep the weak cancel and have handlers that must stop early poll `cb_claims.status` at their own boundaries, or add the notification.
 
-**Extending a lease.** `Message.ExtendLease(ctx)` moves the claim's `visible_at` out by another `Lease` from now, so a handler that is still working keeps its job. It runs `UPDATE cb_claims SET visible_at = now() + lease WHERE message_id = $1 AND attempts = $2` on a pool connection, not on the handler's transaction: a change made inside that transaction is invisible to other workers until it commits, and by then the lease no longer matters. `attempts` is the same lease token completion uses, so an extension that arrives after the lease expired and another worker claimed the job updates nothing and returns `ErrLeaseLost`; the handler should stop, because its transaction will not commit either. The field is a closure the worker installs on the messages it hands to a job handler; on a message from a stream read it is nil.
+**Not building this; the weak cancel is the rule.** The notification needs the worker to keep a map of running message id to cancel function, maintained on claim and on completion and read from the listen loop. It is the only addition on this list that puts mutable state in the middle of the claim loop. A handler that must stop early polls `cb_claims.status` at its own boundaries. Build it if a handler appears that cannot poll — one blocked in a call it does not control.
+
+**Extending a lease.** `ExtendLease` moves the claim's `visible_at` out by another `Lease` from now, so a handler that is still working keeps its job. It runs `UPDATE cb_claims SET visible_at = now() + lease WHERE message_id = $1 AND attempts = $2` on a pool connection, not on the handler's transaction: a change made inside that transaction is invisible to other workers until it commits, and by then the lease no longer matters. `attempts` is the same lease token completion uses, so an extension that arrives after the lease expired and another worker claimed the job updates nothing and returns `ErrLeaseLost`; the handler should stop, because its transaction will not commit either. **Build it as a function, not a field.** `catbird.ExtendLease(ctx, db, msg, lease)`, or a method on `Worker`. The other shape is a field on `Message` — a closure the worker installs on the messages it hands to a job handler, nil on a message from a stream read. That is a field whose validity depends on where the value came from, which every reader of `Message` then has to remember. The statement and the lease-token check are the same either way.
 
 Call it where the handler finished a piece of work — between two records of a batch edit, after one file of an import — not from a timer. A timer renews the lease of a handler that hangs as readily as one that progresses, and no other worker ever takes that job back.
 
@@ -283,6 +306,10 @@ A cancelled context stops the handler only where the handler looks at it. Databa
 
 **Cron helper.** `RunCron(ctx, pool, name, every, queue, topic)` enqueues on the interval and once at start, so applications do not each rebuild the key format, which every client must produce identically. It sets both keys: `DedupKey` `cron:<name>:<minute>`, so several processes ticking in the same minute produce one job, and `UniqueKey` `cron:<name>`, so a run that takes longer than its interval does not pile up — while the previous run is still live the tick's enqueue does nothing and that tick is skipped, not queued.
 
+**Build it on `DedupKey` alone.** `UniqueKey` is not being built, so a cron handler that can overrun its interval opens with `pg_try_advisory_lock` on its own name and returns when it does not get it. That is the same skip, decided by the handler rather than by the enqueue.
+
 **One live job per key.** `EnqueueOptions.UniqueKey`: a second `Enqueue` with the same key does nothing while a job with that key is still live — queued, delayed, running, or waiting to retry — and goes through again once that job completed or died. The key is a column on `cb_claims` with a partial unique index, `CREATE UNIQUE INDEX ... ON cb_claims (unique_key) WHERE status = 0`. Completion deletes the claim and a dead claim leaves the index, so the key frees itself in both cases; a retry keeps the claim live, so the key stays taken. `Enqueue` inserts the message only when no live claim holds the key, and the claim insert carries `ON CONFLICT (unique_key) WHERE status = 0 DO NOTHING`, so two enqueues at the same instant both return 0 for the loser. The loser may leave a message row without a claim; `GC` removes it with the other old messages.
 
 This is a second key next to `DedupKey`, and both are needed. `DedupKey` lives as long as the message and is for keys that must not come back: a cron key, where a process that wakes late in the same minute would otherwise start the job again after the first run finished; a trigger key, where a redone batch would otherwise create a second job for a message whose first job already ran. `UniqueKey` is for "at most one of these at a time": a purge, a sync, a rebuild, which should run again later but not twice at once. Cron jobs need both, see the cron helper.
+
+**Not building this.** Two kinds of key is a distinction that takes the paragraph above to explain, and it lands as a second conflict target inside `Enqueue` and `EnqueueBatch`, already the densest statements in the tree. Its one caller today is the cron helper not piling up overruns, and a cron handler that opens with `pg_try_advisory_lock` and returns early gets that with no column, no index and no second key. Build it when a second caller appears that cannot take a lock.
