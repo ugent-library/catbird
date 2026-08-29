@@ -88,6 +88,18 @@ client exists.
   All workers on one queue must agree on them.
 - Hot-path SQL takes no joins, no advisory locks (the assigner's is the one
   exception), and no N+1 loops.
+- Every predicate a loop runs repeatedly has an index behind it. `Cancel` is one
+  of those: a worker cancels the correlation group of every job that dies.
+- A subtree stream read reaches `cb_messages_topic_position_idx` only through a
+  BitmapOr, which the planner builds only for a custom plan. A change that puts
+  `FetchBatch` on a generic plan silently turns every fetch into a walk of the
+  whole stream since the cursor.
+- A worker's `BatchSize` may not exceed what the pool can carry: a running job
+  holds a connection for its transaction, and a job blocked in `Begin` is
+  burning a lease it already holds.
+- Statements that record how an attempt ended run on a context that shutdown
+  does not cancel. On the job's context they would all fail at exactly the
+  moment they matter.
 - The unique indexes on `dedup_key` and `position` are partial. Deduplicating
   inserts must name the predicate — `ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING`
   — or they stop matching the index.

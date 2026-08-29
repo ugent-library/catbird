@@ -57,12 +57,34 @@ type Worker struct {
 
 // NewWorker declares a worker on the runtime: once the runtime is started, it
 // claims jobs on queue and runs handler for each, up to BatchSize at a time.
+//
+// BatchSize is bounded by the pool. Every running job holds a pool connection
+// for its transaction, so a worker that runs more jobs than the pool has
+// connections does not get more work done: the extra jobs sit in Begin with
+// their leases already running, and a job that waits there long enough is
+// claimed by another worker while this one still holds a slot for it. An
+// unset BatchSize takes the smaller of the default and what the pool can carry;
+// one the caller asked for is lowered with a warning, since it was asked for.
 func NewWorker(r *Runtime, queue string, handler JobHandler, opts WorkerOptions) *Worker {
+	// One connection stays free for the worker's own statements: the claim, and
+	// the retry a failing job writes after its own transaction rolled back.
+	poolMax := int(r.pool.Config().MaxConns)
+	limit := max(poolMax-1, 1)
+	asked := opts.BatchSize
 	opts = opts.withDefaults()
 	if opts.Logger == nil {
 		opts.Logger = r.opts.Logger
 	}
+	if opts.BatchSize > limit {
+		if asked > 0 {
+			opts.Logger.Warn("catbird: BatchSize is above what the pool can carry, lowering it",
+				"queue", queue, "batch_size", asked, "lowered_to", limit,
+				"pool_max_conns", poolMax)
+		}
+		opts.BatchSize = limit
+	}
 	w := &Worker{runtime: r, queue: queue, handler: handler, opts: opts}
+	r.reserve(opts.BatchSize)
 	r.declare("cb_queue_"+queue, w.start)
 	return w
 }
@@ -169,12 +191,23 @@ func (w *Worker) run(ctx context.Context, m Message) {
 		w.opts.Logger.Error("catbird: begin failed", "queue", w.queue, "message_id", m.ID, "err", err)
 		return
 	}
-	defer tx.Rollback(ctx) // no-op after a successful commit
+	defer tx.Rollback(ctx) // the panic path; the ordinary one rolls back below
 
 	err = w.handler(ctx, tx, m)
 	if err == nil {
 		err = w.complete(ctx, tx, m)
 	}
+	// The transaction is over either way, and failed below asks the pool for a
+	// connection of its own. Give this one back first: BatchSize leaves exactly
+	// one connection free, so a worker whose jobs all fail at once would
+	// otherwise run their bookkeeping one at a time through it, each with only
+	// bookkeepingTimeout to get there. Rolling back on the job's context would
+	// not give it back at shutdown -- that context is canceled, and pgx then
+	// closes the connection instead of ending the transaction.
+	rollbackCtx, cancelRollback := context.WithTimeout(context.WithoutCancel(ctx), bookkeepingTimeout)
+	_ = tx.Rollback(rollbackCtx) // no-op after a successful commit
+	cancelRollback()
+
 	switch {
 	case err == nil:
 	case errors.Is(err, errLeaseExpired):
@@ -203,10 +236,24 @@ func (w *Worker) complete(ctx context.Context, tx pgx.Tx, m Message) error {
 	return tx.Commit(ctx)
 }
 
+// bookkeepingTimeout bounds the statements that record how an attempt ended.
+// They run on a context of their own, so a job that failed because the process
+// is shutting down still gets its retry written.
+const bookkeepingTimeout = 5 * time.Second
+
 // failed schedules a retry, or after the last attempt marks the job dead,
 // cancels its correlation group, and runs OnDead.
-func (w *Worker) failed(ctx context.Context, m Message, cause error) {
+//
+// Its statements do not run on the job's context. That context is the worker's,
+// so at shutdown it is already canceled by the time a handler returns, every
+// statement here would fail at once, and the job would keep its claim until the
+// lease expired -- five minutes by default -- instead of being retried. The
+// attempt is over either way; recording how it ended is what has to survive.
+func (w *Worker) failed(jobCtx context.Context, m Message, cause error) {
 	log := w.opts.Logger.With("queue", w.queue, "message_id", m.ID, "attempt", m.Attempts)
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(jobCtx), bookkeepingTimeout)
+	defer cancel()
 
 	if m.Attempts < w.opts.MaxAttempts {
 		log.Warn("catbird: job failed, will retry", "err", cause)
@@ -232,6 +279,12 @@ func (w *Worker) failed(ctx context.Context, m Message, cause error) {
 			log.Error("catbird: cancel failed", "correlation_id", m.CorrelationID, "err", err)
 		}
 	}
+	// OnDead runs on the same context and shares the same budget. It is the
+	// caller's code, so a longer one would be defensible -- a job dies once and
+	// this is the only notification of it -- but shutdown waits for the jobs in
+	// flight, and a budget of Lease would let one slow callback hold a stopping
+	// process for five minutes. A callback with more to do than fits should
+	// write a row here and do the rest from a job.
 	if w.opts.OnDead != nil {
 		if err := w.opts.OnDead(ctx, w.runtime.pool, m); err != nil {
 			log.Error("catbird: OnDead failed", "err", err)

@@ -15,7 +15,12 @@ func Example_basicWorkflow() {
 	ctx := context.Background()
 
 	// The 00001_lite.sql schema must be applied first.
-	pool, err := pgxpool.New(ctx, "postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable")
+	//
+	// Size the pool for the jobs that run at once: every running job holds a
+	// connection for its transaction, so the pool has to carry the workers'
+	// BatchSize plus a little. Without pool_max_conns pgxpool gives you
+	// max(4, NumCPU), and NewWorker lowers BatchSize to match it.
+	pool, err := pgxpool.New(ctx, "postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable&pool_max_conns=25")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -31,6 +36,7 @@ func Example_basicWorkflow() {
 
 	rt := catbird.New(pool, catbird.Options{})
 	catbird.NewWorker(rt, "image_processing", handler, catbird.WorkerOptions{
+		BatchSize: 20, // 20 jobs at once, inside the pool's 25 connections
 		OnDead: func(ctx context.Context, db catbird.Conn, msg catbird.Message) error {
 			log.Printf("job %d failed permanently", msg.ID)
 			return nil

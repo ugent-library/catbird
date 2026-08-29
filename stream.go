@@ -45,6 +45,17 @@ func (r *Runtime) Consumer(cursor string, opts StreamOptions) *Consumer {
 	return NewConsumer(r, cursor, opts)
 }
 
+// assignBatchSize is how many messages one assigner statement takes. The whole
+// statement is one transaction holding the advisory lock, so this bounds how
+// long other assigners are locked out and how much WAL one commit writes.
+const assignBatchSize = 5000
+
+// assignRoundsPerTick bounds how many statements one tick may run before it
+// gives the tick back. Without a bound a process that falls behind never
+// returns to its ticker; with it, a tick that reaches the bound is the signal
+// that publishing is outrunning the assigner.
+const assignRoundsPerTick = 20
+
 // assignPositions gives every published message that has none the next
 // position, every AssignEvery. A message is visible to the assigner only once
 // its transaction committed, so positions follow commit order: a message from a
@@ -52,14 +63,14 @@ func (r *Runtime) Consumer(cursor string, opts StreamOptions) *Consumer {
 // position and a batch of positions becomes readable when this statement
 // commits, so a reader does not pass a message that has no position yet.
 //
-// The advisory lock is taken for the statement only. When another assigner
-// holds it, the one-time filter on the UPDATE skips the scan. The UPDATE also
-// requires position IS NULL, checked again on the committed row when it had to
-// wait for a lock, so two assigners that run at the same time cannot move a
-// position that is already set.
-//
-// When it assigned anything it sends NOTIFY on channel cb_stream with the
-// highest new position, so a LISTENing reader can fetch instead of polling.
+// A tick keeps assigning while its statement comes back full, because one
+// statement takes at most assignBatchSize. Without that, a tick assigns 5000
+// messages and then sleeps whatever is left of AssignEvery however long the
+// backlog is, which caps the stream at assignBatchSize/AssignEvery -- 20k
+// messages a second at the defaults -- and above that rate leaves a backlog
+// that grows without bound, silently, taking stream latency with it.
+// PublishBatch is built for batches far above one statement's worth, so this is
+// reached by a batch and not only by sustained load.
 func assignPositions(ctx context.Context, pool *pgxpool.Pool, opts Options) {
 	ticker := time.NewTicker(opts.AssignEvery)
 	defer ticker.Stop()
@@ -69,29 +80,66 @@ func assignPositions(ctx context.Context, pool *pgxpool.Pool, opts Options) {
 			return
 		case <-ticker.C:
 		}
-		_, err := pool.Exec(ctx, `
-			WITH lock AS (
-				SELECT pg_try_advisory_xact_lock(hashtext('catbird'), 1) AS held
-			),
-			unassigned AS (
-				SELECT id FROM cb_messages
-				WHERE stream AND position IS NULL
-				ORDER BY id
-				LIMIT 5000
-			),
-			assigned AS (
-				UPDATE cb_messages m
-				SET position = nextval('cb_position_seq')
-				FROM unassigned u
-				WHERE m.id = u.id AND m.position IS NULL AND (SELECT held FROM lock)
-				RETURNING position
-			)
-			SELECT pg_notify('cb_stream', max(position)::text) FROM assigned HAVING count(*) > 0
-		`)
-		if err != nil && ctx.Err() == nil {
-			opts.Logger.Error("catbird: assigning stream positions failed", "err", err)
+		for round := 1; ctx.Err() == nil; round++ {
+			n, err := assignBatch(ctx, pool)
+			if err != nil {
+				if ctx.Err() == nil {
+					opts.Logger.Error("catbird: assigning stream positions failed", "err", err)
+				}
+				break
+			}
+			if n < assignBatchSize {
+				break // the backlog is gone, or another assigner holds the lock
+			}
+			if round == assignRoundsPerTick {
+				opts.Logger.Warn("catbird: stream positions are behind, backlog left after a full tick",
+					"assigned", round*assignBatchSize, "assign_every", opts.AssignEvery,
+					"hint", "publishing is outrunning the assigner; lower AssignEvery or publish less")
+				break
+			}
 		}
 	}
+}
+
+// assignBatch runs one assigner statement and returns how many positions it
+// set. A full batch means there may be more waiting.
+//
+// The advisory lock is taken for the statement only. When another assigner
+// holds it, the one-time filter on the UPDATE skips the scan and this returns
+// 0. The UPDATE also requires position IS NULL, checked again on the committed
+// row when it had to wait for a lock, so two assigners that run at the same
+// time cannot move a position that is already set.
+//
+// When it assigned anything it sends NOTIFY on channel cb_stream with the
+// highest new position, so a LISTENing reader can fetch instead of polling. The
+// final join references the notify CTE so that it runs, as an unreferenced
+// SELECT CTE never does, and cannot change the count: the CTE is one row at
+// most, from HAVING count(*) > 0.
+func assignBatch(ctx context.Context, pool *pgxpool.Pool) (int, error) {
+	var assigned int
+	err := pool.QueryRow(ctx, `
+		WITH lock AS (
+			SELECT pg_try_advisory_xact_lock(hashtext('catbird'), 1) AS held
+		),
+		unassigned AS (
+			SELECT id FROM cb_messages
+			WHERE stream AND position IS NULL
+			ORDER BY id
+			LIMIT $1
+		),
+		assigned AS (
+			UPDATE cb_messages m
+			SET position = nextval('cb_position_seq')
+			FROM unassigned u
+			WHERE m.id = u.id AND m.position IS NULL AND (SELECT held FROM lock)
+			RETURNING position
+		),
+		notified AS (
+			SELECT pg_notify('cb_stream', max(position)::text) FROM assigned HAVING count(*) > 0
+		)
+		SELECT count(*) FROM assigned LEFT JOIN notified ON true
+	`, assignBatchSize).Scan(&assigned)
+	return assigned, err
 }
 
 // FetchBatch returns the next published messages after the cursor on topic and
@@ -165,6 +213,7 @@ func NewTrigger(r *Runtime, name, topic, targetQueue string, opts StreamOptions)
 		consumer: NewConsumer(r, "trigger:"+name, opts),
 		opts:     opts.withDefaults(),
 	}
+	r.reserve(1) // the fetch and the transaction that enqueues and acks, one after the other
 	r.declare("cb_stream", t.start)
 	return t
 }

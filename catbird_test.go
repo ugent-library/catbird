@@ -776,3 +776,105 @@ func TestCreatedAtIsSetOnStreamAndJobMessages(t *testing.T) {
 		}
 	}
 }
+
+// A job whose attempt ended because the process is shutting down still gets its
+// retry written. The statements that record how an attempt ended do not run on
+// the job's context, which at shutdown is already canceled; if they did, the
+// claim would keep the lease deadline the claim set and wait it out -- five
+// minutes at the defaults -- instead of coming back after Backoff.
+func TestShutdownSchedulesTheRetry(t *testing.T) {
+	ctx := context.Background()
+	pool := setupTestDB(t)
+	client := catbird.NewClient()
+
+	id, err := client.Enqueue(ctx, pool, "work", "shutdown_queue", nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	running := make(chan struct{})
+	rt := catbird.New(pool, catbird.Options{})
+	catbird.NewWorker(rt, "shutdown_queue", func(ctx context.Context, tx catbird.Conn, msg catbird.Message) error {
+		close(running)
+		<-ctx.Done() // the handler is still working when the process stops
+		return ctx.Err()
+	}, catbird.WorkerOptions{
+		// Far apart, so the assertion can tell a scheduled retry from a lease
+		// left to expire.
+		Backoff:      30 * time.Second,
+		Lease:        30 * time.Minute,
+		MaxAttempts:  5,
+		PollInterval: 50 * time.Millisecond,
+	})
+
+	workers, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { rt.Start(workers); close(done) }()
+
+	select {
+	case <-running:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the job never started")
+	}
+	stop()
+	<-done
+
+	var afterSeconds float64
+	var attempts int
+	err = pool.QueryRow(ctx, `
+		SELECT extract(epoch FROM visible_at - now()), attempts FROM cb_claims WHERE message_id = $1
+	`, id).Scan(&afterSeconds, &attempts)
+	if err != nil {
+		t.Fatalf("read claim: %v", err)
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1", attempts)
+	}
+	// Backoff is 30s and the lease 30 minutes: anything near the lease means the
+	// retry was never written and the job is waiting the lease out.
+	if afterSeconds > 60 {
+		t.Errorf("the job comes back in %.0fs, want about 30s: the retry was not scheduled", afterSeconds)
+	}
+}
+
+// One assigner tick drains a backlog larger than one statement's batch. The
+// tick here is long enough that a tick which assigned only one batch and then
+// slept would still be far from done when the assertion runs.
+func TestAssignerDrainsBacklogInOneTick(t *testing.T) {
+	ctx := context.Background()
+	pool := setupTestDB(t)
+
+	const messages = 20000 // four statements' worth at assignBatchSize 5000
+	_, err := pool.Exec(ctx, `
+		INSERT INTO cb_messages (topic, payload, stream)
+		SELECT 'bulk', '{}'::jsonb, true FROM generate_series(1, $1) i
+	`, messages)
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	rt := catbird.New(pool, catbird.Options{AssignEvery: time.Second})
+	workers, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(workers)
+
+	// The first tick is at 1s and drains everything. One batch per tick would
+	// need four ticks, so it would still be at 5000 when this gives up.
+	deadline := time.Now().Add(2500 * time.Millisecond)
+	var assigned int
+	for time.Now().Before(deadline) {
+		assigned = count(t, pool, "SELECT count(*) FROM cb_messages WHERE position IS NOT NULL")
+		if assigned == messages {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if assigned != messages {
+		t.Fatalf("%d of %d messages have a position; the assigner did not drain its backlog", assigned, messages)
+	}
+
+	// Positions are dense and unique, so a reader walking them misses nothing.
+	if n := count(t, pool, "SELECT count(DISTINCT position) FROM cb_messages"); n != messages {
+		t.Errorf("%d distinct positions, want %d", n, messages)
+	}
+}
