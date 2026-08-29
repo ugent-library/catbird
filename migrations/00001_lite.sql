@@ -58,6 +58,12 @@ CREATE TABLE cb_claims (
 );
 -- Only claimable rows are in the index; dead and waiting rows leave it on their own.
 CREATE INDEX cb_claims_ready_idx ON cb_claims (queue, visible_at) WHERE status = 0 AND dependencies = 0;
+-- Cancel's group lookup. A worker cancels the correlation group of every job
+-- that dies with one, so without this a downstream outage runs one full scan of
+-- cb_claims per dead job: 834 buffers and 4.9 ms at 100k live claims, against 6
+-- buffers here. Jobs with no correlation id stay out of a structure that can
+-- never match them: 112 kB against 2128 kB with 1% of jobs correlated.
+CREATE INDEX cb_claims_correlation_idx ON cb_claims (correlation_id) WHERE status = 0 AND correlation_id IS NOT NULL;
 
 -- Payloads delivered to a job that is waiting on them. Read once, at claim time.
 CREATE TABLE cb_signals (
