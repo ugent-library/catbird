@@ -1026,3 +1026,39 @@ func TestStreamWindow(t *testing.T) {
 		t.Errorf("oldest position %d does not report the gap after position 0", oldest)
 	}
 }
+
+// The LISTEN connection is hijacked out of the pool, so the pool keeps its full
+// width while a process listens. A one-connection pool is the sharpest form of
+// it: the listener takes the only connection, and everything else — here the
+// assigner — still has to be able to work.
+func TestListenDoesNotSpendAPoolConnection(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cfg, err := pgxpool.ParseConfig(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxConns = 1
+	narrow, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer narrow.Close()
+
+	rt := catbird.New(narrow, catbird.Options{})
+	done := make(chan struct{})
+	go func() { defer close(done); rt.Start(ctx) }()
+
+	if _, err := catbird.Publish(ctx, pool, "ev.one", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	waitForPositions(t, ctx, pool, 1)
+
+	if stat := narrow.Stat(); stat.AcquiredConns() != 0 {
+		t.Errorf("%d pool connections still held by the listener, want 0", stat.AcquiredConns())
+	}
+	cancel()
+	<-done
+}

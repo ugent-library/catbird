@@ -180,14 +180,25 @@ func (r *Runtime) wake(channel string) {
 // logs, waits ReconnectAfter, and connects again; in between the loops run on
 // their poll intervals. Notifications sent while there was no connection are
 // gone, so every loop is woken once after each connect.
+//
+// The connection is taken from the pool and then hijacked out of it. Hijack
+// gives the pool its slot back, so a process does not run one connection short
+// of MaxConns for as long as it listens, and it takes the connection out of the
+// pool's set, so a session carrying LISTEN state is never handed to another
+// caller. The process therefore holds MaxConns + 1 connections.
 func (r *Runtime) listen(ctx context.Context, channels []string) {
 	for ctx.Err() == nil {
 		err := func() error {
-			conn, err := r.pool.Acquire(ctx)
+			pooled, err := r.pool.Acquire(ctx)
 			if err != nil {
 				return err
 			}
-			defer conn.Release()
+			conn := pooled.Hijack()
+			// ctx is canceled on shutdown, and closing under a canceled
+			// context sets an immediate deadline, so the Terminate never
+			// reaches the server and the backend has to notice the dropped
+			// socket instead.
+			defer conn.Close(context.WithoutCancel(ctx))
 			for _, channel := range channels {
 				if _, err := conn.Exec(ctx, "LISTEN "+pgx.Identifier{channel}.Sanitize()); err != nil {
 					return err
@@ -195,7 +206,7 @@ func (r *Runtime) listen(ctx context.Context, channels []string) {
 			}
 			r.wake("")
 			for {
-				n, err := conn.Conn().WaitForNotification(ctx)
+				n, err := conn.WaitForNotification(ctx)
 				if err != nil {
 					return err
 				}

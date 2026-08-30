@@ -53,7 +53,7 @@ A handler that calls it inside its own transaction ends the job in the same comm
 
 **At-least-once is the model.** A job runs again after a crash, after a lease expires, and after any attempt that did not reach its completion. A handler therefore either makes its writes idempotent — `Job.ID` is the key to do it with — or completes in the same transaction as them, which is the only way an accumulating write like `balance = balance - 100` can be right. Effects outside the database were never covered by either and need the same idempotency key.
 
-**What a running job costs.** Nothing on the pool: no transaction and no connection are held while a handler runs, so `BatchSize` is a number of goroutines and not a number of connections. The library's own statements need about eight connections — the `LISTEN` connection, the assigner, the claims and completions of its workers, a trigger's batch. What the handlers hold comes on top of that, and it is what the pool has to be sized for; see Known limits.
+**What a running job costs.** Nothing on the pool: no transaction and no connection are held while a handler runs, so `BatchSize` is a number of goroutines and not a number of connections. The library's own statements need a handful of pool connections — the assigner, the claims and completions of its workers, a trigger's batch — and the `LISTEN` connection is not one of them: it is hijacked out of the pool, so a process opens `MaxConns + 1` connections and the pool keeps its full width. What the handlers hold comes on top of that, and it is what the pool has to be sized for; see Known limits.
 
 **Lease rule.** A handler must finish within `Lease` or its work is discarded and the job runs again. Set `Lease` above your longest handler.
 
@@ -131,8 +131,6 @@ Every process enqueues `cron:<name>:<minute>` as the dedup key when the minute s
 ## Bugs
 
 Wrong today, each with a fix that is known and small. In the order they would hurt.
-
-**The `LISTEN` connection comes from the pool.** It is held for the life of the process, so it is a connection nothing else gets back — and when the pool is busy it cannot be opened at all and the process falls back to polling with a reconnect error every `ReconnectAfter`. The fix is to open it from the pool's configuration with `pgx.ConnectConfig` instead of `pool.Acquire`, running the pool's `BeforeConnect` and `AfterConnect` so a caller's setup is not skipped, and closing it on a context shutdown does not cancel.
 
 **The assigner has a ceiling and no drain loop.** `assignPositions` runs one `LIMIT 5000` statement per `AssignEvery` tick and then sleeps the rest of the tick whether or not it filled the batch. That caps the whole database at 5000 per tick — 20k published messages a second at the defaults — and above that rate the unassigned backlog grows without bound, silently, taking stream latency with it. `PublishBatch` is built for batches well above one statement's worth, so a single batch reaches it. `Trigger.start` already does the right thing and continues while its batch came back full. The fix is the same loop, with a bound on the rounds per tick and a warning when it is still behind after them.
 
