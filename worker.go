@@ -179,21 +179,31 @@ func (w *worker) interrupted(ctx context.Context, job *Job, cause error) {
 }
 
 // failed schedules a retry, or after the last attempt marks the job dead,
-// cancels its workflow, and runs OnDead. MaxAttempts, Backoff and OnDead come
-// from the job type, so two kinds of work sharing a queue are retried on their
-// own terms. Both writes carry the attempts lease token, and a write that finds
-// no row means the claim is not this attempt's any more: the handler completed
-// the job and then returned an error, or the lease expired and another worker
-// has it. Neither is this attempt's failure to record, and the cascade must not
-// run for a job that is finished or running elsewhere.
+// cancels its workflow, and runs OnDead. MaxAttempts, MinBackoff, MaxBackoff and
+// OnDead come from the job type, so two kinds of work sharing a queue are
+// retried on their own terms.
+//
+// The retry waits at least MinBackoff and at most what doubling that per attempt
+// has reached, up to MaxBackoff, and the wait itself is drawn at random between
+// the two, so the jobs of an outage come back apart instead of in one second at
+// a service that is still down. The exponent stops at 20 to keep the
+// multiplication inside an interval.
+//
+// Both writes carry the attempts lease token, and a write that finds no row
+// means the claim is not this attempt's any more: the handler completed the job
+// and then returned an error, or the lease expired and another worker has it.
+// Neither is this attempt's failure to record, and the cascade must not run for
+// a job that is finished or running elsewhere.
 func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) {
 	log := w.logger.With("queue", w.queue.name, "job_type", job.Type, "job_id", job.ID, "attempt", job.Attempts)
 
 	if job.Attempts < t.opts.MaxAttempts {
 		tag, err := w.runtime.pool.Exec(ctx, `
-			UPDATE cb_claims SET visible_at = now() + $3::interval
-			WHERE message_id = $1 AND attempts = $2 AND status = $4
-		`, job.ID, job.Attempts, t.opts.Backoff, statusLive)
+			UPDATE cb_claims
+			SET visible_at = now() + $3::interval
+			    + (least($3::interval * 2 ^ least(attempts - 1, 20), $4::interval) - $3::interval) * random()
+			WHERE message_id = $1 AND attempts = $2 AND status = $5
+		`, job.ID, job.Attempts, t.opts.MinBackoff, t.opts.MaxBackoff, statusLive)
 		switch {
 		case err != nil:
 			log.Error("catbird: scheduling retry failed", "err", err, "cause", cause)

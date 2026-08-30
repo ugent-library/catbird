@@ -52,7 +52,7 @@ Five files, one migration, no packages:
   and how work runs under it: `BatchSize`, `Lease`, `PollInterval`. It decides
   who competes with whom, and it is the claim key. `JobType` is a kind of job:
   its name, its queue, and how a run of it is retried (`Signal`,
-  `MaxAttempts`, `Backoff`, `OnDead`). Both are plain Go values; nothing about
+  `MaxAttempts`, `MinBackoff`, `MaxBackoff`, `OnDead`). Both are plain Go values; nothing about
   them is written to the database, and only their names reach a row. The
   handler is not on either — everything on a job type is stamped on a claim or
   decided about a run, and a handler is neither, so it is given at
@@ -135,8 +135,8 @@ client exists.
   cannot be read as index arms and walks the position index instead.
 - The assigner only sets positions that are still empty, so two assigners
   running at once cannot move a position a reader may already have passed.
-- `BatchSize` and `Lease` are queue settings; `MaxAttempts`, `Backoff` and
-  `OnDead` are job type settings. `Lease` is on the queue because the claim sets
+- `BatchSize` and `Lease` are queue settings; `MaxAttempts`, `MinBackoff`,
+  `MaxBackoff` and `OnDead` are job type settings. `Lease` is on the queue because the claim sets
   it for a whole batch in one statement. The handler belongs to neither: it is
   the process's, and `rt.Handle(jobType, handler)` is where the two meet.
 - Hot-path SQL takes no joins, no advisory locks (the assigner's is the one

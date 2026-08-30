@@ -65,17 +65,32 @@ type JobTypeOptions struct {
 	// job.Signal is never nil for a type declared with it, and never anything
 	// but nil for a type without it.
 	Signal      bool
-	MaxAttempts int           // attempts before the job is dead; default 5
-	Backoff     time.Duration // wait after a failed attempt; default 1 minute
-	OnDead      Handler       // runs once after the last failed attempt
+	MaxAttempts int // attempts before the job is dead; default 5
+
+	// MinBackoff is the wait after the first failed attempt and the shortest
+	// wait there is; doubling it per attempt stops at MaxBackoff. Each wait is
+	// drawn at random between the two, so jobs that failed together come back
+	// apart. Defaults are one second and one minute.
+	MinBackoff time.Duration
+	MaxBackoff time.Duration
+
+	OnDead Handler // runs once after the last failed attempt
 }
 
 func (o JobTypeOptions) withDefaults() JobTypeOptions {
 	if o.MaxAttempts <= 0 {
 		o.MaxAttempts = 5
 	}
-	if o.Backoff <= 0 {
-		o.Backoff = time.Minute
+	if o.MinBackoff <= 0 {
+		o.MinBackoff = time.Second
+	}
+	if o.MaxBackoff <= 0 {
+		o.MaxBackoff = time.Minute
+	}
+	if o.MaxBackoff < o.MinBackoff {
+		// A ceiling under the floor would draw the wait backwards and schedule
+		// the retry in the past, so the floor wins and the wait does not grow.
+		o.MaxBackoff = o.MinBackoff
 	}
 	return o
 }

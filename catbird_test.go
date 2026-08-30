@@ -372,7 +372,7 @@ func TestDependencyOutputs(t *testing.T) {
 	queue := catbird.NewQueue("dependencies", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
 	root := catbird.NewJobType("dep_root", queue, catbird.JobTypeOptions{})
 	branch := catbird.NewJobType("dep_branch", queue, catbird.JobTypeOptions{})
-	join := catbird.NewJobType("dep_join", queue, catbird.JobTypeOptions{Backoff: 50 * time.Millisecond})
+	join := catbird.NewJobType("dep_join", queue, catbird.JobTypeOptions{MinBackoff: 50 * time.Millisecond})
 	rejoin := catbird.NewJobType("dep_rejoin", queue, catbird.JobTypeOptions{})
 
 	rootRound := make(chan []json.RawMessage, 1)
@@ -502,7 +502,7 @@ func TestAFailedAttemptAsksForNothing(t *testing.T) {
 
 	queue := catbird.NewQueue("buffer", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
 	next := catbird.NewJobType("next", queue, catbird.JobTypeOptions{})
-	flaky := catbird.NewJobType("flaky", queue, catbird.JobTypeOptions{Backoff: 50 * time.Millisecond})
+	flaky := catbird.NewJobType("flaky", queue, catbird.JobTypeOptions{MinBackoff: 50 * time.Millisecond})
 
 	rt := catbird.New(pool, catbird.Options{})
 	rt.Handle(flaky, func(ctx context.Context, job *catbird.Job) error {
@@ -979,7 +979,7 @@ func TestFailedAttemptWritesNoOutput(t *testing.T) {
 
 	const backoff = time.Second
 	queue := catbird.NewQueue("output_retries", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
-	flaky := catbird.NewJobType("flaky", queue, catbird.JobTypeOptions{Backoff: backoff})
+	flaky := catbird.NewJobType("flaky", queue, catbird.JobTypeOptions{MinBackoff: backoff})
 
 	id, err := catbird.Enqueue(ctx, pool, flaky, nil, catbird.EnqueueOptions{})
 	if err != nil {
@@ -1001,7 +1001,7 @@ func TestFailedAttemptWritesNoOutput(t *testing.T) {
 	go rt.Start(runCtx)
 
 	// The retry row is the first moment the failed attempt is over: it is
-	// written after the handler returned, and the backoff holds it there.
+	// written after the handler returned, and the wait holds it there.
 	waitFor(t, 5*time.Second, "the failed attempt scheduled no retry", func() bool {
 		return count(t, pool, `
 			SELECT count(*) FROM cb_claims
@@ -1360,7 +1360,7 @@ func TestCompletedJobIsNotRetriedAfterAnError(t *testing.T) {
 	defer cancel()
 
 	queue := catbird.NewQueue("late_error", catbird.QueueOptions{PollInterval: 50 * time.Millisecond})
-	done := catbird.NewJobType("done", queue, catbird.JobTypeOptions{Backoff: 50 * time.Millisecond})
+	done := catbird.NewJobType("done", queue, catbird.JobTypeOptions{MinBackoff: 50 * time.Millisecond})
 
 	if _, err := catbird.Enqueue(ctx, pool, done, nil, catbird.EnqueueOptions{}); err != nil {
 		t.Fatal(err)
@@ -1406,7 +1406,7 @@ func TestCompletedJobIsNotRetriedAfterAnError(t *testing.T) {
 }
 
 // A handler that returns an error spends the attempt and keeps the job: the
-// claim stays where it is and its next attempt is held back by Backoff.
+// claim stays where it is and its next attempt is held back by MinBackoff.
 // Without the wait, a queue whose downstream is down retries every failing job
 // as fast as it can claim it.
 func TestHandlerErrorSchedulesARetryAfterBackoff(t *testing.T) {
@@ -1416,7 +1416,7 @@ func TestHandlerErrorSchedulesARetryAfterBackoff(t *testing.T) {
 
 	const backoff = 500 * time.Millisecond
 	queue := catbird.NewQueue("retries", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
-	flaky := catbird.NewJobType("flaky", queue, catbird.JobTypeOptions{Backoff: backoff})
+	flaky := catbird.NewJobType("flaky", queue, catbird.JobTypeOptions{MinBackoff: backoff})
 
 	if _, err := catbird.Enqueue(ctx, pool, flaky, nil, catbird.EnqueueOptions{}); err != nil {
 		t.Fatal(err)
@@ -1435,9 +1435,9 @@ func TestHandlerErrorSchedulesARetryAfterBackoff(t *testing.T) {
 	defer stop()
 	go rt.Start(runCtx)
 
-	// How far off the retry is has to be read in the database's clock: the
-	// backoff is an interval added to the server's now(), and the claim that
-	// picks the job up again compares against the same now().
+	// How far off the retry is has to be read in the database's clock: the wait
+	// is an interval added to the server's now(), and the claim that picks the
+	// job up again compares against the same now().
 	waitFor(t, 5*time.Second, "the failed attempt scheduled no retry a backoff away", func() bool {
 		return count(t, pool, `
 			SELECT count(*) FROM cb_claims
@@ -1453,9 +1453,46 @@ func TestHandlerErrorSchedulesARetryAfterBackoff(t *testing.T) {
 	})
 }
 
+// MaxBackoff is where the doubling stops. Without a ceiling the wait grows past
+// any use it has: doubling from five milliseconds, the seventeenth wait alone
+// reaches five minutes, so the retries of a five-minute outage would go on for
+// an hour after it ended. It is also what spends this job's eighteen attempts
+// inside the wait below, which a wait that kept doubling could not.
+func TestMaxBackoffCapsTheGrowingWait(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("capped", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	flaky := catbird.NewJobType("flaky", queue, catbird.JobTypeOptions{
+		MaxAttempts: 18,
+		MinBackoff:  5 * time.Millisecond,
+		MaxBackoff:  50 * time.Millisecond,
+	})
+
+	if _, err := catbird.Enqueue(ctx, pool, flaky, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Handle(flaky, func(ctx context.Context, job *catbird.Job) error {
+		return errors.New("every attempt fails")
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	waitFor(t, 10*time.Second, "the job did not spend its attempts: the wait grew past MaxBackoff", func() bool {
+		return count(t, pool, `
+			SELECT count(*) FROM cb_claims
+			WHERE queue = 'capped' AND status = 1 AND attempts = 18
+		`) == 1
+	})
+}
+
 // The last attempt ends the job: the claim is marked dead, no worker claims it
-// again, and OnDead runs once with the attempt that failed. MaxAttempts, Backoff
-// and OnDead come from the job type, so the two types sharing this queue are
+// again, and OnDead runs once with the attempt that failed. MaxAttempts,
+// MinBackoff and OnDead come from the job type, so the two types sharing this queue are
 // retried on their own terms.
 func TestMaxAttemptsMarksTheJobDeadAndRunsOnDead(t *testing.T) {
 	pool := setupTestDB(t)
@@ -1466,14 +1503,14 @@ func TestMaxAttemptsMarksTheJobDeadAndRunsOnDead(t *testing.T) {
 	queue := catbird.NewQueue("dead_end", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
 	doomed := catbird.NewJobType("doomed", queue, catbird.JobTypeOptions{
 		MaxAttempts: 3,
-		Backoff:     20 * time.Millisecond,
+		MinBackoff:  20 * time.Millisecond,
 		OnDead: func(ctx context.Context, job *catbird.Job) error {
 			dead <- job
 			return nil
 		},
 	})
 	patient := catbird.NewJobType("patient", queue, catbird.JobTypeOptions{
-		MaxAttempts: 10, Backoff: 20 * time.Millisecond,
+		MaxAttempts: 10, MinBackoff: 20 * time.Millisecond,
 	})
 
 	id, err := catbird.Enqueue(ctx, pool, doomed, nil, catbird.EnqueueOptions{})
@@ -1511,7 +1548,7 @@ func TestMaxAttemptsMarksTheJobDeadAndRunsOnDead(t *testing.T) {
 		t.Errorf("OnDead got attempt %d, want the last one, 3", job.Attempts)
 	}
 
-	// Backoff and poll interval are both far shorter than this wait, so a claim
+	// MinBackoff and poll interval are both far shorter than this wait, so a claim
 	// that still matched the dead row would have run the handler again by now.
 	time.Sleep(300 * time.Millisecond)
 	if n := atomic.LoadInt32(&calls); n != 3 {

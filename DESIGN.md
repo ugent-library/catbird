@@ -33,7 +33,7 @@ Two values, both plain Go, neither written to the database.
 
 **`NewQueue(name, opts)`** is a name and how work runs under it: `BatchSize`, `Lease`, `PollInterval`. It answers one question — who competes with whom for slots — and it is the claim key, the single value the ready index is probed with. `Lease` is here rather than on the job type because the claim sets it for a whole batch in one statement; a job type whose handler runs far longer than its neighbours wants its own queue anyway, which is the same isolation argument.
 
-**`NewJobType(name, queue, opts)`** is a kind of job: its name, its queue, and how a run of it is retried — `Signal`, `MaxAttempts`, `Backoff`, `OnDead`. Both the enqueue and the worker take the value, so what a caller creates and what a handler is given cannot disagree. That is the whole reason it exists, and it is the test for what belongs on it: the enqueue writes it into the row, and the handler's correctness depends on it. `Signal` passes. `MaxAttempts`, `Backoff` and `OnDead` are there because none of them touches the claim — the worker reads them from the type it dispatched on — and because they are plainly properties of the work.
+**`NewJobType(name, queue, opts)`** is a kind of job: its name, its queue, and how a run of it is retried — `Signal`, `MaxAttempts`, `MinBackoff`, `MaxBackoff`, `OnDead`. Both the enqueue and the worker take the value, so what a caller creates and what a handler is given cannot disagree. That is the whole reason it exists, and it is the test for what belongs on it: the enqueue writes it into the row, and the handler's correctness depends on it. `Signal` passes. `MaxAttempts`, `MinBackoff`, `MaxBackoff` and `OnDead` are there because none of them touches the claim — the worker reads them from the type it dispatched on — and because they are plainly properties of the work.
 
 **The function that runs it is not on the value.** It is given at registration: `rt.Handle(Review, handleReview)`. Everything on a job type is either stamped on a claim or decided about a run, and a handler is neither — it is this process's code, which a process that only enqueues has no use for and should not have to link. Putting it on the value also made a job type whose handler names it back a compile error, because Go's initialization analysis follows function bodies, and a handler that enqueues its own type is an ordinary thing: a retry loop, a paginated crawl, a reminder that re-arms itself.
 
@@ -79,9 +79,9 @@ A handler that calls it inside its own transaction ends the job in the same comm
 
 **Lease rule.** A handler must finish within `Lease` or its work is discarded and the job runs again. Set the queue's `Lease` above the longest handler on it.
 
-**Settings rule.** `BatchSize`, `Lease` and `PollInterval` are queue settings; `MaxAttempts`, `Backoff`, `Signal` and `OnDead` are job type settings. Both are declared once and shared by every process that uses them, so the old rule that all workers on a queue must agree is now a property of the value rather than a rule a reader has to hold — as far as one program goes. Across two binaries it is still convention: neither is stored, so two deployments declaring different values disagree silently.
+**Settings rule.** `BatchSize`, `Lease` and `PollInterval` are queue settings; `MaxAttempts`, `MinBackoff`, `MaxBackoff`, `Signal` and `OnDead` are job type settings. Both are declared once and shared by every process that uses them, so the old rule that all workers on a queue must agree is now a property of the value rather than a rule a reader has to hold — as far as one program goes. Across two binaries it is still convention: neither is stored, so two deployments declaring different values disagree silently.
 
-**Failing.** A handler error sets `visible_at = now() + Backoff`. After the job type's `MaxAttempts` the claim is marked dead (`status = 1`), the job's workflow is cancelled, and `OnDead` runs once. A crash counts as a failed attempt like any other, so `OnDead` also fires for jobs that repeatedly crashed a worker. A handler that completed the job and then returns an error is not retried: the retry carries the `attempts = $2` token and the claim it would correct is already gone.
+**Failing.** A handler error schedules the next attempt: `visible_at` is set to `MinBackoff` plus a random share of what the doubling has added to it, and the doubling stops at `MaxBackoff`. The first retry is `MinBackoff` exactly, and no retry is ever sooner. After the job type's `MaxAttempts` the claim is marked dead (`status = 1`), the job's workflow is cancelled, and `OnDead` runs once. A crash counts as a failed attempt like any other, so `OnDead` also fires for jobs that repeatedly crashed a worker. A handler that completed the job and then returns an error is not retried: the retry carries the `attempts = $2` token and the claim it would correct is already gone.
 
 Everything after the handler — the completion, the retry, the give-back — runs on a context detached from the worker's, with a few seconds of its own. At shutdown the worker's context is already canceled by the time the handler returns and pgx would reject those statements locally: the completion of work that is already done would be lost and the job would run a second time.
 
@@ -218,7 +218,7 @@ The rule for everything below: a change leaves the core easier to read than it f
 1. ~~**`Read` and `LastPosition`.**~~ Built, as `ReadAfter`, `Cursor.Read`, `Ack`, `LastPosition` and `OldestPosition`; see "Streams" above.
 2. **`Timeout`.** A `context.WithTimeout` around the handler in `run`. It bounds the attempt's bookkeeping, not the goroutine — a handler that never checks `ctx.Err()` keeps its slot either way — so it is a partial fix, worth its three lines.
 3. **`Status`.** A leaf read over columns that already exist. It is what an application needs to find a gate nobody ever opened, which is the worst of the known limits; built without `last_error`, see below.
-4. **Exponential backoff.** One dense line in `failed`, replacing a real failure: an outage fails every job on a queue at once and a fixed delay brings all of them back in the same second, at a service that is still down. The comment on it states that failure, not the arithmetic.
+4. ~~**Exponential backoff.**~~ Built, as `MinBackoff` and `MaxBackoff` on the job type; see "Failing" above.
 5. **The cron helper**, on `DedupKey` alone.
 6. **`ExtendLease`**, as a function rather than a field on `Job`.
 7. **Wire**, in a file of its own. It calls `ReadAfter` and touches nothing else, so however long it gets, the core files do not get harder to read.
@@ -334,21 +334,24 @@ app.wire.Serve(w, r, catbird.ServeOptions{
 
 ### Jobs
 
-**Exponential backoff.** `Backoff` becomes the delay after the first failed attempt rather than after every one, and `JobTypeOptions.MaxBackoff` caps how far it grows. The wait after attempt n is a random duration below `min(Backoff * 2^(n-1), MaxBackoff)`, computed in the retry statement itself:
+**Exponential backoff.** Built; see "Failing" above. `MinBackoff` is the wait after the first failed attempt and the shortest wait there is, and `JobTypeOptions.MaxBackoff` caps how far the doubling grows it. The wait after attempt n is drawn between `MinBackoff` and `min(MinBackoff * 2^(n-1), MaxBackoff)`, computed in the retry statement itself:
 
 ```sql
 UPDATE cb_claims
-SET visible_at = now() + least($3::interval * 2 ^ least(attempts - 1, 20), $4::interval) * random()
-WHERE message_id = $1 AND attempts = $2 AND status = 0
+SET visible_at = now() + $3::interval
+    + (least($3::interval * 2 ^ least(attempts - 1, 20), $4::interval) - $3::interval) * random()
+WHERE message_id = $1 AND attempts = $2 AND status = $5
 ```
 
-Defaults change with it: `Backoff` one second and `MaxBackoff` one minute, instead of a flat minute. Both are job type settings — they never touch the claim — so two kinds of work on one queue back off on their own terms.
+Defaults changed with it: `MinBackoff` one second and `MaxBackoff` one minute, instead of a flat minute. Both are job type settings — they never touch the claim — so two kinds of work on one queue back off on their own terms.
 
-Two reasons for growing the wait. A handler that fails because a service it calls is down retries at a fixed minute for as long as `MaxAttempts` allows, so five attempts cover five minutes of outage; doubling spends the same five attempts over half an hour. And an outage fails every job on the queue at once: with a fixed delay all of them come back in the same second, hit the service that is still down, and come back together again a minute later. The random draw spreads them, which is why the delay is drawn below the cap instead of being the cap. It also means the setting names a ceiling and not an average: a `Backoff` of one second retries after half a second on average.
+Two reasons for growing the wait. A handler that fails because a service it calls is down retries at a fixed minute for as long as `MaxAttempts` allows, so five attempts cover five minutes of outage; doubling spends the same five attempts over half an hour. And an outage fails every job on the queue at once: with a fixed delay all of them come back in the same second, hit the service that is still down, and come back together again a minute later. The random draw spreads them.
 
 The exponent is clamped at 20 so that a job which somehow reaches a high attempt count does not overflow the interval multiplication before `MaxBackoff` bounds it.
 
-A job type that wants the old fixed pacing sets `Backoff` and `MaxBackoff` to the same value; the draw still spreads the retries below it, which is the part no queue benefits from losing.
+A job type that wants fixed pacing sets `MinBackoff` and `MaxBackoff` to the same value: the distance the draw runs over is zero, and every retry waits exactly that long.
+
+**The draw runs from `MinBackoff`.** Every retry spends one of `MaxAttempts`, so a wait that can be near zero burns one on a service that has had no time to recover — five attempts gone inside a second. What it costs is the spread on the first retry, which is `MinBackoff` exactly for every job that failed; the jobs of an outage spread from the second retry on, and by their own failure times before that. A `MaxBackoff` under `MinBackoff` is raised to it.
 
 **Run status.** `Status(ctx, db, id)` returns queued, scheduled, running, waiting for a signal, waiting for other jobs, dead or completed, with the attempt count: completed means the message exists and its claim is gone; `awaits_signal` with no `signal` and `dependencies > 0` are the two waits, and a live claim with `visible_at` in the future and neither of those is running or backing off, which `attempts` and the type's `MaxAttempts` tell apart. This is what an application needs to find a gate nobody ever opened, which is the worst of the known limits. `cb_claims` gets a nullable `last_error TEXT`, written on every failed attempt, so an application can show why a run failed or is retrying.
 
