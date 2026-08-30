@@ -85,9 +85,21 @@ func TestTortureThroughput(t *testing.T) {
 	t.Logf("wrote %d messages in %v (%.0f/s)", totalMsgs, writeDur, float64(totalMsgs)/writeDur.Seconds())
 
 	var processed int32
-	handler := func(ctx context.Context, tx catbird.Conn, msg catbird.Message) error {
-		// Use the transaction so the Conn path is exercised.
+	handler := func(ctx context.Context, job *catbird.Message) error {
+		// The transactional path: the handler's own writes and the completion
+		// of the job in one commit.
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
 		if _, err := tx.Exec(ctx, "SELECT 1"); err != nil {
+			return err
+		}
+		if err := client.CompleteJob(ctx, tx, job); err != nil {
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
 			return err
 		}
 		atomic.AddInt32(&processed, 1)
@@ -149,7 +161,7 @@ func TestLongJobDoesNotHoldUpTheQueue(t *testing.T) {
 
 	done := make(chan string, short+1)
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Worker("mixed", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
+	rt.Worker("mixed", func(ctx context.Context, m *catbird.Message) error {
 		if m.Topic == "long" {
 			select {
 			case <-release:
@@ -272,8 +284,8 @@ func TestDependenciesAndSignals(t *testing.T) {
 
 	ran := make(chan catbird.Message, 1)
 	rt := catbird.New(pool, catbird.Options{})
-	catbird.NewWorker(rt, "dag_queue", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
-		ran <- m
+	catbird.NewWorker(rt, "dag_queue", func(ctx context.Context, m *catbird.Message) error {
+		ran <- *m
 		return nil
 	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond})
 	runCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -315,13 +327,23 @@ func TestLeaseExpiryFence(t *testing.T) {
 	}
 
 	var calls int32
-	handler := func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
+	handler := func(ctx context.Context, job *catbird.Message) error {
 		atomic.AddInt32(&calls, 1)
-		if m.Attempts == 1 {
+		if job.Attempts == 1 {
 			time.Sleep(800 * time.Millisecond) // past the lease
 		}
-		_, err := tx.Exec(ctx, "INSERT INTO lease_test (attempt) VALUES ($1)", m.Attempts)
-		return err
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx, "INSERT INTO lease_test (attempt) VALUES ($1)", job.Attempts); err != nil {
+			return err
+		}
+		if err := client.CompleteJob(ctx, tx, job); err != nil {
+			return err // the late attempt gets ErrLeaseExpired and its insert is rolled back
+		}
+		return tx.Commit(ctx)
 	}
 	opts := catbird.WorkerOptions{Lease: 200 * time.Millisecond, PollInterval: 50 * time.Millisecond}
 	rt := catbird.New(pool, catbird.Options{})
@@ -366,8 +388,8 @@ func TestTriggerBridgesPayloadUnchanged(t *testing.T) {
 	catbird.NewTrigger(rt, "img", "image", "image_processing", catbird.StreamOptions{PollInterval: 50 * time.Millisecond})
 
 	got := make(chan catbird.Message, 16)
-	catbird.NewWorker(rt, "image_processing", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
-		got <- m
+	catbird.NewWorker(rt, "image_processing", func(ctx context.Context, m *catbird.Message) error {
+		got <- *m
 		return nil
 	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond})
 	go rt.Start(ctx)
@@ -500,14 +522,25 @@ func TestOutputAndStreamNotify(t *testing.T) {
 		t.Fatalf("output before completion: %v", err)
 	}
 	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
-	catbird.NewWorker(rt, "out_queue", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
+	catbird.NewWorker(rt, "out_queue", func(ctx context.Context, job *catbird.Message) error {
 		var in []int
-		json.Unmarshal(m.Payload, &in)
+		json.Unmarshal(job.Payload, &in)
 		sum := 0
 		for _, n := range in {
 			sum += n
 		}
-		return client.SetOutput(ctx, tx, m.ID, sum)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		if err := client.SetOutput(ctx, tx, job.ID, sum); err != nil {
+			return err
+		}
+		if err := client.CompleteJob(ctx, tx, job); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
 	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond})
 	go rt.Start(ctx)
 
@@ -740,7 +773,7 @@ func TestCreatedAtIsSetOnStreamAndJobMessages(t *testing.T) {
 
 	jobCreatedAt := make(chan time.Time, 1)
 	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
-	catbird.NewWorker(rt, "age_queue", func(ctx context.Context, tx catbird.Conn, m catbird.Message) error {
+	catbird.NewWorker(rt, "age_queue", func(ctx context.Context, m *catbird.Message) error {
 		jobCreatedAt <- m.CreatedAt
 		return nil
 	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond})
@@ -774,5 +807,113 @@ func TestCreatedAtIsSetOnStreamAndJobMessages(t *testing.T) {
 		if got.Before(start) || got.After(end) {
 			t.Fatalf("%s message CreatedAt %v, want between %v and %v", name, got, start, end)
 		}
+	}
+}
+
+// Shutdown does not spend an attempt. A job stopped in the middle of its
+// handler is handed back: the attempt is returned and the job is claimable
+// again at once, so a rolling deploy costs neither retries nor lease time.
+func TestShutdownReturnsTheJob(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client := catbird.NewClient()
+
+	if _, err := client.Enqueue(ctx, pool, "slow", "deploys", nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Worker("deploys", func(ctx context.Context, job *catbird.Message) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}, catbird.WorkerOptions{BatchSize: 1, PollInterval: 100 * time.Millisecond})
+
+	workers, stop := context.WithCancel(ctx)
+	stopped := make(chan struct{})
+	go func() {
+		rt.Start(workers)
+		close(stopped)
+	}()
+
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("the job never started")
+	}
+	stop()
+	select {
+	case <-stopped:
+	case <-ctx.Done():
+		t.Fatal("the runtime did not stop")
+	}
+
+	var attempts int
+	var claimable bool
+	err := pool.QueryRow(ctx, `
+		SELECT attempts, visible_at <= now() FROM cb_claims WHERE queue = 'deploys'
+	`).Scan(&attempts, &claimable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 {
+		t.Errorf("attempts = %d, want 0: shutdown spent an attempt on a job that did not fail", attempts)
+	}
+	if !claimable {
+		t.Error("the job is not claimable again: shutdown left the lease deadline in place")
+	}
+}
+
+// A handler that completes the job and then returns an error is not retried:
+// the completion committed, and the retry carries the attempts lease token, so
+// it finds no claim to correct.
+func TestCompletedJobIsNotRetriedAfterAnError(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := catbird.NewClient()
+
+	if _, err := client.Enqueue(ctx, pool, "done", "late_error", nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int32
+	ran := make(chan struct{}, 4)
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Worker("late_error", func(ctx context.Context, job *catbird.Message) error {
+		atomic.AddInt32(&calls, 1)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		if err := client.CompleteJob(ctx, tx, job); err != nil {
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+		ran <- struct{}{}
+		return errors.New("the work is done, the handler is unhappy")
+	}, catbird.WorkerOptions{Backoff: 50 * time.Millisecond, PollInterval: 50 * time.Millisecond})
+
+	runCtx, stop := context.WithTimeout(ctx, 2*time.Second)
+	defer stop()
+	go rt.Start(runCtx)
+
+	select {
+	case <-ran:
+	case <-runCtx.Done():
+		t.Fatal("the job did not run")
+	}
+	<-runCtx.Done()
+
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'late_error'"); n != 0 {
+		t.Errorf("%d claims left: the error undid a completion", n)
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Errorf("the handler ran %d times, want 1: the completed job was retried", n)
 	}
 }

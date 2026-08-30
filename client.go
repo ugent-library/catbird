@@ -14,6 +14,11 @@ import (
 // on anything.
 var ErrNotFound = errors.New("catbird: not found")
 
+// ErrLeaseExpired is returned by CompleteJob when the job's lease ran out and
+// another worker claimed it. The work of the late attempt is not the queue's any
+// more: roll its transaction back.
+var ErrLeaseExpired = errors.New("catbird: lease expired before completion")
+
 // Claim status values.
 const (
 	statusLive int16 = 0 // ready, waiting on dependencies, or claimed; visible_at tells which
@@ -30,12 +35,12 @@ type Message struct {
 	Signals       map[string]json.RawMessage // payloads delivered with DeliverSignal; nil when none
 	Attempts      int                        // 1 on the first run
 	CorrelationID string
+
+	completed bool // CompleteJob's delete succeeded, so the worker does not repeat it
 }
 
 // Conn is the part of pgx.Tx and *pgxpool.Pool this package uses: a pool, a
 // connection, or a transaction.
-// Job handlers receive the worker's transaction through it, so the handler's
-// own writes and the completion of the claim commit together.
 type Conn interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
@@ -204,6 +209,43 @@ func (c *Client) EnqueueBatch(ctx context.Context, db Conn, queue string, msgs [
 		SELECT count(*) FROM claim LEFT JOIN wake ON true
 	`, topics, payloads, dedupKeys, queue, opts.Delay, nullString(opts.CorrelationID), opts.Dependencies).Scan(&created)
 	return created, err
+}
+
+// CompleteJob finishes a job: it deletes the claim and the signals delivered to
+// it. A worker does this itself when the handler returns nil, so a handler only
+// calls it to put the completion in the same transaction as its own writes,
+// which is what makes the job's work and the job's end one commit. attempts is
+// the lease token: if the lease ran out and another worker claimed the job,
+// attempts moved on, nothing is deleted, and this returns ErrLeaseExpired — the
+// caller rolls back and the work of the late attempt is discarded.
+//
+// Both deletes are one statement, so a job costs one round trip to finish.
+//
+// A successful call marks job, so the worker does not run the completion a
+// second time. The mark records that the statement succeeded, not that the
+// caller's transaction committed: a handler that completes the job, rolls the
+// transaction back, and then returns nil leaves a claim nothing deletes until
+// the lease runs out and the job runs again.
+func (c *Client) CompleteJob(ctx context.Context, db Conn, job *Message) error {
+	var completed int
+	err := db.QueryRow(ctx, `
+		WITH claim AS (
+		    DELETE FROM cb_claims WHERE message_id = $1 AND attempts = $2
+		    RETURNING message_id
+		),
+		signals AS (
+		    DELETE FROM cb_signals WHERE message_id IN (SELECT message_id FROM claim)
+		)
+		SELECT count(*) FROM claim
+	`, job.ID, job.Attempts).Scan(&completed)
+	if err != nil {
+		return err
+	}
+	if completed == 0 {
+		return ErrLeaseExpired
+	}
+	job.completed = true
+	return nil
 }
 
 // Cancel marks every live job with this correlation id dead. A job that is

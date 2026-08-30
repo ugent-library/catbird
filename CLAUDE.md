@@ -49,13 +49,13 @@ It talks to the same database directly and needs no Go build.
 Five files, one migration, no packages:
 
 - `client.go` — every statement a caller runs: `Publish`, `PublishBatch`,
-  `Enqueue`, `EnqueueBatch`, `Cancel`, `GC`, `ResolveDependency`,
+  `Enqueue`, `EnqueueBatch`, `CompleteJob`, `Cancel`, `GC`, `ResolveDependency`,
   `DeliverSignal`, `SetOutput`, `Output`. `Client` holds no state and works on
   any `Conn` — a pool, a connection, or a transaction.
 - `runtime.go` — `New` and `Start`. One `Runtime` per process owns the pool, one
   `LISTEN` connection for every channel its loops need, the position assigner,
   and one goroutine per declared worker, trigger and consumer.
-- `worker.go` — the claim loop, the job transaction, retries, `OnDead`.
+- `worker.go` — the claim loop, completion, retries, `OnDead`.
 - `stream.go` — the position assigner, `Consumer` (cursor plus `FetchBatch` and
   `Ack`), and `Trigger`.
 - `migrations/00001_lite.sql` — the whole schema. Goose markers, no goose
@@ -77,9 +77,12 @@ client exists.
 
 **Invariants that edits must not break:**
 
-- A job's completion is `DELETE FROM cb_claims WHERE message_id = $1 AND attempts = $2`
-  inside the handler's own transaction. `attempts` is the lease token. Two
-  workers may run the same job; only the lease holder commits.
+- A job's completion is `DELETE FROM cb_claims WHERE message_id = $1 AND attempts = $2`.
+  `attempts` is the lease token. Two workers may run the same job; only the
+  lease holder deletes the claim. A handler is given no connection: it runs
+  `CompleteJob` in its own transaction to end the job in the same commit as its
+  writes, or returns `nil` and lets the worker complete it afterwards. The
+  worker holds no transaction and no connection while a handler runs.
 - Stream readers go by `position`, never by `id`. Positions are set after commit
   by the assigner, so they follow commit order.
 - The assigner only sets positions that are still empty, so two assigners

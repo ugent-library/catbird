@@ -14,25 +14,43 @@ import (
 func Example_basicWorkflow() {
 	ctx := context.Background()
 
-	// The 00001_lite.sql schema must be applied first.
-	pool, err := pgxpool.New(ctx, "postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable")
+	// The 00001_lite.sql schema must be applied first. The pool carries the
+	// library's own statements — about eight — plus one connection for every
+	// handler that holds a transaction, which is what BatchSize is set against
+	// below.
+	pool, err := pgxpool.New(ctx, "postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable&pool_max_conns=32")
 	if err != nil {
 		log.Fatal(err)
 	}
 	client := catbird.NewClient()
 
-	// The handler receives the worker's transaction. Writes made through tx
-	// commit together with the job's completion, or not at all.
-	handler := func(ctx context.Context, tx catbird.Conn, msg catbird.Message) error {
-		log.Printf("job %d on %s", msg.ID, msg.Topic)
-		// _, err := tx.Exec(ctx, "UPDATE accounts SET balance = balance - 100 WHERE id = 1")
-		return nil
+	// The handler is given no connection and opens one when it needs it. It
+	// completes the job in its own transaction, so its writes and the end of
+	// the job are one commit: the job runs again only if nothing was written.
+	handler := func(ctx context.Context, job *catbird.Message) error {
+		log.Printf("job %d on %s", job.ID, job.Topic)
+
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+
+		// _, err = tx.Exec(ctx, "UPDATE accounts SET balance = balance - 100 WHERE id = 1")
+		if err := client.CompleteJob(ctx, tx, job); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
 	}
 
 	rt := catbird.New(pool, catbird.Options{})
 	catbird.NewWorker(rt, "image_processing", handler, catbird.WorkerOptions{
-		OnDead: func(ctx context.Context, db catbird.Conn, msg catbird.Message) error {
-			log.Printf("job %d failed permanently", msg.ID)
+		// This handler holds a connection for its whole body, so the jobs that
+		// run at once have to fit in the pool beside the library's own
+		// statements. The default of 50 does not fit a default pool.
+		BatchSize: 20,
+		OnDead: func(ctx context.Context, job *catbird.Message) error {
+			log.Printf("job %d failed permanently", job.ID)
 			return nil
 		},
 	})
