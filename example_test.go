@@ -67,7 +67,7 @@ func Example_basicWorkflow() {
 	}()
 
 	// Every message on image.* becomes a job on image_processing.
-	catbird.NewTrigger(rt, "img_processor", "image", "image_processing", catbird.StreamOptions{})
+	catbird.NewTrigger(rt, "img_processor", []string{"image.#"}, "image_processing", catbird.TriggerOptions{})
 
 	go func() {
 		time.Sleep(time.Second)

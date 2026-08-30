@@ -32,9 +32,9 @@ func (o Options) withDefaults() Options {
 }
 
 // Runtime is a process's catbird: the pool, one LISTEN connection, the position
-// assigner, and every worker, trigger and consumer declared on it. Declare them
-// with NewWorker, NewTrigger and NewConsumer (or the methods of the same names),
-// then call Start. The statements a caller runs — Enqueue, Publish, Complete
+// assigner, and every worker and trigger declared on it. Declare them with
+// NewWorker and NewTrigger (or the methods of the same names), then call Start.
+// The statements a caller runs — Enqueue, Publish, Complete, the stream reads
 // and the rest — are package functions and need no runtime: they work on any
 // connection or transaction.
 type Runtime struct {
@@ -73,6 +73,55 @@ func (r *Runtime) Start(ctx context.Context) {
 		wg.Go(func() { loop(ctx) })
 	}
 	wg.Wait()
+}
+
+// assignPositions gives every published message that has none the next
+// position, every AssignEvery. A message is visible to the assigner only once
+// its transaction committed, so positions follow commit order: a message from a
+// transaction that is still open is picked up on a later tick. Readers order by
+// position and a batch of positions becomes readable when this statement
+// commits, so a reader does not pass a message that has no position yet.
+//
+// The advisory lock is taken for the statement only. When another assigner
+// holds it, the one-time filter on the UPDATE skips the scan. The UPDATE also
+// requires position IS NULL, checked again on the committed row when it had to
+// wait for a lock, so two assigners that run at the same time cannot move a
+// position that is already set.
+//
+// When it assigned anything it sends NOTIFY on channel cb_stream with the
+// highest new position, so a LISTENing reader can fetch instead of polling.
+func assignPositions(ctx context.Context, pool *pgxpool.Pool, opts Options) {
+	ticker := time.NewTicker(opts.AssignEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		_, err := pool.Exec(ctx, `
+			WITH lock AS (
+				SELECT pg_try_advisory_xact_lock(hashtext('catbird'), 1) AS held
+			),
+			unassigned AS (
+				SELECT id FROM cb_messages
+				WHERE stream AND position IS NULL
+				ORDER BY id
+				LIMIT 5000
+			),
+			assigned AS (
+				UPDATE cb_messages m
+				SET position = nextval('cb_position_seq')
+				FROM unassigned u
+				WHERE m.id = u.id AND m.position IS NULL AND (SELECT held FROM lock)
+				RETURNING position
+			)
+			SELECT pg_notify('cb_stream', max(position)::text) FROM assigned HAVING count(*) > 0
+		`)
+		if err != nil && ctx.Err() == nil {
+			opts.Logger.Error("catbird: assigning stream positions failed", "err", err)
+		}
+	}
 }
 
 // declare registers a loop for Start to run, and the channel its wake-ups come

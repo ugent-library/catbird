@@ -1,6 +1,6 @@
 # Catbird Lite
 
-A PostgreSQL-backed job queue, stream, and small workflow engine. Five tables, plain SQL, no PL/pgSQL, no extensions. All logic lives in the client statements (Go today; other languages follow the same statements), so the whole system is the schema in `migrations/00001_lite.sql` plus the statements in `client.go`, `worker.go`, and `stream.go`.
+A PostgreSQL-backed job queue, stream, and small workflow engine. Five tables, plain SQL, no PL/pgSQL, no extensions. All logic lives in the client statements (Go today; other languages follow the same statements), so the whole system is the schema in `migrations/00001_lite.sql` plus the statements in `client.go`, `worker.go` and `trigger.go`.
 
 ## Tables
 
@@ -20,9 +20,9 @@ Job messages and published messages share `cb_messages` because a payload has to
 
 ## Runtime
 
-`catbird.New(pool, opts)` returns the process's `Runtime`. Workers, triggers and consumers are declared on it — `NewWorker(runtime, …)`, `NewTrigger(runtime, …)`, `NewConsumer(runtime, …)`, or the methods of the same names — and `Start(ctx)` runs them all: one `LISTEN` connection for every channel they need, the position assigner, and one goroutine per declared loop, until `ctx` ends and every loop has stopped. A process holds one connection for notifications however many workers and triggers it runs, and a running job holds none. Declaring after `Start` panics: the connection's channel set is fixed when it connects. A dropped connection is reconnected after `ReconnectAfter`; until then the loops run on their poll intervals, and after each connect every loop is woken once, because notifications sent in between are gone.
+`catbird.New(pool, opts)` returns the process's `Runtime`. Workers and triggers are declared on it — `NewWorker(runtime, …)`, `NewTrigger(runtime, …)`, or the methods of the same names — and `Start(ctx)` runs them all: one `LISTEN` connection for every channel they need, the position assigner, and one goroutine per declared loop, until `ctx` ends and every loop has stopped. A process holds one connection for notifications however many workers and triggers it runs, and a running job holds none. Declaring after `Start` panics: the connection's channel set is fixed when it connects. A dropped connection is reconnected after `ReconnectAfter`; until then the loops run on their poll intervals, and after each connect every loop is woken once, because notifications sent in between are gone.
 
-The statements a caller runs — `Publish`, `Enqueue`, `Complete`, `Cancel` and the rest — are package functions that take any connection or transaction, so they need no runtime and hold no state of their own. What a process configures lives on the `Runtime`.
+The statements a caller runs — `Publish`, `Enqueue`, `Complete`, `Cancel`, the stream reads and the rest — are package functions that take any connection or transaction, so they need no runtime and hold no state of their own. What a process configures lives on the `Runtime`.
 
 ## Jobs
 
@@ -82,7 +82,18 @@ A permanently failed step cancels its siblings and children through the shared c
 
 ## Streams
 
-`Publish` inserts a message with no claim. `NewConsumer(runtime, name, opts).FetchBatch(topic)` reads messages after the cursor on a topic and every topic under it (`order` covers `order.paid` and `order.paid.refund`; `""` covers everything), in position order. Topic names are literal; there is no pattern syntax. Finer selection is the consumer's code, or an optional payload filter added later as an extra clause. `Ack(position)` moves the cursor; it uses `GREATEST`, so the cursor does not move backwards when two consumers share it.
+`Publish` inserts a message with no claim. Two functions read what it wrote, and both are pure reads on any connection or transaction:
+
+- `ReadAfter(ctx, db, patterns, after, limit)` — for a caller that holds its own position: a poll endpoint, or a connection pushing to a browser.
+- `Cursor{Name, Patterns}.Read(ctx, db, limit)` — for a caller that lets the database remember, with `Ack(position)` moving the cursor. `Ack` uses `GREATEST`, so a batch acked out of order cannot undo a later one's progress. `Read` is a cursor lookup and a `ReadAfter`, so the predicate below exists once.
+
+The patterns and the cursor name sit in one value because a position only says how far a reader has come through the messages its own patterns select. Two readers sharing a name with different patterns skip each other's messages: the one reading less acks past what the other has not seen. The struct gives both calls one construction site; what it cannot catch is the same name built twice in different files, which stays covered by one reader per cursor, below.
+
+**Patterns.** Three forms, AMQP's and the earlier design's: a topic on its own matches that topic exactly; a prefix followed by `.#` matches the prefix and everything under it, so `order.#` covers `order`, `order.paid` and `order.paid.refund` but not `orders`; `#` matches the stream. Anything else is `ErrBadPattern`. There is no `*`, and its absence is deliberate rather than unfinished: a wildcard inside a topic is not a prefix range, so it can use no index at any position, and a pattern holding one would quietly run as the slowest read in the system. Finer selection than a subtree is the reader's own code, or a payload condition added later as an extra clause.
+
+The exact form is not just convenience. It is the only shape whose plan needs no sort — `(topic text_pattern_ops, position)` yields position order for one topic value and the `LIMIT` stops the scan — which is why the grammar makes it expressible instead of folding it into the subtree.
+
+`LastPosition` is the end of the stream, so a page embeds it when it renders and a reader that connects afterwards misses nothing in between. `OldestPosition` is the low end: `GC` deletes messages a reader may still be behind, and the rows that survive carry no sign of the ones that did not, so a reader whose position is below `OldestPosition` knows to refetch its state instead of trusting what it got. That case matters most where readers poll — a backgrounded tab is away for as long as a laptop is shut.
 
 **What a read costs.** A fetch is cheap for a consumer that keeps up whatever plan it gets: the first rows after the cursor are the rows it wants. The case that separates the plans is a consumer that has fallen behind on a topic that is a small share of traffic. Measured with a topic at 0.3% of a 300k-message stream and a cursor 15k messages behind, returning 50 rows:
 
@@ -93,7 +104,11 @@ A permanently failed step cancels its siblings and children through the shared c
 
 `(topic text_pattern_ops, position)` cannot produce position order across topic values on its own, but the planner does not need it to: it reads the two arms of the match — `topic = $2`, and the prefix range from `topic LIKE $3` — as a BitmapOr and sorts the result. The second plan walks everything published since the cursor and throws away 14950 rows, so it gets more expensive exactly while a consumer is trying to catch up.
 
-Which one the planner picks is decided by whether it knows the topic when it plans, so **`FetchBatch` has to reach a custom plan**. Two things would take it off one, and neither is visible in the query: a server-side prepared statement that PostgreSQL keeps long enough to switch to a generic plan, which cannot fold `LIKE $3` into a range; and the `$2 = ''` arm, which a generic plan cannot fold away either. Under pgx's default `QueryExecModeCacheStatement` the statement is prepared, and PostgreSQL keeps the custom plan only while it estimates it cheaper than the generic one. Checking this is part of changing `FetchBatch`: `EXPLAIN` it under `plan_cache_mode = force_generic_plan` and see which plan comes back. Measured on PostgreSQL 18; the rest of the numbers here are from 16.
+Which one the planner picks is decided by whether it knows the topic when it plans, so **a one-subtree read has to reach a custom plan**. Two things would take it off one, and neither is visible in the query: a server-side prepared statement that PostgreSQL keeps long enough to switch to a generic plan, which cannot fold `LIKE $3` into a range; and a generic plan cannot fold the arms away either. Under pgx's default `QueryExecModeCacheStatement` the statement is prepared, and PostgreSQL keeps the custom plan only while it estimates it cheaper than the generic one. Checking this is part of changing the read: `EXPLAIN` it under `plan_cache_mode = force_generic_plan` and see which plan comes back. Measured on PostgreSQL 18; the rest of the numbers here are from 16.
+
+**This is a property of one subtree, not of the read in general.** The bitmap plan has to sort to produce position order, so it cannot stop at the `LIMIT`; the position walk is already ordered and can. Add a second subtree, or move the cursor far enough back, and the planner takes the walk in every form of the query, custom plan included — three subtrees read from position 0 walked in all of them. Plan caching is one way to lose the bitmap plan and not the only one, and no amount of custom planning gets it back. What bounds the walk is retention: it can never scan past what `GC` has kept, which makes the `GC` window the lever on the cost of a read that has fallen behind.
+
+**Each pattern is its own comparison, never an array.** A list compared with `= ANY` or `LIKE ANY` cannot be read as index arms — 188 buffer hits against 72 for three subtrees, on the same rows — so the compiler emits one arm per pattern and the statement text varies with how many there are.
 
 The scale limit past that is the width of the subtree, not the plan. If one is ever reached, the ways out are a `topic_id` column with a `(topic_id, position)` index for consumers that want one exact topic, or a table of `(prefix, position)` maintained on publish.
 
@@ -135,7 +150,7 @@ Not bugs — what this design does not do, or does at a price. A caller has to k
 
 **A trigger does not preserve stream order.** It reads a position-ordered batch and enqueues it onto a queue that runs `BatchSize` jobs at once, so the jobs start in order and finish in any order. A consumer that needs ordering handles the batch itself instead of fanning it out.
 
-**`Consumer` is not safe in more than one process.** `FetchBatch` and `Ack` are two statements with nothing between them, so two processes on the same cursor both handle every batch. Triggers survive this because their dedup keys make a repeated batch a no-op; a general consumer has no such key. Run one, and say so on `NewConsumer`. The cursor lease that would fix it is not being built: work that has to happen once per message across processes is a trigger and a worker, which have leases and retries already.
+**A cursor is not safe in more than one process.** `Read` and `Ack` are two statements with nothing between them, so two processes on the same cursor both handle every batch, and if their patterns differ they also ack past each other's messages. Triggers survive the first of these because their dedup keys make a repeated batch a no-op; a general reader has no such key. Run one per cursor. The cursor lease that would fix it is not being built: work that has to happen once per message across processes is a trigger and a worker, which have leases and retries already.
 
 **A publish costs two writes and two tuples.** The assigner's `UPDATE` is never a HOT update — `position` is covered by three indexes — so it writes a second tuple and, measured over 50k messages of ~450 bytes, more WAL and more time than the `INSERT` it annotates: 42.8 MB and 592 ms against 33.1 MB and 385 ms. This is the price of the position column, and the alternative measured worse on reads. It is the number a capacity plan needs.
 
@@ -166,18 +181,18 @@ Not bugs — what this design does not do, or does at a price. A caller has to k
 
 ## What to build, in order
 
-The rule for everything below: a change leaves the core easier to read than it found it, or leaves it alone. Moderate growth is fine. A second version of a concept the reader already holds is not, however few lines it takes — that is what makes a small system stop being one. The core is about a thousand lines across four files, and that is the property worth protecting.
+The rule for everything below: a change leaves the core easier to read than it found it, or leaves it alone. Moderate growth is fine. A second version of a concept the reader already holds is not, however few lines it takes — that is what makes a small system stop being one. The core is about twelve hundred lines across four files, and that is the property worth protecting.
 
 1. **The bugs above**, in the order they are listed there. Both are wrong behaviour rather than missing behaviour, and the failure path around them is barely tested.
-2. **`Read` and `LastPosition`, with `FetchBatch` rewritten on top of them.** The only item that makes the tree smaller: the subtree predicate and its custom-plan requirement end up in one place instead of two.
+2. ~~**`Read` and `LastPosition`.**~~ Built, as `ReadAfter`, `Cursor.Read`, `Ack`, `LastPosition` and `OldestPosition`; see "Streams" above.
 3. **`Timeout`.** A `context.WithTimeout` around the handler in `run`. It bounds the attempt's bookkeeping, not the goroutine — a handler that never checks `ctx.Err()` keeps its slot either way — so it is a partial fix, worth its three lines.
 4. **`RunOnce` and `Status`.** Both leaves. `RunOnce` is what makes a job test deterministic instead of a background worker and a sleep. `Status` is built without `last_error`; see below.
 5. **Exponential backoff.** One dense line in `failed`, replacing a real failure: an outage fails every job on a queue at once and a fixed delay brings all of them back in the same second, at a service that is still down. The comment on it states that failure, not the arithmetic.
 6. **The cron helper**, on `DedupKey` alone.
 7. **`ExtendLease`**, as a function rather than a field on `Job`.
-8. **Wire**, in a file of its own. It calls `Read` and touches nothing else, so however long it gets, the four core files do not get harder to read.
+8. **Wire**, in a file of its own. It calls `ReadAfter` and touches nothing else, so however long it gets, the four core files do not get harder to read.
 
-Four items below are not being built: the **cursor lease**, **`Consumer.Handle`**, **`UniqueKey`** and **cancelling a running job**. Each stays in this document because the problem it names is real; what changed is the answer. Each carries its ruling in place, with what to watch for that would bring it back. One more is undecided rather than ruled: the **`last_error` column** on `cb_claims`, which costs nothing to read and widens the row this design keeps narrow.
+Four items below are not being built: the **cursor lease**, a **declared stream loop**, **`UniqueKey`** and **cancelling a running job**. Each stays in this document because the problem it names is real; what changed is the answer. Each carries its ruling in place, with what to watch for that would bring it back. One more is undecided rather than ruled: the **`last_error` column** on `cb_claims`, which costs nothing to read and widens the row this design keeps narrow.
 
 ## Planned additions
 
@@ -189,13 +204,11 @@ These come from moving raven, the first application, onto catbird: its own event
 
 **Not building this.** A trigger plus a worker already handles each message once across processes, with leases, retries, `MaxAttempts` and exactly-once completion that all exist and that a reader of this system already holds. A cursor lease would be a second kind of lease beside the job lease, claim-then-do in both stream loops, and a new failure mode when the process holding a cursor dies. What trigger-plus-worker gives up is ordered handling: a worker runs `BatchSize` jobs at once, so the messages start in order and finish in any order. Neither reason above — indexing documents, calling an external API — needs ordering. Build this if something does.
 
-**`Consumer.Handle(topic, handle func(ctx, []Message) error)`.** Declares a loop that `Start` runs: claim the cursor, fetch a batch, call the handler, ack; wake on `NOTIFY cb_stream`, poll on `PollInterval` as the fallback, and keep going while batches come back full. A handler error releases the cursor without advancing, so the batch is retried. Triggers become a handler that enqueues the batch and acks in one transaction.
+**A declared stream loop, `NewStreamHandler(runtime, cursor, handle func(ctx, []Message) error)`.** Declares a loop that `Start` runs: claim the cursor, fetch a batch, call the handler, ack; wake on `NOTIFY cb_stream`, poll on `PollInterval` as the fallback, and keep going while batches come back full. A handler error releases the cursor without advancing, so the batch is retried. Triggers become a handler that enqueues the batch and acks in one transaction.
 
 **Not building this.** It needs the cursor lease, which is not being built, and it adds a fourth kind of declared loop for work a trigger and a worker already do. Same condition to revisit: something that needs the batch handled in order.
 
-**`Read(ctx, pool, topics, after, limit)` and `LastPosition(ctx, db)`.** The read for a caller that holds its own position instead of a cursor: the wire, or a poll endpoint. `topics` is a list of subtrees; the query walks the position index from `after`. `LastPosition` is the current end of the stream, so a page can embed it and start its connection from there.
-
-**Build this first, and put `FetchBatch` on top of it.** `FetchBatch` becomes a cursor lookup and a call to `Read`. Otherwise the subtree predicate exists twice, and so does the custom-plan requirement that decides what it costs — and a change to one copy would not show up in the other.
+**`ReadAfter`, `LastPosition` and `OldestPosition`.** Built; see "Streams" above. What was planned as `Read` is `ReadAfter`, and the cursor read sits on it, so the subtree predicate exists once. Two things came out different from the plan. The pattern list is a grammar rather than a list of bare subtrees, which makes an exact topic — the only shape whose plan needs no sort — expressible for the first time. And the retention gap is reported by `OldestPosition` rather than beside the rows: a read that returns nothing is exactly the case a caller has to distinguish, and a value returned with the rows says nothing when there are none.
 
 ### Wire
 
@@ -209,7 +222,7 @@ type WireOptions struct {
 }
 
 type ServeOptions struct {
-    Topics []string // topic subtrees this connection may read
+    Patterns []string // what this connection may read, in the stream's pattern grammar
     Cursor string   // when set: start at this cb_cursors row and ack every position sent
     Render func(topic string, payload json.RawMessage) (Fragment, error) // nil sends the payload JSON
 }
@@ -227,7 +240,9 @@ func (w *Wire) Serve(rw http.ResponseWriter, r *http.Request, opts ServeOptions)
 
 **Who may read what** is the application's decision, made before it calls `Serve`: the route knows the user and passes the subtrees. Same-origin `EventSource` sends cookies, so a session cookie is enough; an application that wants grants in the URL signs them itself.
 
-**One goroutine per connection.** After every wake-up from the runtime's connection — the assigner's `NOTIFY cb_stream` — the SSE connection runs `Read(topics, after, BatchSize)` and writes each row as a frame. The database does the topic matching, per connection. A slow browser slows only its own goroutine and catches up by position; there is no queue between the listener and the connections, so nothing is dropped and no slow-consumer policy is needed. Every `PollInterval` the connection reads anyway and sends `: ping`, which keeps a proxy from closing an idle stream.
+**One goroutine per connection.** After every wake-up from the runtime's connection — the assigner's `NOTIFY cb_stream` — the SSE connection runs `ReadAfter(patterns, after, BatchSize)` and writes each row as a frame. The database does the topic matching, per connection. A slow browser slows only its own goroutine and catches up by position; there is no queue between the listener and the connections, so nothing is dropped and no slow-consumer policy is needed. Every `PollInterval` the connection reads anyway and sends `: ping`, which keeps a proxy from closing an idle stream.
+
+**One read per connection is the cost to watch.** Every connection running its own read means connections times assigner ticks queries a second, each of them re-deciding the plan above. The way out, if it is ever reached, is one reader per process running `ReadAfter` with `#` — no topic predicate, the cheapest read there is — and each connection matching in Go: a message reaches a connection when one of its topic's prefixes is in that connection's pattern set, which is a map lookup on the few prefixes a topic has. That is the earlier design's matching, which expanded a message's topic into its covering patterns and probed for them rather than scanning rows for a pattern; here it costs no table, because the process doing the matching is already there. It gives up what per-connection reads give for free — a connection that falls behind needs its own catch-up read instead of just being slow — so it is worth building only against a measurement.
 
 **Where a connection starts.**
 
@@ -282,7 +297,7 @@ app.wire.Serve(w, r, catbird.ServeOptions{
 **Not in it, on purpose.**
 
 - Inbox, watches and presence tables: the inbox is a cursor (above); "who is on this record" is an application table with a heartbeat column and a message on the record's topic when it changes.
-- Poll transport: `Read(topics, after)` behind a GET is the whole thing.
+- Poll transport: `ReadAfter(patterns, after)` behind a GET is the whole thing, which is where this starts.
 - A shared read per process with in-memory fan-out. Every connection runs its own `Read` per wake-up, so hundreds of open tabs on a busy stream mean hundreds of small index reads per assigner tick. If that ever matters, one read per process with matching in memory can be added behind the same frame contract.
 
 ### Jobs

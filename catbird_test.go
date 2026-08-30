@@ -379,7 +379,7 @@ func TestTriggerBridgesPayloadUnchanged(t *testing.T) {
 	}
 
 	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
-	catbird.NewTrigger(rt, "img", "image", "image_processing", catbird.StreamOptions{PollInterval: 50 * time.Millisecond})
+	catbird.NewTrigger(rt, "img", []string{"image.#"}, "image_processing", catbird.TriggerOptions{PollInterval: 50 * time.Millisecond})
 
 	got := make(chan catbird.Job, 16)
 	catbird.NewWorker(rt, "image_processing", func(ctx context.Context, m *catbird.Job) error {
@@ -452,7 +452,7 @@ func TestStreamLateCommitIsNotSkipped(t *testing.T) {
 
 	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
 	go rt.Start(ctx)
-	consumer := catbird.NewConsumer(rt, "late", catbird.StreamOptions{})
+	cursor := catbird.Cursor{Name: "late", Patterns: []string{"ev"}}
 
 	// Message 1 is inserted first but its transaction stays open.
 	slow, err := pool.Begin(ctx)
@@ -474,7 +474,7 @@ func TestStreamLateCommitIsNotSkipped(t *testing.T) {
 		var got []string
 		deadline := time.Now().Add(2 * time.Second)
 		for len(got) < len(want) && time.Now().Before(deadline) {
-			msgs, err := consumer.FetchBatch(ctx, "ev")
+			msgs, err := cursor.Read(ctx, pool, 50)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -482,7 +482,7 @@ func TestStreamLateCommitIsNotSkipped(t *testing.T) {
 				var s string
 				json.Unmarshal(m.Payload, &s)
 				got = append(got, s)
-				if err := consumer.Ack(ctx, pool, m.Position); err != nil {
+				if err := cursor.Ack(ctx, pool, m.Position); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -609,12 +609,12 @@ func TestPublishBatchSkipsTakenKeys(t *testing.T) {
 
 	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
 	go rt.Start(ctx)
-	consumer := catbird.NewConsumer(rt, "batch", catbird.StreamOptions{})
+	cursor := catbird.Cursor{Name: "batch", Patterns: []string{"record.work.#"}}
 
 	var got []string
 	deadline := time.Now().Add(2 * time.Second)
 	for len(got) < 3 && time.Now().Before(deadline) {
-		msgs, err := consumer.FetchBatch(ctx, "record.work")
+		msgs, err := cursor.Read(ctx, pool, 50)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -622,7 +622,7 @@ func TestPublishBatchSkipsTakenKeys(t *testing.T) {
 			var s string
 			json.Unmarshal(m.Payload, &s)
 			got = append(got, s)
-			if err := consumer.Ack(ctx, pool, m.Position); err != nil {
+			if err := cursor.Ack(ctx, pool, m.Position); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -717,7 +717,7 @@ func TestTriggerBatchIsEnqueuedOnce(t *testing.T) {
 	}
 
 	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
-	catbird.NewTrigger(rt, "indexer", "record", "index_queue", catbird.StreamOptions{PollInterval: 50 * time.Millisecond})
+	catbird.NewTrigger(rt, "indexer", []string{"record.#"}, "index_queue", catbird.TriggerOptions{PollInterval: 50 * time.Millisecond})
 	go rt.Start(ctx)
 
 	deadline := time.Now().Add(3 * time.Second)
@@ -764,12 +764,12 @@ func TestCreatedAtIsSetOnStreamAndJobMessages(t *testing.T) {
 		jobCreatedAt <- m.CreatedAt
 		return nil
 	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond})
-	consumer := catbird.NewConsumer(rt, "age", catbird.StreamOptions{})
+	cursor := catbird.Cursor{Name: "age", Patterns: []string{"age"}}
 	go rt.Start(ctx)
 
 	var streamCreatedAt time.Time
 	for streamCreatedAt.IsZero() {
-		msgs, err := consumer.FetchBatch(ctx, "age")
+		msgs, err := cursor.Read(ctx, pool, 50)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -900,5 +900,129 @@ func TestCompletedJobIsNotRetriedAfterAnError(t *testing.T) {
 	}
 	if n := atomic.LoadInt32(&calls); n != 1 {
 		t.Errorf("the handler ran %d times, want 1: the completed job was retried", n)
+	}
+}
+
+// waitForPositions blocks until the assigner has given out n positions.
+func waitForPositions(t *testing.T, ctx context.Context, pool *pgxpool.Pool, n int64) {
+	t.Helper()
+	for {
+		last, err := catbird.LastPosition(ctx, pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if last >= n {
+			return
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("only %d of %d messages got a position", last, n)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The three pattern forms: a topic on its own matches exactly, a prefix with
+// ".#" matches the prefix and everything under it, and "#" matches the stream.
+// "orders" is in the stream because a subtree has to stop at the separator.
+func TestReadPatternForms(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for _, topic := range []string{"order", "order.paid", "order.paid.refund", "orders", "other"} {
+		if _, err := catbird.Publish(ctx, pool, topic, topic, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	go rt.Start(ctx)
+	waitForPositions(t, ctx, pool, 5)
+
+	for _, tt := range []struct {
+		patterns []string
+		want     string
+	}{
+		{[]string{"order"}, "order"},
+		{[]string{"order.#"}, "order,order.paid,order.paid.refund"},
+		{[]string{"order.paid.#"}, "order.paid,order.paid.refund"},
+		{[]string{"orders", "other"}, "orders,other"},
+		{[]string{"#"}, "order,order.paid,order.paid.refund,orders,other"},
+		{[]string{"order.nothing.#"}, ""},
+	} {
+		msgs, err := catbird.ReadAfter(ctx, pool, tt.patterns, 0, 50)
+		if err != nil {
+			t.Fatalf("%v: %v", tt.patterns, err)
+		}
+		var topics []string
+		for _, m := range msgs {
+			topics = append(topics, m.Topic)
+		}
+		if got := strings.Join(topics, ","); got != tt.want {
+			t.Errorf("%v read %q, want %q", tt.patterns, got, tt.want)
+		}
+	}
+}
+
+// A pattern that is not one of the three forms is refused, so a caller who
+// expects a wildcard is told instead of quietly reading nothing.
+func TestReadRejectsPatterns(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	for _, patterns := range [][]string{
+		nil,
+		{},
+		{""},
+		{"*"},
+		{"order.*"},
+		{"order.#.paid"},
+		{"ord#er"},
+		{"#", "order.*"},
+	} {
+		if _, err := catbird.ReadAfter(ctx, pool, patterns, 0, 50); !errors.Is(err, catbird.ErrBadPattern) {
+			t.Errorf("%v was accepted (%v)", patterns, err)
+		}
+	}
+}
+
+// A reader that was away longer than GC keeps messages gets the rows that are
+// left with nothing in them to say the rest is gone. OldestPosition is what
+// tells it: past the position the reader held, messages were removed.
+func TestStreamWindow(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for _, payload := range []string{"first", "second", "third"} {
+		if _, err := catbird.Publish(ctx, pool, "ev", payload, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	go rt.Start(ctx)
+	waitForPositions(t, ctx, pool, 3)
+
+	if oldest, err := catbird.OldestPosition(ctx, pool); err != nil || oldest != 1 {
+		t.Fatalf("oldest position %d (%v), want 1", oldest, err)
+	}
+
+	// What GC does to a reader that stopped at position 0.
+	if _, err := pool.Exec(ctx, `DELETE FROM cb_messages WHERE position <= 2`); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := catbird.ReadAfter(ctx, pool, []string{"ev"}, 0, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].Position != 3 {
+		t.Fatalf("read %d messages, want the one that survived", len(msgs))
+	}
+	oldest, err := catbird.OldestPosition(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldest <= 0+1 {
+		t.Errorf("oldest position %d does not report the gap after position 0", oldest)
 	}
 }

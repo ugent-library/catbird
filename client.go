@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -18,6 +20,10 @@ var ErrNotFound = errors.New("catbird: not found")
 // another worker claimed it. The work of the late attempt is not the queue's any
 // more: roll its transaction back.
 var ErrLeaseExpired = errors.New("catbird: lease expired before completion")
+
+// ErrBadPattern is returned by the stream reads when a pattern is not a topic,
+// a prefix followed by ".#", or "#".
+var ErrBadPattern = errors.New("catbird: invalid topic pattern")
 
 // Claim status values.
 const (
@@ -53,6 +59,7 @@ type Job struct {
 // connection, or a transaction.
 type Conn interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
@@ -121,6 +128,162 @@ func PublishBatch(ctx context.Context, db Conn, msgs []BatchMessage) (int, error
 		ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
 	`, topics, payloads, dedupKeys)
 	return int(tag.RowsAffected()), err
+}
+
+// Cursor is a named position in the stream together with what is read from it:
+// the patterns and the position belong to each other, because a position only
+// says how far a reader has come through the messages its own patterns select.
+// Two readers sharing a name with different patterns skip each other's
+// messages — the one reading less acks past what the other has not seen — so
+// build a cursor in one place and let both calls use it.
+type Cursor struct {
+	Name     string
+	Patterns []string
+}
+
+// Read returns the next messages after the cursor, in position order. A cursor
+// that has never been acked starts at position 0. Reading writes nothing and
+// moves nothing; Ack is what moves the cursor.
+//
+// The messages Enqueue writes get no position and are never returned:
+// enqueuing a job does not publish it.
+func (c Cursor) Read(ctx context.Context, db Conn, limit int) ([]Message, error) {
+	start := "COALESCE((SELECT last_position FROM cb_cursors WHERE name = $1), 0)"
+	return readMessages(ctx, db, start, c.Name, c.Patterns, limit)
+}
+
+// Ack moves the cursor to position. The cursor never moves backwards, so a
+// batch acked out of order cannot undo the progress of a later one.
+func (c Cursor) Ack(ctx context.Context, db Conn, position int64) error {
+	_, err := db.Exec(ctx, `
+		INSERT INTO cb_cursors (name, last_position) VALUES ($1, $2)
+		ON CONFLICT (name) DO UPDATE SET last_position = GREATEST(cb_cursors.last_position, EXCLUDED.last_position)
+	`, c.Name, position)
+	return err
+}
+
+// ReadAfter returns the next messages after position, in position order, for a
+// caller that holds its own position instead of a cursor: a poll endpoint, or
+// a connection that pushes messages to a browser.
+//
+// A caller that has been away longer than GC keeps messages resumes past
+// deleted ones with no sign of it here. OldestPosition is what tells it: when
+// that is ahead of the position it held, something was removed and the caller
+// refetches its state instead of trusting the rows.
+func ReadAfter(ctx context.Context, db Conn, patterns []string, after int64, limit int) ([]Message, error) {
+	return readMessages(ctx, db, "$1", after, patterns, limit)
+}
+
+// LastPosition is the end of the stream: the highest position assigned so far,
+// or 0 on an empty stream. A page embeds it when it renders, so a reader that
+// connects afterwards starts there and misses nothing in between.
+func LastPosition(ctx context.Context, db Conn) (int64, error) {
+	var position int64
+	err := db.QueryRow(ctx, `SELECT COALESCE(max(position), 0) FROM cb_messages`).Scan(&position)
+	return position, err
+}
+
+// OldestPosition is the lowest position GC has not removed, or 0 on an empty
+// stream. A reader compares it with the position it holds: when it is higher,
+// the messages in between are gone.
+func OldestPosition(ctx context.Context, db Conn) (int64, error) {
+	var position int64
+	err := db.QueryRow(ctx, `SELECT COALESCE(min(position), 0) FROM cb_messages`).Scan(&position)
+	return position, err
+}
+
+// readMessages runs one stream read. start is the SQL for the position to read
+// after, holding $1, and limit is $2; the patterns take the parameters from $3.
+func readMessages(ctx context.Context, db Conn, start string, startArg any, patterns []string, limit int) ([]Message, error) {
+	match, args, err := compilePatterns(patterns, 3)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := db.Query(ctx, `
+		SELECT id, position, topic, payload, created_at
+		FROM cb_messages
+		WHERE position > `+start+` AND `+match+`
+		ORDER BY position ASC
+		LIMIT $2
+	`, append([]any{startArg, limit}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []Message
+	for rows.Next() {
+		var m Message
+		if err := rows.Scan(&m.ID, &m.Position, &m.Topic, &m.Payload, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, rows.Err()
+}
+
+// compilePatterns turns patterns into one boolean expression and the arguments
+// it reads, numbered from next. Three forms: a topic on its own matches that
+// topic exactly; a prefix followed by ".#" matches the prefix and every topic
+// under it, so "order.#" covers "order", "order.paid" and
+// "order.paid.refund"; "#" matches everything.
+//
+// Each pattern becomes its own comparison rather than one array test. A list
+// compared with = ANY or LIKE ANY cannot be read as index arms, so it walks the
+// position index and filters: 188 buffer hits against 72 for three subtrees
+// read from the start of a 300k-message stream.
+//
+// There is no "*". A wildcard inside a topic is not a prefix range, so it can
+// use no index at any position; a pattern that holds one is refused instead of
+// quietly running as the slowest read in the system.
+func compilePatterns(patterns []string, next int) (string, []any, error) {
+	if len(patterns) == 0 {
+		return "", nil, ErrBadPattern
+	}
+	var arms []string
+	var args []any
+	everything := false
+	for _, pattern := range patterns {
+		switch {
+		case pattern == "#":
+			everything = true
+		case strings.HasSuffix(pattern, ".#"):
+			prefix := strings.TrimSuffix(pattern, ".#")
+			if err := checkTopic(prefix); err != nil {
+				return "", nil, err
+			}
+			arms = append(arms, fmt.Sprintf("(topic = $%d OR topic LIKE $%d)", next, next+1))
+			args = append(args, prefix, subtreeLikePattern(prefix))
+			next += 2
+		default:
+			if err := checkTopic(pattern); err != nil {
+				return "", nil, err
+			}
+			arms = append(arms, fmt.Sprintf("topic = $%d", next))
+			args = append(args, pattern)
+			next++
+		}
+	}
+	// "#" is checked last so that a bad pattern beside it is still refused.
+	if everything {
+		return "true", nil, nil
+	}
+	return "(" + strings.Join(arms, " OR ") + ")", args, nil
+}
+
+func checkTopic(topic string) error {
+	if topic == "" || strings.ContainsAny(topic, "#*") {
+		return ErrBadPattern
+	}
+	return nil
+}
+
+// subtreeLikePattern builds the SQL LIKE pattern matching every topic under
+// prefix — not prefix itself, which is the equality arm beside it. LIKE's own
+// wildcard characters in the prefix are escaped so they match literally:
+// "image_x" is not a topic under "image".
+func subtreeLikePattern(prefix string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix) + ".%"
 }
 
 // Enqueue appends a message and a claim for it, and wakes the queue's workers

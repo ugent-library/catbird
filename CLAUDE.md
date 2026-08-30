@@ -50,17 +50,21 @@ Five files, one migration, no packages:
 
 - `client.go` — every statement a caller runs, as package functions:
   `Publish`, `PublishBatch`, `Enqueue`, `EnqueueBatch`, `Complete`, `Cancel`,
-  `GC`, `ResolveDependency`, `DeliverSignal`, `SetOutput`, `Output`. Each takes
-  a `Conn` — a pool, a connection, or a transaction — and holds no state; what
-  a process configures lives on the `Runtime`. It also holds the two values a
-  caller handles: `Message`, a published message as a consumer reads it, and
-  `Job`, one claimed unit of work as a handler is given it.
-- `runtime.go` — `New` and `Start`. One `Runtime` per process owns the pool, one
-  `LISTEN` connection for every channel its loops need, the position assigner,
-  and one goroutine per declared worker, trigger and consumer.
+  `GC`, `ResolveDependency`, `DeliverSignal`, `SetOutput`, `Output`, and the
+  stream reads `ReadAfter`, `LastPosition` and `OldestPosition`. Each takes a
+  `Conn` — a pool, a connection, or a transaction — and holds no state; what a
+  process configures lives on the `Runtime`. It also holds the three values a
+  caller handles: `Message`, a published message as a reader gets it; `Job`,
+  one claimed unit of work as a handler is given it; and `Cursor`, a name and
+  the patterns read under it, which carries `Read` and `Ack` as methods and
+  holds no connection either.
+- `runtime.go` — `New`, `Start`, and the two loops every process runs whether or
+  not anything is declared: the position assigner and the one `LISTEN`
+  connection that wakes the rest. One `Runtime` per process owns the pool and
+  one goroutine per declared worker and trigger.
 - `worker.go` — the claim loop, completion, retries, `OnDead`.
-- `stream.go` — the position assigner, `Consumer` (cursor plus `FetchBatch` and
-  `Ack`), and `Trigger`.
+- `trigger.go` — `Trigger`: the loop that turns stream messages into jobs. The
+  reads it uses live in `client.go` with the other statements.
 - `migrations/00001_lite.sql` — the whole schema. Goose markers, no goose
   dependency; the tests split the file on `-- +goose down`.
 
@@ -88,6 +92,9 @@ client exists.
   worker holds no transaction and no connection while a handler runs.
 - Stream readers go by `position`, never by `id`. Positions are set after commit
   by the assigner, so they follow commit order.
+- A topic pattern is a topic, a prefix with `.#`, or `#`, and each pattern
+  compiles to its own comparison. A list compared with `= ANY` or `LIKE ANY`
+  cannot be read as index arms and walks the position index instead.
 - The assigner only sets positions that are still empty, so two assigners
   running at once cannot move a position a reader may already have passed.
 - `Lease`, `MaxAttempts` and `Backoff` are worker settings, not job settings.
