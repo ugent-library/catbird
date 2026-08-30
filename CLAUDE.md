@@ -4,7 +4,7 @@ Guidance for Claude Code (claude.ai/code) working in this repository.
 
 ## What is Catbird Lite?
 
-A PostgreSQL-backed job queue, stream, and small workflow engine. Five tables,
+A PostgreSQL-backed job queue, stream, and small workflow engine. Four tables,
 plain SQL, no PL/pgSQL, no extensions, one dependency (pgx). Postgres is the
 only coordinator; workers scale by starting more processes.
 
@@ -38,7 +38,7 @@ go test ./... -run TestEnqueueBatch
 
 Tests use a hardcoded DSN, `postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable`,
 and no env vars. The compose file creates no database, so `cb_tst` is made once
-by hand. `setupTestDB` drops the five tables and applies
+by hand. `setupTestDB` drops the four tables and applies
 `migrations/00001_lite.sql` on every test, so tests do not share state.
 
 `bench_hot.sh` measures index bloat on `cb_claims` under sustained update churn.
@@ -48,33 +48,50 @@ It talks to the same database directly and needs no Go build.
 
 Five files, one migration, no packages:
 
+- `job_type.go` — the two declarations an application writes. `Queue` is a name
+  and how work runs under it: `BatchSize`, `Lease`, `PollInterval`. It decides
+  who competes with whom, and it is the claim key. `JobType` is a kind of job:
+  its name, its queue, and how a run of it is retried (`Signal`,
+  `MaxAttempts`, `Backoff`, `OnDead`). Both are plain Go values; nothing about
+  them is written to the database, and only their names reach a row. The
+  handler is not on either — everything on a job type is stamped on a claim or
+  decided about a run, and a handler is neither, so it is given at
+  registration.
 - `client.go` — every statement a caller runs, as package functions:
-  `Publish`, `PublishBatch`, `Enqueue`, `EnqueueBatch`, `Complete`, `Cancel`,
-  `GC`, `ResolveDependency`, `DeliverSignal`, `Output`, and the
-  stream reads `ReadAfter`, `LastPosition` and `OldestPosition`. Each takes a
-  `Conn` — a pool, a connection, or a transaction — and holds no state; what a
-  process configures lives on the `Runtime`. It also holds the three values a
-  caller handles: `Message`, a published message as a reader gets it; `Job`,
-  one claimed unit of work as a handler is given it, which carries `SetOutput`
-  as a method; and `Cursor`, a name and the patterns read under it, which
-  carries `Read` and `Ack` as methods and holds no connection either.
-- `runtime.go` — `New`, `Start`, and the two loops every process runs whether or
-  not anything is declared: the position assigner and the one `LISTEN`
-  connection that wakes the rest. One `Runtime` per process owns the pool and
-  one goroutine per declared worker and trigger.
-- `worker.go` — the claim loop, completion, retries, `OnDead`.
-- `trigger.go` — `Trigger`: the loop that turns stream messages into jobs. The
-  reads it uses live in `client.go` with the other statements.
+  `Publish`, `PublishBatch`, `Enqueue`, `EnqueueBatch`, `Complete`, `Signal`,
+  `Cancel`, `GC`, `Output`, `Outputs`, and the stream reads `ReadAfter`,
+  `LastPosition` and `OldestPosition`. Each takes a `Conn` — a pool, a
+  connection, or a transaction — and holds no state; what a process runs lives
+  on the `Runtime`. It also holds the three values a caller handles: `Message`,
+  a published message as a reader gets it; `Job`, one claimed unit of work as a
+  handler is given it, which carries `SetOutput`, `Enqueue` and `EnqueueAfter`
+  as methods; and `Cursor`, a name and the patterns read under it, which carries
+  `Read` and `Ack` as methods and holds no connection either.
+- `runtime.go` — `New`, `Handle`, `Start`, and the two loops every process runs
+  whether or not anything is registered: the position assigner and the one
+  `LISTEN` connection that wakes the rest. One `Runtime` per process owns the
+  pool and one goroutine per queue and trigger.
+- `worker.go` — the claim loop, dispatch by job type, completion, retries,
+  `OnDead`. One worker per queue, however many job types run on it.
+- `trigger.go` — `Runtime.Trigger`: the loop that turns stream messages into
+  jobs. The reads it uses live in `client.go` with the other statements.
 - `migrations/00001_lite.sql` — the whole schema. Goose markers, no goose
   dependency; the tests split the file on `-- +goose down`.
 
 ## Architecture
 
-**Tables.** `cb_messages` holds every job's message and every published
-message, one row, written once. `cb_claims` holds one narrow row per job that still has to
-run, rewritten on every claim and retry, deleted on completion. `cb_cursors`,
-`cb_signals` and `cb_outputs` are one row each per consumer, per delivered
-signal, per job result.
+**Tables.** `cb_messages` holds every job's payload and every published message,
+one row, written once. `cb_claims` holds one narrow row per job that still has
+to run, rewritten on every claim and retry, deleted on completion; it carries
+the queue, the job type, the workflow, what the job waits for, and the signal
+payload once one arrives. `cb_cursors` and `cb_outputs` are one row each per
+stream consumer and per job result.
+
+**Queue and job type are two things.** The queue is the claim key and the
+concurrency bound — it decides who competes with whom for `BatchSize` slots.
+The job type decides what code runs and how a run of it is retried. Several
+types share a queue, so a process handling thirty kinds of work runs one claim
+loop, not thirty, and no handler switches on a topic to find out what it is.
 
 **Statements live in Go, not in the database.** There are no SQL functions and
 no PL/pgSQL. A client in another language reimplements the same statements
@@ -89,11 +106,25 @@ client exists.
   lease holder deletes the claim. A handler is given no connection: it runs
   `Complete` in its own transaction to end the job in the same commit as its
   writes, or returns `nil` and lets the worker complete it afterwards. The
-  worker holds no transaction and no connection while a handler runs. That same
-  statement writes the job's result: `SetOutput` is a method on `Job` that only
-  records the value, and nothing else writes `cb_outputs`, so a result cannot
-  outlive an attempt that never finished and a late attempt cannot replace the
-  result of the one that completed the job.
+  worker holds no transaction and no connection while a handler runs.
+- Everything a handler asked for hangs off that one delete, in the same
+  statement: the result `SetOutput` recorded, the countdown of the jobs waiting
+  for this one, and the jobs `Enqueue` and `EnqueueAfter` recorded. All three are
+  buffered on `Job` and written by the completion, so an attempt that lost its
+  lease writes no result, counts nothing down and creates no jobs, and a handler
+  that fails halfway retries with an empty buffer.
+- Nothing outside catbird holds a dependency count. `EnqueueAfter` takes the
+  count of the buffer's other jobs, and each of those carries the waiting job's
+  id in `dependent_job_ids`; both are derived inside the completion from the ids the
+  same statement hands out. The CTE that hands them out is `MATERIALIZED`
+  because `nextval` is volatile and an inlined CTE would give a message and its
+  claim different ids.
+- A job waiting for a signal has `visible_at = 'infinity'`, so waiting is a
+  delay and needs no place in the ready index. `Signal` writes the payload and
+  sets `visible_at` to `now()`.
+- A workflow is `coalesce(group_id, message_id)` of the job that started it.
+  `group_id` is NULL on a job that stands alone, which keeps the volume of
+  single-shot jobs out of `cb_claims_group_idx` and off its write cost.
 - Stream readers go by `position`, never by `id`. Positions are set after commit
   by the assigner, so they follow commit order.
 - A topic pattern is a topic, a prefix with `.#`, or `#`, and each pattern
@@ -101,8 +132,10 @@ client exists.
   cannot be read as index arms and walks the position index instead.
 - The assigner only sets positions that are still empty, so two assigners
   running at once cannot move a position a reader may already have passed.
-- `Lease`, `MaxAttempts` and `Backoff` are worker settings, not job settings.
-  All workers on one queue must agree on them.
+- `BatchSize` and `Lease` are queue settings; `MaxAttempts`, `Backoff` and
+  `OnDead` are job type settings. `Lease` is on the queue because the claim sets
+  it for a whole batch in one statement. The handler belongs to neither: it is
+  the process's, and `rt.Handle(jobType, handler)` is where the two meet.
 - Hot-path SQL takes no joins, no advisory locks (the assigner's is the one
   exception), and no N+1 loops.
 - The unique indexes on `dedup_key` and `position` are partial. Deduplicating
@@ -121,12 +154,14 @@ the rule and then, when it earns its place, the concrete failure it prevents —
 with the measurement when there is one. Comments never narrate history: what
 changed belongs in the commit message, not in the file.
 
-**Job and message.** A job is one claimed unit of work; a message is a row of
-`cb_messages`, and a published message is what a consumer reads. The word job
-belongs where a claim does, and the type carries it rather than the name: the
-handler type is `Handler` and takes a `*Job`, and the completion is `Complete`.
-`ResolveDependency`, `DeliverSignal` and `Output` address a job, so their
-parameter is `jobID`, while the column it matches stays `message_id`.
+**Job, job type and message.** A job is one claimed unit of work; a job type is
+the kind of job it is, declared once and used by both the enqueue and the
+worker; a message is a row of `cb_messages`, and a published message is what a
+consumer reads. The word job belongs where a claim does, and the type carries it
+rather than the name: the handler type is `Handler` and takes a `*Job`, and the
+completion is `Complete`. `Signal`, `Cancel`, `Output` and `Outputs` address a
+workflow, so their parameter is `groupID`, while the column it matches stays
+`group_id`.
 
 **Errors.** Sentinels are prefixed with `catbird:` and checked with
 `errors.Is`.

@@ -2,6 +2,7 @@ package catbird_test
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"time"
 
@@ -9,71 +10,135 @@ import (
 	"github.com/ugent-library/catbird"
 )
 
-// Example_basicWorkflow shows a worker, a cron enqueue that is safe to run from
-// several processes, and a trigger that turns stream messages into jobs.
-func Example_basicWorkflow() {
+// A queue decides who competes with whom for worker slots, and how long one
+// attempt may run. Extraction is slow and bursty, so it does not take slots
+// from the short jobs that run once a deposit has been decided.
+var (
+	ingest  = catbird.NewQueue("ingest", catbird.QueueOptions{BatchSize: 8, Lease: 30 * time.Minute})
+	deposit = catbird.NewQueue("deposit", catbird.QueueOptions{BatchSize: 50, Lease: time.Minute})
+)
+
+// A job type decides what kind of work a job is and how a run of it is retried.
+// Review waits for a person, and the enqueue stamps that on the row, so a review
+// job cannot be created by a caller that never sends a decision — and its
+// handler is always given one.
+var (
+	submitted = catbird.NewJobType("submitted", deposit, catbird.JobTypeOptions{})
+	extract   = catbird.NewJobType("extract", ingest, catbird.JobTypeOptions{MaxAttempts: 3})
+	scan      = catbird.NewJobType("scan", ingest, catbird.JobTypeOptions{MaxAttempts: 3})
+	review    = catbird.NewJobType("review", deposit, catbird.JobTypeOptions{Signal: true})
+	publish   = catbird.NewJobType("publish", deposit, catbird.JobTypeOptions{MaxAttempts: 5})
+	archive   = catbird.NewJobType("archive", deposit, catbird.JobTypeOptions{})
+)
+
+var pool *pgxpool.Pool
+
+// Example_workflow shows a multi-step workflow: two steps in parallel, a step
+// that waits for both and for a person's decision, and what follows chosen by
+// that decision.
+func Example_workflow() {
 	ctx := context.Background()
 
 	// The 00001_lite.sql schema must be applied first. The pool carries the
 	// library's own statements — about eight — plus one connection for every
-	// handler that holds a transaction, which is what BatchSize is set against
-	// below.
-	pool, err := pgxpool.New(ctx, "postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable&pool_max_conns=32")
+	// handler that holds a transaction, which is what BatchSize is set against.
+	pool, _ = pgxpool.New(ctx, "postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable&pool_max_conns=32")
+
+	// What this process runs. A process that only enqueues registers nothing
+	// and links none of these functions.
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Handle(submitted, handleSubmitted)
+	rt.Handle(extract, handleExtract)
+	rt.Handle(scan, handleScan)
+	rt.Handle(review, handleReview)
+	rt.Handle(publish, handlePublish)
+	rt.Handle(archive, handleArchive)
+	go rt.Start(ctx)
+
+	// Starting one workflow. The id it returns is the workflow: signal it,
+	// cancel it, read its results by it. It is the only thing the deposit row
+	// has to keep.
+	groupID, err := catbird.Enqueue(ctx, pool, submitted, 42, catbird.EnqueueOptions{
+		DedupKey: "deposit:42", // a retried POST does not start a second workflow
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// The handler is given no connection and opens one when it needs it. It
-	// completes the job in its own transaction, so its writes and the end of
-	// the job are one commit: the job runs again only if nothing was written.
-	handler := func(ctx context.Context, job *catbird.Job) error {
-		log.Printf("job %d on %s", job.ID, job.Topic)
+	// Later, from an HTTP handler. ErrNotFound means nothing is waiting any
+	// more: the workflow ended, or the decision arrived twice.
+	if err := catbird.Signal(ctx, pool, groupID, review, decision{Approved: true, By: "ann"}); err != nil {
+		log.Print(err)
+	}
+}
 
-		tx, err := pool.Begin(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
+type decision struct {
+	Approved bool   `json:"approved"`
+	By       string `json:"by"`
+}
 
-		// _, err = tx.Exec(ctx, "UPDATE accounts SET balance = balance - 100 WHERE id = 1")
-		if err := catbird.Complete(ctx, tx, job); err != nil {
-			return err
-		}
-		return tx.Commit(ctx)
+type scanResult struct {
+	Clean   bool   `json:"clean"`
+	Finding string `json:"finding"`
+}
+
+// handleSubmitted fans the workflow out. What it asks for is written by the
+// statement that ends this job, so a crash in between cannot leave a submitted
+// deposit with nothing started for it, and a retry starts with an empty buffer.
+func handleSubmitted(ctx context.Context, job *catbird.Job) error {
+	var depositID int
+	if err := json.Unmarshal(job.Payload, &depositID); err != nil {
+		return err
+	}
+	job.Enqueue(extract, depositID)
+	job.Enqueue(scan, depositID)
+	job.EnqueueAfter(review, depositID) // after both of the above
+	return nil
+}
+
+// handleScan records a result the review step reads later. It opens no
+// transaction: the worker completes the job, and the completion writes what
+// SetOutput recorded.
+func handleScan(ctx context.Context, job *catbird.Job) error {
+	var depositID int
+	if err := json.Unmarshal(job.Payload, &depositID); err != nil {
+		return err
+	}
+	finding := virusCheck(depositID)
+	return job.SetOutput(scanResult{Clean: finding == "", Finding: finding})
+}
+
+// handleReview runs when extraction and the scan finished and a decision
+// arrived. The gate guarantees the decision is here, so there is no case for
+// its absence.
+func handleReview(ctx context.Context, job *catbird.Job) error {
+	var depositID int
+	if err := json.Unmarshal(job.Payload, &depositID); err != nil {
+		return err
+	}
+	var d decision
+	if err := json.Unmarshal(job.Signal, &d); err != nil {
+		return err
 	}
 
-	rt := catbird.New(pool, catbird.Options{})
-	catbird.NewWorker(rt, "image_processing", handler, catbird.WorkerOptions{
-		// This handler holds a connection for its whole body, so the jobs that
-		// run at once have to fit in the pool beside the library's own
-		// statements. The default of 50 does not fit a default pool.
-		BatchSize: 20,
-		OnDead: func(ctx context.Context, job *catbird.Job) error {
-			log.Printf("job %d failed permanently", job.ID)
-			return nil
-		},
-	})
+	// The scan's result, read by what produced it: a job a handler asked for
+	// has no id anyone can hold, so the workflow and the job type address it.
+	var scanned scanResult
+	if err := catbird.Output(ctx, pool, job.GroupID, scan, &scanned); err != nil {
+		return err
+	}
 
-	// Cron without leader election: every process enqueues the same key each
-	// minute; the dedup key lets exactly one insert through. The minute is
-	// formatted in UTC and in this exact layout, because every process has to
-	// produce the same key for the minute it is in.
-	go func() {
-		for {
-			time.Sleep(time.Minute)
-			key := "cron:heartbeat:" + time.Now().UTC().Format("2006-01-02T15:04Z")
-			catbird.Enqueue(ctx, pool, "cron.minutely", "cron_workers", nil, catbird.EnqueueOptions{DedupKey: key})
-		}
-	}()
-
-	// Every message on image.* becomes a job on image_processing.
-	catbird.NewTrigger(rt, "img_processor", []string{"image.#"}, "image_processing", catbird.TriggerOptions{})
-
-	go func() {
-		time.Sleep(time.Second)
-		catbird.Publish(ctx, pool, "image.uploaded", map[string]string{"url": "https://example.com/img.png"}, "")
-	}()
-
-	go rt.Start(ctx)
-	time.Sleep(7 * time.Second)
+	switch {
+	case !scanned.Clean:
+		job.Enqueue(archive, depositID)
+	case d.Approved:
+		job.Enqueue(publish, depositID)
+	}
+	return nil
 }
+
+func handleExtract(ctx context.Context, job *catbird.Job) error { return nil }
+func handlePublish(ctx context.Context, job *catbird.Job) error { return nil }
+func handleArchive(ctx context.Context, job *catbird.Job) error { return nil }
+
+func virusCheck(depositID int) string { return "" }

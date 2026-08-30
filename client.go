@@ -12,9 +12,13 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// ErrNotFound is returned when the addressed job does not exist or is not waiting
-// on anything.
+// ErrNotFound is returned when the addressed job or result does not exist, or
+// the job is not waiting for what was delivered to it.
 var ErrNotFound = errors.New("catbird: not found")
+
+// ErrAmbiguous is returned by Output when a workflow holds several results of
+// the job type asked for. Read them with Outputs.
+var ErrAmbiguous = errors.New("catbird: several results")
 
 // ErrLeaseExpired is returned by Complete when the job's lease ran out and
 // another worker claimed it. The work of the late attempt is not the queue's any
@@ -27,7 +31,7 @@ var ErrBadPattern = errors.New("catbird: invalid topic pattern")
 
 // Claim status values.
 const (
-	statusLive int16 = 0 // ready, waiting on dependencies, or claimed; visible_at tells which
+	statusLive int16 = 0 // ready, waiting, or claimed; visible_at and dependencies tell which
 	statusDead int16 = 1 // failed permanently or canceled; never claimed again
 )
 
@@ -40,20 +44,35 @@ type Message struct {
 	CreatedAt time.Time // insert time, not commit time: it does not follow position order
 }
 
-// Job is one claimed unit of work, as a handler is given it: the message it was
-// enqueued with, and what its attempt needs to know. A job has no position; it
-// is not part of the stream.
+// Job is one claimed unit of work, as a handler is given it. A job has no
+// position; it is not part of the stream.
 type Job struct {
-	ID            int64
-	Topic         string
-	Payload       json.RawMessage
-	CreatedAt     time.Time                  // insert time of the message the job was enqueued with
-	Signals       map[string]json.RawMessage // payloads delivered with DeliverSignal; nil when none
-	Attempts      int                        // 1 on the first run
-	CorrelationID string
+	ID   int64
+	Type string // the job type's name
+	// The workflow this job belongs to, and the value Signal, Cancel and the
+	// result reads take. A job that stands alone is its own group.
+	GroupID   int64
+	Topic     string
+	Payload   json.RawMessage
+	Signal    json.RawMessage // the payload delivered by Signal; nil unless the type declared one
+	Attempts  int             // 1 on the first run
+	CreatedAt time.Time       // insert time of the job's message
 
-	completed bool            // Complete's delete succeeded, so the worker does not repeat it
-	output    json.RawMessage // what SetOutput recorded, written by the completion
+	completed  bool            // Complete's delete succeeded, so the worker does not repeat it
+	output     json.RawMessage // what SetOutput recorded, written by the completion
+	newJobs    []newJob        // what Enqueue and EnqueueAfter recorded, written by the completion
+	payloadErr error           // a payload that could not be marshaled, returned by the completion
+}
+
+// newJob is one job a handler asked for, in the shape the completion writes.
+type newJob struct {
+	jobType string
+	queue   string
+	payload []byte
+	// Whether this job depends on the others: a dependent job runs when every
+	// job of the same buffer that is not dependent has completed.
+	dependent bool
+	signal    bool
 }
 
 // SetOutput records the job's result. Nothing is written here: the completion
@@ -74,6 +93,44 @@ func (j *Job) SetOutput(v any) error {
 	return nil
 }
 
+// Enqueue records a job to run when this one completes. Nothing is written
+// here: the completion writes it in the statement that deletes the claim, so
+// the work this job asked for and the end of this job are one commit, and a
+// handler that fails or crashes halfway records nothing and retries with an
+// empty buffer.
+//
+// The new job joins this job's workflow, so Signal, Cancel and the result reads
+// address it by the same group id. A marshal failure is kept and returned by
+// the completion, which fails the attempt.
+func (j *Job) Enqueue(t *JobType, payload any) {
+	j.record(t, payload, false)
+}
+
+// EnqueueAfter records a job to run after the jobs this handler recorded with
+// Enqueue — all of them, and nothing wider: not the rest of the workflow, and
+// not what another handler is adding at the same time. The count comes from the
+// buffer, so nothing outside catbird holds it and it cannot be wrong.
+//
+// Recorded with no Enqueue beside it, the job waits for nothing and runs at
+// once.
+func (j *Job) EnqueueAfter(t *JobType, payload any) {
+	j.record(t, payload, true)
+}
+
+func (j *Job) record(t *JobType, payload any, dependent bool) {
+	body, err := json.Marshal(payload)
+	if err != nil && j.payloadErr == nil {
+		j.payloadErr = fmt.Errorf("catbird: job type %s: %w", t.name, err)
+	}
+	j.newJobs = append(j.newJobs, newJob{
+		jobType:   t.name,
+		queue:     t.queue.name,
+		payload:   body,
+		dependent: dependent,
+		signal:    t.opts.Signal,
+	})
+}
+
 // Conn is the part of pgx.Tx and *pgxpool.Pool this package uses: a pool, a
 // connection, or a transaction.
 type Conn interface {
@@ -84,10 +141,9 @@ type Conn interface {
 
 // EnqueueOptions are the optional parts of Enqueue.
 type EnqueueOptions struct {
-	DedupKey      string        // when set, a second Enqueue with the same key does nothing
-	CorrelationID string        // groups jobs so Cancel can stop them together
-	Delay         time.Duration // earliest start, measured from now
-	Dependencies  int           // number of ResolveDependency and DeliverSignal calls the job waits for
+	DedupKey string        // when set, a second Enqueue with the same key does nothing
+	Delay    time.Duration // earliest start, measured from now
+	Topic    string        // what the job is about; the job type's name when empty
 }
 
 // Publish appends a message to the stream: consumers see it, no worker runs it.
@@ -110,7 +166,7 @@ func Publish(ctx context.Context, db Conn, topic string, payload any, dedupKey s
 	return id, err
 }
 
-// BatchMessage is one message for PublishBatch.
+// BatchMessage is one message for PublishBatch and EnqueueBatch.
 type BatchMessage struct {
 	Topic    string
 	Payload  any    // marshalled to JSON; a json.RawMessage is written as it is
@@ -130,15 +186,9 @@ func PublishBatch(ctx context.Context, db Conn, msgs []BatchMessage) (int, error
 	if len(msgs) == 0 {
 		return 0, nil
 	}
-	topics := make([]string, len(msgs))
-	payloads := make([][]byte, len(msgs))
-	dedupKeys := make([]*string, len(msgs))
-	for i, msg := range msgs {
-		body, err := json.Marshal(msg.Payload)
-		if err != nil {
-			return 0, err
-		}
-		topics[i], payloads[i], dedupKeys[i] = msg.Topic, body, nullString(msg.DedupKey)
+	topics, payloads, dedupKeys, err := batchArrays(msgs)
+	if err != nil {
+		return 0, err
 	}
 	tag, err := db.Exec(ctx, `
 		INSERT INTO cb_messages (topic, payload, stream, dedup_key)
@@ -306,18 +356,24 @@ func subtreeLikePattern(prefix string) string {
 }
 
 // Enqueue appends a message and a claim for it, and wakes the queue's workers
-// unless the job still waits on dependencies. Returns the job's id, which is
-// what ResolveDependency, DeliverSignal and Output address it by, or 0 when
-// opts.DedupKey already exists.
+// unless the job cannot run yet. Returns the job's id, which is also the id of
+// the workflow it starts — what Signal, Cancel and the result reads address —
+// or 0 when opts.DedupKey already exists.
 //
-// One statement does all three. The wake CTE calls pg_notify only when
-// dependencies = 0; the final LEFT JOIN references it so that it runs (an
-// unreferenced SELECT CTE is never executed). The notification is delivered
-// when the caller's transaction commits, together with the row.
-func Enqueue(ctx context.Context, db Conn, topic, queue string, payload any, opts EnqueueOptions) (int64, error) {
+// One statement does all three. The wake CTE calls pg_notify only for a job
+// that is claimable now, so a delayed job and a job waiting for a signal do not
+// wake workers that can do nothing with them; the final LEFT JOIN references it
+// so that it runs, since an unreferenced SELECT CTE is never executed. The
+// notification is delivered when the caller's transaction commits, together
+// with the row.
+func Enqueue(ctx context.Context, db Conn, t *JobType, payload any, opts EnqueueOptions) (int64, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return 0, err
+	}
+	topic := opts.Topic
+	if topic == "" {
+		topic = t.name
 	}
 	var id int64
 	err = db.QueryRow(ctx, `
@@ -328,30 +384,32 @@ func Enqueue(ctx context.Context, db Conn, topic, queue string, payload any, opt
 			RETURNING id
 		),
 		claim AS (
-			INSERT INTO cb_claims (message_id, queue, visible_at, correlation_id, dependencies)
-			SELECT id, $4, now() + $5::interval, $6, $7 FROM message
-			RETURNING message_id, dependencies
+			INSERT INTO cb_claims (message_id, queue, job_type, visible_at, awaits_signal)
+			SELECT id, $4, $5,
+			       CASE WHEN $6 THEN 'infinity'::timestamptz ELSE now() + $7::interval END, $6
+			FROM message
+			RETURNING message_id, visible_at
 		),
 		wake AS (
-			SELECT pg_notify('cb_queue_' || $4, '') FROM claim WHERE dependencies = 0
+			SELECT pg_notify('cb_queue_' || $4, '') FROM claim WHERE visible_at <= now()
 		)
 		SELECT message_id FROM claim LEFT JOIN wake ON true
-	`, topic, body, nullString(opts.DedupKey), queue, opts.Delay, nullString(opts.CorrelationID), opts.Dependencies).Scan(&id)
+	`, topic, body, nullString(opts.DedupKey), t.queue.name, t.name, t.opts.Signal, opts.Delay).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil
 	}
 	return id, err
 }
 
-// EnqueueBatch appends messages and their claims on one queue in one statement
-// and wakes the queue's workers. Returns how many jobs it created: a message
-// whose DedupKey is already taken, or that repeats a key from its own batch,
-// gets neither a message nor a claim and is not counted.
+// EnqueueBatch appends messages and their claims for one job type in one
+// statement and wakes the queue's workers. Returns how many jobs it created: a
+// message whose DedupKey is already taken, or that repeats a key from its own
+// batch, gets neither a message nor a claim and is not counted.
 //
-// opts applies to every job in the batch — one delay, one correlation id, one
-// dependency count. Each message brings its own dedup key, so opts.DedupKey is
-// not used. Jobs that need different options, or another queue, go in separate
-// calls.
+// This is the volume path — what a trigger uses. Every job in the batch takes
+// the same options, and none of them starts a workflow or waits for anything: a
+// job type declared with Signal cannot be enqueued this way, because a batch has
+// no ids for a caller to signal.
 //
 // The claims come from the messages that were written, so a deduplicated
 // message produces no job. The wake CTE reads the claims through LIMIT 1, which
@@ -360,22 +418,19 @@ func Enqueue(ctx context.Context, db Conn, topic, queue string, payload any, opt
 // rather than the wake-ups — Postgres delivers identical notifications from one
 // transaction once whatever we do. Reading the claim CTE through a LIMIT does
 // not cut the insert short; a data-modifying CTE always runs in full.
-func EnqueueBatch(ctx context.Context, db Conn, queue string, msgs []BatchMessage, opts EnqueueOptions) (int, error) {
+func EnqueueBatch(ctx context.Context, db Conn, t *JobType, msgs []BatchMessage, opts EnqueueOptions) (int, error) {
 	if len(msgs) == 0 {
 		return 0, nil
 	}
-	topics := make([]string, len(msgs))
-	payloads := make([][]byte, len(msgs))
-	dedupKeys := make([]*string, len(msgs))
-	for i, msg := range msgs {
-		body, err := json.Marshal(msg.Payload)
-		if err != nil {
-			return 0, err
-		}
-		topics[i], payloads[i], dedupKeys[i] = msg.Topic, body, nullString(msg.DedupKey)
+	if t.opts.Signal {
+		return 0, fmt.Errorf("catbird: job type %s waits for a signal and cannot be enqueued in a batch", t.name)
+	}
+	topics, payloads, dedupKeys, err := batchArrays(msgs)
+	if err != nil {
+		return 0, err
 	}
 	var created int
-	err := db.QueryRow(ctx, `
+	err = db.QueryRow(ctx, `
 		WITH input AS (
 			SELECT * FROM unnest($1::text[], $2::jsonb[], $3::text[]) AS message (topic, payload, dedup_key)
 		),
@@ -386,31 +441,40 @@ func EnqueueBatch(ctx context.Context, db Conn, queue string, msgs []BatchMessag
 			RETURNING id
 		),
 		claim AS (
-			INSERT INTO cb_claims (message_id, queue, visible_at, correlation_id, dependencies)
-			SELECT id, $4, now() + $5::interval, $6, $7 FROM message
+			INSERT INTO cb_claims (message_id, queue, job_type, visible_at)
+			SELECT id, $4, $5, now() + $6::interval FROM message
 			RETURNING message_id
 		),
 		wake AS (
-			SELECT pg_notify('cb_queue_' || $4, '') FROM (SELECT 1 FROM claim LIMIT 1) one WHERE $7 = 0
+			SELECT pg_notify('cb_queue_' || $4, '') FROM (SELECT 1 FROM claim LIMIT 1) one WHERE $7
 		)
 		SELECT count(*) FROM claim LEFT JOIN wake ON true
-	`, topics, payloads, dedupKeys, queue, opts.Delay, nullString(opts.CorrelationID), opts.Dependencies).Scan(&created)
+	`, topics, payloads, dedupKeys, t.queue.name, t.name, opts.Delay, opts.Delay <= 0).Scan(&created)
 	return created, err
 }
 
-// Complete finishes a job: it deletes the claim and the signals delivered to
-// it, and writes the result the handler recorded with SetOutput. A worker does
-// this itself when the handler returns nil, so a handler only calls it to put
-// the completion in the same transaction as its own writes, which is what makes
-// the job's work and the job's end one commit. attempts is the lease token: if
-// the lease ran out and another worker claimed the job, attempts moved on,
-// nothing is deleted, and this returns ErrLeaseExpired — the caller rolls back
-// and the work of the late attempt is discarded.
+// Complete finishes a job: it deletes the claim, writes the result the handler
+// recorded with SetOutput, counts down the jobs waiting for this one, and
+// creates the jobs the handler recorded with Enqueue and EnqueueAfter. A worker
+// does this itself when the handler returns nil, so a handler only calls it to
+// put the completion in the same transaction as its own writes, which is what
+// makes the job's work and the job's end one commit. attempts is the lease
+// token: if the lease ran out and another worker claimed the job, attempts moved
+// on, nothing is deleted, and this returns ErrLeaseExpired — the caller rolls
+// back and the work of the late attempt is discarded.
 //
-// The deletes and the result are one statement, so a job costs one round trip
-// to finish. Nothing else writes a result, which puts it behind the same lease
-// check as the claim: a late attempt writes nothing, and cannot replace the
-// result of the attempt that finished the job.
+// It is one statement, so a job costs one round trip to finish however much it
+// asked for. Everything in it hangs off the claim the delete returned, so an
+// attempt that lost its lease writes no result, counts nothing down and creates no
+// jobs.
+//
+// The new jobs get their ids from the sequence inside the statement, which is
+// what lets one statement point the jobs that are not dependent at the ones
+// that are: a job recorded with EnqueueAfter takes the count of the others as
+// its dependencies, and each of the others carries its id in dependent_job_ids.
+// The CTE that hands out the ids is MATERIALIZED because nextval is volatile and
+// an inlined CTE would be evaluated once per reference, giving a message and its
+// claim different ids.
 //
 // A successful call marks job, so the worker does not run the completion a
 // second time. The mark records that the statement succeeded, not that the
@@ -418,21 +482,59 @@ func EnqueueBatch(ctx context.Context, db Conn, queue string, msgs []BatchMessag
 // transaction back, and then returns nil leaves a claim nothing deletes until
 // the lease runs out and the job runs again.
 func Complete(ctx context.Context, db Conn, job *Job) error {
-	var completed int
+	if job.payloadErr != nil {
+		return job.payloadErr
+	}
+	types, queues, payloads, dependents, signals := newJobArrays(job.newJobs)
+	var completed, woken int
 	err := db.QueryRow(ctx, `
 		WITH claim AS (
 		    DELETE FROM cb_claims WHERE message_id = $1 AND attempts = $2
-		    RETURNING message_id
-		),
-		signals AS (
-		    DELETE FROM cb_signals WHERE message_id IN (SELECT message_id FROM claim)
+		    RETURNING message_id, job_type, coalesce(group_id, message_id) AS group_id, dependent_job_ids
 		),
 		output AS (
-		    INSERT INTO cb_outputs (message_id, output)
-		    SELECT message_id, $3::jsonb FROM claim WHERE $3::jsonb IS NOT NULL
+		    INSERT INTO cb_outputs (message_id, group_id, job_type, output)
+		    SELECT message_id, group_id, job_type, $3::jsonb FROM claim WHERE $3::jsonb IS NOT NULL
+		),
+		dependent_job AS (
+		    UPDATE cb_claims SET dependencies = dependencies - 1
+		    WHERE message_id IN (SELECT unnest(dependent_job_ids) FROM claim)
+		      AND status = 0 AND dependencies > 0
+		    RETURNING queue, dependencies, visible_at
+		),
+		new_job AS MATERIALIZED (
+		    SELECT nextval('cb_messages_id_seq') AS id, n.*
+		    FROM unnest($4::text[], $5::text[], $6::jsonb[], $7::boolean[], $8::boolean[])
+		         AS n (job_type, queue, payload, dependent, signal)
+		),
+		new_message AS (
+		    INSERT INTO cb_messages (id, topic, payload)
+		    SELECT n.id, n.job_type, n.payload FROM new_job n, claim
+		),
+		new_claim AS (
+		    INSERT INTO cb_claims (message_id, queue, job_type, group_id, visible_at,
+		                           dependencies, dependent_job_ids, awaits_signal)
+		    SELECT n.id, n.queue, n.job_type, c.group_id,
+		           CASE WHEN n.signal THEN 'infinity'::timestamptz ELSE now() END,
+		           CASE WHEN n.dependent THEN (SELECT count(*) FROM new_job WHERE NOT dependent) ELSE 0 END::smallint,
+		           CASE WHEN n.dependent THEN NULL ELSE (SELECT array_agg(id) FROM new_job WHERE dependent) END,
+		           n.signal
+		    FROM new_job n, claim c
+		    RETURNING queue, dependencies, visible_at
+		),
+		woken AS (
+		    SELECT DISTINCT queue FROM (
+		        SELECT queue, dependencies, visible_at FROM dependent_job
+		        UNION ALL
+		        SELECT queue, dependencies, visible_at FROM new_claim
+		    ) ready
+		    WHERE dependencies = 0 AND visible_at <= now()
+		),
+		wake AS (
+		    SELECT pg_notify('cb_queue_' || queue, '') FROM woken
 		)
-		SELECT count(*) FROM claim
-	`, job.ID, job.Attempts, job.output).Scan(&completed)
+		SELECT (SELECT count(*) FROM claim), (SELECT count(*) FROM wake)
+	`, job.ID, job.Attempts, job.output, types, queues, payloads, dependents, signals).Scan(&completed, &woken)
 	if err != nil {
 		return err
 	}
@@ -443,18 +545,56 @@ func Complete(ctx context.Context, db Conn, job *Job) error {
 	return nil
 }
 
-// Cancel marks every live job with this correlation id dead. A job that is
-// already running finishes; cancel only stops jobs from starting.
-func Cancel(ctx context.Context, db Conn, correlationID string) error {
+// Signal delivers the payload a job of this type is waiting for in the given
+// workflow, and makes it claimable. groupID is what Enqueue returned for the
+// job that started the workflow, which is also the id of a job that stands
+// alone. Returns ErrNotFound when nothing is waiting: no such workflow, no live
+// job of that type in it, or the signal was already delivered.
+//
+// The job is addressed by what it is rather than by its id, because a job a
+// handler asked for has no id until that handler's completion runs and no
+// caller can hold one. Every live job of the type in the workflow is given the
+// payload; declaring one gate per type in a workflow is what keeps that to one.
+func Signal(ctx context.Context, db Conn, groupID int64, t *JobType, payload any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	var delivered, woken int
+	err = db.QueryRow(ctx, `
+		WITH gated AS (
+			UPDATE cb_claims SET signal = $3, visible_at = now()
+			WHERE (group_id = $1 OR message_id = $1) AND job_type = $2
+			  AND status = $4 AND awaits_signal AND signal IS NULL
+			RETURNING queue, dependencies
+		),
+		wake AS (
+			SELECT pg_notify('cb_queue_' || queue, '') FROM gated WHERE dependencies = 0
+		)
+		SELECT (SELECT count(*) FROM gated), (SELECT count(*) FROM wake)
+	`, groupID, t.name, body, statusLive).Scan(&delivered, &woken)
+	if err != nil {
+		return err
+	}
+	if delivered == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// Cancel marks every live job of the workflow dead, the job that started it
+// included. A job that is already running finishes; cancel only stops jobs from
+// starting.
+func Cancel(ctx context.Context, db Conn, groupID int64) error {
 	_, err := db.Exec(ctx, `
 		UPDATE cb_claims SET status = $2
-		WHERE correlation_id = $1 AND status = $3
-	`, correlationID, statusDead, statusLive)
+		WHERE (group_id = $1 OR message_id = $1) AND status = $3
+	`, groupID, statusDead, statusLive)
 	return err
 }
 
 // GC deletes dead claims and messages older than retention. A message that
-// still has a claim is kept, however old it is. Signals go with their message.
+// still has a claim is kept, however old it is. Results go with their message.
 func GC(ctx context.Context, db Conn, retention time.Duration) error {
 	_, err := db.Exec(ctx, `
 		DELETE FROM cb_claims
@@ -471,101 +611,82 @@ func GC(ctx context.Context, db Conn, retention time.Duration) error {
 	return err
 }
 
-// ResolveDependency counts one dependency of the job as done and wakes the queue
-// when it was the last one. Returns ErrNotFound when the job is not waiting.
-// Same shape as Enqueue: the wake CTE notifies only when the count hit 0.
-func ResolveDependency(ctx context.Context, db Conn, jobID int64) error {
-	var left int
-	err := db.QueryRow(ctx, `
-		WITH counted AS (
-			UPDATE cb_claims SET dependencies = dependencies - 1
-			WHERE message_id = $1 AND status = $2 AND dependencies > 0
-			RETURNING queue, dependencies
-		),
-		wake AS (
-			SELECT pg_notify('cb_queue_' || queue, '') FROM counted WHERE dependencies = 0
-		)
-		SELECT dependencies FROM counted LEFT JOIN wake ON true
-	`, jobID, statusLive).Scan(&left)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
-	}
-	return err
-}
-
-// DeliverSignal stores a payload for a job that waits on it and counts one
-// dependency as done. Delivering the same name twice is a no-op. Returns
-// ErrNotFound when the job is not waiting: signals must be counted in
-// EnqueueOptions.Dependencies before they are delivered.
+// Output unmarshals into dest the result recorded by the workflow's job of this
+// type. It takes a destination rather than returning the JSON because the caller
+// that reads a result is the one that wrote it and knows its type; a caller that
+// wants the JSON untouched passes a *json.RawMessage.
 //
-// The statement inserts the signal only if the job is waiting, and decrements
-// only if the insert happened, so a duplicate can never decrement twice. When
-// nothing was counted a second query tells a duplicate (fine) from a job that
-// is not waiting (ErrNotFound).
-func DeliverSignal(ctx context.Context, db Conn, jobID int64, name string, payload any) error {
-	body, err := json.Marshal(payload)
+// Returns ErrNotFound when no job of the type recorded one, and ErrAmbiguous
+// when several did — a fan-out, which Outputs reads.
+func Output(ctx context.Context, db Conn, groupID int64, t *JobType, dest any) error {
+	bodies, err := Outputs(ctx, db, groupID, t)
 	if err != nil {
 		return err
 	}
-	var left int
-	err = db.QueryRow(ctx, `
-		WITH waiting AS (
-			SELECT message_id FROM cb_claims
-			WHERE message_id = $1 AND status = $4 AND dependencies > 0
-		),
-		signal AS (
-			INSERT INTO cb_signals (message_id, name, payload)
-			SELECT message_id, $2, $3 FROM waiting
-			ON CONFLICT DO NOTHING
-			RETURNING message_id
-		),
-		counted AS (
-			UPDATE cb_claims SET dependencies = dependencies - 1
-			WHERE message_id IN (SELECT message_id FROM signal) AND dependencies > 0
-			RETURNING queue, dependencies
-		),
-		wake AS (
-			SELECT pg_notify('cb_queue_' || queue, '') FROM counted WHERE dependencies = 0
-		)
-		SELECT dependencies FROM counted LEFT JOIN wake ON true
-	`, jobID, name, body, statusLive).Scan(&left)
-	if err == nil {
-		return nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return err
-	}
-	// Nothing was counted: either this signal was delivered before, or the job
-	// is not waiting.
-	var delivered bool
-	err = db.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM cb_signals WHERE message_id = $1 AND name = $2)
-	`, jobID, name).Scan(&delivered)
-	if err != nil {
-		return err
-	}
-	if !delivered {
+	switch len(bodies) {
+	case 0:
 		return ErrNotFound
+	case 1:
+		return json.Unmarshal(bodies[0], dest)
+	default:
+		return ErrAmbiguous
 	}
-	return nil
 }
 
-// Output unmarshals into dest the result a job's handler recorded with
-// SetOutput, and returns ErrNotFound when the job recorded none. It takes a
-// destination rather than returning the JSON because the caller that reads a
-// result is the one that wrote it and knows its type. A caller that wants the
-// JSON untouched passes a *json.RawMessage, which unmarshals by copying the
-// bytes.
-func Output(ctx context.Context, db Conn, jobID int64, dest any) error {
-	var body json.RawMessage
-	err := db.QueryRow(ctx, `SELECT output FROM cb_outputs WHERE message_id = $1`, jobID).Scan(&body)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
-	}
+// Outputs returns the results recorded by the workflow's jobs of this type, in
+// the order the jobs were created — the fan-out read. Any count, zero included.
+func Outputs(ctx context.Context, db Conn, groupID int64, t *JobType) ([]json.RawMessage, error) {
+	rows, err := db.Query(ctx, `
+		SELECT output FROM cb_outputs
+		WHERE group_id = $1 AND job_type = $2
+		ORDER BY message_id
+	`, groupID, t.name)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return json.Unmarshal(body, dest)
+	defer rows.Close()
+
+	var bodies []json.RawMessage
+	for rows.Next() {
+		var body json.RawMessage
+		if err := rows.Scan(&body); err != nil {
+			return nil, err
+		}
+		bodies = append(bodies, body)
+	}
+	return bodies, rows.Err()
+}
+
+// batchArrays turns messages into the three parallel arrays the batch
+// statements unnest, so the number of messages is not limited by the number of
+// statement parameters.
+func batchArrays(msgs []BatchMessage) (topics []string, payloads [][]byte, dedupKeys []*string, err error) {
+	topics = make([]string, len(msgs))
+	payloads = make([][]byte, len(msgs))
+	dedupKeys = make([]*string, len(msgs))
+	for i, msg := range msgs {
+		body, err := json.Marshal(msg.Payload)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		topics[i], payloads[i], dedupKeys[i] = msg.Topic, body, nullString(msg.DedupKey)
+	}
+	return topics, payloads, dedupKeys, nil
+}
+
+// newJobArrays turns a handler's buffer into the five parallel arrays the
+// completion unnests.
+func newJobArrays(jobs []newJob) (types, queues []string, payloads [][]byte, dependents, signals []bool) {
+	types = make([]string, len(jobs))
+	queues = make([]string, len(jobs))
+	payloads = make([][]byte, len(jobs))
+	dependents = make([]bool, len(jobs))
+	signals = make([]bool, len(jobs))
+	for i, n := range jobs {
+		types[i], queues[i], payloads[i] = n.jobType, n.queue, n.payload
+		dependents[i], signals[i] = n.dependent, n.signal
+	}
+	return types, queues, payloads, dependents, signals
 }
 
 func nullString(s string) *string {

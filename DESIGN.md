@@ -1,42 +1,64 @@
 # Catbird Lite
 
-A PostgreSQL-backed job queue, stream, and small workflow engine. Five tables, plain SQL, no PL/pgSQL, no extensions. All logic lives in the client statements (Go today; other languages follow the same statements), so the whole system is the schema in `migrations/00001_lite.sql` plus the statements in `client.go`, `worker.go` and `trigger.go`.
+A PostgreSQL-backed job queue, stream, and small workflow engine. Four tables, plain SQL, no PL/pgSQL, no extensions. All logic lives in the client statements (Go today; other languages follow the same statements), so the whole system is the schema in `migrations/00001_lite.sql` plus the declarations in `job_type.go` and the statements in `client.go`, `worker.go` and `trigger.go`.
 
 ## Tables
 
-- `cb_messages` — every job's message and every published message is one row. A job's message is written once; a published message is updated once, when the assigner sets its `position`. Measured: one dead tuple per published message, cleaned by a routine vacuum; see the position benchmark note below.
-- `cb_claims` — one narrow row per job that still has to run. Updated on every claim and retry, deleted on completion. Aggressive autovacuum settings on the table keep it small.
+- `cb_messages` — every job's payload and every published message is one row. A job's payload is written once; a published message is updated once, when the assigner sets its `position`. Measured: one dead tuple per published message, cleaned by a routine vacuum; see the position benchmark note below.
+- `cb_claims` — one narrow row per job that still has to run. Updated on every claim and retry, deleted on completion. Aggressive autovacuum settings on the table keep it small. It carries `queue` (the claim key), `job_type` (which handler runs it), `group_id` (the workflow), `dependencies` and `dependent_job_ids` (what it waits for and what waits for it), and `awaits_signal` with `signal` (the gate and its payload).
 - `cb_cursors` — one row per stream consumer: the highest position it processed.
-- `cb_signals` — payloads delivered to a job that waits for them.
-- `cb_outputs` — optional job results. A handler records one with `SetOutput` and the completion writes it, in the statement that deletes the claim, so a result cannot outlive an attempt that never finished. Read with `Output`.
+- `cb_outputs` — optional job results. A handler records one with `SetOutput` and the completion writes it, in the statement that deletes the claim, so a result cannot outlive an attempt that never finished. `group_id` and `job_type` are copied from the claim beside it, so a later job of the same workflow reads an earlier one's result by what produced it. Read with `Output` and `Outputs`.
 
-A partial index on `cb_claims (queue, visible_at) WHERE status = 0 AND dependencies = 0` holds only claimable rows. Dead rows and rows waiting on dependencies are not in it.
+A partial index on `cb_claims (queue, visible_at) WHERE status = 0 AND dependencies = 0` holds only claimable rows. Dead rows and rows waiting on other jobs are not in it, and a job waiting for a signal sits at the far end on `'infinity'`, where the claim's `LIMIT` never reaches it.
 
-A second partial index, `cb_claims (correlation_id) WHERE status = 0 AND correlation_id IS NOT NULL`, is what `Cancel` probes. A worker cancels the correlation group of every job that dies with one, so a downstream outage that fails a whole group calls it once per dead job: 6 buffers each with the index, 834 and 4.9 ms without it at 100k live claims. Jobs with no correlation id stay out of it — 112 kB against 2128 kB with 1% of jobs correlated.
+A second partial index, `cb_claims (group_id) WHERE status = 0 AND group_id IS NOT NULL`, is what `Cancel` and `Signal` probe. A worker cancels the workflow of every job that dies in one, so a downstream outage that fails a whole workflow calls it once per dead job: 6 buffers each with the index, 834 and 4.9 ms without it at 100k live claims. `group_id` is NULL on a job that stands alone, so the volume of single-shot jobs stays out of it — 112 kB against 2128 kB with 1% of jobs in a workflow — and, more to the point, does not pay for a second index entry on every claim and retry.
 
 The unique indexes on `cb_messages (position)` and `cb_messages (dedup_key)` are partial as well, over the rows that have a value. This is what keeps one table for both worlds cheap: a job's message has neither a position nor usually a dedup key, and a full unique index writes an entry for every NULL — measured, 1272 kB per index per 200k job messages, probed by nothing, and a third of the insert time. The deduplicating inserts name the predicate, `ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING`, so they still match the partial index.
 
 Job messages and published messages share `cb_messages` because a payload has to live in a row that is never updated. `cb_claims` is rewritten on every claim and every retry, so a payload stored there would be rewritten with it; the message row is written once. Nothing reads across the two kinds — stream reads filter on `position`, job reads go through `cb_claims` — so the shared table is a storage decision, not a shared lifecycle.
 
+**The signal payload is the one exception, and it earns it.** It lives on `cb_claims`, not in a table of its own, because it is created, read and deleted with the claim: a table beside it would exist only to be deleted by the same statement. The rewrite cost is bounded — a signal is on the few jobs that wait for one, a large one is TOASTed so the rewrite copies a pointer, and an absent one costs a null-bitmap bit — and it takes a per-job subquery out of the claim's hot path.
+
 ## Runtime
 
-`catbird.New(pool, opts)` returns the process's `Runtime`. Workers and triggers are declared on it — `NewWorker(runtime, …)`, `NewTrigger(runtime, …)`, or the methods of the same names — and `Start(ctx)` runs them all: one `LISTEN` connection for every channel they need, the position assigner, and one goroutine per declared loop, until `ctx` ends and every loop has stopped. A process holds one connection for notifications however many workers and triggers it runs, and a running job holds none. Declaring after `Start` panics: the connection's channel set is fixed when it connects. A dropped connection is reconnected after `ReconnectAfter`; until then the loops run on their poll intervals, and after each connect every loop is woken once, because notifications sent in between are gone.
+`catbird.New(pool, opts)` returns the process's `Runtime`. Job types are registered on it with `Handle`, each with the function that runs it; triggers with `Trigger`; and `Start(ctx)` runs them all: one `LISTEN` connection for every channel they need, the position assigner, and one goroutine per queue and per trigger, until `ctx` ends and every loop has stopped. Job types sharing a queue share one claim loop, so a process handling thirty kinds of work runs one worker, not thirty. A process holds one connection for notifications however many queues and triggers it runs, and a running job holds none. Registering after `Start` panics: the connection's channel set is fixed when it connects. A dropped connection is reconnected after `ReconnectAfter`; until then the loops run on their poll intervals, and after each connect every loop is woken once, because notifications sent in between are gone.
 
-The statements a caller runs — `Publish`, `Enqueue`, `Complete`, `Cancel`, the stream reads and the rest — are package functions that take any connection or transaction, so they need no runtime and hold no state of their own. What a process configures lives on the `Runtime`.
+A process claims only the job types registered on it — the claim filters on `job_type = ANY($registered)`. A job of a type this process does not know is left where it is for a process that does, which is what makes a deploy that adds a type safe in either order.
+
+The statements a caller runs — `Publish`, `Enqueue`, `Complete`, `Signal`, `Cancel`, the stream reads and the rest — are package functions that take any connection or transaction, so they need no runtime and hold no state of their own. What a process runs lives on the `Runtime`; what a kind of work is lives on its `JobType`.
+
+## Declarations
+
+Two values, both plain Go, neither written to the database.
+
+**`NewQueue(name, opts)`** is a name and how work runs under it: `BatchSize`, `Lease`, `PollInterval`. It answers one question — who competes with whom for slots — and it is the claim key, the single value the ready index is probed with. `Lease` is here rather than on the job type because the claim sets it for a whole batch in one statement; a job type whose handler runs far longer than its neighbours wants its own queue anyway, which is the same isolation argument.
+
+**`NewJobType(name, queue, opts)`** is a kind of job: its name, its queue, and how a run of it is retried — `Signal`, `MaxAttempts`, `Backoff`, `OnDead`. Both the enqueue and the worker take the value, so what a caller creates and what a handler is given cannot disagree. That is the whole reason it exists, and it is the test for what belongs on it: the enqueue writes it into the row, and the handler's correctness depends on it. `Signal` passes. `MaxAttempts`, `Backoff` and `OnDead` are there because none of them touches the claim — the worker reads them from the type it dispatched on — and because they are plainly properties of the work.
+
+**The function that runs it is not on the value.** It is given at registration: `rt.Handle(Review, handleReview)`. Everything on a job type is either stamped on a claim or decided about a run, and a handler is neither — it is this process's code, which a process that only enqueues has no use for and should not have to link. Putting it on the value also made a job type whose handler names it back a compile error, because Go's initialization analysis follows function bodies, and a handler that enqueues its own type is an ordinary thing: a retry loop, a paginated crawl, a reminder that re-arms itself.
+
+What registration gives up in exchange is that `rt.Handle(Review, handlePublish)` compiles. That is a copy-paste error among adjacent lines which runs the wrong handler on the first job — loud, and nothing like the silent failures the rest of this design is built to remove.
+
+Nothing is declared in the database: no definition table, no `Define` call, no deploy-order rule. Only the two names reach a row, so adding a job type is not a migration.
 
 ## Jobs
 
-`Enqueue` inserts the message and its claim in one statement and sends `NOTIFY` on the queue's channel. The runtime's connection listens on it and wakes the queue's workers, which also poll on an interval, so a lost notification delays a job rather than losing it.
+`Enqueue(ctx, db, jobType, payload, opts)` inserts the message and its claim in one statement and sends `NOTIFY` on the queue's channel. The runtime's connection listens on it and wakes the queue's workers, which also poll on an interval, so a lost notification delays a job rather than losing it. It returns the job's id, which is also the id of the workflow it starts — what `Signal`, `Cancel`, `Output` and `Outputs` address.
 
-**Enqueueing many at once.** `EnqueueBatch` takes a queue, a slice of `BatchMessage` and one `EnqueueOptions` for the whole batch, and writes the messages and their claims with one statement. Claims are made only for the messages that were written, so a message whose dedup key is taken produces no job, as with the single verb. The options are shared — one delay, one correlation id, one dependency count — because the callers that need a batch either give every job the same options (a trigger) or are creating one group of them (the children of a step). The key that has to differ per job is on the message.
+The wake fires only for a job that is claimable now. A delayed job and a job waiting for a signal wake nobody, because no worker could do anything with them.
 
-It returns how many jobs it created, not their ids, for the same reason `PublishBatch` does. A caller that has to resolve these jobs' dependencies later needs their ids, so it either enqueues them one at a time or gives each a dedup key and reads the ids back with `SELECT id, dedup_key FROM cb_messages WHERE dedup_key = ANY($1)`, which answers with the existing job's id when a key was already taken.
+**Enqueueing many at once.** `EnqueueBatch` takes a job type, a slice of `BatchMessage` and one `EnqueueOptions` for the whole batch, and writes the messages and their claims with one statement. Claims are made only for the messages that were written, so a message whose dedup key is taken produces no job, as with the single verb. It is the volume path — what a trigger uses — and it is deliberately the plainer of the two: every job takes the same options, none of them starts a workflow, and a job type declared with `Signal` is refused, because a batch hands back no ids for a caller to signal. It returns how many jobs it created.
 
 **Running jobs.** A worker keeps up to `BatchSize` jobs running at once. It claims as many jobs as it has free slots, runs each in its own goroutine, and claims again as soon as a slot frees, so one long job does not hold up the jobs beside it. While jobs are still waiting it gives slots 5 milliseconds to free before claiming, so a queue of short jobs is claimed by one bigger statement instead of one statement per finished job; on an empty queue nothing is delayed and the loop waits for a `NOTIFY` or for `PollInterval`.
 
-**Claiming.** A worker takes up to as many rows as it has free slots with `FOR UPDATE SKIP LOCKED`, sets `visible_at = now() + Lease`, and increments `attempts`. There is no "running" status: a job with `visible_at` in the future is either delayed, backing off after a failure, or claimed. Once `visible_at` passes, any worker may claim it again. That is how a crashed worker's job comes back.
+**Claiming.** A worker takes up to as many rows as it has free slots with `FOR UPDATE SKIP LOCKED`, sets `visible_at = now() + Lease`, and increments `attempts`. There is no "running" status: a job with `visible_at` in the future is either delayed, backing off after a failure, waiting for a signal, or claimed. Once `visible_at` passes, any worker may claim it again. That is how a crashed worker's job comes back. The claim also filters on `job_type = ANY($registered)`, so a process never takes work it has no handler for; dispatch is then a map lookup in Go.
 
-**Completing.** A handler is given no connection and the worker holds none while it runs. Completion is one statement — the claim and the job's delivered signals deleted together, and the result the handler recorded with `SetOutput` written beside them — and `Complete` runs it on any connection or transaction:
+**Completing.** A handler is given no connection and the worker holds none while it runs. Completion is one statement, and everything the attempt produced hangs off the one delete inside it:
+
+- the claim, deleted under the `attempts` lease token;
+- the result the handler recorded with `SetOutput`, written to `cb_outputs` with the claim's `group_id` and `job_type` beside it;
+- one counted down from every job in `dependent_job_ids`, and a `NOTIFY` for each that reached zero;
+- the jobs the handler recorded with `Enqueue` and `EnqueueAfter`, with their messages, their claims and their `NOTIFY`.
 
 ```go
 func(ctx context.Context, job *catbird.Job) error {
@@ -49,36 +71,46 @@ func(ctx context.Context, job *catbird.Job) error {
 }
 ```
 
-A handler that calls it inside its own transaction ends the job in the same commit as its writes. A handler that returns `nil` without calling it is completed by the worker afterwards, on the pool. A handler that calls it and then rolls the transaction back has told the worker the job is finished when it is not: the mark it leaves records the statement, not the commit, so nothing deletes the claim until the lease runs out and the job runs again. `attempts` is the lease token in both cases: if the lease expired and another worker claimed the job, `attempts` moved on, nothing is deleted, and `Complete` returns `ErrLeaseExpired` so the late attempt rolls back. Two workers may execute the same job; only the one holding the lease commits.
+A handler that calls it inside its own transaction ends the job in the same commit as its writes. A handler that returns `nil` without calling it is completed by the worker afterwards, on the pool. A handler that calls it and then rolls the transaction back has told the worker the job is finished when it is not: the mark it leaves records the statement, not the commit, so nothing deletes the claim until the lease runs out and the job runs again. `attempts` is the lease token in every case: if the lease expired and another worker claimed the job, `attempts` moved on, the delete matches nothing, and everything hanging off it is skipped — no result, no countdown, no new jobs — and `Complete` returns `ErrLeaseExpired` so the late attempt rolls back. Two workers may execute the same job; only the one holding the lease commits.
 
 **At-least-once is the model.** A job runs again after a crash, after a lease expires, and after any attempt that did not reach its completion. A handler therefore either makes its writes idempotent — `Job.ID` is the key to do it with — or completes in the same transaction as them, which is the only way an accumulating write like `balance = balance - 100` can be right. Effects outside the database were never covered by either and need the same idempotency key.
 
 **What a running job costs.** Nothing on the pool: no transaction and no connection are held while a handler runs, so `BatchSize` is a number of goroutines and not a number of connections. The library's own statements need a handful of pool connections — the assigner, the claims and completions of its workers, a trigger's batch — and the `LISTEN` connection is not one of them: it is hijacked out of the pool, so a process opens `MaxConns + 1` connections and the pool keeps its full width. What the handlers hold comes on top of that, and it is what the pool has to be sized for; see Known limits.
 
-**Lease rule.** A handler must finish within `Lease` or its work is discarded and the job runs again. Set `Lease` above your longest handler.
+**Lease rule.** A handler must finish within `Lease` or its work is discarded and the job runs again. Set the queue's `Lease` above the longest handler on it.
 
-**Settings rule.** `Lease`, `MaxAttempts` and `Backoff` are worker settings; nothing about them is stored with the job. All workers on one queue must use the same values, otherwise how long a job may run and how often it is retried depend on which worker took the attempt.
+**Settings rule.** `BatchSize`, `Lease` and `PollInterval` are queue settings; `MaxAttempts`, `Backoff`, `Signal` and `OnDead` are job type settings. Both are declared once and shared by every process that uses them, so the old rule that all workers on a queue must agree is now a property of the value rather than a rule a reader has to hold — as far as one program goes. Across two binaries it is still convention: neither is stored, so two deployments declaring different values disagree silently.
 
-**Failing.** A handler error sets `visible_at = now() + Backoff`. After `MaxAttempts` the claim is marked dead (`status = 1`), `Cancel` runs for its correlation id, and `OnDead` runs once. A crash counts as a failed attempt like any other, so `OnDead` also fires for jobs that repeatedly crashed a worker. A handler that completed the job and then returns an error is not retried: the retry carries the `attempts = $2` token and the claim it would correct is already gone.
+**Failing.** A handler error sets `visible_at = now() + Backoff`. After the job type's `MaxAttempts` the claim is marked dead (`status = 1`), the job's workflow is cancelled, and `OnDead` runs once. A crash counts as a failed attempt like any other, so `OnDead` also fires for jobs that repeatedly crashed a worker. A handler that completed the job and then returns an error is not retried: the retry carries the `attempts = $2` token and the claim it would correct is already gone.
 
 Everything after the handler — the completion, the retry, the give-back — runs on a context detached from the worker's, with a few seconds of its own. At shutdown the worker's context is already canceled by the time the handler returns and pgx would reject those statements locally: the completion of work that is already done would be lost and the job would run a second time.
 
 **Shutdown rule.** A job stopped by shutdown is not a failed job, and neither is a handler error that arrives once the worker's context is canceled: the two cannot be told apart, giving the attempt back is the safer mistake, and the error is logged. It is handed back: `attempts` is given back and `visible_at` is set to `now()`, so the next process claims it at once, and neither `MaxAttempts`, nor the cancel cascade, nor `OnDead` runs. Without this, three rolling deploys spend three of five attempts and 15 minutes of lease on a job that never ran wrong. The write carries the same `attempts = $2` lease token as the completion, so a job whose lease had already expired and been claimed elsewhere is left alone. A crash still costs an attempt, because a crashed worker writes nothing: the increment at claim time is the only thing that counts an attempt nobody saw end, and without it a job that kills its worker would be retried forever.
 
-**Cancel rule.** `Cancel(correlationID)` marks live claims dead. It stops jobs from starting; a job that is already running finishes and completes. Cancel does not undo anything.
+**Cancel rule.** `Cancel(groupID)` marks the workflow's live claims dead. It stops jobs from starting; a job that is already running finishes and completes. Cancel does not undo anything.
 
-## Dependencies and signals
+## Workflows
 
-`EnqueueOptions.Dependencies = n` creates a job that stays out of the ready index until `n` events arrive. Two kinds of event count:
+There is no flow object: not in the API, not in the schema, not in the vocabulary. A workflow is a job whose handler asks for more jobs.
 
-- `ResolveDependency(childID)` — a parent step completed. Call it inside the parent's handler transaction so it commits with the parent's completion.
-- `DeliverSignal(childID, name, payload)` — an external input arrived. The payload is stored in `cb_signals` and handed to the handler as `Job.Signals[name]` at claim time. Delivering the same name twice is a no-op.
+`Job` carries two methods beside `SetOutput`, and all three behave the same way — they record, and the completion writes:
 
-The decrement is `UPDATE ... SET dependencies = dependencies - 1 WHERE dependencies > 0`, so concurrent parents do not lose an update. When the counter reaches 0 the statement also sends `NOTIFY`.
+- `job.Enqueue(jobType, payload)` — run this when I complete.
+- `job.EnqueueAfter(jobType, payload)` — run this after the jobs I recorded with `Enqueue`. All of them, and nothing wider: not the rest of the workflow, and not what another handler is adding at the same time.
 
-**Signal rule.** A signal must be counted in `Dependencies` before it is delivered. Delivering to a job that is not waiting returns `ErrNotFound`; nothing is stored. Signals that arrive before the job exists are the caller's problem to retry.
+Everything a handler asks for joins its workflow, so `Signal`, `Cancel` and the result reads address all of it by one id. A handler that fails or crashes halfway records nothing and its retry starts with an empty buffer, so the jobs it asked for are created exactly once, by the attempt that completed.
 
-A permanently failed step cancels its siblings and children through the shared correlation id. Children then stay dead with `dependencies > 0` until `GC` removes them.
+**The count is derived, never supplied.** In the completion statement a job recorded with `EnqueueAfter` takes `dependencies = count(the buffer's jobs that do not wait)`, and each of those carries the waiting job's id in `dependent_job_ids`. Both come from the ids the same statement hands out, through a `MATERIALIZED` CTE over `nextval` — materialized because `nextval` is volatile and an inlined CTE would be evaluated once per reference, giving a message and its claim different ids. Nothing outside catbird ever holds a count, which is what makes the old design's worst failure — a dependency count that is silently one too high and hangs the job forever — unreachable.
+
+**What this shape does not do.** A job waits for the buffer that created it and for nothing else. There is no way to make a job wait for jobs another handler is adding, and no way to build a general graph up front. Deeper workflows compose instead: the joining job's handler asks for the next round, which is usually where the decision about what comes next actually lives.
+
+**Signals are a gate.** A job type declared with `Signal: true` produces jobs that do not run until a payload arrives. The wait is a delay — `visible_at = 'infinity'` — so it needs no place in the ready index and no second wait mechanism; `Signal` writes the payload and sets `visible_at = now()`. Because the type declares it, `job.Signal` is never nil for a gated type and never anything but nil for an ungated one: there is no branch in the handler for "did I get one".
+
+`Signal(ctx, db, groupID, jobType, payload)` addresses the job by the workflow and what it is, not by an id, because a job a handler asked for has no id until that handler's completion runs and no caller can hold one. Delivering to a workflow with no live gated job of that type — it already ran, the signal already arrived, the workflow is gone — returns `ErrNotFound`. Every live job of the type in the workflow is given the payload; one gate per type per workflow is what keeps that to one.
+
+**No deadline.** A gate waits forever. An application that needs "approve within a week" runs its own cron over `cb_claims` and cancels; catbird will not tell it that a gate has been open too long. This is the one thing the gate deliberately does not do, and the cheap addition if it hurts is a deadline that marks the job dead and runs `OnDead`, so the timeout branch is a different function rather than a nil check.
+
+**Reading an earlier job's result.** `Output(ctx, db, groupID, jobType, dest)` reads the result of the workflow's job of that type, and `Outputs` reads all of them in the order the jobs were created — the fan-out read. This is how a joining job reads what it waited for: it never knew their ids. A single-result read of a fan-out returns `ErrAmbiguous` rather than picking one.
 
 ## Streams
 
@@ -126,13 +158,17 @@ Every process enqueues `cron:<name>:<minute>` as the dedup key when the minute s
 
 ## Retention
 
-`GC(retention)` deletes dead claims older than `retention` and then messages older than `retention` that have no claim. A delayed or waiting job keeps its message however old it is. `cb_signals` and `cb_claims` reference `cb_messages` with `ON DELETE CASCADE`, so nothing is orphaned.
+`GC(retention)` deletes dead claims older than `retention` and then messages older than `retention` that have no claim. A delayed or waiting job keeps its message however old it is. `cb_claims` and `cb_outputs` reference `cb_messages` with `ON DELETE CASCADE`, so nothing is orphaned.
 
 ## Known limits
 
 What this design does not do, or does at a price. A caller has to know about these now.
 
-**A wrong dependency count is silent and permanent.** `EnqueueOptions.Dependencies` is a number the caller supplies and `ResolveDependency` counts down. One too high and the job never runs: no error, no status, and nothing that distinguishes it from a job that is legitimately waiting. One too low and it runs before its parents finish. A second `ResolveDependency` for the same dependency returns `ErrNotFound`, but a missing one cannot be detected at all, because nothing knows what the count was supposed to be. Nothing validates the graph because nothing has the graph — the flow DSL this replaced validated it at construction. This is the most serious of these. Until something checks it, an application that builds flows should watch `SELECT * FROM cb_claims WHERE dependencies > 0 AND visible_at < now() - interval '1 hour'` itself.
+**A gate waits forever and nothing says so.** A job type declared with `Signal` produces jobs that sit on `visible_at = 'infinity'` until a payload arrives. If none ever does, the job is indistinguishable from one that is legitimately still waiting. There is no deadline and no report. An application with gates should watch `SELECT * FROM cb_claims WHERE awaits_signal AND signal IS NULL AND status = 0` itself and cancel what has waited too long. This is the most serious of these, and it is the same shape as the dependency-count limit it replaced — a job that quietly never runs — with the difference that the cause is now always outside catbird.
+
+**A job can wait only for the buffer that created it.** `EnqueueAfter` waits for the other jobs the same handler recorded. There is no way to make a job wait for jobs another handler is adding, and no way to declare a graph up front. Deeper shapes compose through the joining job's handler, which is usually where the decision belongs anyway, but a genuine many-to-many dependency between two independently created sets is not expressible.
+
+**A job a handler asked for takes no options.** `job.Enqueue` and `job.EnqueueAfter` take a job type and a payload, and nothing else: no delay, no dedup key. A job that should run in an hour has to be enqueued by something else.
 
 **A handler that opens a connection has to fit in the pool.** The worker holds none while a handler runs, so `BatchSize` is a number of goroutines — but a handler that opens a transaction for its whole body holds a connection for that whole body, and the two defaults do not fit each other: `BatchSize` is 50 and pgxpool's `MaxConns` is `max(4, NumCPU)`. Fifty handlers then queue in `Begin` against eight connections with their leases already running, and one that waits there longer than `Lease` has its job claimed by a second worker while it still holds a slot for it. Nothing deadlocks, because the worker holds no connection while it waits for one, but the queue runs at the pool's width instead of `BatchSize`'s. Size `MaxConns` for the handlers, or set `BatchSize` to what the pool can carry.
 
@@ -146,11 +182,11 @@ What this design does not do, or does at a price. A caller has to know about the
 
 **`status = 1` does not say why.** A job that failed permanently and a job that `Cancel` stopped are the same row. There is no run history and no dead-letter table, and `OnDead` is a callback with nothing durable behind it: if the process is down or the callback returns an error, the fact is logged and gone. There is nothing to re-drive from. "Run status" below adds `last_error`; it does not add the distinction or the dead letter.
 
+**A job type nobody registers waits silently.** The claim filters on the types the process handles, so a job whose type no running process declares is left where it is rather than failing. That is what makes a deploy safe in either order, and it is also why a typo in a deployment leaves jobs sitting in the queue with nothing to say so.
+
 **One dedup-key namespace for both worlds.** `cb_messages.dedup_key` is unique across the table, so a `Publish` key and an `Enqueue` key collide. Prefix them if both are in use.
 
-**A dedup key lives as long as its message, and so does an output.** `GC` deletes messages by age and frees their keys with them, so a key stops deduplicating once its message ages out — fine for `cron:<name>:<minute>`, but retention has to exceed the window for any key used for idempotency. `cb_outputs` cascades from `cb_messages` the same way, so retention also has to exceed the longest flow or a late step cannot read an early step's output.
-
-**A delayed `Enqueue` still wakes the queue.** The wake checks only `dependencies = 0`, not `visible_at`, so every scheduled job wakes every worker on its queue for work none of them can claim yet.
+**A dedup key lives as long as its message, and so does a result.** `GC` deletes messages by age and frees their keys with them, so a key stops deduplicating once its message ages out — fine for `cron:<name>:<minute>`, but retention has to exceed the window for any key used for idempotency. `cb_outputs` cascades from `cb_messages` the same way, so retention also has to exceed the longest workflow or a late job cannot read an early one's result.
 
 **`Enqueue` returns `(0, nil)` when the dedup key was taken** and gives no way to get the existing id, so a caller that needs it makes a second round trip.
 
@@ -164,22 +200,25 @@ What this design does not do, or does at a price. A caller has to know about the
 
 **`hashtext` is undocumented.** The assigner's advisory lock key is `hashtext('catbird')`, an internal function with no stability guarantee across major versions. A client in another language has to produce the same number.
 
-**The assigner's statement depends on a referenced CTE running.** `pg_notify` fires from a CTE that the final `SELECT` has to reference, which is planner behaviour rather than anything the SQL states. A client in another language has to reproduce it exactly, and "the schema plus `client.go` is the whole contract" rests on it.
+**The assigner's statement depends on a referenced CTE running.** `pg_notify` fires from a CTE that the final `SELECT` has to reference, which is planner behaviour rather than anything the SQL states. `Enqueue`, `Complete` and `Signal` do the same. A client in another language has to reproduce it exactly, and "the schema plus `client.go` is the whole contract" rests on it.
+
+**The completion depends on `MATERIALIZED` meaning what it says.** The ids of the jobs a handler asked for come from `nextval` inside a CTE that two later CTEs read. Without the keyword PostgreSQL 12 and later inline it, evaluating the volatile function once per reference, and a message and its claim would get different ids. A client in another language has to write the keyword too.
 
 - Rate limits and per-queue configuration are out of scope. Applications build them on their own tables. The browser layer is planned; see below.
 - Without a `Logger`, failures are reported through `slog.Default()`. Errors the library cannot return to the caller are logged.
 
 ## What to build, in order
 
-The rule for everything below: a change leaves the core easier to read than it found it, or leaves it alone. Moderate growth is fine. A second version of a concept the reader already holds is not, however few lines it takes — that is what makes a small system stop being one. The core is about twelve hundred lines across four files, and that is the property worth protecting.
+The rule for everything below: a change leaves the core easier to read than it found it, or leaves it alone. Moderate growth is fine. A second version of a concept the reader already holds is not, however few lines it takes — that is what makes a small system stop being one. The core is about thirteen hundred lines across five files, and that is the property worth protecting.
 
 1. ~~**`Read` and `LastPosition`.**~~ Built, as `ReadAfter`, `Cursor.Read`, `Ack`, `LastPosition` and `OldestPosition`; see "Streams" above.
 2. **`Timeout`.** A `context.WithTimeout` around the handler in `run`. It bounds the attempt's bookkeeping, not the goroutine — a handler that never checks `ctx.Err()` keeps its slot either way — so it is a partial fix, worth its three lines.
-3. **`RunOnce` and `Status`.** Both leaves. `RunOnce` is what makes a job test deterministic instead of a background worker and a sleep. `Status` is built without `last_error`; see below.
+3. **`RunOnce` and `Status`.** Both leaves. `RunOnce(ctx, queue)` on the `Runtime` is what makes a job test deterministic instead of a background worker and a sleep. `Status` is built without `last_error`; see below.
 4. **Exponential backoff.** One dense line in `failed`, replacing a real failure: an outage fails every job on a queue at once and a fixed delay brings all of them back in the same second, at a service that is still down. The comment on it states that failure, not the arithmetic.
 5. **The cron helper**, on `DedupKey` alone.
 6. **`ExtendLease`**, as a function rather than a field on `Job`.
-7. **Wire**, in a file of its own. It calls `ReadAfter` and touches nothing else, so however long it gets, the four core files do not get harder to read.
+7. **Wire**, in a file of its own. It calls `ReadAfter` and touches nothing else, so however long it gets, the core files do not get harder to read.
+8. **Typed handler input**, by reflection rather than generics: `newHandler` accepts a small set of signatures and folds the types away, so a handler takes its payload as a struct. It is entirely in the Go binding — no schema, no statements — so it stays available indefinitely. Its price is that the handler parameter widens from `Handler` to `any` and the signature check moves from the compiler to registration, for every handler. `(Out, error)` is the shape not to take with it: a handler that completes in its own transaction cannot return an output the completion already wrote, so `SetOutput` would have to stay beside it.
 
 Four items below are not being built: the **cursor lease**, a **declared stream loop**, **`UniqueKey`** and **cancelling a running job**. Each stays in this document because the problem it names is real; what changed is the answer. Each carries its ruling in place, with what to watch for that would bring it back. One more is undecided rather than ruled: the **`last_error` column** on `cb_claims`, which costs nothing to read and widens the row this design keeps narrow.
 
@@ -291,7 +330,7 @@ app.wire.Serve(w, r, catbird.ServeOptions{
 
 ### Jobs
 
-**Exponential backoff.** `Backoff` becomes the delay after the first failed attempt rather than after every one, and `WorkerOptions.MaxBackoff` caps how far it grows. The wait after attempt n is a random duration below `min(Backoff * 2^(n-1), MaxBackoff)`, computed in the retry statement itself:
+**Exponential backoff.** `Backoff` becomes the delay after the first failed attempt rather than after every one, and `JobTypeOptions.MaxBackoff` caps how far it grows. The wait after attempt n is a random duration below `min(Backoff * 2^(n-1), MaxBackoff)`, computed in the retry statement itself:
 
 ```sql
 UPDATE cb_claims
@@ -299,15 +338,15 @@ SET visible_at = now() + least($3::interval * 2 ^ least(attempts - 1, 20), $4::i
 WHERE message_id = $1 AND attempts = $2 AND status = 0
 ```
 
-Defaults change with it: `Backoff` one second and `MaxBackoff` one minute, instead of a flat minute. Both are worker settings under the settings rule, so all workers on a queue must use the same values.
+Defaults change with it: `Backoff` one second and `MaxBackoff` one minute, instead of a flat minute. Both are job type settings — they never touch the claim — so two kinds of work on one queue back off on their own terms.
 
 Two reasons for growing the wait. A handler that fails because a service it calls is down retries at a fixed minute for as long as `MaxAttempts` allows, so five attempts cover five minutes of outage; doubling spends the same five attempts over half an hour. And an outage fails every job on the queue at once: with a fixed delay all of them come back in the same second, hit the service that is still down, and come back together again a minute later. The random draw spreads them, which is why the delay is drawn below the cap instead of being the cap. It also means the setting names a ceiling and not an average: a `Backoff` of one second retries after half a second on average.
 
 The exponent is clamped at 20 so that a job which somehow reaches a high attempt count does not overflow the interval multiplication before `MaxBackoff` bounds it.
 
-A queue that wants the old fixed pacing sets `Backoff` and `MaxBackoff` to the same value; the draw still spreads the retries below it, which is the part no queue benefits from losing.
+A job type that wants the old fixed pacing sets `Backoff` and `MaxBackoff` to the same value; the draw still spreads the retries below it, which is the part no queue benefits from losing.
 
-**Run status.** `Status(ctx, db, id)` returns queued, scheduled, running, dead or completed, with the attempt count: completed means the message exists and its claim is gone; a live claim with `visible_at` in the future is running or waiting to retry, which `attempts` and the worker's `MaxAttempts` tell apart. `cb_claims` gets a nullable `last_error TEXT`, written on every failed attempt, so an application can show why a run failed or is retrying.
+**Run status.** `Status(ctx, db, id)` returns queued, scheduled, running, waiting for a signal, waiting for other jobs, dead or completed, with the attempt count: completed means the message exists and its claim is gone; `awaits_signal` with no `signal` and `dependencies > 0` are the two waits, and a live claim with `visible_at` in the future and neither of those is running or backing off, which `attempts` and the type's `MaxAttempts` tell apart. This is what an application needs to find a gate nobody ever opened, which is the worst of the known limits. `cb_claims` gets a nullable `last_error TEXT`, written on every failed attempt, so an application can show why a run failed or is retrying.
 
 **`Status` yes, `last_error` undecided.** `Status` reads columns that already exist, so it is a leaf query and costs nothing. The column is two lines in `failed` and nothing harder to read, but it puts error text in the one row that is rewritten on every claim and every retry, which is the row this design keeps narrow on purpose. Decide it on that, and if the answer is no, decide where a failed job's error text lives instead.
 
@@ -321,15 +360,15 @@ Call it where the handler finished a piece of work — between two records of a 
 
 With extension, `Lease` bounds one step of a handler instead of the whole handler. A queue whose jobs run for an hour can keep a lease of minutes, so a crashed worker's job comes back in minutes; without it the lease has to cover the longest handler, and every crash on that queue costs that long.
 
-**Job timeout.** `WorkerOptions.Timeout` bounds one attempt: the handler and its completion run on a context with that deadline, and when it passes the context is cancelled, the transaction rolls back, and the attempt counts as failed — retry after `Backoff`, dead after `MaxAttempts`. The default is `Lease`, and `ExtendLease` moves the deadline out together with the lease, so the two never disagree. A `Timeout` above `Lease` is a mistake: past the lease another worker may claim the job and the first worker's transaction cannot commit any more. Like `Lease` and `MaxAttempts` it is a worker setting, so all workers on a queue must use the same value.
+**Job timeout.** `QueueOptions.Timeout` bounds one attempt: the handler and its completion run on a context with that deadline, and when it passes the context is cancelled, the transaction rolls back, and the attempt counts as failed — retry after `Backoff`, dead after `MaxAttempts`. The default is `Lease`, and `ExtendLease` moves the deadline out together with the lease, so the two never disagree. A `Timeout` above `Lease` is a mistake: past the lease another worker may claim the job and the first worker's transaction cannot commit any more. It sits beside `Lease` on the queue for the same reason: the two must agree, and a `Timeout` above `Lease` is a mistake.
 
 Without it, a handler that waits on a socket with no deadline of its own keeps its slot and its pool connection until the process restarts. The lease brings the job back for another worker but nothing stops the first attempt, so a queue can end up with every slot held by attempts nobody is waiting for.
 
 A cancelled context stops the handler only where the handler looks at it. Database calls do — pgx cancels the running query — but a computation that never checks `ctx.Err()` runs on and keeps its slot; the timeout ends the attempt's bookkeeping, not the goroutine.
 
-**`Worker.RunOnce(ctx)`.** Claim one batch, run it, return. Tests run jobs deterministically without a background worker.
+**`Runtime.RunOnce(ctx, queue)`.** Claim one batch on that queue, run it, return. Tests run jobs deterministically without a background worker. It takes the queue rather than returning a handle from `Handle`, so registration stays a call that returns nothing.
 
-**Cron helper.** `RunCron(ctx, pool, name, every, queue, topic)` enqueues on the interval and once at start, so applications do not each rebuild the key format, which every client must produce identically. It sets both keys: `DedupKey` `cron:<name>:<minute>`, so several processes ticking in the same minute produce one job, and `UniqueKey` `cron:<name>`, so a run that takes longer than its interval does not pile up — while the previous run is still live the tick's enqueue does nothing and that tick is skipped, not queued.
+**Cron helper.** `RunCron(ctx, pool, name, every, jobType)` enqueues on the interval and once at start, so applications do not each rebuild the key format, which every client must produce identically. It sets both keys: `DedupKey` `cron:<name>:<minute>`, so several processes ticking in the same minute produce one job, and `UniqueKey` `cron:<name>`, so a run that takes longer than its interval does not pile up — while the previous run is still live the tick's enqueue does nothing and that tick is skipped, not queued.
 
 **Build it on `DedupKey` alone.** `UniqueKey` is not being built, so a cron handler that can overrun its interval opens with `pg_try_advisory_lock` on its own name and returns when it does not get it. That is the same skip, decided by the handler rather than by the enqueue.
 

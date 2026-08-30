@@ -32,11 +32,10 @@ func (o Options) withDefaults() Options {
 }
 
 // Runtime is a process's catbird: the pool, one LISTEN connection, the position
-// assigner, and every worker and trigger declared on it. Declare them with
-// NewWorker and NewTrigger (or the methods of the same names), then call Start.
-// The statements a caller runs — Enqueue, Publish, Complete, the stream reads
-// and the rest — are package functions and need no runtime: they work on any
-// connection or transaction.
+// assigner, and every job type and trigger registered on it. Register them with
+// Handle and Trigger, then call Start. The statements a caller runs — Enqueue,
+// Publish, Complete, the stream reads and the rest — are package functions and
+// need no runtime: they work on any connection or transaction.
 type Runtime struct {
 	pool *pgxpool.Pool
 	opts Options
@@ -46,6 +45,7 @@ type Runtime struct {
 	channels []string                              // what the connection LISTENs on; fixed at Start
 	loops    []func(ctx context.Context)           // what Start runs, one goroutine each
 	wakes    map[string]map[chan struct{}]struct{} // per channel, the loops waiting for a notification on it
+	workers  map[string]*worker                    // one per queue a registered job type runs on
 }
 
 func New(pool *pgxpool.Pool, opts Options) *Runtime {
@@ -54,7 +54,43 @@ func New(pool *pgxpool.Pool, opts Options) *Runtime {
 		opts:     opts.withDefaults(),
 		channels: []string{"cb_stream"},
 		wakes:    map[string]map[chan struct{}]struct{}{},
+		workers:  map[string]*worker{},
 	}
+}
+
+// Handle registers a job type on the runtime together with the function that
+// runs it: once the runtime is started, this process claims that type's jobs and
+// runs handle for each. Types sharing a queue share one claim loop, one
+// goroutine and one notification channel, so a process handling thirty kinds of
+// work does not run thirty of each.
+//
+// A process claims only the types registered on it. A job of a type it does not
+// know is left for a process that does, which is what makes a deploy that adds a
+// type safe in either order.
+func (r *Runtime) Handle(t *JobType, handle Handler) {
+	if handle == nil {
+		panic("catbird: job type " + t.name + " registered with no handler")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.started {
+		panic("catbird: registered after Start")
+	}
+	w := r.workers[t.queue.name]
+	if w == nil {
+		logger := t.queue.opts.Logger
+		if logger == nil {
+			logger = r.opts.Logger
+		}
+		w = &worker{runtime: r, queue: t.queue, handlers: map[string]registration{}, logger: logger}
+		r.workers[t.queue.name] = w
+		r.declareLocked("cb_queue_"+t.queue.name, w.start)
+	}
+	if _, taken := w.handlers[t.name]; taken {
+		panic("catbird: job type " + t.name + " is already registered on queue " + t.queue.name)
+	}
+	w.handlers[t.name] = registration{jobType: t, handle: handle}
+	w.names = append(w.names, t.name)
 }
 
 // Start runs everything declared on the runtime until ctx is canceled, then
@@ -168,6 +204,10 @@ func assignPositionBatch(ctx context.Context, pool *pgxpool.Pool) (int, error) {
 func (r *Runtime) declare(channel string, loop func(ctx context.Context)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.declareLocked(channel, loop)
+}
+
+func (r *Runtime) declareLocked(channel string, loop func(ctx context.Context)) {
 	if r.started {
 		panic("catbird: declared after Start")
 	}
