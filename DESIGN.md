@@ -128,15 +128,9 @@ Every process enqueues `cron:<name>:<minute>` as the dedup key when the minute s
 
 `GC(retention)` deletes dead claims older than `retention` and then messages older than `retention` that have no claim. A delayed or waiting job keeps its message however old it is. `cb_signals` and `cb_claims` reference `cb_messages` with `ON DELETE CASCADE`, so nothing is orphaned.
 
-## Bugs
-
-Wrong today, each with a fix that is known and small.
-
-**The failure path is barely tested.** One test covers shutdown handing a job back. Nothing in the suite fails a handler: no test for a handler error scheduling a retry, for `Backoff` timing, for `MaxAttempts` marking a job dead, for `OnDead` firing, for the cancel cascade `failed` triggers, or for `listen` reconnecting. `Cancel` appears once, as setup for a GC test. This is the least exercised part of the system.
-
 ## Known limits
 
-Not bugs — what this design does not do, or does at a price. A caller has to know about these now.
+What this design does not do, or does at a price. A caller has to know about these now.
 
 **A wrong dependency count is silent and permanent.** `EnqueueOptions.Dependencies` is a number the caller supplies and `ResolveDependency` counts down. One too high and the job never runs: no error, no status, and nothing that distinguishes it from a job that is legitimately waiting. One too low and it runs before its parents finish. A second `ResolveDependency` for the same dependency returns `ErrNotFound`, but a missing one cannot be detected at all, because nothing knows what the count was supposed to be. Nothing validates the graph because nothing has the graph — the flow DSL this replaced validated it at construction. This is the most serious of these. Until something checks it, an application that builds flows should watch `SELECT * FROM cb_claims WHERE dependencies > 0 AND visible_at < now() - interval '1 hour'` itself.
 
@@ -179,14 +173,13 @@ Not bugs — what this design does not do, or does at a price. A caller has to k
 
 The rule for everything below: a change leaves the core easier to read than it found it, or leaves it alone. Moderate growth is fine. A second version of a concept the reader already holds is not, however few lines it takes — that is what makes a small system stop being one. The core is about twelve hundred lines across four files, and that is the property worth protecting.
 
-1. **The bugs above**, in the order they are listed there. Both are wrong behaviour rather than missing behaviour, and the failure path around them is barely tested.
-2. ~~**`Read` and `LastPosition`.**~~ Built, as `ReadAfter`, `Cursor.Read`, `Ack`, `LastPosition` and `OldestPosition`; see "Streams" above.
-3. **`Timeout`.** A `context.WithTimeout` around the handler in `run`. It bounds the attempt's bookkeeping, not the goroutine — a handler that never checks `ctx.Err()` keeps its slot either way — so it is a partial fix, worth its three lines.
-4. **`RunOnce` and `Status`.** Both leaves. `RunOnce` is what makes a job test deterministic instead of a background worker and a sleep. `Status` is built without `last_error`; see below.
-5. **Exponential backoff.** One dense line in `failed`, replacing a real failure: an outage fails every job on a queue at once and a fixed delay brings all of them back in the same second, at a service that is still down. The comment on it states that failure, not the arithmetic.
-6. **The cron helper**, on `DedupKey` alone.
-7. **`ExtendLease`**, as a function rather than a field on `Job`.
-8. **Wire**, in a file of its own. It calls `ReadAfter` and touches nothing else, so however long it gets, the four core files do not get harder to read.
+1. ~~**`Read` and `LastPosition`.**~~ Built, as `ReadAfter`, `Cursor.Read`, `Ack`, `LastPosition` and `OldestPosition`; see "Streams" above.
+2. **`Timeout`.** A `context.WithTimeout` around the handler in `run`. It bounds the attempt's bookkeeping, not the goroutine — a handler that never checks `ctx.Err()` keeps its slot either way — so it is a partial fix, worth its three lines.
+3. **`RunOnce` and `Status`.** Both leaves. `RunOnce` is what makes a job test deterministic instead of a background worker and a sleep. `Status` is built without `last_error`; see below.
+4. **Exponential backoff.** One dense line in `failed`, replacing a real failure: an outage fails every job on a queue at once and a fixed delay brings all of them back in the same second, at a service that is still down. The comment on it states that failure, not the arithmetic.
+5. **The cron helper**, on `DedupKey` alone.
+6. **`ExtendLease`**, as a function rather than a field on `Job`.
+7. **Wire**, in a file of its own. It calls `ReadAfter` and touches nothing else, so however long it gets, the four core files do not get harder to read.
 
 Four items below are not being built: the **cursor lease**, a **declared stream loop**, **`UniqueKey`** and **cancelling a running job**. Each stays in this document because the problem it names is real; what changed is the answer. Each carries its ruling in place, with what to watch for that would bring it back. One more is undecided rather than ruled: the **`last_error` column** on `cb_claims`, which costs nothing to read and widens the row this design keeps narrow.
 

@@ -938,6 +938,232 @@ func TestCompletedJobIsNotRetriedAfterAnError(t *testing.T) {
 	}
 }
 
+// waitFor polls cond every 10 milliseconds until it holds, and fails with msg
+// when it has not held within timeout.
+func waitFor(t *testing.T, timeout time.Duration, msg string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal(msg)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A handler that returns an error spends the attempt and keeps the job: the
+// claim stays where it is and its next attempt is held back by Backoff.
+// Without the wait, a queue whose downstream is down retries every failing job
+// as fast as it can claim it.
+func TestHandlerErrorSchedulesARetryAfterBackoff(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const backoff = 500 * time.Millisecond
+
+	if _, err := catbird.Enqueue(ctx, pool, "flaky", "retries", nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int32
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Worker("retries", func(ctx context.Context, job *catbird.Job) error {
+		atomic.AddInt32(&calls, 1)
+		if job.Attempts == 1 {
+			return errors.New("the first attempt fails")
+		}
+		return nil
+	}, catbird.WorkerOptions{Backoff: backoff, PollInterval: 25 * time.Millisecond})
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	// How far off the retry is has to be read in the database's clock: the
+	// backoff is an interval added to the server's now(), and the claim that
+	// picks the job up again compares against the same now().
+	waitFor(t, 5*time.Second, "the failed attempt scheduled no retry a backoff away", func() bool {
+		return count(t, pool, `
+			SELECT count(*) FROM cb_claims
+			WHERE queue = 'retries' AND status = 0 AND attempts = 1
+			  AND visible_at > now() + $1::interval
+		`, backoff/2) == 1
+	})
+	waitFor(t, 5*time.Second, "the failed job was never retried", func() bool {
+		return atomic.LoadInt32(&calls) == 2
+	})
+	waitFor(t, 5*time.Second, "the second attempt did not complete the job", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'retries'") == 0
+	})
+}
+
+// The last attempt ends the job: the claim is marked dead, no worker claims it
+// again, and OnDead runs once with the attempt that failed.
+func TestMaxAttemptsMarksTheJobDeadAndRunsOnDead(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	id, err := catbird.Enqueue(ctx, pool, "doomed", "dead_end", nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int32
+	dead := make(chan *catbird.Job, 4)
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Worker("dead_end", func(ctx context.Context, job *catbird.Job) error {
+		atomic.AddInt32(&calls, 1)
+		return errors.New("this handler never succeeds")
+	}, catbird.WorkerOptions{
+		MaxAttempts:  3,
+		Backoff:      20 * time.Millisecond,
+		PollInterval: 25 * time.Millisecond,
+		OnDead: func(ctx context.Context, job *catbird.Job) error {
+			dead <- job
+			return nil
+		},
+	})
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	var job *catbird.Job
+	select {
+	case job = <-dead:
+	case <-ctx.Done():
+		t.Fatal("OnDead never ran")
+	}
+	if job.ID != id {
+		t.Errorf("OnDead got job %d, want %d", job.ID, id)
+	}
+	if job.Attempts != 3 {
+		t.Errorf("OnDead got attempt %d, want the last one, 3", job.Attempts)
+	}
+
+	// Backoff and poll interval are both far shorter than this wait, so a claim
+	// that still matched the dead row would have run the handler again by now.
+	time.Sleep(300 * time.Millisecond)
+	if n := atomic.LoadInt32(&calls); n != 3 {
+		t.Errorf("the handler ran %d times, want MaxAttempts, 3", n)
+	}
+	if n := len(dead); n != 0 {
+		t.Errorf("OnDead ran %d more times, want once", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE message_id = $1 AND status = 1 AND attempts = 3", id); n != 1 {
+		t.Error("the dead job's claim is not marked dead at its last attempt")
+	}
+}
+
+// A job that dies with a correlation id stops the rest of its group: every
+// sibling that has not run is marked dead and no worker claims it. A job in
+// another group is left alone.
+func TestADeadJobCancelsItsCorrelationGroup(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	if _, err := catbird.Enqueue(ctx, pool, "step.one", "cascade", nil, catbird.EnqueueOptions{CorrelationID: "wf1"}); err != nil {
+		t.Fatal(err)
+	}
+	// The sibling and the bystander sit on a queue no worker in this test runs,
+	// so what reaches them is the cascade and nothing else.
+	sibling, err := catbird.Enqueue(ctx, pool, "step.two", "cascade_rest", nil, catbird.EnqueueOptions{CorrelationID: "wf1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bystander, err := catbird.Enqueue(ctx, pool, "unrelated", "cascade_rest", nil, catbird.EnqueueOptions{CorrelationID: "wf2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Worker("cascade", func(ctx context.Context, job *catbird.Job) error {
+		return errors.New("the first step fails")
+	}, catbird.WorkerOptions{MaxAttempts: 1, PollInterval: 25 * time.Millisecond})
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	waitFor(t, 5*time.Second, "the sibling of the dead job was never canceled", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE message_id = $1 AND status = 1", sibling) == 1
+	})
+	if n := count(t, pool, `
+		SELECT count(*) FROM cb_claims
+		WHERE message_id = $1 AND status = 0 AND dependencies = 0 AND visible_at <= now()
+	`, bystander); n != 1 {
+		t.Error("the cascade took a job from another correlation group")
+	}
+}
+
+// Cancel stops the jobs of a group that have not started; the one already
+// running finishes and completes. A cancel that also undid a running job would
+// leave its writes half done with no claim left to retry them.
+func TestCancelStopsWaitingJobsAndLetsARunningOneFinish(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	running, err := catbird.Enqueue(ctx, pool, "running", "cancels", nil, catbird.EnqueueOptions{CorrelationID: "wf"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The delay keeps the second job out of the first claim, so the worker's one
+	// slot goes to the job the handler below blocks in.
+	waiting, err := catbird.Enqueue(ctx, pool, "waiting", "cancels", nil, catbird.EnqueueOptions{CorrelationID: "wf", Delay: 300 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var ranWaiting atomic.Bool
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Worker("cancels", func(ctx context.Context, job *catbird.Job) error {
+		if job.Topic == "waiting" {
+			ranWaiting.Store(true)
+			return nil
+		}
+		close(started)
+		<-release
+		return nil
+	}, catbird.WorkerOptions{BatchSize: 1, PollInterval: 25 * time.Millisecond})
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("the first job never started")
+	}
+	if err := catbird.Cancel(ctx, pool, "wf"); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE message_id = $1 AND status = 1", waiting); n != 1 {
+		t.Error("the waiting job was not canceled")
+	}
+	close(release)
+
+	waitFor(t, 5*time.Second, "the running job's claim is still there: Cancel stopped a job that had already started", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE message_id = $1", running) == 0
+	})
+
+	// Past its delay the canceled job would be claimable again if the cancel
+	// had not taken it out of the ready index.
+	time.Sleep(500 * time.Millisecond)
+	if ranWaiting.Load() {
+		t.Error("the canceled job ran")
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE message_id = $1 AND status = 1 AND attempts = 0", waiting); n != 1 {
+		t.Error("the canceled job was claimed after all: its claim is not the untouched row Cancel left")
+	}
+}
+
 // waitForPositions blocks until the assigner has given out n positions.
 func waitForPositions(t *testing.T, ctx context.Context, pool *pgxpool.Pool, n int64) {
 	t.Helper()
@@ -1096,4 +1322,62 @@ func TestListenDoesNotSpendAPoolConnection(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+// The one LISTEN connection comes back after the server drops it, and a job
+// enqueued afterwards still wakes its worker. The poll interval here is a
+// minute, so a worker that runs the job did not fall back to polling for it.
+func TestListenReconnectsAfterTheConnectionDrops(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	ran := make(chan int64, 4)
+	rt := catbird.New(pool, catbird.Options{ReconnectAfter: 100 * time.Millisecond})
+	rt.Worker("reconnect", func(ctx context.Context, job *catbird.Job) error {
+		ran <- job.ID
+		return nil
+	}, catbird.WorkerOptions{PollInterval: time.Minute})
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	// The runtime's is the only connection that runs a LISTEN, so its backend
+	// is the one whose last statement was one.
+	listener := func() int {
+		return count(t, pool, `
+			SELECT coalesce(max(pid), 0) FROM pg_stat_activity
+			WHERE datname = current_database() AND query LIKE 'LISTEN %'
+		`)
+	}
+	var dropped int
+	waitFor(t, 10*time.Second, "the runtime never listened", func() bool {
+		dropped = listener()
+		return dropped != 0
+	})
+	if _, err := pool.Exec(ctx, "SELECT pg_terminate_backend($1)", dropped); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "the listen connection did not come back", func() bool {
+		pid := listener()
+		return pid != 0 && pid != dropped
+	})
+	// A reconnect wakes every loop once, so the worker has already been nudged,
+	// found nothing and gone back to waiting. What wakes it below is the
+	// enqueue's own notification.
+	time.Sleep(200 * time.Millisecond)
+
+	id, err := catbird.Enqueue(ctx, pool, "after.reconnect", "reconnect", nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-ran:
+		if got != id {
+			t.Errorf("ran job %d, want %d", got, id)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the job did not run: no notification arrived after the reconnect")
+	}
 }
