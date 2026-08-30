@@ -509,7 +509,8 @@ func TestOutputAndStreamNotify(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := catbird.Output(ctx, pool, id); !errors.Is(err, catbird.ErrNotFound) {
+	var result int
+	if err := catbird.Output(ctx, pool, id, &result); !errors.Is(err, catbird.ErrNotFound) {
 		t.Fatalf("output before completion: %v", err)
 	}
 	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
@@ -520,26 +521,14 @@ func TestOutputAndStreamNotify(t *testing.T) {
 		for _, n := range in {
 			sum += n
 		}
-		tx, err := pool.Begin(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-		if err := catbird.SetOutput(ctx, tx, job.ID, sum); err != nil {
-			return err
-		}
-		if err := catbird.Complete(ctx, tx, job); err != nil {
-			return err
-		}
-		return tx.Commit(ctx)
+		return job.SetOutput(sum) // the worker writes it with the completion
 	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond})
 	go rt.Start(ctx)
 
 	for {
-		out, err := catbird.Output(ctx, pool, id)
-		if err == nil {
-			if string(out) != "6" {
-				t.Fatalf("output %s, want 6", out)
+		if err := catbird.Output(ctx, pool, id, &result); err == nil {
+			if result != 6 {
+				t.Fatalf("output %d, want 6", result)
 			}
 			break
 		}
@@ -567,6 +556,63 @@ func TestOutputAndStreamNotify(t *testing.T) {
 	}
 	if n.Payload != "1" {
 		t.Fatalf("notified position %q, want 1", n.Payload)
+	}
+}
+
+// A result is written by the completion and by nothing else. An attempt that
+// records one and then fails leaves nothing behind, so a reader never sees the
+// result of work that did not finish, and the attempt that completes the job is
+// the one whose result is readable.
+func TestFailedAttemptWritesNoOutput(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const backoff = time.Second
+
+	id, err := catbird.Enqueue(ctx, pool, "flaky", "output_retries", nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Worker("output_retries", func(ctx context.Context, job *catbird.Job) error {
+		if err := job.SetOutput(job.Attempts); err != nil {
+			return err
+		}
+		if job.Attempts == 1 {
+			return errors.New("the first attempt fails after recording its result")
+		}
+		return nil
+	}, catbird.WorkerOptions{Backoff: backoff, PollInterval: 25 * time.Millisecond})
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	// The retry row is the first moment the failed attempt is over: it is
+	// written after the handler returned, and the backoff holds it there.
+	waitFor(t, 5*time.Second, "the failed attempt scheduled no retry", func() bool {
+		return count(t, pool, `
+			SELECT count(*) FROM cb_claims
+			WHERE queue = 'output_retries' AND status = 0 AND attempts = 1
+			  AND visible_at > now()
+		`) == 1
+	})
+	var raw json.RawMessage
+	if err := catbird.Output(ctx, pool, id, &raw); !errors.Is(err, catbird.ErrNotFound) {
+		t.Fatalf("the failed attempt left a result behind: %v", err)
+	}
+
+	waitFor(t, 5*time.Second, "the job was never completed", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'output_retries'") == 0
+	})
+	var attempt int
+	if err := catbird.Output(ctx, pool, id, &attempt); err != nil {
+		t.Fatal(err)
+	}
+	if attempt != 2 {
+		t.Fatalf("output %d, want 2: the result of the attempt that completed the job", attempt)
 	}
 }
 

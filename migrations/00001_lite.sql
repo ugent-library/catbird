@@ -73,8 +73,9 @@ CREATE TABLE cb_signals (
     PRIMARY KEY (message_id, name)
 );
 
--- Optional result of a job, written by its handler with SetOutput in the job's
--- transaction and read with Output. Deleted with the message.
+-- Optional result of a job. The handler records it with SetOutput and the
+-- completion writes it here, so a result cannot outlive an attempt that never
+-- finished. Read with Output, deleted with the message.
 CREATE TABLE cb_outputs (
     message_id BIGINT PRIMARY KEY REFERENCES cb_messages (id) ON DELETE CASCADE,
     output JSONB

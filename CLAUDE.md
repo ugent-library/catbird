@@ -50,14 +50,14 @@ Five files, one migration, no packages:
 
 - `client.go` — every statement a caller runs, as package functions:
   `Publish`, `PublishBatch`, `Enqueue`, `EnqueueBatch`, `Complete`, `Cancel`,
-  `GC`, `ResolveDependency`, `DeliverSignal`, `SetOutput`, `Output`, and the
+  `GC`, `ResolveDependency`, `DeliverSignal`, `Output`, and the
   stream reads `ReadAfter`, `LastPosition` and `OldestPosition`. Each takes a
   `Conn` — a pool, a connection, or a transaction — and holds no state; what a
   process configures lives on the `Runtime`. It also holds the three values a
   caller handles: `Message`, a published message as a reader gets it; `Job`,
-  one claimed unit of work as a handler is given it; and `Cursor`, a name and
-  the patterns read under it, which carries `Read` and `Ack` as methods and
-  holds no connection either.
+  one claimed unit of work as a handler is given it, which carries `SetOutput`
+  as a method; and `Cursor`, a name and the patterns read under it, which
+  carries `Read` and `Ack` as methods and holds no connection either.
 - `runtime.go` — `New`, `Start`, and the two loops every process runs whether or
   not anything is declared: the position assigner and the one `LISTEN`
   connection that wakes the rest. One `Runtime` per process owns the pool and
@@ -89,7 +89,11 @@ client exists.
   lease holder deletes the claim. A handler is given no connection: it runs
   `Complete` in its own transaction to end the job in the same commit as its
   writes, or returns `nil` and lets the worker complete it afterwards. The
-  worker holds no transaction and no connection while a handler runs.
+  worker holds no transaction and no connection while a handler runs. That same
+  statement writes the job's result: `SetOutput` is a method on `Job` that only
+  records the value, and nothing else writes `cb_outputs`, so a result cannot
+  outlive an attempt that never finished and a late attempt cannot replace the
+  result of the one that completed the job.
 - Stream readers go by `position`, never by `id`. Positions are set after commit
   by the assigner, so they follow commit order.
 - A topic pattern is a topic, a prefix with `.#`, or `#`, and each pattern
@@ -121,8 +125,8 @@ changed belongs in the commit message, not in the file.
 `cb_messages`, and a published message is what a consumer reads. The word job
 belongs where a claim does, and the type carries it rather than the name: the
 handler type is `Handler` and takes a `*Job`, and the completion is `Complete`.
-`ResolveDependency`, `DeliverSignal`, `SetOutput` and `Output` address a job, so
-their parameter is `jobID`, while the column it matches stays `message_id`.
+`ResolveDependency`, `DeliverSignal` and `Output` address a job, so their
+parameter is `jobID`, while the column it matches stays `message_id`.
 
 **Errors.** Sentinels are prefixed with `catbird:` and checked with
 `errors.Is`.

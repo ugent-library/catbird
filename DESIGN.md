@@ -8,7 +8,7 @@ A PostgreSQL-backed job queue, stream, and small workflow engine. Five tables, p
 - `cb_claims` — one narrow row per job that still has to run. Updated on every claim and retry, deleted on completion. Aggressive autovacuum settings on the table keep it small.
 - `cb_cursors` — one row per stream consumer: the highest position it processed.
 - `cb_signals` — payloads delivered to a job that waits for them.
-- `cb_outputs` — optional job results, written by the handler with `SetOutput` in its transaction, read with `Output`.
+- `cb_outputs` — optional job results. A handler records one with `SetOutput` and the completion writes it, in the statement that deletes the claim, so a result cannot outlive an attempt that never finished. Read with `Output`.
 
 A partial index on `cb_claims (queue, visible_at) WHERE status = 0 AND dependencies = 0` holds only claimable rows. Dead rows and rows waiting on dependencies are not in it.
 
@@ -36,7 +36,7 @@ It returns how many jobs it created, not their ids, for the same reason `Publish
 
 **Claiming.** A worker takes up to as many rows as it has free slots with `FOR UPDATE SKIP LOCKED`, sets `visible_at = now() + Lease`, and increments `attempts`. There is no "running" status: a job with `visible_at` in the future is either delayed, backing off after a failure, or claimed. Once `visible_at` passes, any worker may claim it again. That is how a crashed worker's job comes back.
 
-**Completing.** A handler is given no connection and the worker holds none while it runs. Completion is one statement — the claim and the job's delivered signals deleted together — and `Complete` runs it on any connection or transaction:
+**Completing.** A handler is given no connection and the worker holds none while it runs. Completion is one statement — the claim and the job's delivered signals deleted together, and the result the handler recorded with `SetOutput` written beside them — and `Complete` runs it on any connection or transaction:
 
 ```go
 func(ctx context.Context, job *catbird.Job) error {

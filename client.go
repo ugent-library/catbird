@@ -52,7 +52,26 @@ type Job struct {
 	Attempts      int                        // 1 on the first run
 	CorrelationID string
 
-	completed bool // Complete's delete succeeded, so the worker does not repeat it
+	completed bool            // Complete's delete succeeded, so the worker does not repeat it
+	output    json.RawMessage // what SetOutput recorded, written by the completion
+}
+
+// SetOutput records the job's result. Nothing is written here: the completion
+// writes the result in the statement that deletes the claim, so a result cannot
+// outlive an attempt that never finished. Call it and then either complete the
+// job or return nil and let the worker complete it. A second call replaces the
+// first.
+//
+// The value is marshaled here rather than in the completion: a value that
+// cannot be marshaled fails the attempt that produced it, instead of failing
+// every attempt once its work is already done.
+func (j *Job) SetOutput(v any) error {
+	body, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	j.output = body
+	return nil
 }
 
 // Conn is the part of pgx.Tx and *pgxpool.Pool this package uses: a pool, a
@@ -288,8 +307,8 @@ func subtreeLikePattern(prefix string) string {
 
 // Enqueue appends a message and a claim for it, and wakes the queue's workers
 // unless the job still waits on dependencies. Returns the job's id, which is
-// what ResolveDependency, DeliverSignal, SetOutput and Output address it by, or
-// 0 when opts.DedupKey already exists.
+// what ResolveDependency, DeliverSignal and Output address it by, or 0 when
+// opts.DedupKey already exists.
 //
 // One statement does all three. The wake CTE calls pg_notify only when
 // dependencies = 0; the final LEFT JOIN references it so that it runs (an
@@ -380,14 +399,18 @@ func EnqueueBatch(ctx context.Context, db Conn, queue string, msgs []BatchMessag
 }
 
 // Complete finishes a job: it deletes the claim and the signals delivered to
-// it. A worker does this itself when the handler returns nil, so a handler only
-// calls it to put the completion in the same transaction as its own writes,
-// which is what makes the job's work and the job's end one commit. attempts is
-// the lease token: if the lease ran out and another worker claimed the job,
-// attempts moved on, nothing is deleted, and this returns ErrLeaseExpired — the
-// caller rolls back and the work of the late attempt is discarded.
+// it, and writes the result the handler recorded with SetOutput. A worker does
+// this itself when the handler returns nil, so a handler only calls it to put
+// the completion in the same transaction as its own writes, which is what makes
+// the job's work and the job's end one commit. attempts is the lease token: if
+// the lease ran out and another worker claimed the job, attempts moved on,
+// nothing is deleted, and this returns ErrLeaseExpired — the caller rolls back
+// and the work of the late attempt is discarded.
 //
-// Both deletes are one statement, so a job costs one round trip to finish.
+// The deletes and the result are one statement, so a job costs one round trip
+// to finish. Nothing else writes a result, which puts it behind the same lease
+// check as the claim: a late attempt writes nothing, and cannot replace the
+// result of the attempt that finished the job.
 //
 // A successful call marks job, so the worker does not run the completion a
 // second time. The mark records that the statement succeeded, not that the
@@ -403,9 +426,13 @@ func Complete(ctx context.Context, db Conn, job *Job) error {
 		),
 		signals AS (
 		    DELETE FROM cb_signals WHERE message_id IN (SELECT message_id FROM claim)
+		),
+		output AS (
+		    INSERT INTO cb_outputs (message_id, output)
+		    SELECT message_id, $3::jsonb FROM claim WHERE $3::jsonb IS NOT NULL
 		)
 		SELECT count(*) FROM claim
-	`, job.ID, job.Attempts).Scan(&completed)
+	`, job.ID, job.Attempts, job.output).Scan(&completed)
 	if err != nil {
 		return err
 	}
@@ -523,29 +550,22 @@ func DeliverSignal(ctx context.Context, db Conn, jobID int64, name string, paylo
 	return nil
 }
 
-// SetOutput stores the job's result. Call it from the handler with the
-// handler's tx so the result commits with the job's completion. A second call
-// replaces the first.
-func SetOutput(ctx context.Context, db Conn, jobID int64, output any) error {
-	body, err := json.Marshal(output)
+// Output unmarshals into dest the result a job's handler recorded with
+// SetOutput, and returns ErrNotFound when the job recorded none. It takes a
+// destination rather than returning the JSON because the caller that reads a
+// result is the one that wrote it and knows its type. A caller that wants the
+// JSON untouched passes a *json.RawMessage, which unmarshals by copying the
+// bytes.
+func Output(ctx context.Context, db Conn, jobID int64, dest any) error {
+	var body json.RawMessage
+	err := db.QueryRow(ctx, `SELECT output FROM cb_outputs WHERE message_id = $1`, jobID).Scan(&body)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(ctx, `
-		INSERT INTO cb_outputs (message_id, output) VALUES ($1, $2)
-		ON CONFLICT (message_id) DO UPDATE SET output = EXCLUDED.output
-	`, jobID, body)
-	return err
-}
-
-// Output returns the result a job stored with SetOutput, or ErrNotFound.
-func Output(ctx context.Context, db Conn, jobID int64) (json.RawMessage, error) {
-	var out json.RawMessage
-	err := db.QueryRow(ctx, `SELECT output FROM cb_outputs WHERE message_id = $1`, jobID).Scan(&out)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	return out, err
+	return json.Unmarshal(body, dest)
 }
 
 func nullString(s string) *string {
