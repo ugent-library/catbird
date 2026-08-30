@@ -57,9 +57,14 @@ CREATE TABLE cb_claims (
     attempts SMALLINT NOT NULL DEFAULT 0, -- incremented on claim; doubles as the lease token
     -- How many jobs this one is still waiting for; it runs when this reaches 0.
     dependencies SMALLINT NOT NULL DEFAULT 0,
+    -- Which jobs those are, in the order they were enqueued, so a handler reads
+    -- the results of exactly the jobs it waited for instead of every job of
+    -- their type in the workflow. NULL on a job that waited for nothing.
+    dependency_job_ids BIGINT[],
     -- The other direction: the jobs waiting for this one. Completing it takes one
-    -- off each of their dependencies. Both are set by the completion that created
-    -- them, so nothing outside catbird holds a count.
+    -- off each of their dependencies. All three are set by the completion that
+    -- created them, out of the ids one statement handed out, so nothing outside
+    -- catbird holds a count and no count can disagree with its list.
     dependent_job_ids BIGINT[],
     -- Whether this job waits for a signal, and the payload once one arrived.
     -- A waiting job has visible_at = 'infinity'; Signal writes the payload and

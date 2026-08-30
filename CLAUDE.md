@@ -64,9 +64,10 @@ Five files, one migration, no packages:
   connection, or a transaction — and holds no state; what a process runs lives
   on the `Runtime`. It also holds the three values a caller handles: `Message`,
   a published message as a reader gets it; `Job`, one claimed unit of work as a
-  handler is given it, which carries `SetOutput`, `Enqueue` and `EnqueueAfter`
-  as methods; and `Cursor`, a name and the patterns read under it, which carries
-  `Read` and `Ack` as methods and holds no connection either.
+  handler is given it, which carries `SetOutput`, `Enqueue`, `EnqueueAfter` and
+  `DependencyOutputs` as methods; and `Cursor`, a name and the patterns read
+  under it, which carries `Read` and `Ack` as methods and holds no connection
+  either.
 - `runtime.go` — `New`, `Handle`, `Start`, and the two loops every process runs
   whether or not anything is registered: the position assigner and the one
   `LISTEN` connection that wakes the rest. One `Runtime` per process owns the
@@ -114,11 +115,13 @@ client exists.
   lease writes no result, counts nothing down and creates no jobs, and a handler
   that fails halfway retries with an empty buffer.
 - Nothing outside catbird holds a dependency count. `EnqueueAfter` takes the
-  count of the buffer's other jobs, and each of those carries the waiting job's
-  id in `dependent_job_ids`; both are derived inside the completion from the ids the
-  same statement hands out. The CTE that hands them out is `MATERIALIZED`
-  because `nextval` is volatile and an inlined CTE would give a message and its
-  claim different ids.
+  count of the buffer's other jobs and their ids in `dependency_job_ids`, and each
+  of those carries the waiting job's id in `dependent_job_ids`; all three are
+  derived inside the completion from the ids the same statement hands out. The
+  ids are what `DependencyOutputs` reads, so a joining job takes the results of
+  the jobs it waited for and not every job of their type in the workflow. The
+  CTE that hands them out is `MATERIALIZED` because `nextval` is volatile and an
+  inlined CTE would give a message and its claim different ids.
 - A job waiting for a signal has `visible_at = 'infinity'`, so waiting is a
   delay and needs no place in the ready index. `Signal` writes the payload and
   sets `visible_at` to `now()`.

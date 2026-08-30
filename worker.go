@@ -245,10 +245,11 @@ func (w *worker) claimBatch(ctx context.Context, limit int) ([]*Job, error) {
 				ORDER BY visible_at ASC LIMIT $3
 				FOR UPDATE SKIP LOCKED
 			)
-			RETURNING message_id, job_type, attempts, coalesce(group_id, message_id) AS group_id, signal
+			RETURNING message_id, job_type, attempts, coalesce(group_id, message_id) AS group_id,
+			          signal, dependency_job_ids
 		)
 		SELECT m.id, m.topic, m.payload, m.created_at,
-		       l.job_type, l.attempts, l.group_id, l.signal
+		       l.job_type, l.attempts, l.group_id, l.signal, l.dependency_job_ids
 		FROM leased l
 		JOIN cb_messages m ON m.id = l.message_id
 	`, w.queue.name, w.queue.opts.Lease, limit, statusLive, w.names)
@@ -261,7 +262,7 @@ func (w *worker) claimBatch(ctx context.Context, limit int) ([]*Job, error) {
 	for rows.Next() {
 		var job Job
 		if err := rows.Scan(&job.ID, &job.Topic, &job.Payload, &job.CreatedAt,
-			&job.Type, &job.Attempts, &job.GroupID, &job.Signal); err != nil {
+			&job.Type, &job.Attempts, &job.GroupID, &job.Signal, &job.dependencyIDs); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, &job)

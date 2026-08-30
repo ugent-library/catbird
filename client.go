@@ -58,10 +58,11 @@ type Job struct {
 	Attempts  int             // 1 on the first run
 	CreatedAt time.Time       // insert time of the job's message
 
-	completed  bool            // Complete's delete succeeded, so the worker does not repeat it
-	output     json.RawMessage // what SetOutput recorded, written by the completion
-	newJobs    []newJob        // what Enqueue and EnqueueAfter recorded, written by the completion
-	payloadErr error           // a payload that could not be marshaled, returned by the completion
+	dependencyIDs []int64         // the jobs this one waited for, read by DependencyOutputs
+	completed     bool            // Complete's delete succeeded, so the worker does not repeat it
+	output        json.RawMessage // what SetOutput recorded, written by the completion
+	newJobs       []newJob        // what Enqueue and EnqueueAfter recorded, written by the completion
+	payloadErr    error           // a payload that could not be marshaled, returned by the completion
 }
 
 // newJob is one job a handler asked for, in the shape the completion writes.
@@ -129,6 +130,41 @@ func (j *Job) record(t *JobType, payload any, dependent bool) {
 		dependent: dependent,
 		signal:    t.opts.Signal,
 	})
+}
+
+// DependencyOutputs returns the results of the jobs this one waited for: the
+// jobs the completion that created it recorded with Enqueue, one element per
+// job, in the order they were enqueued, nil where a job recorded no result. Nil
+// for a job that waited for nothing.
+//
+// This is the read a joining job makes. It waited for one buffer's jobs and
+// this returns those, where Outputs returns every job of a type in the whole
+// workflow — every round of it, and the jobs another handler added. The ids come
+// from the claim, so the read probes cb_outputs by primary key.
+func (j *Job) DependencyOutputs(ctx context.Context, db Conn) ([]json.RawMessage, error) {
+	if len(j.dependencyIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := db.Query(ctx, `
+		SELECT result.output
+		FROM unnest($1::bigint[]) WITH ORDINALITY AS dependency (job_id, place)
+		LEFT JOIN cb_outputs result ON result.message_id = dependency.job_id
+		ORDER BY dependency.place
+	`, j.dependencyIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	bodies := make([]json.RawMessage, 0, len(j.dependencyIDs))
+	for rows.Next() {
+		var body json.RawMessage
+		if err := rows.Scan(&body); err != nil {
+			return nil, err
+		}
+		bodies = append(bodies, body)
+	}
+	return bodies, rows.Err()
 }
 
 // Conn is the part of pgx.Tx and *pgxpool.Pool this package uses: a pool, a
@@ -471,7 +507,9 @@ func EnqueueBatch(ctx context.Context, db Conn, t *JobType, msgs []BatchMessage,
 // The new jobs get their ids from the sequence inside the statement, which is
 // what lets one statement point the jobs that are not dependent at the ones
 // that are: a job recorded with EnqueueAfter takes the count of the others as
-// its dependencies, and each of the others carries its id in dependent_job_ids.
+// its dependencies and their ids in dependency_job_ids, and each of the others
+// carries its id in dependent_job_ids. The count and the list come out of the
+// same rows, so they cannot disagree.
 // The CTE that hands out the ids is MATERIALIZED because nextval is volatile and
 // an inlined CTE would be evaluated once per reference, giving a message and its
 // claim different ids.
@@ -513,11 +551,12 @@ func Complete(ctx context.Context, db Conn, job *Job) error {
 		),
 		new_claim AS (
 		    INSERT INTO cb_claims (message_id, queue, job_type, group_id, visible_at,
-		                           dependencies, dependent_job_ids, awaits_signal)
+		                           dependencies, dependency_job_ids, dependent_job_ids, awaits_signal)
 		    SELECT n.id, n.queue, n.job_type, c.group_id,
 		           CASE WHEN n.signal THEN 'infinity'::timestamptz ELSE now() END,
 		           CASE WHEN n.dependent THEN (SELECT count(*) FROM new_job WHERE NOT dependent) ELSE 0 END::smallint,
-		           CASE WHEN n.dependent THEN NULL ELSE (SELECT array_agg(id) FROM new_job WHERE dependent) END,
+		           CASE WHEN n.dependent THEN (SELECT array_agg(id ORDER BY id) FROM new_job WHERE NOT dependent) END,
+		           CASE WHEN n.dependent THEN NULL ELSE (SELECT array_agg(id ORDER BY id) FROM new_job WHERE dependent) END,
 		           n.signal
 		    FROM new_job n, claim c
 		    RETURNING queue, dependencies, visible_at

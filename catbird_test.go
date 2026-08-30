@@ -359,6 +359,140 @@ func TestHandlerFansOutAndJoins(t *testing.T) {
 	})
 }
 
+// A joining job reads the results of the jobs it waited for, by the ids the
+// completion that created it wrote on its claim: one element per job, in the
+// order they were enqueued, nil where a job recorded nothing, and the same on
+// every attempt. The read by job type is the wider one — it takes every job of
+// that type in the workflow, a round this job never waited for included.
+func TestDependencyOutputs(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("dependencies", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	root := catbird.NewJobType("dep_root", queue, catbird.JobTypeOptions{})
+	branch := catbird.NewJobType("dep_branch", queue, catbird.JobTypeOptions{})
+	join := catbird.NewJobType("dep_join", queue, catbird.JobTypeOptions{Backoff: 50 * time.Millisecond})
+	rejoin := catbird.NewJobType("dep_rejoin", queue, catbird.JobTypeOptions{})
+
+	rootRound := make(chan []json.RawMessage, 1)
+	firstAttempt := make(chan []json.RawMessage, 1)
+	retriedAttempt := make(chan []json.RawMessage, 1)
+	secondRound := make(chan []json.RawMessage, 1)
+
+	read := func(job *catbird.Job, to chan<- []json.RawMessage) error {
+		bodies, err := job.DependencyOutputs(ctx, pool)
+		if err != nil {
+			return err
+		}
+		to <- bodies
+		return nil
+	}
+
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Handle(root, func(ctx context.Context, job *catbird.Job) error {
+		if err := read(job, rootRound); err != nil {
+			return err
+		}
+		job.Enqueue(branch, 3)
+		job.Enqueue(branch, 1)
+		job.Enqueue(branch, 2) // this one records no result
+		job.EnqueueAfter(join, nil)
+		return nil
+	})
+	rt.Handle(branch, func(ctx context.Context, job *catbird.Job) error {
+		var n int
+		if err := json.Unmarshal(job.Payload, &n); err != nil {
+			return err
+		}
+		if n == 2 {
+			return nil
+		}
+		return job.SetOutput(n * 10)
+	})
+	rt.Handle(join, func(ctx context.Context, job *catbird.Job) error {
+		if job.Attempts == 1 {
+			if err := read(job, firstAttempt); err != nil {
+				return err
+			}
+			return errors.New("the first attempt fails after reading its dependencies")
+		}
+		if err := read(job, retriedAttempt); err != nil {
+			return err
+		}
+		// A second round of a type the first round already ran.
+		job.Enqueue(branch, 4)
+		job.EnqueueAfter(rejoin, nil)
+		return nil
+	})
+	rt.Handle(rejoin, func(ctx context.Context, job *catbird.Job) error {
+		return read(job, secondRound)
+	})
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	groupID, err := catbird.Enqueue(ctx, pool, root, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	show := func(bodies []json.RawMessage) string {
+		parts := make([]string, len(bodies))
+		for i, body := range bodies {
+			parts[i] = "nil"
+			if body != nil {
+				parts[i] = string(body)
+			}
+		}
+		return strings.Join(parts, " ")
+	}
+	take := func(from <-chan []json.RawMessage, what string) string {
+		t.Helper()
+		select {
+		case bodies := <-from:
+			return show(bodies)
+		case <-ctx.Done():
+			t.Fatalf("%s never ran", what)
+			return ""
+		}
+	}
+
+	if got := take(rootRound, "the job that started the workflow"); got != "" {
+		t.Errorf("a job that waited for nothing read %q, want no results", got)
+	}
+	// One element per branch, in the order they were enqueued — which is neither
+	// the order of their ids nor of their results — and the branch that recorded
+	// nothing keeps its place.
+	if got := take(firstAttempt, "the joining job"); got != "30 10 nil" {
+		t.Errorf("the joining job read %q, want \"30 10 nil\"", got)
+	}
+	// The retry reads the same: the ids are on the claim, and claiming a job
+	// again rewrites the row without touching them.
+	if got := take(retriedAttempt, "the joining job's retry"); got != "30 10 nil" {
+		t.Errorf("the retried attempt read %q, want \"30 10 nil\": what the first attempt read", got)
+	}
+	// The second round waited for one job and reads that one, not the three the
+	// first round produced.
+	if got := take(secondRound, "the second joining job"); got != "40" {
+		t.Errorf("the second joining job read %q, want \"40\"", got)
+	}
+
+	waitFor(t, 5*time.Second, "the workflow left claims behind", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims") == 0
+	})
+
+	// What the read by job type takes: every branch of the workflow, both rounds.
+	bodies, err := catbird.Outputs(ctx, pool, groupID, branch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := show(bodies); got != "30 10 40" {
+		t.Errorf("the read by job type took %q, want \"30 10 40\": every round of it", got)
+	}
+}
+
 // A handler that fails records nothing: its retry starts with an empty buffer,
 // so the jobs it asked for are created once, by the attempt that completed.
 func TestAFailedAttemptAsksForNothing(t *testing.T) {
