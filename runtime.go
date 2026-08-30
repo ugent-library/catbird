@@ -79,17 +79,17 @@ func (r *Runtime) Start(ctx context.Context) {
 // position, every AssignEvery. A message is visible to the assigner only once
 // its transaction committed, so positions follow commit order: a message from a
 // transaction that is still open is picked up on a later tick. Readers order by
-// position and a batch of positions becomes readable when this statement
+// position and a batch of positions becomes readable when the statement
 // commits, so a reader does not pass a message that has no position yet.
 //
-// The advisory lock is taken for the statement only. When another assigner
-// holds it, the one-time filter on the UPDATE skips the scan. The UPDATE also
-// requires position IS NULL, checked again on the committed row when it had to
-// wait for a lock, so two assigners that run at the same time cannot move a
-// position that is already set.
-//
-// When it assigned anything it sends NOTIFY on channel cb_stream with the
-// highest new position, so a LISTENing reader can fetch instead of polling.
+// A tick drains: the statement takes assignBatchSize messages at a time and
+// runs again while its batch came back full, up to assignRoundsPerTick. One
+// statement per tick would cap the whole database at 5000 positions per tick,
+// 20k a second at the defaults, and a single PublishBatch of more than that
+// would wait ticks it does not need to. The round bound keeps one tick from
+// running without end; when the last round it was allowed was still full, the
+// backlog is growing faster than the assigner drains it, which is logged rather
+// than left to show up as stream latency.
 func assignPositions(ctx context.Context, pool *pgxpool.Pool, opts Options) {
 	ticker := time.NewTicker(opts.AssignEvery)
 	defer ticker.Stop()
@@ -99,29 +99,67 @@ func assignPositions(ctx context.Context, pool *pgxpool.Pool, opts Options) {
 			return
 		case <-ticker.C:
 		}
-		_, err := pool.Exec(ctx, `
-			WITH lock AS (
-				SELECT pg_try_advisory_xact_lock(hashtext('catbird'), 1) AS held
-			),
-			unassigned AS (
-				SELECT id FROM cb_messages
-				WHERE stream AND position IS NULL
-				ORDER BY id
-				LIMIT 5000
-			),
-			assigned AS (
-				UPDATE cb_messages m
-				SET position = nextval('cb_position_seq')
-				FROM unassigned u
-				WHERE m.id = u.id AND m.position IS NULL AND (SELECT held FROM lock)
-				RETURNING position
-			)
-			SELECT pg_notify('cb_stream', max(position)::text) FROM assigned HAVING count(*) > 0
-		`)
-		if err != nil && ctx.Err() == nil {
-			opts.Logger.Error("catbird: assigning stream positions failed", "err", err)
+		for round := 1; ; round++ {
+			assigned, err := assignPositionBatch(ctx, pool)
+			if err != nil {
+				if ctx.Err() == nil {
+					opts.Logger.Error("catbird: assigning stream positions failed", "err", err)
+				}
+				break
+			}
+			if assigned < assignBatchSize {
+				break
+			}
+			if round == assignRoundsPerTick {
+				opts.Logger.Warn("catbird: more stream messages published than positions assigned",
+					"assigned", round*assignBatchSize, "every", opts.AssignEvery)
+				break
+			}
 		}
 	}
+}
+
+const (
+	assignBatchSize     = 5000 // positions one statement assigns
+	assignRoundsPerTick = 20   // statements one tick runs before it reports a backlog
+)
+
+// assignPositionBatch assigns the next assignBatchSize positions and returns
+// how many it set. When it set any it sends NOTIFY on channel cb_stream with
+// the highest of them, so a LISTENing reader can fetch instead of polling.
+//
+// The advisory lock is taken for the statement only. When another assigner
+// holds it, the one-time filter on the UPDATE skips the scan and the batch
+// comes back empty. The UPDATE also requires position IS NULL, checked again on
+// the committed row when it had to wait for a lock, so two assigners that run
+// at the same time cannot move a position that is already set.
+func assignPositionBatch(ctx context.Context, pool *pgxpool.Pool) (int, error) {
+	var assigned int
+	err := pool.QueryRow(ctx, `
+		WITH lock AS (
+			SELECT pg_try_advisory_xact_lock(hashtext('catbird'), 1) AS held
+		),
+		unassigned AS (
+			SELECT id FROM cb_messages
+			WHERE stream AND position IS NULL
+			ORDER BY id
+			LIMIT $1
+		),
+		assigned AS (
+			UPDATE cb_messages m
+			SET position = nextval('cb_position_seq')
+			FROM unassigned u
+			WHERE m.id = u.id AND m.position IS NULL AND (SELECT held FROM lock)
+			RETURNING position
+		),
+		announcement AS (
+			SELECT count(*)::int AS positions, pg_notify('cb_stream', max(position)::text)
+			FROM assigned
+			HAVING count(*) > 0
+		)
+		SELECT coalesce((SELECT positions FROM announcement), 0)
+	`, assignBatchSize).Scan(&assigned)
+	return assigned, err
 }
 
 // declare registers a loop for Start to run, and the channel its wake-ups come

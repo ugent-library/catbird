@@ -633,6 +633,41 @@ func TestPublishBatchSkipsTakenKeys(t *testing.T) {
 	}
 }
 
+// One tick of the assigner assigns a whole backlog, not one statement's worth.
+// A batch larger than the statement's limit used to wait a tick per 5000
+// messages, so the last of these would only be readable four ticks after its
+// commit.
+func TestAssignerDrainsABacklogInOneTick(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const messages = 12000 // more than two statements' worth
+	batch := make([]catbird.BatchMessage, messages)
+	for i := range batch {
+		batch[i] = catbird.BatchMessage{Topic: "backlog", Payload: i}
+	}
+	if n, err := catbird.PublishBatch(ctx, pool, batch); err != nil || n != messages {
+		t.Fatalf("published %d messages (%v), want %d", n, err, messages)
+	}
+
+	// The tick is long enough that a second one cannot rescue an assigner that
+	// stops after its first statement: the first fires at 2s, the deadline is
+	// half a second before the second.
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 2 * time.Second})
+	go rt.Start(ctx)
+
+	assigned := 0
+	deadline := time.Now().Add(3500 * time.Millisecond)
+	for time.Now().Before(deadline) && assigned < messages {
+		assigned = count(t, pool, "SELECT count(*) FROM cb_messages WHERE position IS NOT NULL")
+		time.Sleep(50 * time.Millisecond)
+	}
+	if assigned != messages {
+		t.Fatalf("%d messages have a position after one tick, want %d", assigned, messages)
+	}
+}
+
 // EnqueueBatch creates one job per message that survives deduplication, and
 // wakes the queue once for the whole batch — never once per job, and not at all
 // while the jobs are still waiting on dependencies.
