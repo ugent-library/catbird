@@ -97,8 +97,8 @@ func assignPositions(ctx context.Context, pool *pgxpool.Pool, opts Options) {
 // FetchBatch returns the next published messages after the cursor on topic and
 // on every topic under it: "order" matches "order", "order.paid" and
 // "order.paid.refund"; "" matches everything. Topic names are literal; there is
-// no pattern syntax. Job inputs written by Enqueue have no position and are
-// not returned.
+// no pattern syntax. The messages Enqueue writes get no position and are not
+// returned: enqueuing a job does not publish it.
 func (c *Consumer) FetchBatch(ctx context.Context, topic string) ([]Message, error) {
 	rows, err := c.runtime.pool.Query(ctx, `
 		SELECT id, position, topic, payload, created_at
@@ -223,8 +223,7 @@ func (t *Trigger) enqueueNextBatch(ctx context.Context) (int, error) {
 	}
 	defer tx.Rollback(ctx)
 
-	client := NewClient()
-	if _, err := client.EnqueueBatch(ctx, tx, t.queue, jobs, EnqueueOptions{}); err != nil {
+	if _, err := EnqueueBatch(ctx, tx, t.queue, jobs, EnqueueOptions{}); err != nil {
 		return 0, err
 	}
 	if err := t.consumer.Ack(ctx, tx, msgs[len(msgs)-1].Position); err != nil {

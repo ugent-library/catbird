@@ -22,12 +22,11 @@ func Example_basicWorkflow() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	client := catbird.NewClient()
 
 	// The handler is given no connection and opens one when it needs it. It
 	// completes the job in its own transaction, so its writes and the end of
 	// the job are one commit: the job runs again only if nothing was written.
-	handler := func(ctx context.Context, job *catbird.Message) error {
+	handler := func(ctx context.Context, job *catbird.Job) error {
 		log.Printf("job %d on %s", job.ID, job.Topic)
 
 		tx, err := pool.Begin(ctx)
@@ -37,7 +36,7 @@ func Example_basicWorkflow() {
 		defer tx.Rollback(ctx)
 
 		// _, err = tx.Exec(ctx, "UPDATE accounts SET balance = balance - 100 WHERE id = 1")
-		if err := client.CompleteJob(ctx, tx, job); err != nil {
+		if err := catbird.Complete(ctx, tx, job); err != nil {
 			return err
 		}
 		return tx.Commit(ctx)
@@ -49,7 +48,7 @@ func Example_basicWorkflow() {
 		// run at once have to fit in the pool beside the library's own
 		// statements. The default of 50 does not fit a default pool.
 		BatchSize: 20,
-		OnDead: func(ctx context.Context, job *catbird.Message) error {
+		OnDead: func(ctx context.Context, job *catbird.Job) error {
 			log.Printf("job %d failed permanently", job.ID)
 			return nil
 		},
@@ -63,7 +62,7 @@ func Example_basicWorkflow() {
 		for {
 			time.Sleep(time.Minute)
 			key := "cron:heartbeat:" + time.Now().UTC().Format("2006-01-02T15:04Z")
-			client.Enqueue(ctx, pool, "cron.minutely", "cron_workers", nil, catbird.EnqueueOptions{DedupKey: key})
+			catbird.Enqueue(ctx, pool, "cron.minutely", "cron_workers", nil, catbird.EnqueueOptions{DedupKey: key})
 		}
 	}()
 
@@ -72,7 +71,7 @@ func Example_basicWorkflow() {
 
 	go func() {
 		time.Sleep(time.Second)
-		client.Publish(ctx, pool, "image.uploaded", map[string]string{"url": "https://example.com/img.png"}, "")
+		catbird.Publish(ctx, pool, "image.uploaded", map[string]string{"url": "https://example.com/img.png"}, "")
 	}()
 
 	go rt.Start(ctx)

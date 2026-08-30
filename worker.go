@@ -9,12 +9,12 @@ import (
 	"time"
 )
 
-// JobHandler runs one job. It is given no connection: a handler that needs one
+// Handler runs one job. It is given no connection: a handler that needs one
 // opens it, and decides for itself how long to hold it. A handler that returns
-// nil without calling Client.CompleteJob leaves the job for the worker to
-// complete afterwards, which means its writes committed before the job ended
-// and a crash in between runs them again. See CompleteJob.
-type JobHandler func(ctx context.Context, job *Message) error
+// nil without calling Complete leaves the job for the worker to complete
+// afterwards, which means its writes committed before the job ended and a
+// crash in between runs them again. See Complete.
+type Handler func(ctx context.Context, job *Job) error
 
 // WorkerOptions are the optional parts of NewWorker. Zero values take the defaults.
 type WorkerOptions struct {
@@ -23,7 +23,7 @@ type WorkerOptions struct {
 	Backoff      time.Duration // wait after a failed attempt; default 1 minute
 	BatchSize    int           // jobs running at once; default 50
 	PollInterval time.Duration // wake-up interval when no notification arrives; default 5 seconds
-	OnDead       JobHandler    // runs once after the last failed attempt
+	OnDead       Handler       // runs once after the last failed attempt
 	Logger       *slog.Logger  // default: the runtime's logger
 }
 
@@ -49,13 +49,13 @@ func (o WorkerOptions) withDefaults() WorkerOptions {
 type Worker struct {
 	runtime *Runtime
 	queue   string
-	handler JobHandler
+	handler Handler
 	opts    WorkerOptions
 }
 
 // NewWorker declares a worker on the runtime: once the runtime is started, it
 // claims jobs on queue and runs handler for each, up to BatchSize at a time.
-func NewWorker(r *Runtime, queue string, handler JobHandler, opts WorkerOptions) *Worker {
+func NewWorker(r *Runtime, queue string, handler Handler, opts WorkerOptions) *Worker {
 	opts = opts.withDefaults()
 	if opts.Logger == nil {
 		opts.Logger = r.opts.Logger
@@ -66,7 +66,7 @@ func NewWorker(r *Runtime, queue string, handler JobHandler, opts WorkerOptions)
 }
 
 // Worker is NewWorker(r, queue, handler, opts).
-func (r *Runtime) Worker(queue string, handler JobHandler, opts WorkerOptions) *Worker {
+func (r *Runtime) Worker(queue string, handler Handler, opts WorkerOptions) *Worker {
 	return NewWorker(r, queue, handler, opts)
 }
 
@@ -170,7 +170,7 @@ func (w *Worker) takeFreeSlots(free chan struct{}, backlog bool) int {
 // the job in a transaction of its own, the worker completes it with one
 // statement; an error schedules a retry or marks the job dead, and a shutdown
 // hands the job back.
-func (w *Worker) run(ctx context.Context, job *Message) {
+func (w *Worker) run(ctx context.Context, job *Job) {
 	err := w.handler(ctx, job)
 
 	// The statements after the handler run on a context detached from the
@@ -183,12 +183,12 @@ func (w *Worker) run(ctx context.Context, job *Message) {
 	defer cancel()
 
 	if err == nil && !job.completed {
-		err = NewClient().CompleteJob(after, w.runtime.pool, job)
+		err = Complete(after, w.runtime.pool, job)
 	}
 	switch {
 	case err == nil:
 	case errors.Is(err, ErrLeaseExpired):
-		w.opts.Logger.Warn("catbird: lease expired before completion, work discarded", "queue", w.queue, "message_id", job.ID, "attempt", job.Attempts)
+		w.opts.Logger.Warn("catbird: lease expired before completion, work discarded", "queue", w.queue, "job_id", job.ID, "attempt", job.Attempts)
 	case ctx.Err() != nil:
 		w.interrupted(after, job, err)
 	default:
@@ -207,16 +207,16 @@ func (w *Worker) run(ctx context.Context, job *Message) {
 // worker is retried forever. cause is what the handler returned: a real failure
 // inside the shutdown window cannot be told from an interruption, so it is
 // logged and the attempt is still given back.
-func (w *Worker) interrupted(ctx context.Context, job *Message, cause error) {
+func (w *Worker) interrupted(ctx context.Context, job *Job, cause error) {
 	_, err := w.runtime.pool.Exec(ctx, `
 		UPDATE cb_claims SET attempts = attempts - 1, visible_at = now()
 		WHERE message_id = $1 AND attempts = $2 AND status = $3
 	`, job.ID, job.Attempts, statusLive)
 	if err != nil {
-		w.opts.Logger.Error("catbird: returning an interrupted job failed", "queue", w.queue, "message_id", job.ID, "err", err, "cause", cause)
+		w.opts.Logger.Error("catbird: returning an interrupted job failed", "queue", w.queue, "job_id", job.ID, "err", err, "cause", cause)
 		return
 	}
-	w.opts.Logger.Info("catbird: job stopped by shutdown, returned to the queue", "queue", w.queue, "message_id", job.ID, "err", cause)
+	w.opts.Logger.Info("catbird: job stopped by shutdown, returned to the queue", "queue", w.queue, "job_id", job.ID, "err", cause)
 }
 
 // failed schedules a retry, or after the last attempt marks the job dead,
@@ -226,8 +226,8 @@ func (w *Worker) interrupted(ctx context.Context, job *Message, cause error) {
 // error, or the lease expired and another worker has it. Neither is this
 // attempt's failure to record, and the cascade must not run for a job that is
 // finished or running elsewhere.
-func (w *Worker) failed(ctx context.Context, job *Message, cause error) {
-	log := w.opts.Logger.With("queue", w.queue, "message_id", job.ID, "attempt", job.Attempts)
+func (w *Worker) failed(ctx context.Context, job *Job, cause error) {
+	log := w.opts.Logger.With("queue", w.queue, "job_id", job.ID, "attempt", job.Attempts)
 
 	if job.Attempts < w.opts.MaxAttempts {
 		tag, err := w.runtime.pool.Exec(ctx, `
@@ -259,7 +259,7 @@ func (w *Worker) failed(ctx context.Context, job *Message, cause error) {
 
 	log.Error("catbird: job dead", "err", cause)
 	if job.CorrelationID != "" {
-		if err := NewClient().Cancel(ctx, w.runtime.pool, job.CorrelationID); err != nil {
+		if err := Cancel(ctx, w.runtime.pool, job.CorrelationID); err != nil {
 			log.Error("catbird: cancel failed", "correlation_id", job.CorrelationID, "err", err)
 		}
 	}
@@ -272,7 +272,7 @@ func (w *Worker) failed(ctx context.Context, job *Message, cause error) {
 
 // claimBatch leases up to limit ready jobs by moving visible_at past the lease,
 // and returns them with their payloads and delivered signals.
-func (w *Worker) claimBatch(ctx context.Context, limit int) ([]*Message, error) {
+func (w *Worker) claimBatch(ctx context.Context, limit int) ([]*Job, error) {
 	rows, err := w.runtime.pool.Query(ctx, `
 		WITH leased AS (
 			UPDATE cb_claims
@@ -295,23 +295,23 @@ func (w *Worker) claimBatch(ctx context.Context, limit int) ([]*Message, error) 
 	}
 	defer rows.Close()
 
-	var jobs []*Message
+	var jobs []*Job
 	for rows.Next() {
-		var m Message
+		var job Job
 		var correlation *string
 		var signals []byte
-		if err := rows.Scan(&m.ID, &m.Topic, &m.Payload, &m.CreatedAt, &m.Attempts, &correlation, &signals); err != nil {
+		if err := rows.Scan(&job.ID, &job.Topic, &job.Payload, &job.CreatedAt, &job.Attempts, &correlation, &signals); err != nil {
 			return nil, err
 		}
 		if correlation != nil {
-			m.CorrelationID = *correlation
+			job.CorrelationID = *correlation
 		}
 		if len(signals) > 0 {
-			if err := json.Unmarshal(signals, &m.Signals); err != nil {
+			if err := json.Unmarshal(signals, &job.Signals); err != nil {
 				return nil, err
 			}
 		}
-		jobs = append(jobs, &m)
+		jobs = append(jobs, &job)
 	}
 	return jobs, rows.Err()
 }

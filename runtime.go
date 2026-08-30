@@ -34,8 +34,9 @@ func (o Options) withDefaults() Options {
 // Runtime is a process's catbird: the pool, one LISTEN connection, the position
 // assigner, and every worker, trigger and consumer declared on it. Declare them
 // with NewWorker, NewTrigger and NewConsumer (or the methods of the same names),
-// then call Start. Client is not created from the runtime: it is a plain helper
-// that works on any connection or transaction.
+// then call Start. The statements a caller runs — Enqueue, Publish, Complete
+// and the rest — are package functions and need no runtime: they work on any
+// connection or transaction.
 type Runtime struct {
 	pool *pgxpool.Pool
 	opts Options

@@ -48,10 +48,13 @@ It talks to the same database directly and needs no Go build.
 
 Five files, one migration, no packages:
 
-- `client.go` — every statement a caller runs: `Publish`, `PublishBatch`,
-  `Enqueue`, `EnqueueBatch`, `CompleteJob`, `Cancel`, `GC`, `ResolveDependency`,
-  `DeliverSignal`, `SetOutput`, `Output`. `Client` holds no state and works on
-  any `Conn` — a pool, a connection, or a transaction.
+- `client.go` — every statement a caller runs, as package functions:
+  `Publish`, `PublishBatch`, `Enqueue`, `EnqueueBatch`, `Complete`, `Cancel`,
+  `GC`, `ResolveDependency`, `DeliverSignal`, `SetOutput`, `Output`. Each takes
+  a `Conn` — a pool, a connection, or a transaction — and holds no state; what
+  a process configures lives on the `Runtime`. It also holds the two values a
+  caller handles: `Message`, a published message as a consumer reads it, and
+  `Job`, one claimed unit of work as a handler is given it.
 - `runtime.go` — `New` and `Start`. One `Runtime` per process owns the pool, one
   `LISTEN` connection for every channel its loops need, the position assigner,
   and one goroutine per declared worker, trigger and consumer.
@@ -63,8 +66,8 @@ Five files, one migration, no packages:
 
 ## Architecture
 
-**Tables.** `cb_messages` holds every job input and every published message, one
-row, written once. `cb_claims` holds one narrow row per job that still has to
+**Tables.** `cb_messages` holds every job's message and every published
+message, one row, written once. `cb_claims` holds one narrow row per job that still has to
 run, rewritten on every claim and retry, deleted on completion. `cb_cursors`,
 `cb_signals` and `cb_outputs` are one row each per consumer, per delivered
 signal, per job result.
@@ -80,7 +83,7 @@ client exists.
 - A job's completion is `DELETE FROM cb_claims WHERE message_id = $1 AND attempts = $2`.
   `attempts` is the lease token. Two workers may run the same job; only the
   lease holder deletes the claim. A handler is given no connection: it runs
-  `CompleteJob` in its own transaction to end the job in the same commit as its
+  `Complete` in its own transaction to end the job in the same commit as its
   writes, or returns `nil` and lets the worker complete it afterwards. The
   worker holds no transaction and no connection while a handler runs.
 - Stream readers go by `position`, never by `id`. Positions are set after commit
@@ -106,6 +109,13 @@ what a thing does in the sentence a reader would use for it. A comment states
 the rule and then, when it earns its place, the concrete failure it prevents —
 with the measurement when there is one. Comments never narrate history: what
 changed belongs in the commit message, not in the file.
+
+**Job and message.** A job is one claimed unit of work; a message is a row of
+`cb_messages`, and a published message is what a consumer reads. The word job
+belongs where a claim does, and the type carries it rather than the name: the
+handler type is `Handler` and takes a `*Job`, and the completion is `Complete`.
+`ResolveDependency`, `DeliverSignal`, `SetOutput` and `Output` address a job, so
+their parameter is `jobID`, while the column it matches stays `message_id`.
 
 **Errors.** Sentinels are prefixed with `catbird:` and checked with
 `errors.Is`.

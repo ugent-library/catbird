@@ -59,7 +59,6 @@ func TestTortureThroughput(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	client := catbird.NewClient()
 
 	const numProducers = 10
 	const msgsPerProducer = 1000
@@ -72,7 +71,7 @@ func TestTortureThroughput(t *testing.T) {
 		go func(prodID int) {
 			defer prodWg.Done()
 			for j := 0; j < msgsPerProducer; j++ {
-				_, err := client.Enqueue(ctx, pool, "torture.task", "torture_queue", map[string]int{"prod": prodID, "task": j}, catbird.EnqueueOptions{})
+				_, err := catbird.Enqueue(ctx, pool, "torture.task", "torture_queue", map[string]int{"prod": prodID, "task": j}, catbird.EnqueueOptions{})
 				if err != nil {
 					t.Errorf("enqueue: %v", err)
 					return
@@ -85,7 +84,7 @@ func TestTortureThroughput(t *testing.T) {
 	t.Logf("wrote %d messages in %v (%.0f/s)", totalMsgs, writeDur, float64(totalMsgs)/writeDur.Seconds())
 
 	var processed int32
-	handler := func(ctx context.Context, job *catbird.Message) error {
+	handler := func(ctx context.Context, job *catbird.Job) error {
 		// The transactional path: the handler's own writes and the completion
 		// of the job in one commit.
 		tx, err := pool.Begin(ctx)
@@ -96,7 +95,7 @@ func TestTortureThroughput(t *testing.T) {
 		if _, err := tx.Exec(ctx, "SELECT 1"); err != nil {
 			return err
 		}
-		if err := client.CompleteJob(ctx, tx, job); err != nil {
+		if err := catbird.Complete(ctx, tx, job); err != nil {
 			return err
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -143,11 +142,10 @@ func TestLongJobDoesNotHoldUpTheQueue(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	client := catbird.NewClient()
 
 	// The long job is enqueued first, so the worker claims it first.
 	release := make(chan struct{})
-	if _, err := client.Enqueue(ctx, pool, "long", "mixed", nil, catbird.EnqueueOptions{}); err != nil {
+	if _, err := catbird.Enqueue(ctx, pool, "long", "mixed", nil, catbird.EnqueueOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	const short = 20
@@ -155,13 +153,13 @@ func TestLongJobDoesNotHoldUpTheQueue(t *testing.T) {
 	for i := range batch {
 		batch[i] = catbird.BatchMessage{Topic: "short", Payload: i}
 	}
-	if _, err := client.EnqueueBatch(ctx, pool, "mixed", batch, catbird.EnqueueOptions{}); err != nil {
+	if _, err := catbird.EnqueueBatch(ctx, pool, "mixed", batch, catbird.EnqueueOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
 	done := make(chan string, short+1)
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Worker("mixed", func(ctx context.Context, m *catbird.Message) error {
+	rt.Worker("mixed", func(ctx context.Context, m *catbird.Job) error {
 		if m.Topic == "long" {
 			select {
 			case <-release:
@@ -212,10 +210,9 @@ func TestLongJobDoesNotHoldUpTheQueue(t *testing.T) {
 func TestExactlyOnceDedup(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx := context.Background()
-	client := catbird.NewClient()
 	opts := catbird.EnqueueOptions{DedupKey: "deterministic-hash-12345"}
 
-	id, err := client.Enqueue(ctx, pool, "task", "dedup_queue", nil, opts)
+	id, err := catbird.Enqueue(ctx, pool, "task", "dedup_queue", nil, opts)
 	if err != nil || id == 0 {
 		t.Fatalf("first enqueue: id=%d err=%v", id, err)
 	}
@@ -225,7 +222,7 @@ func TestExactlyOnceDedup(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			id, err := client.Enqueue(ctx, pool, "task", "dedup_queue", nil, opts)
+			id, err := catbird.Enqueue(ctx, pool, "task", "dedup_queue", nil, opts)
 			if err != nil {
 				t.Errorf("duplicate enqueue: %v", err)
 			}
@@ -244,10 +241,9 @@ func TestExactlyOnceDedup(t *testing.T) {
 func TestDependenciesAndSignals(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx := context.Background()
-	client := catbird.NewClient()
 
 	// Two parent steps and one external signal.
-	childID, err := client.Enqueue(ctx, pool, "join_task", "dag_queue", nil, catbird.EnqueueOptions{Dependencies: 3})
+	childID, err := catbird.Enqueue(ctx, pool, "join_task", "dag_queue", nil, catbird.EnqueueOptions{Dependencies: 3})
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
@@ -255,24 +251,24 @@ func TestDependenciesAndSignals(t *testing.T) {
 		t.Fatalf("expected 0 ready claims, got %d", n)
 	}
 
-	if err := client.ResolveDependency(ctx, pool, childID); err != nil {
+	if err := catbird.ResolveDependency(ctx, pool, childID); err != nil {
 		t.Fatalf("resolve 1: %v", err)
 	}
-	if err := client.ResolveDependency(ctx, pool, childID); err != nil {
+	if err := catbird.ResolveDependency(ctx, pool, childID); err != nil {
 		t.Fatalf("resolve 2: %v", err)
 	}
-	if err := client.DeliverSignal(ctx, pool, childID, "human_approval", map[string]bool{"ok": true}); err != nil {
+	if err := catbird.DeliverSignal(ctx, pool, childID, "human_approval", map[string]bool{"ok": true}); err != nil {
 		t.Fatalf("signal: %v", err)
 	}
 	// The same signal again is a no-op, not an error.
-	if err := client.DeliverSignal(ctx, pool, childID, "human_approval", map[string]bool{"ok": false}); err != nil {
+	if err := catbird.DeliverSignal(ctx, pool, childID, "human_approval", map[string]bool{"ok": false}); err != nil {
 		t.Fatalf("duplicate signal: %v", err)
 	}
 	// The job no longer waits: another signal or resolution is refused.
-	if err := client.DeliverSignal(ctx, pool, childID, "other", nil); !errors.Is(err, catbird.ErrNotFound) {
+	if err := catbird.DeliverSignal(ctx, pool, childID, "other", nil); !errors.Is(err, catbird.ErrNotFound) {
 		t.Fatalf("signal to non-waiting job: got %v, want ErrNotFound", err)
 	}
-	if err := client.ResolveDependency(ctx, pool, childID); !errors.Is(err, catbird.ErrNotFound) {
+	if err := catbird.ResolveDependency(ctx, pool, childID); !errors.Is(err, catbird.ErrNotFound) {
 		t.Fatalf("resolve on non-waiting job: got %v, want ErrNotFound", err)
 	}
 	if n := count(t, pool, "SELECT count(*) FROM cb_signals"); n != 1 {
@@ -282,9 +278,9 @@ func TestDependenciesAndSignals(t *testing.T) {
 		t.Fatalf("expected 1 ready claim, got %d", n)
 	}
 
-	ran := make(chan catbird.Message, 1)
+	ran := make(chan catbird.Job, 1)
 	rt := catbird.New(pool, catbird.Options{})
-	catbird.NewWorker(rt, "dag_queue", func(ctx context.Context, m *catbird.Message) error {
+	catbird.NewWorker(rt, "dag_queue", func(ctx context.Context, m *catbird.Job) error {
 		ran <- *m
 		return nil
 	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond})
@@ -315,19 +311,18 @@ func TestLeaseExpiryFence(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	client := catbird.NewClient()
 
 	if _, err := pool.Exec(ctx, "CREATE TABLE IF NOT EXISTS lease_test (attempt INT)"); err != nil {
 		t.Fatal(err)
 	}
 	pool.Exec(ctx, "TRUNCATE lease_test")
 
-	if _, err := client.Enqueue(ctx, pool, "slow", "lease_queue", nil, catbird.EnqueueOptions{}); err != nil {
+	if _, err := catbird.Enqueue(ctx, pool, "slow", "lease_queue", nil, catbird.EnqueueOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
 	var calls int32
-	handler := func(ctx context.Context, job *catbird.Message) error {
+	handler := func(ctx context.Context, job *catbird.Job) error {
 		atomic.AddInt32(&calls, 1)
 		if job.Attempts == 1 {
 			time.Sleep(800 * time.Millisecond) // past the lease
@@ -340,7 +335,7 @@ func TestLeaseExpiryFence(t *testing.T) {
 		if _, err := tx.Exec(ctx, "INSERT INTO lease_test (attempt) VALUES ($1)", job.Attempts); err != nil {
 			return err
 		}
-		if err := client.CompleteJob(ctx, tx, job); err != nil {
+		if err := catbird.Complete(ctx, tx, job); err != nil {
 			return err // the late attempt gets ErrLeaseExpired and its insert is rolled back
 		}
 		return tx.Commit(ctx)
@@ -375,20 +370,19 @@ func TestTriggerBridgesPayloadUnchanged(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	client := catbird.NewClient()
 
-	if _, err := client.Publish(ctx, pool, "image.uploaded", map[string]string{"url": "https://example.com/a.png"}, ""); err != nil {
+	if _, err := catbird.Publish(ctx, pool, "image.uploaded", map[string]string{"url": "https://example.com/a.png"}, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Publish(ctx, pool, "image_x", nil, ""); err != nil {
+	if _, err := catbird.Publish(ctx, pool, "image_x", nil, ""); err != nil {
 		t.Fatal(err)
 	}
 
 	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
 	catbird.NewTrigger(rt, "img", "image", "image_processing", catbird.StreamOptions{PollInterval: 50 * time.Millisecond})
 
-	got := make(chan catbird.Message, 16)
-	catbird.NewWorker(rt, "image_processing", func(ctx context.Context, m *catbird.Message) error {
+	got := make(chan catbird.Job, 16)
+	catbird.NewWorker(rt, "image_processing", func(ctx context.Context, m *catbird.Job) error {
 		got <- *m
 		return nil
 	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond})
@@ -420,18 +414,17 @@ func TestTriggerBridgesPayloadUnchanged(t *testing.T) {
 func TestGCKeepsLiveClaims(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx := context.Background()
-	client := catbird.NewClient()
 
-	if _, err := client.Enqueue(ctx, pool, "later", "gc_queue", nil, catbird.EnqueueOptions{Delay: time.Hour}); err != nil {
+	if _, err := catbird.Enqueue(ctx, pool, "later", "gc_queue", nil, catbird.EnqueueOptions{Delay: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Enqueue(ctx, pool, "doomed", "gc_queue", nil, catbird.EnqueueOptions{CorrelationID: "wf1"}); err != nil {
+	if _, err := catbird.Enqueue(ctx, pool, "doomed", "gc_queue", nil, catbird.EnqueueOptions{CorrelationID: "wf1"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Publish(ctx, pool, "event", nil, ""); err != nil {
+	if _, err := catbird.Publish(ctx, pool, "event", nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.Cancel(ctx, pool, "wf1"); err != nil {
+	if err := catbird.Cancel(ctx, pool, "wf1"); err != nil {
 		t.Fatal(err)
 	}
 	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE status = 0 AND dependencies = 0 AND visible_at <= now()"); n != 0 {
@@ -439,7 +432,7 @@ func TestGCKeepsLiveClaims(t *testing.T) {
 	}
 
 	time.Sleep(20 * time.Millisecond)
-	if err := client.GC(ctx, pool, 10*time.Millisecond); err != nil {
+	if err := catbird.GC(ctx, pool, 10*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if n := count(t, pool, "SELECT count(*) FROM cb_claims"); n != 1 {
@@ -456,7 +449,6 @@ func TestStreamLateCommitIsNotSkipped(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	client := catbird.NewClient()
 
 	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
 	go rt.Start(ctx)
@@ -467,12 +459,12 @@ func TestStreamLateCommitIsNotSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Publish(ctx, slow, "ev", "first inserted, last committed", ""); err != nil {
+	if _, err := catbird.Publish(ctx, slow, "ev", "first inserted, last committed", ""); err != nil {
 		t.Fatal(err)
 	}
 	// Messages 2 and 3 commit right away.
 	for _, p := range []string{"second", "third"} {
-		if _, err := client.Publish(ctx, pool, "ev", p, ""); err != nil {
+		if _, err := catbird.Publish(ctx, pool, "ev", p, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -512,17 +504,16 @@ func TestOutputAndStreamNotify(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	client := catbird.NewClient()
 
-	id, err := client.Enqueue(ctx, pool, "sum", "out_queue", []int{1, 2, 3}, catbird.EnqueueOptions{})
+	id, err := catbird.Enqueue(ctx, pool, "sum", "out_queue", []int{1, 2, 3}, catbird.EnqueueOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Output(ctx, pool, id); !errors.Is(err, catbird.ErrNotFound) {
+	if _, err := catbird.Output(ctx, pool, id); !errors.Is(err, catbird.ErrNotFound) {
 		t.Fatalf("output before completion: %v", err)
 	}
 	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
-	catbird.NewWorker(rt, "out_queue", func(ctx context.Context, job *catbird.Message) error {
+	catbird.NewWorker(rt, "out_queue", func(ctx context.Context, job *catbird.Job) error {
 		var in []int
 		json.Unmarshal(job.Payload, &in)
 		sum := 0
@@ -534,10 +525,10 @@ func TestOutputAndStreamNotify(t *testing.T) {
 			return err
 		}
 		defer tx.Rollback(ctx)
-		if err := client.SetOutput(ctx, tx, job.ID, sum); err != nil {
+		if err := catbird.SetOutput(ctx, tx, job.ID, sum); err != nil {
 			return err
 		}
-		if err := client.CompleteJob(ctx, tx, job); err != nil {
+		if err := catbird.Complete(ctx, tx, job); err != nil {
 			return err
 		}
 		return tx.Commit(ctx)
@@ -545,7 +536,7 @@ func TestOutputAndStreamNotify(t *testing.T) {
 	go rt.Start(ctx)
 
 	for {
-		out, err := client.Output(ctx, pool, id)
+		out, err := catbird.Output(ctx, pool, id)
 		if err == nil {
 			if string(out) != "6" {
 				t.Fatalf("output %s, want 6", out)
@@ -567,7 +558,7 @@ func TestOutputAndStreamNotify(t *testing.T) {
 	if _, err := conn.Exec(ctx, "LISTEN cb_stream"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Publish(ctx, pool, "ev", nil, ""); err != nil {
+	if _, err := catbird.Publish(ctx, pool, "ev", nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	n, err := conn.Conn().WaitForNotification(ctx)
@@ -586,13 +577,12 @@ func TestPublishBatchSkipsTakenKeys(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	client := catbird.NewClient()
 
-	if _, err := client.Publish(ctx, pool, "record.work.1", "first", "taken"); err != nil {
+	if _, err := catbird.Publish(ctx, pool, "record.work.1", "first", "taken"); err != nil {
 		t.Fatal(err)
 	}
 
-	n, err := client.PublishBatch(ctx, pool, []catbird.BatchMessage{
+	n, err := catbird.PublishBatch(ctx, pool, []catbird.BatchMessage{
 		{Topic: "record.work.2", Payload: "second"},
 		{Topic: "record.work.3", Payload: "skipped", DedupKey: "taken"}, // published above
 		{Topic: "record.work.4", Payload: "third", DedupKey: "once"},
@@ -613,7 +603,7 @@ func TestPublishBatchSkipsTakenKeys(t *testing.T) {
 	}
 
 	// An empty batch is a no-op.
-	if n, err := client.PublishBatch(ctx, pool, nil); err != nil || n != 0 {
+	if n, err := catbird.PublishBatch(ctx, pool, nil); err != nil || n != 0 {
 		t.Fatalf("empty batch wrote %d (%v)", n, err)
 	}
 
@@ -650,11 +640,10 @@ func TestEnqueueBatchWakesTheQueueOnce(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	client := catbird.NewClient()
 
 	// This job's key is taken before the listener starts, so its notification
 	// is not delivered here.
-	if _, err := client.Enqueue(ctx, pool, "resize", "images", nil, catbird.EnqueueOptions{DedupKey: "taken"}); err != nil {
+	if _, err := catbird.Enqueue(ctx, pool, "resize", "images", nil, catbird.EnqueueOptions{DedupKey: "taken"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -667,7 +656,7 @@ func TestEnqueueBatchWakesTheQueueOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	n, err := client.EnqueueBatch(ctx, pool, "images", []catbird.BatchMessage{
+	n, err := catbird.EnqueueBatch(ctx, pool, "images", []catbird.BatchMessage{
 		{Topic: "resize", Payload: 1, DedupKey: "taken"}, // enqueued above
 		{Topic: "resize", Payload: 2, DedupKey: "once"},
 		{Topic: "resize", Payload: 3, DedupKey: "once"}, // repeats a key from this batch
@@ -688,7 +677,7 @@ func TestEnqueueBatchWakesTheQueueOnce(t *testing.T) {
 
 	// A batch that still waits on a dependency stays out of the ready index and
 	// sends nothing.
-	if n, err := client.EnqueueBatch(ctx, pool, "images", []catbird.BatchMessage{
+	if n, err := catbird.EnqueueBatch(ctx, pool, "images", []catbird.BatchMessage{
 		{Topic: "resize", Payload: 5},
 		{Topic: "resize", Payload: 6},
 	}, catbird.EnqueueOptions{Dependencies: 1}); err != nil || n != 2 {
@@ -718,13 +707,12 @@ func TestTriggerBatchIsEnqueuedOnce(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	client := catbird.NewClient()
 
 	msgs := make([]catbird.BatchMessage, 20)
 	for i := range msgs {
 		msgs[i] = catbird.BatchMessage{Topic: "record.work", Payload: i}
 	}
-	if n, err := client.PublishBatch(ctx, pool, msgs); err != nil || n != 20 {
+	if n, err := catbird.PublishBatch(ctx, pool, msgs); err != nil || n != 20 {
 		t.Fatalf("published %d messages (%v)", n, err)
 	}
 
@@ -752,7 +740,6 @@ func TestCreatedAtIsSetOnStreamAndJobMessages(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	client := catbird.NewClient()
 
 	dbNow := func() time.Time {
 		t.Helper()
@@ -764,16 +751,16 @@ func TestCreatedAtIsSetOnStreamAndJobMessages(t *testing.T) {
 	}
 	start := dbNow()
 
-	if _, err := client.Publish(ctx, pool, "age", "published", ""); err != nil {
+	if _, err := catbird.Publish(ctx, pool, "age", "published", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Enqueue(ctx, pool, "age", "age_queue", "enqueued", catbird.EnqueueOptions{}); err != nil {
+	if _, err := catbird.Enqueue(ctx, pool, "age", "age_queue", "enqueued", catbird.EnqueueOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
 	jobCreatedAt := make(chan time.Time, 1)
 	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
-	catbird.NewWorker(rt, "age_queue", func(ctx context.Context, m *catbird.Message) error {
+	catbird.NewWorker(rt, "age_queue", func(ctx context.Context, m *catbird.Job) error {
 		jobCreatedAt <- m.CreatedAt
 		return nil
 	}, catbird.WorkerOptions{PollInterval: 50 * time.Millisecond})
@@ -817,15 +804,14 @@ func TestShutdownReturnsTheJob(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	client := catbird.NewClient()
 
-	if _, err := client.Enqueue(ctx, pool, "slow", "deploys", nil, catbird.EnqueueOptions{}); err != nil {
+	if _, err := catbird.Enqueue(ctx, pool, "slow", "deploys", nil, catbird.EnqueueOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
 	started := make(chan struct{})
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Worker("deploys", func(ctx context.Context, job *catbird.Message) error {
+	rt.Worker("deploys", func(ctx context.Context, job *catbird.Job) error {
 		close(started)
 		<-ctx.Done()
 		return ctx.Err()
@@ -873,23 +859,22 @@ func TestCompletedJobIsNotRetriedAfterAnError(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	client := catbird.NewClient()
 
-	if _, err := client.Enqueue(ctx, pool, "done", "late_error", nil, catbird.EnqueueOptions{}); err != nil {
+	if _, err := catbird.Enqueue(ctx, pool, "done", "late_error", nil, catbird.EnqueueOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
 	var calls int32
 	ran := make(chan struct{}, 4)
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Worker("late_error", func(ctx context.Context, job *catbird.Message) error {
+	rt.Worker("late_error", func(ctx context.Context, job *catbird.Job) error {
 		atomic.AddInt32(&calls, 1)
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback(ctx)
-		if err := client.CompleteJob(ctx, tx, job); err != nil {
+		if err := catbird.Complete(ctx, tx, job); err != nil {
 			return err
 		}
 		if err := tx.Commit(ctx); err != nil {

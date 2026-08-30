@@ -14,7 +14,7 @@ import (
 // on anything.
 var ErrNotFound = errors.New("catbird: not found")
 
-// ErrLeaseExpired is returned by CompleteJob when the job's lease ran out and
+// ErrLeaseExpired is returned by Complete when the job's lease ran out and
 // another worker claimed it. The work of the late attempt is not the queue's any
 // more: roll its transaction back.
 var ErrLeaseExpired = errors.New("catbird: lease expired before completion")
@@ -25,18 +25,28 @@ const (
 	statusDead int16 = 1 // failed permanently or canceled; never claimed again
 )
 
-// Message is one row of cb_messages plus the job fields a worker needs.
+// Message is a published message, as a consumer reads it.
 type Message struct {
+	ID        int64
+	Position  int64 // place in the stream, in commit order
+	Topic     string
+	Payload   json.RawMessage
+	CreatedAt time.Time // insert time, not commit time: it does not follow position order
+}
+
+// Job is one claimed unit of work, as a handler is given it: the message it was
+// enqueued with, and what its attempt needs to know. A job has no position; it
+// is not part of the stream.
+type Job struct {
 	ID            int64
-	Position      int64 // place in the stream; 0 for job inputs
 	Topic         string
 	Payload       json.RawMessage
-	CreatedAt     time.Time                  // insert time, not commit time: it does not follow position order
+	CreatedAt     time.Time                  // insert time of the message the job was enqueued with
 	Signals       map[string]json.RawMessage // payloads delivered with DeliverSignal; nil when none
 	Attempts      int                        // 1 on the first run
 	CorrelationID string
 
-	completed bool // CompleteJob's delete succeeded, so the worker does not repeat it
+	completed bool // Complete's delete succeeded, so the worker does not repeat it
 }
 
 // Conn is the part of pgx.Tx and *pgxpool.Pool this package uses: a pool, a
@@ -44,12 +54,6 @@ type Message struct {
 type Conn interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
-}
-
-type Client struct{}
-
-func NewClient() *Client {
-	return &Client{}
 }
 
 // EnqueueOptions are the optional parts of Enqueue.
@@ -62,7 +66,7 @@ type EnqueueOptions struct {
 
 // Publish appends a message to the stream: consumers see it, no worker runs it.
 // Returns the message id, or 0 when dedupKey already exists.
-func (c *Client) Publish(ctx context.Context, db Conn, topic string, payload any, dedupKey string) (int64, error) {
+func Publish(ctx context.Context, db Conn, topic string, payload any, dedupKey string) (int64, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return 0, err
@@ -96,7 +100,7 @@ type BatchMessage struct {
 // number of messages is not limited by the number of statement parameters. Like
 // Publish it sends no notification: the assigner announces the messages when it
 // gives them their positions.
-func (c *Client) PublishBatch(ctx context.Context, db Conn, msgs []BatchMessage) (int, error) {
+func PublishBatch(ctx context.Context, db Conn, msgs []BatchMessage) (int, error) {
 	if len(msgs) == 0 {
 		return 0, nil
 	}
@@ -120,14 +124,15 @@ func (c *Client) PublishBatch(ctx context.Context, db Conn, msgs []BatchMessage)
 }
 
 // Enqueue appends a message and a claim for it, and wakes the queue's workers
-// unless the job still waits on dependencies. Returns the message id, or 0 when
-// opts.DedupKey already exists.
+// unless the job still waits on dependencies. Returns the job's id, which is
+// what ResolveDependency, DeliverSignal, SetOutput and Output address it by, or
+// 0 when opts.DedupKey already exists.
 //
 // One statement does all three. The wake CTE calls pg_notify only when
 // dependencies = 0; the final LEFT JOIN references it so that it runs (an
 // unreferenced SELECT CTE is never executed). The notification is delivered
 // when the caller's transaction commits, together with the row.
-func (c *Client) Enqueue(ctx context.Context, db Conn, topic, queue string, payload any, opts EnqueueOptions) (int64, error) {
+func Enqueue(ctx context.Context, db Conn, topic, queue string, payload any, opts EnqueueOptions) (int64, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return 0, err
@@ -173,7 +178,7 @@ func (c *Client) Enqueue(ctx context.Context, db Conn, topic, queue string, payl
 // rather than the wake-ups — Postgres delivers identical notifications from one
 // transaction once whatever we do. Reading the claim CTE through a LIMIT does
 // not cut the insert short; a data-modifying CTE always runs in full.
-func (c *Client) EnqueueBatch(ctx context.Context, db Conn, queue string, msgs []BatchMessage, opts EnqueueOptions) (int, error) {
+func EnqueueBatch(ctx context.Context, db Conn, queue string, msgs []BatchMessage, opts EnqueueOptions) (int, error) {
 	if len(msgs) == 0 {
 		return 0, nil
 	}
@@ -211,7 +216,7 @@ func (c *Client) EnqueueBatch(ctx context.Context, db Conn, queue string, msgs [
 	return created, err
 }
 
-// CompleteJob finishes a job: it deletes the claim and the signals delivered to
+// Complete finishes a job: it deletes the claim and the signals delivered to
 // it. A worker does this itself when the handler returns nil, so a handler only
 // calls it to put the completion in the same transaction as its own writes,
 // which is what makes the job's work and the job's end one commit. attempts is
@@ -226,7 +231,7 @@ func (c *Client) EnqueueBatch(ctx context.Context, db Conn, queue string, msgs [
 // caller's transaction committed: a handler that completes the job, rolls the
 // transaction back, and then returns nil leaves a claim nothing deletes until
 // the lease runs out and the job runs again.
-func (c *Client) CompleteJob(ctx context.Context, db Conn, job *Message) error {
+func Complete(ctx context.Context, db Conn, job *Job) error {
 	var completed int
 	err := db.QueryRow(ctx, `
 		WITH claim AS (
@@ -250,7 +255,7 @@ func (c *Client) CompleteJob(ctx context.Context, db Conn, job *Message) error {
 
 // Cancel marks every live job with this correlation id dead. A job that is
 // already running finishes; cancel only stops jobs from starting.
-func (c *Client) Cancel(ctx context.Context, db Conn, correlationID string) error {
+func Cancel(ctx context.Context, db Conn, correlationID string) error {
 	_, err := db.Exec(ctx, `
 		UPDATE cb_claims SET status = $2
 		WHERE correlation_id = $1 AND status = $3
@@ -260,7 +265,7 @@ func (c *Client) Cancel(ctx context.Context, db Conn, correlationID string) erro
 
 // GC deletes dead claims and messages older than retention. A message that
 // still has a claim is kept, however old it is. Signals go with their message.
-func (c *Client) GC(ctx context.Context, db Conn, retention time.Duration) error {
+func GC(ctx context.Context, db Conn, retention time.Duration) error {
 	_, err := db.Exec(ctx, `
 		DELETE FROM cb_claims
 		WHERE status = $2 AND visible_at < now() - $1::interval
@@ -279,7 +284,7 @@ func (c *Client) GC(ctx context.Context, db Conn, retention time.Duration) error
 // ResolveDependency counts one dependency of the job as done and wakes the queue
 // when it was the last one. Returns ErrNotFound when the job is not waiting.
 // Same shape as Enqueue: the wake CTE notifies only when the count hit 0.
-func (c *Client) ResolveDependency(ctx context.Context, db Conn, messageID int64) error {
+func ResolveDependency(ctx context.Context, db Conn, jobID int64) error {
 	var left int
 	err := db.QueryRow(ctx, `
 		WITH counted AS (
@@ -291,7 +296,7 @@ func (c *Client) ResolveDependency(ctx context.Context, db Conn, messageID int64
 			SELECT pg_notify('cb_queue_' || queue, '') FROM counted WHERE dependencies = 0
 		)
 		SELECT dependencies FROM counted LEFT JOIN wake ON true
-	`, messageID, statusLive).Scan(&left)
+	`, jobID, statusLive).Scan(&left)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -307,7 +312,7 @@ func (c *Client) ResolveDependency(ctx context.Context, db Conn, messageID int64
 // only if the insert happened, so a duplicate can never decrement twice. When
 // nothing was counted a second query tells a duplicate (fine) from a job that
 // is not waiting (ErrNotFound).
-func (c *Client) DeliverSignal(ctx context.Context, db Conn, messageID int64, name string, payload any) error {
+func DeliverSignal(ctx context.Context, db Conn, jobID int64, name string, payload any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -333,7 +338,7 @@ func (c *Client) DeliverSignal(ctx context.Context, db Conn, messageID int64, na
 			SELECT pg_notify('cb_queue_' || queue, '') FROM counted WHERE dependencies = 0
 		)
 		SELECT dependencies FROM counted LEFT JOIN wake ON true
-	`, messageID, name, body, statusLive).Scan(&left)
+	`, jobID, name, body, statusLive).Scan(&left)
 	if err == nil {
 		return nil
 	}
@@ -345,7 +350,7 @@ func (c *Client) DeliverSignal(ctx context.Context, db Conn, messageID int64, na
 	var delivered bool
 	err = db.QueryRow(ctx, `
 		SELECT EXISTS (SELECT 1 FROM cb_signals WHERE message_id = $1 AND name = $2)
-	`, messageID, name).Scan(&delivered)
+	`, jobID, name).Scan(&delivered)
 	if err != nil {
 		return err
 	}
@@ -358,7 +363,7 @@ func (c *Client) DeliverSignal(ctx context.Context, db Conn, messageID int64, na
 // SetOutput stores the job's result. Call it from the handler with the
 // handler's tx so the result commits with the job's completion. A second call
 // replaces the first.
-func (c *Client) SetOutput(ctx context.Context, db Conn, messageID int64, output any) error {
+func SetOutput(ctx context.Context, db Conn, jobID int64, output any) error {
 	body, err := json.Marshal(output)
 	if err != nil {
 		return err
@@ -366,14 +371,14 @@ func (c *Client) SetOutput(ctx context.Context, db Conn, messageID int64, output
 	_, err = db.Exec(ctx, `
 		INSERT INTO cb_outputs (message_id, output) VALUES ($1, $2)
 		ON CONFLICT (message_id) DO UPDATE SET output = EXCLUDED.output
-	`, messageID, body)
+	`, jobID, body)
 	return err
 }
 
 // Output returns the result a job stored with SetOutput, or ErrNotFound.
-func (c *Client) Output(ctx context.Context, db Conn, messageID int64) (json.RawMessage, error) {
+func Output(ctx context.Context, db Conn, jobID int64) (json.RawMessage, error) {
 	var out json.RawMessage
-	err := db.QueryRow(ctx, `SELECT output FROM cb_outputs WHERE message_id = $1`, messageID).Scan(&out)
+	err := db.QueryRow(ctx, `SELECT output FROM cb_outputs WHERE message_id = $1`, jobID).Scan(&out)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
