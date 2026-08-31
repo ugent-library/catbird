@@ -127,10 +127,19 @@ func (w *worker) takeFreeSlots(free chan struct{}, backlog bool) int {
 // transaction, no connection. When the handler returns nil and did not complete
 // the job in a transaction of its own, the worker completes it with one
 // statement; an error schedules a retry or marks the job dead, and a shutdown
-// hands the job back.
+// hands the job back. An attempt that runs past the queue's Timeout is a failed
+// attempt like any other.
 func (w *worker) run(ctx context.Context, job *Job) {
 	registered := w.handlers[job.Type]
-	err := registered.handle(ctx, job)
+
+	// The handler's context carries the queue's Timeout and is never a shadow of
+	// ctx: the switch below tells a shutdown from a failure by the worker's
+	// context, and a timeout that had cancelled that one would give the attempt
+	// back instead of counting it, so a handler that always times out would be
+	// claimed again at once, forever.
+	handlerCtx, cancelHandler := context.WithTimeout(ctx, w.queue.opts.Timeout)
+	defer cancelHandler()
+	err := registered.handle(handlerCtx, job)
 
 	// The statements after the handler run on a context detached from the
 	// worker's, with a bound of their own. At shutdown the worker's context is

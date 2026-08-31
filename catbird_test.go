@@ -1351,6 +1351,68 @@ func TestShutdownReturnsTheJob(t *testing.T) {
 	}
 }
 
+// A handler that runs past the queue's Timeout has its context cancelled, and
+// the attempt is counted as a failure like any other: the retry waits MinBackoff
+// and the attempt is not given back. What decides that is the worker's own
+// context, which the timeout does not touch. A timeout that cancelled it would
+// look like a shutdown, and a handler that always times out would be given its
+// attempt back and claimed again at once, forever.
+func TestTimeoutCountsTheAttemptAsFailed(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const backoff = 500 * time.Millisecond
+	// The lease is far enough from the backoff to tell the two apart below.
+	queue := catbird.NewQueue("timeouts", catbird.QueueOptions{
+		Lease:        5 * time.Second,
+		Timeout:      100 * time.Millisecond,
+		PollInterval: 25 * time.Millisecond,
+	})
+	hangs := catbird.NewJobType("hangs", queue, catbird.JobTypeOptions{MinBackoff: backoff})
+
+	if _, err := catbird.Enqueue(ctx, pool, hangs, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int32
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Handle(hangs, func(ctx context.Context, job *catbird.Job) error {
+		atomic.AddInt32(&calls, 1)
+		<-ctx.Done() // the queue's Timeout, with the runtime still running
+		return ctx.Err()
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	stopped := make(chan struct{})
+	go func() {
+		rt.Start(runCtx)
+		close(stopped)
+	}()
+	// The handler hangs until its attempt times out, so the runtime is stopped
+	// and waited for before the pool closes.
+	t.Cleanup(func() {
+		stop()
+		<-stopped
+	})
+
+	// The wait is read in the database's clock, like the backoff test below: the
+	// retry is an interval added to the server's now(). It is a band and not
+	// "some time from now" because a running job also has visible_at in the
+	// future: the claim set it a lease ahead. The first retry of a failed
+	// attempt is MinBackoff exactly, a give-back leaves visible_at at now()
+	// below the band, and a running attempt leaves it a lease ahead, above it.
+	waitFor(t, 5*time.Second, "no retry a backoff away: the timed-out attempt was not counted as a failure", func() bool {
+		return count(t, pool, `
+			SELECT count(*) FROM cb_claims
+			WHERE queue = 'timeouts' AND status = 0 AND attempts = 1
+			  AND visible_at > now() + $1::interval AND visible_at < now() + $2::interval
+		`, backoff/2, backoff*2) == 1
+	})
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Errorf("the handler ran %d times, want 1: the timed-out attempt was given back instead of counted", n)
+	}
+}
+
 // A handler that completes the job and then returns an error is not retried:
 // the completion committed, and the retry carries the attempts lease token, so
 // it finds no claim to correct.

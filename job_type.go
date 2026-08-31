@@ -16,9 +16,21 @@ type Handler func(ctx context.Context, job *Job) error
 // QueueOptions are the optional parts of NewQueue. Zero values take the defaults.
 type QueueOptions struct {
 	BatchSize    int           // jobs running at once; default 50
-	Lease        time.Duration // how long one attempt may run; default 5 minutes
+	Lease        time.Duration // how long one attempt keeps its claim; default 5 minutes
 	PollInterval time.Duration // wake-up interval when no notification arrives; default 5 seconds
-	Logger       *slog.Logger  // default: the runtime's logger
+
+	// Timeout bounds one attempt: the handler's context is cancelled when it
+	// passes and the attempt counts as failed like any other. It ends the
+	// attempt and not the goroutine — a handler that never looks at its context
+	// keeps its slot until it returns.
+	//
+	// The default keeps the completion's few seconds inside the lease, and a
+	// larger value is lowered to Lease: past the lease another worker may hold
+	// the claim, so the retry would update no row and the failure would not be
+	// recorded.
+	Timeout time.Duration
+
+	Logger *slog.Logger // default: the runtime's logger
 }
 
 func (o QueueOptions) withDefaults() QueueOptions {
@@ -31,13 +43,22 @@ func (o QueueOptions) withDefaults() QueueOptions {
 	if o.PollInterval <= 0 {
 		o.PollInterval = 5 * time.Second
 	}
+	if o.Timeout <= 0 {
+		// Room for the completion inside the lease, and never less than half of
+		// it, so a short lease still leaves the handler most of its time.
+		o.Timeout = max(o.Lease-afterHandlerTimeout, o.Lease/2)
+	}
+	if o.Timeout > o.Lease {
+		o.Timeout = o.Lease
+	}
 	return o
 }
 
-// Queue is a name and how work runs under it: how many jobs run at once, and
-// how long one attempt may take. It decides who competes with whom — every job
-// type on one queue takes its slots from the same BatchSize — and it is the
-// claim key, the single value a worker probes the ready index with.
+// Queue is a name and how work runs under it: how many jobs run at once, how
+// long an attempt keeps its claim, and how long a handler may run. It decides
+// who competes with whom — every job type on one queue takes its slots from the
+// same BatchSize — and it is the claim key, the single value a worker probes the
+// ready index with.
 //
 // Lease is here rather than on the job type because the claim sets it for a
 // whole batch in one statement. A job type whose handler runs much longer than

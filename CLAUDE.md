@@ -49,8 +49,8 @@ It talks to the same database directly and needs no Go build.
 Five files, one migration, no packages:
 
 - `job_type.go` — the two declarations an application writes. `Queue` is a name
-  and how work runs under it: `BatchSize`, `Lease`, `PollInterval`. It decides
-  who competes with whom, and it is the claim key. `JobType` is a kind of job:
+  and how work runs under it: `BatchSize`, `Lease`, `Timeout`, `PollInterval`.
+  It decides who competes with whom, and it is the claim key. `JobType` is a kind of job:
   its name, its queue, and how a run of it is retried (`Signal`,
   `MaxAttempts`, `MinBackoff`, `MaxBackoff`, `OnDead`). Both are plain Go values; nothing about
   them is written to the database, and only their names reach a row. The
@@ -73,7 +73,10 @@ Five files, one migration, no packages:
   `LISTEN` connection that wakes the rest. One `Runtime` per process owns the
   pool and one goroutine per queue and trigger.
 - `worker.go` — the claim loop, dispatch by job type, completion, retries,
-  `OnDead`. One worker per queue, however many job types run on it.
+  `OnDead`. One worker per queue, however many job types run on it. The handler
+  runs on a context of its own carrying the queue's `Timeout`; the worker's own
+  context is what tells a shutdown from a failure, so the two are never the same
+  variable.
 - `trigger.go` — `Runtime.Trigger`: the loop that turns stream messages into
   jobs. The reads it uses live in `client.go` with the other statements.
 - `migrations/00001_lite.sql` — the whole schema. Goose markers, no goose
@@ -135,10 +138,12 @@ client exists.
   cannot be read as index arms and walks the position index instead.
 - The assigner only sets positions that are still empty, so two assigners
   running at once cannot move a position a reader may already have passed.
-- `BatchSize` and `Lease` are queue settings; `MaxAttempts`, `MinBackoff`,
-  `MaxBackoff` and `OnDead` are job type settings. `Lease` is on the queue because the claim sets
-  it for a whole batch in one statement. The handler belongs to neither: it is
-  the process's, and `rt.Handle(jobType, handler)` is where the two meet.
+- `BatchSize`, `Lease` and `Timeout` are queue settings; `MaxAttempts`,
+  `MinBackoff`, `MaxBackoff` and `OnDead` are job type settings. `Lease` is on
+  the queue because the claim sets it for a whole batch in one statement, and
+  `Timeout` because it has to agree with `Lease`. The handler belongs to
+  neither: it is the process's, and `rt.Handle(jobType, handler)` is where the
+  two meet.
 - Hot-path SQL takes no joins, no advisory locks (the assigner's is the one
   exception), and no N+1 loops.
 - The unique indexes on `dedup_key` and `position` are partial. Deduplicating
