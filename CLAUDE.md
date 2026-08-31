@@ -59,8 +59,8 @@ Five files, one migration, no packages:
   registration.
 - `client.go` — every statement a caller runs, as package functions:
   `Publish`, `PublishBatch`, `Enqueue`, `EnqueueBatch`, `Complete`, `Signal`,
-  `Cancel`, `GC`, `Output`, `Outputs`, and the stream reads `ReadAfter`,
-  `LastPosition` and `OldestPosition`. Each takes a `Conn` — a pool, a
+  `Cancel`, `Status`, `GC`, `Output`, `Outputs`, and the stream reads
+  `ReadAfter`, `LastPosition` and `OldestPosition`. Each takes a `Conn` — a pool, a
   connection, or a transaction — and holds no state; what a process runs lives
   on the `Runtime`. It also holds the three values a caller handles: `Message`,
   a published message as a reader gets it; `Job`, one claimed unit of work as a
@@ -87,8 +87,9 @@ Five files, one migration, no packages:
 **Tables.** `cb_messages` holds every job's payload and every published message,
 one row, written once. `cb_claims` holds one narrow row per job that still has
 to run, rewritten on every claim and retry, deleted on completion; it carries
-the queue, the job type, the workflow, what the job waits for, and the signal
-payload once one arrives. `cb_cursors` and `cb_outputs` are one row each per
+the queue, the job type, the workflow, what the job waits for, the signal
+payload once one arrives, whether any worker will claim it again, and what the
+last failed attempt returned. `cb_cursors` and `cb_outputs` are one row each per
 stream consumer and per job result.
 
 **Queue and job type are two things.** The queue is the claim key and the
@@ -128,6 +129,23 @@ client exists.
 - A job waiting for a signal has `visible_at = 'infinity'`, so waiting is a
   delay and needs no place in the ready index. `Signal` writes the payload and
   sets `visible_at` to `now()`.
+- What a job is doing is not stored. `cb_claims.dead` is one bit — no worker
+  will claim this job again — and `Status` derives the eight states a caller
+  sees from `visible_at`, `attempts`, `dependencies`, `awaits_signal` and
+  `last_error`. There is deliberately no `status` column: the word names the
+  derived answer, and a column of the same name meant something narrower in the
+  same statement, which is what a second client stumbles over.
+- `cb_claims` declares its columns widest first, so the fixed-width ones pack
+  with no padding between them: 75 bytes against 79, on the row every claim and
+  retry rewrites. A column added in the middle by role rather than by width
+  costs padding.
+- The failure writes `last_error` and the claim clears it, which is the only
+  thing that tells `StatusRunning` from `StatusWaitingToRetry`: both are a live
+  claim with `visible_at` in the future and an attempt spent. The write carries
+  the `attempts` lease token like the retry it rides on, so a late attempt
+  records no error text either, and the 256-character cut keeps a claim row out
+  of TOAST. It is not a run history: the next failure overwrites it and the
+  completion deletes it with the row.
 - A workflow is `coalesce(group_id, message_id)` of the job that started it.
   `group_id` is NULL on a job that stands alone, which keeps the volume of
   single-shot jobs out of `cb_claims_group_idx` and off its write cost.

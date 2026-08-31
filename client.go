@@ -29,11 +29,35 @@ var ErrLeaseExpired = errors.New("catbird: lease expired before completion")
 // a prefix followed by ".#", or "#".
 var ErrBadPattern = errors.New("catbird: invalid topic pattern")
 
-// Claim status values.
+// JobStatus is what a job is doing. No column holds it; Status derives it.
+type JobStatus int
+
 const (
-	statusLive int16 = 0 // ready, waiting, or claimed; visible_at and dependencies tell which
-	statusDead int16 = 1 // failed permanently or canceled; never claimed again
+	StatusQueued           JobStatus = iota // ready, waiting for a worker to take it
+	StatusScheduled                         // never claimed, the start time is still ahead
+	StatusRunning                           // a worker holds the lease
+	StatusWaitingToRetry                    // an attempt failed, the retry is scheduled
+	StatusWaitingForSignal                  // waiting for Signal to deliver a payload
+	StatusWaitingForJobs                    // waiting for the jobs it was enqueued after
+	StatusDead                              // failed permanently, or Cancel stopped it
+	StatusCompleted                         // the message is here and its claim is gone
 )
+
+// statusNames are the words the statement in Status returns, in constant order.
+// The statement names the states so another client reads them out of the SQL.
+var statusNames = [...]string{
+	"queued", "scheduled", "running", "waiting to retry",
+	"waiting for signal", "waiting for jobs", "dead", "completed",
+}
+
+// String returns the word the statement returns, so a log line and a database
+// read of the same job agree.
+func (s JobStatus) String() string {
+	if s < 0 || int(s) >= len(statusNames) {
+		return fmt.Sprintf("JobStatus(%d)", int(s))
+	}
+	return statusNames[s]
+}
 
 // Message is a published message, as a consumer reads it.
 type Message struct {
@@ -537,7 +561,7 @@ func Complete(ctx context.Context, db Conn, job *Job) error {
 		dependent_job AS (
 		    UPDATE cb_claims SET dependencies = dependencies - 1
 		    WHERE message_id IN (SELECT unnest(dependent_job_ids) FROM claim)
-		      AND status = 0 AND dependencies > 0
+		      AND NOT dead AND dependencies > 0
 		    RETURNING queue, dependencies, visible_at
 		),
 		new_job AS MATERIALIZED (
@@ -604,14 +628,14 @@ func Signal(ctx context.Context, db Conn, groupID int64, t *JobType, payload any
 		WITH gated AS (
 			UPDATE cb_claims SET signal = $3, visible_at = now()
 			WHERE (group_id = $1 OR message_id = $1) AND job_type = $2
-			  AND status = $4 AND awaits_signal AND signal IS NULL
+			  AND NOT dead AND awaits_signal AND signal IS NULL
 			RETURNING queue, dependencies
 		),
 		wake AS (
 			SELECT pg_notify('cb_queue_' || queue, '') FROM gated WHERE dependencies = 0
 		)
 		SELECT (SELECT count(*) FROM gated), (SELECT count(*) FROM wake)
-	`, groupID, t.name, body, statusLive).Scan(&delivered, &woken)
+	`, groupID, t.name, body).Scan(&delivered, &woken)
 	if err != nil {
 		return err
 	}
@@ -626,10 +650,55 @@ func Signal(ctx context.Context, db Conn, groupID int64, t *JobType, payload any
 // starting.
 func Cancel(ctx context.Context, db Conn, groupID int64) error {
 	_, err := db.Exec(ctx, `
-		UPDATE cb_claims SET status = $2
-		WHERE (group_id = $1 OR message_id = $1) AND status = $3
-	`, groupID, statusDead, statusLive)
+		UPDATE cb_claims SET dead = true
+		WHERE (group_id = $1 OR message_id = $1) AND NOT dead
+	`, groupID)
 	return err
+}
+
+// Status reports what one job is doing, the attempts it has spent, and what its
+// last failed attempt returned. Two primary-key probes; no column holds a state.
+//
+// lastError is empty while an attempt runs, because the claim clears it. That is
+// what separates StatusRunning from StatusWaitingToRetry.
+//
+// StatusCompleted means the message is here and its claim is gone, so it lasts
+// only as long as the message: after GC the job returns ErrNotFound, as does a
+// published message's id.
+func Status(ctx context.Context, db Conn, id int64) (status JobStatus, attempts int, lastError string, err error) {
+	var name string
+	var text *string
+	err = db.QueryRow(ctx, `
+		SELECT CASE
+		           WHEN claim.message_id IS NULL THEN 'completed'
+		           WHEN claim.dead THEN 'dead'
+		           WHEN claim.awaits_signal AND claim.signal IS NULL THEN 'waiting for signal'
+		           WHEN claim.dependencies > 0 THEN 'waiting for jobs'
+		           WHEN claim.visible_at <= now() THEN 'queued'
+		           WHEN claim.attempts = 0 THEN 'scheduled'
+		           WHEN claim.last_error IS NOT NULL THEN 'waiting to retry'
+		           ELSE 'running'
+		       END,
+		       coalesce(claim.attempts, 0), claim.last_error
+		FROM cb_messages message
+		LEFT JOIN cb_claims claim ON claim.message_id = message.id
+		WHERE message.id = $1 AND NOT message.stream
+	`, id).Scan(&name, &attempts, &text)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, 0, "", ErrNotFound
+	}
+	if err != nil {
+		return 0, 0, "", err
+	}
+	if text != nil {
+		lastError = *text
+	}
+	for i, n := range statusNames {
+		if n == name {
+			return JobStatus(i), attempts, lastError, nil
+		}
+	}
+	return 0, 0, "", fmt.Errorf("catbird: unknown job status %q", name)
 }
 
 // GC deletes dead claims and messages older than retention. A message that
@@ -637,8 +706,8 @@ func Cancel(ctx context.Context, db Conn, groupID int64) error {
 func GC(ctx context.Context, db Conn, retention time.Duration) error {
 	_, err := db.Exec(ctx, `
 		DELETE FROM cb_claims
-		WHERE status = $2 AND visible_at < now() - $1::interval
-	`, retention, statusDead)
+		WHERE dead AND visible_at < now() - $1::interval
+	`, retention)
 	if err != nil {
 		return err
 	}

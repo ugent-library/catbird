@@ -832,7 +832,7 @@ func TestGCKeepsLiveClaims(t *testing.T) {
 	if err := catbird.Cancel(ctx, pool, doomedID); err != nil {
 		t.Fatal(err)
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE status = 0 AND dependencies = 0 AND visible_at <= now()"); n != 0 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE NOT dead AND dependencies = 0 AND visible_at <= now()"); n != 0 {
 		t.Fatalf("canceled job still claimable")
 	}
 
@@ -1005,7 +1005,7 @@ func TestFailedAttemptWritesNoOutput(t *testing.T) {
 	waitFor(t, 5*time.Second, "the failed attempt scheduled no retry", func() bool {
 		return count(t, pool, `
 			SELECT count(*) FROM cb_claims
-			WHERE queue = 'output_retries' AND status = 0 AND attempts = 1
+			WHERE queue = 'output_retries' AND NOT dead AND attempts = 1
 			  AND visible_at > now()
 		`) == 1
 	})
@@ -1404,7 +1404,7 @@ func TestTimeoutCountsTheAttemptAsFailed(t *testing.T) {
 	waitFor(t, 5*time.Second, "no retry a backoff away: the timed-out attempt was not counted as a failure", func() bool {
 		return count(t, pool, `
 			SELECT count(*) FROM cb_claims
-			WHERE queue = 'timeouts' AND status = 0 AND attempts = 1
+			WHERE queue = 'timeouts' AND NOT dead AND attempts = 1
 			  AND visible_at > now() + $1::interval AND visible_at < now() + $2::interval
 		`, backoff/2, backoff*2) == 1
 	})
@@ -1503,7 +1503,7 @@ func TestHandlerErrorSchedulesARetryAfterBackoff(t *testing.T) {
 	waitFor(t, 5*time.Second, "the failed attempt scheduled no retry a backoff away", func() bool {
 		return count(t, pool, `
 			SELECT count(*) FROM cb_claims
-			WHERE queue = 'retries' AND status = 0 AND attempts = 1
+			WHERE queue = 'retries' AND NOT dead AND attempts = 1
 			  AND visible_at > now() + $1::interval
 		`, backoff/2) == 1
 	})
@@ -1547,7 +1547,7 @@ func TestMaxBackoffCapsTheGrowingWait(t *testing.T) {
 	waitFor(t, 10*time.Second, "the job did not spend its attempts: the wait grew past MaxBackoff", func() bool {
 		return count(t, pool, `
 			SELECT count(*) FROM cb_claims
-			WHERE queue = 'capped' AND status = 1 AND attempts = 18
+			WHERE queue = 'capped' AND dead AND attempts = 18
 		`) == 1
 	})
 }
@@ -1619,7 +1619,7 @@ func TestMaxAttemptsMarksTheJobDeadAndRunsOnDead(t *testing.T) {
 	if n := len(dead); n != 0 {
 		t.Errorf("OnDead ran %d more times, want once", n)
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE message_id = $1 AND status = 1 AND attempts = 3", id); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE message_id = $1 AND dead AND attempts = 3", id); n != 1 {
 		t.Error("the dead job's claim is not marked dead at its last attempt")
 	}
 	if n := atomic.LoadInt32(&patientCalls); n <= 3 {
@@ -1667,12 +1667,12 @@ func TestADeadJobCancelsItsWorkflow(t *testing.T) {
 	waitFor(t, 10*time.Second, "the sibling of the dead job was never canceled", func() bool {
 		return count(t, pool, `
 			SELECT count(*) FROM cb_claims
-			WHERE group_id = $1 AND job_type = 'sibling' AND status = 1
+			WHERE group_id = $1 AND job_type = 'sibling' AND dead
 		`, groupID) == 1
 	})
 	if n := count(t, pool, `
 		SELECT count(*) FROM cb_claims
-		WHERE message_id = $1 AND status = 0 AND dependencies = 0 AND visible_at <= now()
+		WHERE message_id = $1 AND NOT dead AND dependencies = 0 AND visible_at <= now()
 	`, bystander); n != 1 {
 		t.Error("the cascade took a job outside the workflow")
 	}
@@ -1722,7 +1722,7 @@ func TestCancelStopsWaitingJobsAndLetsARunningOneFinish(t *testing.T) {
 	if err := catbird.Cancel(ctx, pool, groupID); err != nil {
 		t.Fatal(err)
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE group_id = $1 AND job_type = 'waiting' AND status = 1", groupID); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE group_id = $1 AND job_type = 'waiting' AND dead", groupID); n != 1 {
 		t.Error("the waiting job was not canceled")
 	}
 	close(release)
@@ -1734,7 +1734,7 @@ func TestCancelStopsWaitingJobsAndLetsARunningOneFinish(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if n := count(t, pool, `
 		SELECT count(*) FROM cb_claims
-		WHERE group_id = $1 AND job_type = 'waiting' AND status = 1 AND attempts = 0
+		WHERE group_id = $1 AND job_type = 'waiting' AND dead AND attempts = 0
 	`, groupID); n != 1 {
 		t.Error("the canceled job was claimed after all: its claim is not the untouched row Cancel left")
 	}
@@ -1957,5 +1957,214 @@ func TestListenReconnectsAfterTheConnectionDrops(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the job did not run: no notification arrived after the reconnect")
+	}
+}
+
+// Every state Status reports comes from columns that were already there. The
+// ones below need no worker: a job's row says it is queued, scheduled or waiting
+// before anything has claimed it.
+func TestStatusReportsWhatAJobIsDoing(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("states", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	plain := catbird.NewJobType("plain", queue, catbird.JobTypeOptions{})
+	gate := catbird.NewJobType("gate", queue, catbird.JobTypeOptions{Signal: true})
+	// Nothing handles this type, so the jobs a handler fans out to it stay where
+	// they are and the job enqueued after them keeps waiting.
+	stuck := catbird.NewJobType("stuck", catbird.NewQueue("nobody", catbird.QueueOptions{}), catbird.JobTypeOptions{})
+	joins := catbird.NewJobType("joins", queue, catbird.JobTypeOptions{})
+
+	status := func(id int64) catbird.JobStatus {
+		t.Helper()
+		s, _, _, err := catbird.Status(ctx, pool, id)
+		if err != nil {
+			t.Fatalf("status of %d: %v", id, err)
+		}
+		return s
+	}
+
+	queued, err := catbird.Enqueue(ctx, pool, plain, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduled, err := catbird.Enqueue(ctx, pool, plain, nil, catbird.EnqueueOptions{Delay: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gated, err := catbird.Enqueue(ctx, pool, gate, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canceled, err := catbird.Enqueue(ctx, pool, plain, nil, catbird.EnqueueOptions{Delay: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catbird.Cancel(ctx, pool, canceled); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range []struct {
+		id   int64
+		want catbird.JobStatus
+	}{
+		{queued, catbird.StatusQueued},
+		{scheduled, catbird.StatusScheduled},
+		{gated, catbird.StatusWaitingForSignal},
+		{canceled, catbird.StatusDead},
+	} {
+		if got := status(c.id); got != c.want {
+			t.Errorf("job %d: %v, want %v", c.id, got, c.want)
+		}
+	}
+
+	// A signal turns the wait into a job that is ready to run.
+	if err := catbird.Signal(ctx, pool, gated, gate, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := status(gated); got != catbird.StatusQueued {
+		t.Errorf("signaled job: %v, want %v", got, catbird.StatusQueued)
+	}
+
+	// A published message is not a job, and neither is an id nothing was written
+	// under.
+	published, err := catbird.Publish(ctx, pool, "not.a.job", nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := catbird.Status(ctx, pool, published); !errors.Is(err, catbird.ErrNotFound) {
+		t.Errorf("status of a published message: %v, want ErrNotFound", err)
+	}
+	if _, _, _, err := catbird.Status(ctx, pool, published+10000); !errors.Is(err, catbird.ErrNotFound) {
+		t.Errorf("status of no such id: %v, want ErrNotFound", err)
+	}
+
+	// A completed job is a message whose claim is gone.
+	var fansOut int64
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Handle(plain, func(ctx context.Context, job *catbird.Job) error { return nil })
+	rt.Handle(joins, func(ctx context.Context, job *catbird.Job) error { return nil })
+	rt.Handle(gate, func(ctx context.Context, job *catbird.Job) error {
+		job.Enqueue(stuck, nil)
+		job.Enqueue(stuck, nil)
+		job.EnqueueAfter(joins, nil)
+		return nil
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	waitFor(t, 5*time.Second, "the queued job never completed", func() bool {
+		s, _, _, err := catbird.Status(ctx, pool, queued)
+		return err == nil && s == catbird.StatusCompleted
+	})
+
+	// The job the handler enqueued after two others waits for them, and they are
+	// on a queue nobody runs, so it keeps waiting.
+	waitFor(t, 5*time.Second, "the joining job never came to wait for its dependencies", func() bool {
+		return pool.QueryRow(ctx, `
+			SELECT message_id FROM cb_claims WHERE job_type = 'joins'
+		`).Scan(&fansOut) == nil
+	})
+	if got := status(fansOut); got != catbird.StatusWaitingForJobs {
+		t.Errorf("joining job: %v, want %v", got, catbird.StatusWaitingForJobs)
+	}
+}
+
+// Running and waiting to retry are the same row but for the error text: a live
+// claim with visible_at in the future and an attempt spent. The claim clears the
+// text, so what is there belongs to the attempt that is waiting and never to the
+// one running.
+func TestStatusTellsARunningJobFromOneWaitingToRetry(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("running", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	flaky := catbird.NewJobType("flaky", queue, catbird.JobTypeOptions{MinBackoff: time.Hour})
+
+	id, err := catbird.Enqueue(ctx, pool, flaky, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	started := make(chan struct{}, 2)
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Handle(flaky, func(ctx context.Context, job *catbird.Job) error {
+		started <- struct{}{}
+		<-release
+		return errors.New("the service is down")
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("the job never ran")
+	}
+	status, attempts, lastError, err := catbird.Status(ctx, pool, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != catbird.StatusRunning || attempts != 1 || lastError != "" {
+		t.Errorf("while the handler runs: %v, attempt %d, error %q; want running, attempt 1, no error",
+			status, attempts, lastError)
+	}
+
+	// The retry is an hour out, so the job stays where the failure left it.
+	close(release)
+	waitFor(t, 5*time.Second, "the failed attempt did not leave the job waiting to retry", func() bool {
+		status, attempts, lastError, err = catbird.Status(ctx, pool, id)
+		return err == nil && status == catbird.StatusWaitingToRetry
+	})
+	if attempts != 1 || lastError != "the service is down" {
+		t.Errorf("after the failure: attempt %d, error %q; want attempt 1, the handler's error", attempts, lastError)
+	}
+}
+
+// The text is cut to what the column holds, and a job that dies keeps it: a dead
+// claim is not deleted, so the error of the attempt that ended the job is the one
+// thing left to say why.
+func TestADeadJobKeepsItsLastError(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("dying", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	doomed := catbird.NewJobType("doomed", queue, catbird.JobTypeOptions{
+		MaxAttempts: 2,
+		MinBackoff:  10 * time.Millisecond,
+	})
+
+	id, err := catbird.Enqueue(ctx, pool, doomed, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	long := strings.Repeat("a wrapped error chain, ", 40) // 920 characters
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Handle(doomed, func(ctx context.Context, job *catbird.Job) error {
+		return errors.New(long)
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	var status catbird.JobStatus
+	var attempts int
+	var lastError string
+	waitFor(t, 5*time.Second, "the job never died", func() bool {
+		status, attempts, lastError, err = catbird.Status(ctx, pool, id)
+		return err == nil && status == catbird.StatusDead
+	})
+	if attempts != 2 {
+		t.Errorf("dead after %d attempts, want 2", attempts)
+	}
+	if len(lastError) != 256 || lastError != long[:256] {
+		t.Errorf("error text is %d characters, want the first 256 of what the handler returned", len(lastError))
 	}
 }

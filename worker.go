@@ -178,8 +178,8 @@ func (w *worker) run(ctx context.Context, job *Job) {
 func (w *worker) interrupted(ctx context.Context, job *Job, cause error) {
 	_, err := w.runtime.pool.Exec(ctx, `
 		UPDATE cb_claims SET attempts = attempts - 1, visible_at = now()
-		WHERE message_id = $1 AND attempts = $2 AND status = $3
-	`, job.ID, job.Attempts, statusLive)
+		WHERE message_id = $1 AND attempts = $2 AND NOT dead
+	`, job.ID, job.Attempts)
 	if err != nil {
 		w.logger.Error("catbird: returning an interrupted job failed", "queue", w.queue.name, "job_id", job.ID, "err", err, "cause", cause)
 		return
@@ -202,7 +202,8 @@ func (w *worker) interrupted(ctx context.Context, job *Job, cause error) {
 // means the claim is not this attempt's any more: the handler completed the job
 // and then returned an error, or the lease expired and another worker has it.
 // Neither is this attempt's failure to record, and the cascade must not run for
-// a job that is finished or running elsewhere.
+// a job that is finished or running elsewhere. The error text rides on the same
+// two writes, so an attempt that lost its lease records none.
 func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) {
 	log := w.logger.With("queue", w.queue.name, "job_type", job.Type, "job_id", job.ID, "attempt", job.Attempts)
 
@@ -210,9 +211,10 @@ func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) 
 		tag, err := w.runtime.pool.Exec(ctx, `
 			UPDATE cb_claims
 			SET visible_at = now() + $3::interval
-			    + (least($3::interval * 2 ^ least(attempts - 1, 20), $4::interval) - $3::interval) * random()
-			WHERE message_id = $1 AND attempts = $2 AND status = $5
-		`, job.ID, job.Attempts, t.opts.MinBackoff, t.opts.MaxBackoff, statusLive)
+			    + (least($3::interval * 2 ^ least(attempts - 1, 20), $4::interval) - $3::interval) * random(),
+			    last_error = left($5, 256)
+			WHERE message_id = $1 AND attempts = $2 AND NOT dead
+		`, job.ID, job.Attempts, t.opts.MinBackoff, t.opts.MaxBackoff, cause.Error())
 		switch {
 		case err != nil:
 			log.Error("catbird: scheduling retry failed", "err", err, "cause", cause)
@@ -225,8 +227,9 @@ func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) 
 	}
 
 	tag, err := w.runtime.pool.Exec(ctx, `
-		UPDATE cb_claims SET status = $3 WHERE message_id = $1 AND attempts = $2
-	`, job.ID, job.Attempts, statusDead)
+		UPDATE cb_claims SET dead = true, last_error = left($3, 256)
+		WHERE message_id = $1 AND attempts = $2
+	`, job.ID, job.Attempts, cause.Error())
 	if err != nil {
 		log.Error("catbird: marking dead failed", "err", err, "cause", cause)
 		return
@@ -252,15 +255,21 @@ func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) 
 // filter is what keeps a process from taking work it has no handler for: a job
 // of a type this process does not know is left for one that does, rather than
 // failing here.
+//
+// The claim clears last_error, so text on a row always belongs to the attempt
+// waiting to retry and never to the one running. That is what Status reads to
+// tell them apart. Clearing a NULL column is free: 372 bytes of WAL per row with
+// the clause and without it. On rows that do carry text it saves, 372 against
+// 629, because the claim writes a 75-byte tuple instead of a 336-byte one.
 func (w *worker) claimBatch(ctx context.Context, limit int) ([]*Job, error) {
 	rows, err := w.runtime.pool.Query(ctx, `
 		WITH leased AS (
 			UPDATE cb_claims
-			SET visible_at = now() + $2::interval, attempts = attempts + 1
+			SET visible_at = now() + $2::interval, attempts = attempts + 1, last_error = NULL
 			WHERE message_id IN (
 				SELECT message_id FROM cb_claims
-				WHERE queue = $1 AND status = $4 AND dependencies = 0 AND visible_at <= now()
-				  AND job_type = ANY($5)
+				WHERE queue = $1 AND NOT dead AND dependencies = 0 AND visible_at <= now()
+				  AND job_type = ANY($4)
 				ORDER BY visible_at ASC LIMIT $3
 				FOR UPDATE SKIP LOCKED
 			)
@@ -271,7 +280,7 @@ func (w *worker) claimBatch(ctx context.Context, limit int) ([]*Job, error) {
 		       l.job_type, l.attempts, l.group_id, l.signal, l.dependency_job_ids
 		FROM leased l
 		JOIN cb_messages m ON m.id = l.message_id
-	`, w.queue.name, w.queue.opts.Lease, limit, statusLive, w.names)
+	`, w.queue.name, w.queue.opts.Lease, limit, w.names)
 	if err != nil {
 		return nil, err
 	}

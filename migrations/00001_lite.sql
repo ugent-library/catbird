@@ -43,36 +43,52 @@ CREATE TABLE cb_cursors (
 -- One row per job that still has to run. Deleted when the job completes.
 -- visible_at is both the earliest start time and the lease deadline: a claimed
 -- job has visible_at in the future; when it passes, any worker may claim it again.
+--
+-- Columns run widest first so the fixed-width ones pack without padding: 75
+-- bytes a row instead of 79. Grouping them by role costs those 4 bytes on every
+-- claim and retry, so the comments carry the grouping.
 CREATE TABLE cb_claims (
     message_id BIGINT PRIMARY KEY REFERENCES cb_messages (id) ON DELETE CASCADE,
-    queue TEXT NOT NULL, -- the claim key: which workers may take this job
-    job_type TEXT NOT NULL, -- which handler runs it
     -- The workflow this job belongs to: the id of the job that started it.
     -- NULL for a job that started one or stands alone, so the volume of
-    -- single-shot jobs stays out of the index below and pays nothing for it
-    -- on every claim and retry. A job's own group is coalesce(group_id, message_id).
+    -- single-shot jobs stays out of cb_claims_group_idx below and pays nothing
+    -- for it on every claim and retry. A job's own group is
+    -- coalesce(group_id, message_id).
     group_id BIGINT,
     visible_at TIMESTAMPTZ NOT NULL,
-    status SMALLINT NOT NULL DEFAULT 0, -- 0 live, 1 dead (failed permanently or canceled)
     attempts SMALLINT NOT NULL DEFAULT 0, -- incremented on claim; doubles as the lease token
     -- How many jobs this one is still waiting for; it runs when this reaches 0.
     dependencies SMALLINT NOT NULL DEFAULT 0,
-    -- Which jobs those are, in the order they were enqueued, so a handler reads
-    -- the results of exactly the jobs it waited for instead of every job of
-    -- their type in the workflow. NULL on a job that waited for nothing.
+    -- No worker claims this job again: it failed permanently or Cancel stopped
+    -- it. One bit, not a state machine. What a job is doing is stored nowhere;
+    -- Status derives it from the columns here.
+    dead BOOLEAN NOT NULL DEFAULT false,
+    -- This job waits for a signal; the payload arrives in signal below. It sits
+    -- on visible_at = 'infinity', so the wait is a delay and needs no place in
+    -- the ready index. Signal writes the payload and sets visible_at to now().
+    awaits_signal BOOLEAN NOT NULL DEFAULT false,
+    queue TEXT NOT NULL, -- the claim key: which workers may take this job
+    job_type TEXT NOT NULL, -- which handler runs it
+    -- Which jobs it waits for, in the order they were enqueued, so a handler
+    -- reads the results of exactly the jobs it waited for instead of every job
+    -- of their type in the workflow. NULL on a job that waited for nothing.
     dependency_job_ids BIGINT[],
     -- The other direction: the jobs waiting for this one. Completing it takes one
     -- off each of their dependencies. All three are set by the completion that
     -- created them, out of the ids one statement handed out, so nothing outside
     -- catbird holds a count and no count can disagree with its list.
     dependent_job_ids BIGINT[],
-    -- Whether this job waits for a signal, and the payload once one arrived.
-    -- A waiting job has visible_at = 'infinity'; Signal writes the payload and
-    -- sets visible_at to now(), so the wait is a delay and needs no place in
-    -- the ready index. The payload lives here rather than in a table of its
-    -- own because it is created, read and deleted with the claim.
-    awaits_signal BOOLEAN NOT NULL DEFAULT false,
-    signal JSONB
+    -- The signal payload, once one arrived. It lives here and not in a table of
+    -- its own because it is created, read and deleted with the claim.
+    signal JSONB,
+    -- What the last failed attempt returned, cut to 256 characters. The claim
+    -- clears it, so text means the job is waiting to retry and no text means an
+    -- attempt is running; both are otherwise a live claim with visible_at in the
+    -- future. Not a run history: the next failure overwrites it and completion
+    -- deletes the row. A job that never failed pays nothing, and 256 characters
+    -- put the tuple at 336 bytes against 75 empty. Past about 1.9 kB every
+    -- failed attempt would compress the text and write it to a toast table.
+    last_error TEXT
 ) WITH (
     -- This table is small and rewritten constantly; vacuum it when 1% of it changed.
     autovacuum_vacuum_scale_factor = 0.01,
@@ -81,13 +97,13 @@ CREATE TABLE cb_claims (
 -- Only claimable rows are in the index; dead and waiting rows leave it on their
 -- own, and a job waiting for a signal sits at the far end on 'infinity' where
 -- the claim's LIMIT never reaches it.
-CREATE INDEX cb_claims_ready_idx ON cb_claims (queue, visible_at) WHERE status = 0 AND dependencies = 0;
+CREATE INDEX cb_claims_ready_idx ON cb_claims (queue, visible_at) WHERE NOT dead AND dependencies = 0;
 -- What Cancel and Signal probe. A worker cancels the group of every job that
 -- dies in one, so without this a downstream outage runs one full scan of
 -- cb_claims per dead job: 834 buffers and 4.9 ms at 100k live claims, against 6
 -- buffers here. Jobs outside a workflow stay out of a structure that can never
 -- match them: 112 kB against 2128 kB with 1% of jobs grouped.
-CREATE INDEX cb_claims_group_idx ON cb_claims (group_id) WHERE status = 0 AND group_id IS NOT NULL;
+CREATE INDEX cb_claims_group_idx ON cb_claims (group_id) WHERE NOT dead AND group_id IS NOT NULL;
 
 -- Optional result of a job. The handler records it with SetOutput and the
 -- completion writes it here, so a result cannot outlive an attempt that never
