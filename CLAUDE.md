@@ -46,7 +46,7 @@ It talks to the same database directly and needs no Go build.
 
 ## Layout
 
-Six files, one migration, no packages:
+Six files and one migration in the root package, and one package under it:
 
 - `job_type.go` — the two declarations an application writes. `Queue` is a name
   and how work runs under it: `BatchSize`, `Lease`, `Timeout`, `PollInterval`.
@@ -86,6 +86,15 @@ Six files, one migration, no packages:
   others.
 - `migrations/00001_lite.sql` — the whole schema. Goose markers, no goose
   dependency; the tests split the file on `-- +goose down`.
+- `wire/` — the browser layer, a package of its own so the core keeps no
+  `net/http`; DESIGN.md's "Wire" section is its spec and only the renderer
+  exists so far. `renderer.go` holds `Renderer`, a process-global mux from
+  topic patterns to handlers: the pattern grammar is the stream's plus
+  `{name}`, which matches one segment in Go and never reaches SQL, and
+  dispatch runs each rule once per distinct variable binding with that
+  binding's messages, so a batch of fifty edits renders a record once. A
+  handler error drops that call's fragments and the rest still go out. The
+  transports — `ServePoll` with the signed token, SSE — are not built yet.
 
 ## Architecture
 
