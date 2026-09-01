@@ -239,8 +239,8 @@ The rule for everything below: a change leaves the core easier to read than it f
 4. ~~**Exponential backoff.**~~ Built, as `MinBackoff` and `MaxBackoff` on the job type; see "Failing" above.
 5. ~~**The cron helper**, on `DeduplicationKey` alone.~~ Built wider than planned, as `Schedule` on the job type with a live-run guard; see "Periodic jobs" above.
 6. ~~**Lease extension.**~~ Built, as renewal in the worker rather than an `ExtendLease` the handler calls; see "Lease and Timeout rule" above and "Extending a lease" below.
-7. **Wire**, in a file of its own. It calls `ReadAfter` and touches nothing else, so however long it gets, the core files do not get harder to read.
-8. **Typed handler input**, by reflection rather than generics: `newHandler` accepts a small set of signatures and folds the types away, so a handler takes its payload as a struct. It is entirely in the Go binding — no schema, no statements — so it stays available indefinitely. Its price is that the handler parameter widens from `Handler` to `any` and the signature check moves from the compiler to registration, for every handler. `(Out, error)` is the shape not to take with it: a handler that completes in its own transaction cannot return an output the completion already wrote, so `SetOutput` would have to stay beside it.
+7. **Wire**, a package of its own: hypermedia delivery of stream messages to browsers, a polled GET first and SSE later on the same renderer; see "Wire" below. It uses only the exported stream reads, so the core does not change for it.
+8. **`Handler` as an interface, and typed payloads as an adapter.** `Handler` becomes `interface { HandleJob(ctx context.Context, job *Job) error }`, with a `HandlerFunc` type beside it and `Runtime.HandleFunc` for registering a plain function, the same pairing `net/http` uses. A handler with dependencies is then a struct implementing the interface instead of a closure over half the application, and logging, metrics or panic recovery wrap every handler as a `func(Handler) Handler`. Typed payloads ride on the interface as a compile-checked adapter — `JobHandler[T any](fn func(ctx context.Context, payload T, job *Job) error) Handler`, ten lines that unmarshal and call — which replaces the reflection this item used to prescribe: no parameter widened to `any`, no signature check moved from the compiler to registration. `(Out, error)` is still the shape not to take: a handler that completes in its own transaction cannot return an output the completion already wrote, so `SetOutput` stays beside it. Wire's renderer registers handlers the same way, so one idiom covers both.
 9. **A migration runner and schema versioning.** One `.sql` file, no version table, no path from an installation of the earlier catbird — the known limit above. The second schema change needs all of it, so it is built before that change and not during it.
 10. **Metrics and telemetry.** What the queues are doing, readable without writing SQL: depth and age of the oldest ready job per queue, throughput, failures, dead jobs. The shape is undecided — counters the process exports, a read like `Status` for a whole queue, or a documented set of queries — and deciding that is part of the item.
 11. **A review of what lives in Go but belongs in the database.** Every statement lives in `client.go`, so a second client reimplements them all — including the ones the known limits call fragile, where the SQL has to be reproduced exactly. Walk the statements and decide which should become SQL functions that clients call instead. The review is the item; moving anything is its own decision.
@@ -265,93 +265,124 @@ These come from moving raven, the first application, onto catbird: its own event
 
 ### Wire
 
-The browser layer: stream messages pushed to browsers over SSE. One type, created from the runtime, no tables of its own, no token machinery. **It goes in a file of its own**: it calls `Read` and touches nothing else, so its length costs the core nothing.
+The browser layer: stream messages delivered to browsers as HTML fragments. A page carries a signed list of the topics it may read, a process-wide renderer says how the messages under a pattern become fragments, and the first transport is a polled GET — SSE comes second, on the same renderer. **It is a package of its own, `wire`**: the core keeps no web types and no `net/http` import, and the poll transport uses only the exported stream reads, so the core does not change for it. Nothing wire-shaped lives in a process either — `ServePoll` is a package function like the reads it wraps, and the type that owns goroutines arrives with SSE, the transport that needs them.
 
 ```go
-type WireOptions struct {
-    BatchSize    int           // messages read per round; default 50
-    PollInterval time.Duration // read anyway and send an SSE comment so proxies keep the connection open; default 15 s
-    Logger       *slog.Logger
+// Handler turns the messages one rule matched into HTML fragments.
+type Handler interface {
+    ServeMessages(r *http.Request, m Match, f *Fragment) error
 }
 
-type ServeOptions struct {
-    Patterns []string // what this connection may read, in the stream's pattern grammar
-    Cursor string   // when set: start at this cb_cursors row and ack every position sent
-    Render func(topic string, payload json.RawMessage) (Fragment, error) // nil sends the payload JSON
+// HandlerFunc implements Handler, like http.HandlerFunc.
+type HandlerFunc func(r *http.Request, m Match, f *Fragment) error
+
+// Match is what one rule matched in one poll: the messages, oldest first,
+// and the values the pattern's variables took.
+type Match struct {
+    Messages []catbird.Message
+}
+func (m Match) Var(name string) string
+
+// Fragment collects the HTML the handlers write. It is an io.Writer, so a
+// template component renders straight into it.
+type Fragment struct{ ... }
+
+func NewRenderer() *Renderer
+func (rd *Renderer) Handle(pattern string, h Handler)
+func (rd *Renderer) HandleFunc(pattern string, fn func(*http.Request, Match, *Fragment) error)
+
+type Grant struct {
+    Topics  []string  // what the page may read, in the stream's pattern grammar
+    Cursor  string    // the cb_cursors row to read from and ack, when the page has one
+    Expires time.Time
+}
+func SignGrant(secret []byte, g Grant) string
+func VerifyGrant(secret []byte, s string) (Grant, error)
+
+type PollOptions struct {
+    Grant  Grant    // the subscription, verified by the route
+    Topics []string // the subscription when the route derives it itself, e.g. from the session
+    Cursor string   // cursor for the Topics form
+    Limit  int      // messages per poll; default 50
 }
 
-// Fragment is one frame's content. Event defaults to the topic; empty Data
-// sends nothing. Write lets a template component render straight into it.
-type Fragment struct {
-    Event string
-    Data  string
-}
-
-func NewWire(r *Runtime, opts WireOptions) *Wire
-func (w *Wire) Serve(rw http.ResponseWriter, r *http.Request, opts ServeOptions)
+func ServePoll(w http.ResponseWriter, r *http.Request, db catbird.Conn, rd *Renderer, opts PollOptions)
 ```
 
-**Who may read what** is the application's decision, made before it calls `Serve`: the route knows the user and passes the subtrees. Same-origin `EventSource` sends cookies, so a session cookie is enough; an application that wants grants in the URL signs them itself.
+**The renderer is a mux.** One per process, built at startup the way an `http.ServeMux` is, and `Handle` reads like it: on this pattern, this handler. A rule's pattern is the stream grammar plus `{name}`, which matches one topic segment — `record.work.{id}.#` — and hands the segment to the handler as `m.Var("id")`. `{name}` never reaches the database: rules match in Go, over rows the subscription already read, so the ruling that keeps wildcards out of the read patterns stands untouched. Handlers take the request and derive view context from it; which record a call concerns arrives as the variable, and whether the page may see it was settled before dispatch, because the read returned only granted topics.
 
-**One goroutine per connection.** After every wake-up from the runtime's connection — the assigner's `NOTIFY cb_stream` — the SSE connection runs `ReadAfter(patterns, after, BatchSize)` and writes each row as a frame. The database does the topic matching, per connection. A slow browser slows only its own goroutine and catches up by position; there is no queue between the listener and the connections, so nothing is dropped and no slow-consumer policy is needed. Every `PollInterval` the connection reads anyway and sends `: ping`, which keeps a proxy from closing an idle stream.
+**A handler takes a batch, not a message.** One poll reads everything since the last one, and a rule's handler runs once per distinct binding of its variables, with that binding's messages oldest first. That is what makes catch-up cheap: a page that was closed through fifty edits of a record polls once, the rule for `record.work.{id}.#` runs once for that id, and the handler reads the record's current state and renders it one time — a handler called per message would have rendered fifty times and read the record fifty times. A rule that does want one fragment per message loops over `m.Messages`, so the per-message shape costs three lines; the batch shape could not be recovered from a per-message API at all, which is why the batch is the one on offer. A rule whose pattern matched nothing does not run — otherwise every empty poll would rewrite every region — and when several rules match the same message, all of them run, in registration order: the case is ordinary, one rule writing a tray item per notification while another rewrites the unread badge once.
 
-**One read per connection is the cost to watch.** Every connection running its own read means connections times assigner ticks queries a second, each of them re-deciding the plan above. The way out, if it is ever reached, is one reader per process running `ReadAfter` with `#` — no topic predicate, the cheapest read there is — and each connection matching in Go: a message reaches a connection when one of its topic's prefixes is in that connection's pattern set, which is a map lookup on the few prefixes a topic has. That is the earlier design's matching, which expanded a message's topic into its covering patterns and probed for them rather than scanning rows for a pattern; here it costs no table, because the process doing the matching is already there. It gives up what per-connection reads give for free — a connection that falls behind needs its own catch-up read instead of just being slow — so it is worth building only against a measurement.
+**The subscription is the grant; rules only project.** What a poll reads is the grant's topics (or `Topics`, for a route that derives the list itself — a tray endpoint that only ever reads `user.<session user>.#` needs no grant). The rules decide only what gets written: a rule broader than the grant reads nothing extra, because the read never sees topics the grant did not name, and a granted topic no rule matches is read and renders nothing, and the renderer is the one place to look when a region stays empty. Nothing reaches the browser unless a handler wrote it. There is deliberately no fallback that sends the payload when no rule matches: a payload leaking to the browser should be a handler someone wrote, not the result of subscribing to more than the renderer knows.
 
-**Where a connection starts.**
+**The grant.** At render time the page knows what it shows — which records, which panels; the poll route knows only who is asking. The grant carries that knowledge across: the topics the page may read, the cursor it acks, and an expiry, signed with an application secret so the browser can hold it without being able to widen it. The cursor rides inside the signature for a concrete reason: a cursor name taken from a bare query parameter lets one browser ack another user's cursor, silently marking someone else's notifications seen. `SignGrant` and `VerifyGrant` are wire's own — every application would otherwise write the same HMAC, expiry and encoding, and a mistake in any of them is invisible until someone forges a grant. The route verifies, decides its 401, and passes the grant on. Topics can name record ids, and a signed grant sits in URLs and access logs; encrypting it is a flag to add when an application minds, not a second mechanism.
 
-- With `Cursor`: at the `cb_cursors` row, created at 0 if missing. After a batch is written and flushed the connection acks the last position, so a message is shown once across page loads and tabs. Sent is seen. A crash between the flush and the ack shows the same message once more; nothing is lost. `Last-Event-ID` is ignored here: acks follow sends, so a reconnecting tab's id is not ahead of the cursor. This is the durable inbox: a notification is `Publish("user.<id>.<kind>", payload)`, the tray is `Serve` on `user.<id>` with cursor `user:<id>`, and retention is `GC`. Note what retention means here: `GC` deletes messages by age whether or not they were ever seen, so a notification the user never opened disappears after the retention window. raven's current inbox keeps a notification until the user has seen it, however long that takes. That is a real change in behaviour and needs its own decision when wire is built. Two tabs open at once may both show a message that arrived before either acked; per-tab cursors (`user:<id>:<tab>`) would avoid that at the price of showing everything in every tab.
-- Without `Cursor`: at `Last-Event-ID` when the browser reconnects (checked first, because `EventSource` reconnects with the original URL and `?after=` is stale by then), else at `?after=`, else at `LastPosition`. The browser holds the position; a dropped connection resumes where it stopped for as long as `GC` still holds the rows. A page embeds `LastPosition` at render time so the messages between rendering and connecting are not missed. For a `Last-Event-ID` older than retention the connection simply gets what is left; a page that cannot afford the gap refetches its state.
+**`ServePoll`** reads after the cursor with the subscription's topics, dispatches the batch through the renderer, writes every fragment as one HTML response, and acks the last position read. Nothing waiting is a `204`. Every fragment addresses its own element — `hx-swap-oob`, or whatever the page's library reads — so the polling element itself swaps nothing. A handler error is logged, that call's fragments are dropped, and the response and the ack still go out: the alternative, failing the poll and holding the ack, lets one message a handler cannot render stop the page's polling for good, while dropping the call costs one region until its next message. The ack advances past unmatched and dropped messages alike; every message read was named by the grant, so a skipped message was allowed, just not rendered.
 
-**The frame.** Plain SSE, nothing framework-specific:
+- **With a cursor** — the grant's, or `PollOptions.Cursor` — the read starts at the `cb_cursors` row, created at 0 if missing, and the ack after each response means a message is shown once across page loads and tabs. Sent is seen. A crash between the response and the ack shows the same message once more; nothing is lost. This is the durable inbox: a notification is `Publish("user.<id>.<kind>", payload)`, the tray polls on a grant naming `user.<id>.#` and cursor `user:<id>`, and retention is `GC`. Note what retention means here: `GC` deletes messages by age whether or not they were ever seen, so a notification the user never opened disappears after the retention window, where raven's current inbox keeps one until it is seen, however long that takes. That difference still needs its own decision when raven's tray moves. Two tabs polling at once may both show a message that arrived between their polls; per-tab cursors (`user:<id>:<tab>`) would avoid that at the price of showing everything in every tab.
+- **Without a cursor** the browser holds the position: the page embeds `LastPosition` at render time, polls with `?after=`, and the response carries the next position by rewriting the polling element itself, out of band like everything else. The cursor form is built first, because raven's tray is the first caller; this form follows when a page needs it.
 
-```
-id: 4183
-event: user.7f3a.batch_edit
-data: <div class="alert">…</div>
-
-```
-
-`id:` is the position, `event:` is the topic unless `Render` set `Fragment.Event`, `data:` is `Fragment.Data` split into one `data:` line per line of text. When `Render` is nil the payload JSON is the data. A render error is logged and the message skipped; the position still advances, and a skipped message is read and skipped again after a reconnect, which is harmless.
-
-**Rendering** is a closure the route builds, so it has the request's user, language and view context in hand without the library knowing about any of them:
+**Usage.** At startup:
 
 ```go
-app.wire.Serve(w, r, catbird.ServeOptions{
-    Topics: []string{"user." + user},
-    Cursor: "user:" + user,
-    Render: func(topic string, payload json.RawMessage) (catbird.Fragment, error) {
-        f := catbird.Fragment{Event: "notification"}
-        switch kind := topic[strings.LastIndex(topic, ".")+1:]; kind {
-        case "batch_edit":
-            var out BatchOutput
-            if err := json.Unmarshal(payload, &out); err != nil {
-                return f, err
-            }
-            return f, views.BatchEditNotification(vc, out).Render(r.Context(), &f)
-        default:
-            return catbird.Fragment{}, nil // unknown kind: nothing sent
-        }
-    },
+rd := wire.NewRenderer()
+rd.HandleFunc("user.{id}.#", app.notifications)
+rd.HandleFunc("record.work.{id}.#", app.recordDetail)
+```
+
+Rendering a page that shows a record and the tray:
+
+```go
+grant := wire.SignGrant(app.secret, wire.Grant{
+    Topics:  []string{"user." + user.ID + ".#", "record.work." + rec.ID + ".#"},
+    Cursor:  "user:" + user.ID,
+    Expires: time.Now().Add(12 * time.Hour),
 })
 ```
 
-**The browser side.** The htmx SSE extension and a plain `EventSource` both resend `Last-Event-ID` on reconnect by themselves:
-
 ```html
-<div id="notifications" hx-ext="sse" sse-connect="/notifications/stream"
-     sse-swap="notification" hx-swap="afterbegin"></div>
-
-<div hx-ext="sse" sse-connect="/events?after={{ .LastPosition }}"
-     sse-swap="record.work.0193…" hx-swap="innerHTML"></div>
+<div hx-get="/events?grant={{ .Grant }}" hx-trigger="every 15s" hx-swap="none"></div>
 ```
 
-`wire.js`, served by `ServeScript`, is the glue for pages without htmx: it connects an `EventSource` and re-dispatches each named event as a DOM event `wire:<topic>`, optionally swapping the data into elements whose `data-wire-swap` lists the topic. `EventSource` has no wildcard for event names, so a page names the topics it uses.
+The poll route and the handlers:
+
+```go
+func (app *App) events(w http.ResponseWriter, r *http.Request) {
+    g, err := wire.VerifyGrant(app.secret, r.FormValue("grant"))
+    if err != nil {
+        http.Error(w, "", http.StatusUnauthorized)
+        return
+    }
+    wire.ServePoll(w, r, app.db, app.renderer, wire.PollOptions{Grant: g})
+}
+
+func (app *App) notifications(r *http.Request, m wire.Match, f *wire.Fragment) error {
+    vc := app.viewContext(r)
+    for _, msg := range m.Messages {
+        if err := views.TrayItem(vc, msg).Render(r.Context(), f); err != nil {
+            return err
+        }
+    }
+    return views.UnreadBadge(vc).Render(r.Context(), f)
+}
+
+func (app *App) recordDetail(r *http.Request, m wire.Match, f *wire.Fragment) error {
+    rec, err := app.records.Get(r.Context(), m.Var("id"))
+    if err != nil {
+        return err
+    }
+    return views.RecordDetail(app.viewContext(r), rec).Render(r.Context(), f)
+}
+```
+
+The templates carry their own addresses — `TrayItem` renders `<div hx-swap-oob="afterbegin:#tray">…</div>` — so one response updates the tray, the badge and the record together, and the handlers never mention a target.
+
+**SSE, the second transport, on the same renderer.** What it adds: a type that owns one goroutine per connection, woken by the assigner's `NOTIFY cb_stream`, which needs an exported way to hang on the runtime's `LISTEN` connection — designed when it is built. Each wake-up reads, dispatches through the same rules, and writes frames: `id:` the position, `event:` a name the handler sets, `data:` the fragment — `Fragment` grows an `Event` field then, which is why it is a struct now. A connection resumes at `Last-Event-ID`, then `?after=`, then `LastPosition`, and sends `: ping` on an interval so proxies keep the idle stream. The cost to watch is one read per connection per wake-up; the way out, if a measurement ever asks for it, is one `#` read per process with the pattern matching done in Go, behind the same renderer. `wire.js`, the glue for pages without htmx, comes with it.
 
 **Not in it, on purpose.**
 
 - Inbox, watches and presence tables: the inbox is a cursor (above); "who is on this record" is an application table with a heartbeat column and a message on the record's topic when it changes. Whether catbird should offer presence as a convenience on top of that is an open question; wire itself does not carry it.
-- Poll transport: `ReadAfter(patterns, after)` behind a GET is the whole thing, which is where this starts.
-- A shared read per process with in-memory fan-out. Every connection runs its own `Read` per wake-up, so hundreds of open tabs on a busy stream mean hundreds of small index reads per assigner tick. If that ever matters, one read per process with matching in memory can be added behind the same frame contract.
+- Payloads to programs. Wire writes HTML for browsers; a JSON consumer calls `ReadAfter` behind a GET the application writes, and if wire ever serves one it is a handler that writes the payload, declared like any other.
 
 ### Jobs
 
