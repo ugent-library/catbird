@@ -85,13 +85,18 @@ type JobTypeOptions struct {
 	// The enqueue stamps it on the row, so the handler is always given one:
 	// job.Signal is never nil for a type declared with it, and never anything
 	// but nil for a type without it.
-	Signal      bool
-	MaxAttempts int // attempts before the job is dead; default 5
+	Signal bool
+
+	// MaxAttempts is how many attempts a job gets before it is dead; default
+	// 15, which with the default backoff rides out about an hour of outage.
+	// Dying is the expensive outcome — the workflow is cancelled, OnDead runs
+	// once, and nothing re-drives a dead job — so the default errs long.
+	MaxAttempts int
 
 	// MinBackoff is the wait after the first failed attempt and the shortest
 	// wait there is; doubling it per attempt stops at MaxBackoff. Each wait is
 	// drawn at random between the two, so jobs that failed together come back
-	// apart. Defaults are one second and one minute.
+	// apart. Defaults are one second and ten minutes.
 	MinBackoff time.Duration
 	MaxBackoff time.Duration
 
@@ -100,13 +105,13 @@ type JobTypeOptions struct {
 
 func (o JobTypeOptions) withDefaults() JobTypeOptions {
 	if o.MaxAttempts <= 0 {
-		o.MaxAttempts = 5
+		o.MaxAttempts = 15
 	}
 	if o.MinBackoff <= 0 {
 		o.MinBackoff = time.Second
 	}
 	if o.MaxBackoff <= 0 {
-		o.MaxBackoff = time.Minute
+		o.MaxBackoff = 10 * time.Minute
 	}
 	if o.MaxBackoff < o.MinBackoff {
 		// A ceiling under the floor would draw the wait backwards and schedule

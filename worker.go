@@ -166,8 +166,8 @@ func (w *worker) run(ctx context.Context, job *Job) {
 
 // interrupted hands a job back after shutdown stopped it: the attempt is given
 // back and the job is visible again at once, because nothing about it failed.
-// Without this, three rolling deploys spend three of five attempts and 15
-// minutes of lease on a job that never ran wrong. attempts is the lease token,
+// Without this, three rolling deploys spend three attempts and 15 minutes of
+// lease on a job that never ran wrong. attempts is the lease token,
 // so if the lease had expired and another worker claimed the job, attempts has
 // moved on and this writes nothing. A worker that crashes writes nothing at
 // all, which is why the attempt is charged at claim time: it is the only thing
