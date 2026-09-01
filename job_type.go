@@ -13,21 +13,38 @@ import (
 // in between runs them again. See Complete.
 type Handler func(ctx context.Context, job *Job) error
 
-// QueueOptions are the optional parts of NewQueue. Zero values take the defaults.
+// QueueOptions are the optional parts of NewQueue. Zero values take the
+// defaults. Lease and Timeout are the two durations to set with care, and how
+// they compare is itself a setting: with Timeout inside Lease — the default —
+// a handler must finish within the lease, and with Timeout above Lease the
+// worker renews the leases of its running jobs, so a handler may run to
+// Timeout while a crashed worker's job still comes back within Lease.
 type QueueOptions struct {
-	BatchSize    int           // jobs running at once in this process; default 50
-	Lease        time.Duration // how long one attempt keeps its claim; default 5 minutes
+	BatchSize int // jobs running at once in this process; default 50
+
+	// Lease is how long one attempt keeps its claim before any worker may take
+	// the job again — and so how long a job stays stuck when the process
+	// running it crashes. It bounds the handler only on a queue that does not
+	// renew; see Timeout. Default 5 minutes.
+	Lease time.Duration
+
 	PollInterval time.Duration // wake-up interval when no notification arrives; default 5 seconds
 
 	// Timeout bounds one attempt: the handler's context is cancelled when it
 	// passes and the attempt counts as failed like any other. It ends the
 	// attempt and not the goroutine — a handler that never looks at its context
-	// keeps its slot until it returns.
+	// keeps its slot until it returns. The default keeps the completion's few
+	// seconds inside the lease, which makes the lease the bound a handler must
+	// finish within: past it another worker may hold the claim, and the late
+	// attempt's writes match no row.
 	//
-	// The default keeps the completion's few seconds inside the lease, and a
-	// larger value is lowered to Lease: past the lease another worker may hold
-	// the claim, so the retry would update no row and the failure would not be
-	// recorded.
+	// A Timeout above Lease is how a queue runs jobs longer than its lease: the
+	// worker then renews the leases of its running jobs every half Lease, so
+	// Timeout alone bounds an attempt and Lease decides how soon a crashed
+	// worker's job is claimed again — a queue of hour-long jobs keeps a lease
+	// of minutes. Renewal follows the handler's context: a handler that hangs
+	// past Timeout is renewed no further, and its job comes back about a lease
+	// later like any other overrun.
 	Timeout time.Duration
 
 	Logger *slog.Logger // default: the runtime's logger
@@ -48,9 +65,6 @@ func (o QueueOptions) withDefaults() QueueOptions {
 		// it, so a short lease still leaves the handler most of its time.
 		o.Timeout = max(o.Lease-afterHandlerTimeout, o.Lease/2)
 	}
-	if o.Timeout > o.Lease {
-		o.Timeout = o.Lease
-	}
 	return o
 }
 
@@ -61,9 +75,10 @@ func (o QueueOptions) withDefaults() QueueOptions {
 // ready index with.
 //
 // Lease is here rather than on the job type because the claim sets it for a
-// whole batch in one statement. A job type whose handler runs much longer than
-// its neighbours wants its own queue, which is also what its handler holding a
-// slot for that long already argues for.
+// whole batch in one statement, and the renewal, on a queue whose Timeout
+// exceeds its Lease, renews a whole batch the same way. A job type whose
+// handler runs much longer than its neighbours wants its own queue, which is
+// also what its handler holding a slot for that long already argues for.
 type Queue struct {
 	name string
 	opts QueueOptions

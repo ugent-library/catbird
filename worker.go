@@ -18,6 +18,23 @@ type worker struct {
 	handlers map[string]registration
 	names    []string // what the claim filters on, so a process takes no job it cannot run
 	logger   *slog.Logger
+
+	// The jobs whose leases the renewal loop keeps alive, by job id. Nil on a
+	// queue whose Timeout fits inside its Lease: every attempt there is over
+	// before its lease is, so there is nothing to renew, and track and untrack
+	// do nothing. See extendLeases.
+	mu       sync.Mutex
+	inFlight map[int64]*inFlightJob
+}
+
+// inFlightJob is one running job as the renewal loop sees it: the lease token,
+// the handler's context, whose end stops renewal, and the cancel that ends the
+// handler when the claim is not this attempt's any more.
+type inFlightJob struct {
+	id       int64
+	attempts int
+	ctx      context.Context
+	cancel   context.CancelCauseFunc
 }
 
 // registration is a job type and the function this process runs it with. The
@@ -54,6 +71,13 @@ func (w *worker) start(ctx context.Context) {
 	}
 	var running sync.WaitGroup
 	defer running.Wait() // on shutdown, return when the jobs in flight are done
+
+	// A Timeout above Lease means an attempt may outlive its lease, so this
+	// worker renews the leases of its running jobs; see extendLeases.
+	if w.queue.opts.Timeout > w.queue.opts.Lease {
+		w.inFlight = map[int64]*inFlightJob{}
+		running.Go(func() { w.extendLeases(ctx) })
+	}
 
 	backlog := false // the last claim came back full, so jobs are still waiting
 	for {
@@ -136,10 +160,19 @@ func (w *worker) run(ctx context.Context, job *Job) {
 	// ctx: the switch below tells a shutdown from a failure by the worker's
 	// context, and a timeout that had cancelled that one would give the attempt
 	// back instead of counting it, so a handler that always times out would be
-	// claimed again at once, forever.
-	handlerCtx, cancelHandler := context.WithTimeout(ctx, w.queue.opts.Timeout)
+	// claimed again at once, forever. The cause layer underneath is for the
+	// renewal loop: it cancels through it with ErrLeaseExpired when the claim is
+	// not this attempt's any more, and the switch reads the cause, so the
+	// attempt is discarded rather than retried on a claim it lost.
+	lost, cancelLost := context.WithCancelCause(ctx)
+	defer cancelLost(nil)
+	handlerCtx, cancelHandler := context.WithTimeout(lost, w.queue.opts.Timeout)
 	defer cancelHandler()
+
+	tracked := &inFlightJob{id: job.ID, attempts: job.Attempts, ctx: handlerCtx, cancel: cancelLost}
+	w.track(tracked)
 	err := registered.handle(handlerCtx, job)
+	w.untrack(tracked)
 
 	// The statements after the handler run on a context detached from the
 	// worker's, with a bound of their own. At shutdown the worker's context is
@@ -155,7 +188,7 @@ func (w *worker) run(ctx context.Context, job *Job) {
 	}
 	switch {
 	case err == nil:
-	case errors.Is(err, ErrLeaseExpired):
+	case errors.Is(err, ErrLeaseExpired), errors.Is(context.Cause(handlerCtx), ErrLeaseExpired):
 		w.logger.Warn("catbird: lease expired before completion, work discarded", "queue", w.queue.name, "job_type", job.Type, "job_id", job.ID, "attempt", job.Attempts)
 	case ctx.Err() != nil:
 		w.interrupted(after, job, err)
@@ -296,4 +329,118 @@ func (w *worker) claimBatch(ctx context.Context, limit int) ([]*Job, error) {
 		jobs = append(jobs, &job)
 	}
 	return jobs, rows.Err()
+}
+
+// track and untrack keep the set the renewal loop reads; on a queue that does
+// not renew they do nothing. untrack removes only its own entry: a handler
+// that hangs past Timeout loses its lease, and this process may claim the job
+// again while the hung handler still runs, so the id can be tracked twice and
+// the first return must not stop the renewal of the live attempt.
+func (w *worker) track(j *inFlightJob) {
+	if w.inFlight == nil {
+		return
+	}
+	w.mu.Lock()
+	w.inFlight[j.id] = j
+	w.mu.Unlock()
+}
+
+func (w *worker) untrack(j *inFlightJob) {
+	if w.inFlight == nil {
+		return
+	}
+	w.mu.Lock()
+	if w.inFlight[j.id] == j {
+		delete(w.inFlight, j.id)
+	}
+	w.mu.Unlock()
+}
+
+// running is the jobs the next renewal covers: the tracked jobs whose handler
+// contexts are still live. A spent context is skipped, which is what stops the
+// renewal of a handler that ran past Timeout.
+func (w *worker) running() []*inFlightJob {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	jobs := make([]*inFlightJob, 0, len(w.inFlight))
+	for _, j := range w.inFlight {
+		if j.ctx.Err() == nil {
+			jobs = append(jobs, j)
+		}
+	}
+	return jobs
+}
+
+// extendLeases keeps the claims of running handlers from expiring, on a queue
+// whose Timeout lets an attempt outlive its Lease. Every half Lease it moves
+// visible_at a full Lease out for every job whose handler context is still
+// live, all in one statement, so one missed tick — a network error, a slow
+// statement — loses nothing. Renewal follows the handler's context rather than
+// the handler: past Timeout the context is spent and the job is renewed no
+// further, so a handler that hangs there holding its goroutine still loses the
+// job to another worker about a lease later. Lease is then how long a job
+// stays stuck when the process running it crashes, and Timeout alone bounds an
+// attempt.
+//
+// The renewal carries the attempts lease token like every other write. One
+// that matches no row means the claim is not this attempt's any more — the
+// lease lapsed and another worker claimed it, or Cancel marked the job dead —
+// so the handler is cancelled with ErrLeaseExpired to stop work nothing will
+// commit. That is also what lets Cancel reach a running handler on a renewing
+// queue, within about half a lease.
+func (w *worker) extendLeases(ctx context.Context) {
+	tick := time.NewTicker(w.queue.opts.Lease / 2)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		running := w.running()
+		if len(running) == 0 {
+			continue
+		}
+		ids := make([]int64, len(running))
+		attempts := make([]int32, len(running))
+		for i, j := range running {
+			ids[i], attempts[i] = j.id, int32(j.attempts)
+		}
+		renewed := map[int64]bool{}
+		rows, err := w.runtime.pool.Query(ctx, `
+			UPDATE cb_claims claim
+			SET visible_at = now() + $3::interval
+			FROM unnest($1::bigint[], $2::int[]) AS running (message_id, attempts)
+			WHERE claim.message_id = running.message_id AND claim.attempts = running.attempts
+			  AND claim.died_at IS NULL
+			RETURNING claim.message_id
+		`, ids, attempts, w.queue.opts.Lease)
+		if err == nil {
+			for rows.Next() {
+				var id int64
+				if err = rows.Scan(&id); err != nil {
+					break
+				}
+				renewed[id] = true
+			}
+			rows.Close()
+			if err == nil {
+				err = rows.Err()
+			}
+		}
+		if err != nil {
+			// Nothing is cancelled on an error: the claims may all still be
+			// this worker's, and the next tick renews them a full lease deep.
+			if ctx.Err() == nil {
+				w.logger.Error("catbird: renewing leases failed", "queue", w.queue.name, "err", err)
+			}
+			continue
+		}
+		for _, j := range running {
+			if !renewed[j.id] {
+				w.logger.Warn("catbird: lease lost, cancelling the handler", "queue", w.queue.name, "job_id", j.id, "attempt", j.attempts)
+				j.cancel(ErrLeaseExpired)
+			}
+		}
+	}
 }

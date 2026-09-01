@@ -1442,6 +1442,165 @@ func TestTimeoutCountsTheAttemptAsFailed(t *testing.T) {
 	}
 }
 
+// A queue whose Timeout exceeds its Lease renews the leases of its running
+// jobs, so a handler may run for several leases without another worker taking
+// the job.
+func TestRenewalKeepsALongJobClaimed(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("renews", catbird.QueueOptions{
+		Lease:        300 * time.Millisecond,
+		Timeout:      5 * time.Second,
+		PollInterval: 50 * time.Millisecond,
+	})
+	long := catbird.NewJobType("long", queue, catbird.JobTypeOptions{})
+
+	if _, err := catbird.Enqueue(ctx, pool, long, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int32
+	handle := func(ctx context.Context, job *catbird.Job) error {
+		atomic.AddInt32(&calls, 1)
+		time.Sleep(900 * time.Millisecond) // three leases
+		return nil
+	}
+	// Two processes, so a lease that lapsed would put the job in the other
+	// worker's hands.
+	for range 2 {
+		rt := catbird.New(pool, catbird.Options{})
+		rt.Handle(long, handle)
+		go rt.Start(ctx)
+	}
+
+	waitFor(t, 5*time.Second, "the job was not completed", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims") == 0
+	})
+	time.Sleep(500 * time.Millisecond) // room for a wrongly claimed second attempt to surface
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Errorf("the handler ran %d times, want 1: the lease was not renewed", n)
+	}
+}
+
+// Renewal follows the handler's context: a handler that hangs past Timeout is
+// renewed no further, so its job is claimed again about a lease later even
+// though the hung goroutine never returns its slot, and the attempts token
+// fences whatever the hung attempt does afterwards.
+func TestRenewalStopsAtTimeout(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("renews_hang", catbird.QueueOptions{
+		Lease:        300 * time.Millisecond,
+		Timeout:      600 * time.Millisecond,
+		PollInterval: 50 * time.Millisecond,
+	})
+	hangs := catbird.NewJobType("hangs", queue, catbird.JobTypeOptions{})
+
+	if _, err := catbird.Enqueue(ctx, pool, hangs, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int32
+	handle := func(ctx context.Context, job *catbird.Job) error {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			time.Sleep(1500 * time.Millisecond) // ignores its context well past Timeout
+		}
+		return nil
+	}
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Handle(hangs, handle)
+	runCtx, stop := context.WithCancel(ctx)
+	stopped := make(chan struct{})
+	go func() {
+		rt.Start(runCtx)
+		close(stopped)
+	}()
+	// The hung attempt outlives the assertions, so the runtime is stopped and
+	// waited for before the pool closes.
+	t.Cleanup(func() {
+		stop()
+		<-stopped
+	})
+
+	waitFor(t, 5*time.Second, "the hung attempt kept its lease: the job was never claimed again", func() bool {
+		return atomic.LoadInt32(&calls) == 2
+	})
+	waitFor(t, 5*time.Second, "the second attempt did not complete", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims") == 0
+	})
+}
+
+// On a renewing queue a renewal that matches no row cancels the handler:
+// Cancel marks the claim dead, the next renewal misses it, and the running
+// handler's context ends with ErrLeaseExpired as its cause — so a cancelled
+// job stops holding its slot within about half a lease instead of running to
+// Timeout.
+func TestCancelStopsARenewingHandler(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("renews_cancel", catbird.QueueOptions{
+		Lease:        300 * time.Millisecond,
+		Timeout:      10 * time.Second,
+		PollInterval: 50 * time.Millisecond,
+	})
+	waits := catbird.NewJobType("waits", queue, catbird.JobTypeOptions{})
+
+	id, err := catbird.Enqueue(ctx, pool, waits, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var runs int32
+	started := make(chan struct{})
+	causes := make(chan error, 1)
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Handle(waits, func(ctx context.Context, job *catbird.Job) error {
+		if atomic.AddInt32(&runs, 1) == 1 {
+			close(started)
+		}
+		<-ctx.Done()
+		causes <- context.Cause(ctx)
+		return ctx.Err()
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	stopped := make(chan struct{})
+	go func() {
+		rt.Start(runCtx)
+		close(stopped)
+	}()
+	t.Cleanup(func() {
+		stop()
+		<-stopped
+	})
+
+	<-started
+	if err := catbird.Cancel(ctx, pool, id); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case cause := <-causes:
+		if !errors.Is(cause, catbird.ErrLeaseExpired) {
+			t.Errorf("handler cancelled with cause %v, want ErrLeaseExpired", cause)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Cancel did not reach the running handler")
+	}
+	// The attempt is discarded rather than counted as a failure: the dead claim
+	// keeps its one spent attempt and no error text.
+	waitFor(t, 2*time.Second, "the discarded attempt wrote on the dead claim", func() bool {
+		return count(t, pool, `
+			SELECT count(*) FROM cb_claims
+			WHERE message_id = $1 AND died_at IS NOT NULL AND attempts = 1 AND last_error IS NULL
+		`, id) == 1
+	})
+}
+
 // A handler that completes the job and then returns an error is not retried:
 // the completion committed, and the retry carries the attempts lease token, so
 // it finds no claim to correct.

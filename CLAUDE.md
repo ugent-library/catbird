@@ -73,7 +73,8 @@ Five files, one migration, no packages:
   `LISTEN` connection that wakes the rest. One `Runtime` per process owns the
   pool and one goroutine per queue and trigger.
 - `worker.go` — the claim loop, dispatch by job type, completion, retries,
-  `OnDead`. One worker per queue, however many job types run on it. The handler
+  `OnDead`, and the lease renewal a queue with `Timeout` above `Lease` runs.
+  One worker per queue, however many job types run on it. The handler
   runs on a context of its own carrying the queue's `Timeout`; the worker's own
   context is what tells a shutdown from a failure, so the two are never the same
   variable.
@@ -160,7 +161,12 @@ client exists.
 - `BatchSize`, `Lease` and `Timeout` are queue settings; `MaxAttempts`,
   `MinBackoff`, `MaxBackoff` and `OnDead` are job type settings. `Lease` is on
   the queue because the claim sets it for a whole batch in one statement, and
-  `Timeout` because it has to agree with `Lease`. The handler belongs to
+  `Timeout` because its comparison with `Lease` is itself a setting: `Timeout`
+  above `Lease` makes the worker renew the leases of its running jobs every
+  half `Lease`, which is how a queue runs jobs longer than its lease. Renewal
+  follows the handler's context — past `Timeout` a job is renewed no further —
+  carries the `attempts` token like every write, and cancels the handler with
+  `ErrLeaseExpired` when it matches no row. The handler belongs to
   neither: it is the process's, and `rt.Handle(jobType, handler)` is where the
   two meet.
 - Hot-path SQL takes no joins, no advisory locks (the assigner's is the one
