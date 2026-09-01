@@ -46,12 +46,12 @@ It talks to the same database directly and needs no Go build.
 
 ## Layout
 
-Five files, one migration, no packages:
+Six files, one migration, no packages:
 
 - `job_type.go` — the two declarations an application writes. `Queue` is a name
   and how work runs under it: `BatchSize`, `Lease`, `Timeout`, `PollInterval`.
   It decides who competes with whom, and it is the claim key. `JobType` is a kind of job:
-  its name, its queue, and how a run of it is retried (`Signal`,
+  its name, its queue, and how a run of it is retried (`Signal`, `Schedule`,
   `MaxAttempts`, `MinBackoff`, `MaxBackoff`, `OnDead`). Both are plain Go values; nothing about
   them is written to the database, and only their names reach a row. The
   handler is not on either — everything on a job type is stamped on a claim or
@@ -80,6 +80,10 @@ Five files, one migration, no packages:
   variable.
 - `trigger.go` — `Runtime.Trigger`: the loop that turns stream messages into
   jobs. The reads it uses live in `client.go` with the other statements.
+- `periodic.go` — the schedule parser and the tick loop `Handle` starts for a
+  job type declared with `Schedule`, so a scheduled type ticks in the
+  processes that can run it. Its statement lives in `client.go` with the
+  others.
 - `migrations/00001_lite.sql` — the whole schema. Goose markers, no goose
   dependency; the tests split the file on `-- +goose down`.
 
@@ -158,8 +162,15 @@ client exists.
   cannot be read as index arms and walks the position index instead.
 - The assigner only sets positions that are still empty, so two assigners
   running at once cannot move a position a reader may already have passed.
-- `BatchSize`, `Lease` and `Timeout` are queue settings; `MaxAttempts`,
-  `MinBackoff`, `MaxBackoff` and `OnDead` are job type settings. `Lease` is on
+- A scheduled type's tick is one statement with two guards: the deduplication
+  key `periodic:<type>:<minute>` makes every process ticking in the same
+  minute one job, and the insert runs only while no live claim of the type
+  exists — at most one job of a scheduled type is live, and a run that
+  outlives its schedule swallows the ticks it covers rather than queueing
+  them. The guard repeats `dependencies = 0` so its probe stays on the ready
+  index instead of scanning the heap.
+- `BatchSize`, `Lease` and `Timeout` are queue settings; `Schedule`,
+  `MaxAttempts`, `MinBackoff`, `MaxBackoff` and `OnDead` are job type settings. `Lease` is on
   the queue because the claim sets it for a whole batch in one statement, and
   `Timeout` because its comparison with `Lease` is itself a setting: `Timeout`
   above `Lease` makes the worker renew the leases of its running jobs every

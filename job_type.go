@@ -102,6 +102,24 @@ type JobTypeOptions struct {
 	// but nil for a type without it.
 	Signal bool
 
+	// Schedule makes every process that handles this type enqueue a job of it
+	// on the minutes the schedule names — five fields separated by spaces:
+	// minute (0-59), hour (0-23), day of month (1-31), month (1-12), day of
+	// week (0-6, Sunday is 0 and 7 also means Sunday). Each field is "*", a
+	// number, a range "8-17", a list "0,30", or a step "*/5", "8-17/2";
+	// numbers only, evaluated in UTC. As in cron, when both day fields are
+	// restricted a day matching either one counts.
+	//
+	// The schedule is on the type rather than given at registration so that
+	// two processes cannot disagree on it, for the same reason Signal is. At
+	// most one job of a scheduled type is live at a time: a tick during a
+	// live run — a tick's job or a manual Enqueue of the type — writes
+	// nothing, so a run that outlives its schedule swallows the ticks it
+	// covers and the next run starts on the first matching minute after it
+	// ends. A scheduled job takes no payload; the same code under two
+	// schedules or two arguments is two job types sharing one handler.
+	Schedule string
+
 	// MaxAttempts is how many attempts a job gets before it is dead; default
 	// 15, which with the default backoff rides out about an hour of outage.
 	// Dying is the expensive outcome — the workflow is cancelled, OnDead runs
@@ -146,18 +164,38 @@ func (o JobTypeOptions) withDefaults() JobTypeOptions {
 // Nothing is declared in the database. Only the name reaches a row, beside the
 // queue's, so adding a job type is not a migration.
 type JobType struct {
-	name  string
-	queue *Queue
-	opts  JobTypeOptions
+	name     string
+	queue    *Queue
+	opts     JobTypeOptions
+	schedule *schedule // parsed opts.Schedule; nil on an unscheduled type
 }
 
 // NewJobType declares a job type. Runtime.Handle gives it a handler and makes a
 // process run it; enqueueing it needs only the value.
+//
+// A bad Schedule panics here rather than failing on every tick once the
+// runtime is started, and so does a Schedule beside Signal: a gated job never
+// becomes claimable on its own, so its claim would hold the live-run guard
+// against every later tick.
 func NewJobType(name string, queue *Queue, opts JobTypeOptions) *JobType {
 	if queue == nil {
 		panic("catbird: job type " + name + " has no queue")
 	}
-	return &JobType{name: name, queue: queue, opts: opts.withDefaults()}
+	t := &JobType{name: name, queue: queue, opts: opts.withDefaults()}
+	if opts.Schedule != "" {
+		if opts.Signal {
+			panic("catbird: job type " + name + " waits for a signal and cannot run on a schedule")
+		}
+		s, err := parseSchedule(opts.Schedule)
+		if err != nil {
+			panic(err)
+		}
+		if s.next(time.Now()).IsZero() {
+			panic("catbird: job type " + name + ": schedule " + opts.Schedule + " matches no time")
+		}
+		t.schedule = &s
+	}
+	return t
 }
 
 // Name is the job type's name, as it is stored on a claim and on a result.

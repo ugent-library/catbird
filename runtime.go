@@ -91,6 +91,15 @@ func (r *Runtime) Handle(t *JobType, handle Handler) {
 	}
 	w.handlers[t.name] = registration{jobType: t, handle: handle}
 	w.names = append(w.names, t.name)
+
+	// A type declared with Schedule is ticked by the processes that handle it,
+	// so a scheduled job is only ever enqueued where something can run it and
+	// an enqueue-only process never ticks. Every handling process ticks; the
+	// tick statement's guards keep the result single, so there is no leader.
+	if t.schedule != nil {
+		p := &periodic{runtime: r, jobType: t, logger: w.logger}
+		r.declareLocked("", p.start)
+	}
 }
 
 // Start runs everything declared on the runtime until ctx is canceled, then
@@ -199,8 +208,9 @@ func assignPositionBatch(ctx context.Context, pool *pgxpool.Pool) (int, error) {
 }
 
 // declare registers a loop for Start to run, and the channel its wake-ups come
-// from. Declaring after Start is a programming error: the connection's channel
-// set is fixed when it connects.
+// from — empty for a loop that runs on time alone, like a periodic's. Declaring
+// after Start is a programming error: the connection's channel set is fixed
+// when it connects.
 func (r *Runtime) declare(channel string, loop func(ctx context.Context)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -211,7 +221,7 @@ func (r *Runtime) declareLocked(channel string, loop func(ctx context.Context)) 
 	if r.started {
 		panic("catbird: declared after Start")
 	}
-	if !slices.Contains(r.channels, channel) {
+	if channel != "" && !slices.Contains(r.channels, channel) {
 		r.channels = append(r.channels, channel)
 	}
 	r.loops = append(r.loops, loop)

@@ -514,6 +514,49 @@ func EnqueueBatch(ctx context.Context, db Conn, t *JobType, msgs []BatchMessage,
 	return created, err
 }
 
+// enqueuePeriodic writes one tick of a scheduled job type: the job whose
+// deduplication key names the minute, unless that key is taken or a live job
+// of the type exists. Two guards in one statement. The key,
+// periodic:<type>:<minute> with the minute in UTC as YYYY-MM-DDTHH:MMZ,
+// collapses every process ticking in the same minute into one job; the format
+// is fixed because every process must produce the same key. The NOT EXISTS
+// makes a tick during a live run write nothing at all — no message row, no
+// key — so a run that outlives its schedule swallows the ticks it covers and
+// no backlog of stale ticks can form.
+//
+// The guard counts every live job of the type, not only ticks, so a manual
+// Enqueue of the type holds it too — "run it now" composes — but is not
+// itself guarded: two manual enqueues can overlap. It repeats the ready
+// index's dependencies = 0 so the probe stays on that index instead of
+// scanning the heap; the cost is that a job of the type created inside a
+// workflow is not counted while it still waits for other jobs.
+func enqueuePeriodic(ctx context.Context, db Conn, t *JobType, minute time.Time) error {
+	key := "periodic:" + t.name + ":" + minute.UTC().Format("2006-01-02T15:04") + "Z"
+	_, err := db.Exec(ctx, `
+		WITH message AS (
+			INSERT INTO cb_messages (topic, deduplication_key)
+			SELECT $1, $2
+			WHERE NOT EXISTS (
+				SELECT 1 FROM cb_claims
+				WHERE queue = $3 AND job_type = $1 AND died_at IS NULL AND dependencies = 0
+			)
+			ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
+			RETURNING id
+		),
+		claim AS (
+			INSERT INTO cb_claims (message_id, queue, job_type, visible_at)
+			SELECT id, $3, $1, now()
+			FROM message
+			RETURNING message_id
+		),
+		wake AS (
+			SELECT pg_notify('cb_queue_' || $3, '') FROM claim
+		)
+		SELECT message_id FROM claim LEFT JOIN wake ON true
+	`, t.name, key, t.queue.name)
+	return err
+}
+
 // Complete finishes a job: it deletes the claim, writes the result the handler
 // recorded with SetOutput, counts down the jobs waiting for this one, and
 // creates the jobs the handler recorded with Enqueue and EnqueueAfter. A worker
