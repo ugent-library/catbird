@@ -108,7 +108,8 @@ Six files and one migration in the root package, and one package under it:
   acks the last position read. The ack comes after the response on a context
   the client cannot cancel — sent is seen — and an empty poll acks nothing,
   so idle pages write no rows. The form without a cursor, where the page
-  holds the position and polls with `?after=`, and SSE are not built yet.
+  holds the position and polls with `?after=`, and SSE are deferred until a
+  page needs them; DESIGN.md's "Wire" section carries both rulings.
 
 ## Architecture
 
