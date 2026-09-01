@@ -210,7 +210,7 @@ What this design does not do, or does at a price. A caller has to know about the
 
 **No partitioning.** `cb_messages` is one table for the whole database, and retention is a row-by-row `DELETE` with the index churn that implies rather than dropping a partition.
 
-**No schema versioning and no migration path.** One `.sql` file with goose markers, no runner, no version table, and no route from an installation of the earlier catbird. The second schema change has to invent all of it.
+**No schema versioning and no migration path.** One `.sql` file with goose markers, no runner, no version table, and no route from an installation of the earlier catbird. The second schema change has to invent all of it; building that is on the build list below.
 
 **Positions follow insert order inside a tick.** The assigner orders its batch by `id`, so two messages that commit within one window can get positions in insert order rather than commit order. Commit order is what holds across ticks, which is what a reader depends on.
 
@@ -220,7 +220,7 @@ What this design does not do, or does at a price. A caller has to know about the
 
 **The completion depends on `MATERIALIZED` meaning what it says.** The ids of the jobs a handler asked for come from `nextval` inside a CTE that two later CTEs read. Without the keyword PostgreSQL 12 and later inline it, evaluating the volatile function once per reference, and a message and its claim would get different ids. A client in another language has to write the keyword too.
 
-- Rate limits and per-queue configuration are out of scope. Applications build them on their own tables. The browser layer is planned; see below.
+- Rate limits and per-queue configuration are out of scope; applications build them on their own tables. Whether catbird should carry a circuit breaker — a queue that stops claiming while its handlers keep failing against a service that is down — is an open question. The browser layer is planned; see below.
 - Without a `Logger`, failures are reported through `slog.Default()`. Errors the library cannot return to the caller are logged.
 
 ## What to build, in order
@@ -235,8 +235,11 @@ The rule for everything below: a change leaves the core easier to read than it f
 6. **`ExtendLease`**, as a function rather than a field on `Job`.
 7. **Wire**, in a file of its own. It calls `ReadAfter` and touches nothing else, so however long it gets, the core files do not get harder to read.
 8. **Typed handler input**, by reflection rather than generics: `newHandler` accepts a small set of signatures and folds the types away, so a handler takes its payload as a struct. It is entirely in the Go binding — no schema, no statements — so it stays available indefinitely. Its price is that the handler parameter widens from `Handler` to `any` and the signature check moves from the compiler to registration, for every handler. `(Out, error)` is the shape not to take with it: a handler that completes in its own transaction cannot return an output the completion already wrote, so `SetOutput` would have to stay beside it.
+9. **A migration runner and schema versioning.** One `.sql` file, no version table, no path from an installation of the earlier catbird — the known limit above. The second schema change needs all of it, so it is built before that change and not during it.
+10. **Metrics and telemetry.** What the queues are doing, readable without writing SQL: depth and age of the oldest ready job per queue, throughput, failures, dead jobs. The shape is undecided — counters the process exports, a read like `Status` for a whole queue, or a documented set of queries — and deciding that is part of the item.
+11. **A review of what lives in Go but belongs in the database.** Every statement lives in `client.go`, so a second client reimplements them all — including the ones the known limits call fragile, where the SQL has to be reproduced exactly. Walk the statements and decide which should become SQL functions that clients call instead. The review is the item; moving anything is its own decision.
 
-Four items below are not being built: the **cursor lease**, a **declared stream loop**, **`UniqueKey`** and **cancelling a running job**. Each stays in this document because the problem it names is real; what changed is the answer. Each carries its ruling in place, with what to watch for that would bring it back. One is deferred rather than ruled out: **`RunOnce`** has no caller yet, so it is not built; the entry below says what would bring it back and what shape it takes when it does.
+Three items below are not being built: the **cursor lease**, a **declared stream loop** and **cancelling a running job**. Each stays in this document because the problem it names is real; what changed is the answer. Each carries its ruling in place, with what to watch for that would bring it back. Two more are open rather than ruled out: **`RunOnce`** has no caller yet, so it is not built until one appears; and **`UniqueKey`** is an open question that the raven move decides — its entry below says why.
 
 ## Planned additions
 
@@ -340,7 +343,7 @@ app.wire.Serve(w, r, catbird.ServeOptions{
 
 **Not in it, on purpose.**
 
-- Inbox, watches and presence tables: the inbox is a cursor (above); "who is on this record" is an application table with a heartbeat column and a message on the record's topic when it changes.
+- Inbox, watches and presence tables: the inbox is a cursor (above); "who is on this record" is an application table with a heartbeat column and a message on the record's topic when it changes. Whether catbird should offer presence as a convenience on top of that is an open question; wire itself does not carry it.
 - Poll transport: `ReadAfter(patterns, after)` behind a GET is the whole thing, which is where this starts.
 - A shared read per process with in-memory fan-out. Every connection runs its own `Read` per wake-up, so hundreds of open tabs on a busy stream mean hundreds of small index reads per assigner tick. If that ever matters, one read per process with matching in memory can be added behind the same frame contract.
 
@@ -401,4 +404,4 @@ With extension, `Lease` bounds one step of a handler instead of the whole handle
 
 This is a second key next to `DedupKey`, and both are needed. `DedupKey` lives as long as the message and is for keys that must not come back: a cron key, where a process that wakes late in the same minute would otherwise start the job again after the first run finished; a trigger key, where a redone batch would otherwise create a second job for a message whose first job already ran. `UniqueKey` is for "at most one of these at a time": a purge, a sync, a rebuild, which should run again later but not twice at once. Cron jobs need both, see the cron helper.
 
-**Not building this.** Two kinds of key is a distinction that takes the paragraph above to explain, and it lands as a second conflict target inside `Enqueue` and `EnqueueBatch`, already the densest statements in the tree. Its one caller today is the cron helper not piling up overruns, and a cron handler that opens with `pg_try_advisory_lock` and returns early gets that with no column, no index and no second key. Build it when a second caller appears that cannot take a lock.
+**Open question.** Two kinds of key is a distinction that takes the paragraph above to explain, and it lands as a second conflict target inside `Enqueue` and `EnqueueBatch`, already the densest statements in the tree. A cron handler that opens with `pg_try_advisory_lock` and returns early gets the same skip with no column, no index and no second key. What keeps the question open is the raven move: raven's jobs run on River today, River has unique jobs, and how raven actually uses them decides whether the lock pattern covers them or this key gets built.
