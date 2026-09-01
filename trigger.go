@@ -40,9 +40,10 @@ type trigger struct {
 //
 // The jobs carry the stream message's topic, so a handler can see which message
 // caused it; the topic decides nothing, the job type does. The enqueues and the
-// cursor advance commit in one transaction, and each job carries a dedup key
-// derived from the message id, so a crash or a second process running the same
-// trigger cannot produce a second job for the same message.
+// cursor advance commit in one transaction, and each job carries a
+// deduplication key derived from the message id, so a crash or a second
+// process running the same trigger cannot produce a second job for the same
+// message.
 func (r *Runtime) Trigger(name string, patterns []string, jobType *JobType, opts TriggerOptions) {
 	if _, _, err := compilePatterns(patterns, 1); err != nil {
 		panic(err)
@@ -94,9 +95,9 @@ func (t *trigger) enqueueNextBatch(ctx context.Context) (int, error) {
 	jobs := make([]BatchMessage, len(msgs))
 	for i, m := range msgs {
 		jobs[i] = BatchMessage{
-			Topic:    m.Topic,
-			Payload:  m.Payload,
-			DedupKey: "trigger:" + t.name + ":" + strconv.FormatInt(m.ID, 10),
+			Topic:            m.Topic,
+			Payload:          m.Payload,
+			DeduplicationKey: "trigger:" + t.name + ":" + strconv.FormatInt(m.ID, 10),
 		}
 	}
 

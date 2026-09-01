@@ -230,12 +230,12 @@ func TestLongJobDoesNotHoldUpTheQueue(t *testing.T) {
 	}
 }
 
-func TestExactlyOnceDedup(t *testing.T) {
+func TestExactlyOnceDeduplication(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx := context.Background()
-	queue := catbird.NewQueue("dedup_queue", catbird.QueueOptions{})
+	queue := catbird.NewQueue("deduplication_queue", catbird.QueueOptions{})
 	task := catbird.NewJobType("task", queue, catbird.JobTypeOptions{})
-	opts := catbird.EnqueueOptions{DedupKey: "deterministic-hash-12345"}
+	opts := catbird.EnqueueOptions{DeduplicationKey: "deterministic-hash-12345"}
 
 	id, err := catbird.Enqueue(ctx, pool, task, nil, opts)
 	if err != nil || id == 0 {
@@ -258,7 +258,7 @@ func TestExactlyOnceDedup(t *testing.T) {
 	}
 	wg.Wait()
 
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'dedup_queue'"); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'deduplication_queue'"); n != 1 {
 		t.Fatalf("expected 1 claim, got %d", n)
 	}
 }
@@ -1069,9 +1069,9 @@ func TestPublishBatchSkipsTakenKeys(t *testing.T) {
 
 	n, err := catbird.PublishBatch(ctx, pool, []catbird.BatchMessage{
 		{Topic: "record.work.2", Payload: "second"},
-		{Topic: "record.work.3", Payload: "skipped", DedupKey: "taken"}, // published above
-		{Topic: "record.work.4", Payload: "third", DedupKey: "once"},
-		{Topic: "record.work.5", Payload: "skipped", DedupKey: "once"}, // repeats a key from this batch
+		{Topic: "record.work.3", Payload: "skipped", DeduplicationKey: "taken"}, // published above
+		{Topic: "record.work.4", Payload: "third", DeduplicationKey: "once"},
+		{Topic: "record.work.5", Payload: "skipped", DeduplicationKey: "once"}, // repeats a key from this batch
 		{Topic: "other", Payload: "not on this topic"},
 	})
 	if err != nil {
@@ -1166,7 +1166,7 @@ func TestEnqueueBatchWakesTheQueueOnce(t *testing.T) {
 
 	// This job's key is taken before the listener starts, so its notification
 	// is not delivered here.
-	if _, err := catbird.Enqueue(ctx, pool, resize, nil, catbird.EnqueueOptions{DedupKey: "taken"}); err != nil {
+	if _, err := catbird.Enqueue(ctx, pool, resize, nil, catbird.EnqueueOptions{DeduplicationKey: "taken"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1180,9 +1180,9 @@ func TestEnqueueBatchWakesTheQueueOnce(t *testing.T) {
 	}
 
 	n, err := catbird.EnqueueBatch(ctx, pool, resize, []catbird.BatchMessage{
-		{Topic: "resize", Payload: 1, DedupKey: "taken"}, // enqueued above
-		{Topic: "resize", Payload: 2, DedupKey: "once"},
-		{Topic: "resize", Payload: 3, DedupKey: "once"}, // repeats a key from this batch
+		{Topic: "resize", Payload: 1, DeduplicationKey: "taken"}, // enqueued above
+		{Topic: "resize", Payload: 2, DeduplicationKey: "once"},
+		{Topic: "resize", Payload: 3, DeduplicationKey: "once"}, // repeats a key from this batch
 		{Topic: "resize", Payload: 4},
 	}, catbird.EnqueueOptions{})
 	if err != nil {

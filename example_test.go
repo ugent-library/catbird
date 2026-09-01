@@ -59,7 +59,7 @@ func Example_workflow() {
 	// cancel it, read its results by it. It is the only thing the deposit row
 	// has to keep.
 	groupID, err := catbird.Enqueue(ctx, pool, submitted, 42, catbird.EnqueueOptions{
-		DedupKey: "deposit:42", // a retried POST does not start a second workflow
+		DeduplicationKey: "deposit:42", // a retried POST does not start a second workflow
 	})
 	if err != nil {
 		log.Fatal(err)

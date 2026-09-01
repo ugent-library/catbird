@@ -171,8 +171,8 @@ client exists.
   two meet.
 - Hot-path SQL takes no joins, no advisory locks (the assigner's is the one
   exception), and no N+1 loops.
-- The unique indexes on `dedup_key` and `position` are partial. Deduplicating
-  inserts must name the predicate — `ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING`
+- The unique indexes on `deduplication_key` and `position` are partial. Deduplicating
+  inserts must name the predicate — `ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING`
   — or they stop matching the index.
 
 ## Conventions

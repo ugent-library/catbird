@@ -201,25 +201,25 @@ type Conn interface {
 
 // EnqueueOptions are the optional parts of Enqueue.
 type EnqueueOptions struct {
-	DedupKey string        // when set, a second Enqueue with the same key does nothing
-	Delay    time.Duration // earliest start, measured from now
-	Topic    string        // what the job is about; the job type's name when empty
+	DeduplicationKey string        // when set, a second Enqueue with the same key does nothing
+	Delay            time.Duration // earliest start, measured from now
+	Topic            string        // what the job is about; the job type's name when empty
 }
 
 // Publish appends a message to the stream: consumers see it, no worker runs it.
-// Returns the message id, or 0 when dedupKey already exists.
-func Publish(ctx context.Context, db Conn, topic string, payload any, dedupKey string) (int64, error) {
+// Returns the message id, or 0 when deduplicationKey already exists.
+func Publish(ctx context.Context, db Conn, topic string, payload any, deduplicationKey string) (int64, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return 0, err
 	}
 	var id int64
 	err = db.QueryRow(ctx, `
-		INSERT INTO cb_messages (topic, payload, stream, dedup_key)
+		INSERT INTO cb_messages (topic, payload, stream, deduplication_key)
 		VALUES ($1, $2, true, $3)
-		ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
+		ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
 		RETURNING id
-	`, topic, body, nullString(dedupKey)).Scan(&id)
+	`, topic, body, nullString(deduplicationKey)).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil
 	}
@@ -228,15 +228,16 @@ func Publish(ctx context.Context, db Conn, topic string, payload any, dedupKey s
 
 // BatchMessage is one message for PublishBatch and EnqueueBatch.
 type BatchMessage struct {
-	Topic    string
-	Payload  any    // marshalled to JSON; a json.RawMessage is written as it is
-	DedupKey string // when set, a second message with the same key is not written
+	Topic            string
+	Payload          any    // marshalled to JSON; a json.RawMessage is written as it is
+	DeduplicationKey string // when set, a second message with the same key is not written
 }
 
 // PublishBatch appends messages to the stream in one statement, so a
 // transaction that changed ten thousand records announces them in one round
-// trip. Returns how many were written: a message whose DedupKey already exists,
-// or that repeats a key from its own batch, is skipped and not counted.
+// trip. Returns how many were written: a message whose DeduplicationKey
+// already exists, or that repeats a key from its own batch, is skipped and not
+// counted.
 //
 // The messages travel as three arrays that are unnested into rows, so the
 // number of messages is not limited by the number of statement parameters. Like
@@ -246,16 +247,16 @@ func PublishBatch(ctx context.Context, db Conn, msgs []BatchMessage) (int, error
 	if len(msgs) == 0 {
 		return 0, nil
 	}
-	topics, payloads, dedupKeys, err := batchArrays(msgs)
+	topics, payloads, deduplicationKeys, err := batchArrays(msgs)
 	if err != nil {
 		return 0, err
 	}
 	tag, err := db.Exec(ctx, `
-		INSERT INTO cb_messages (topic, payload, stream, dedup_key)
-		SELECT topic, payload, true, dedup_key
-		FROM unnest($1::text[], $2::jsonb[], $3::text[]) AS message (topic, payload, dedup_key)
-		ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
-	`, topics, payloads, dedupKeys)
+		INSERT INTO cb_messages (topic, payload, stream, deduplication_key)
+		SELECT topic, payload, true, deduplication_key
+		FROM unnest($1::text[], $2::jsonb[], $3::text[]) AS message (topic, payload, deduplication_key)
+		ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
+	`, topics, payloads, deduplicationKeys)
 	return int(tag.RowsAffected()), err
 }
 
@@ -418,7 +419,7 @@ func subtreeLikePattern(prefix string) string {
 // Enqueue appends a message and a claim for it, and wakes the queue's workers
 // unless the job cannot run yet. Returns the job's id, which is also the id of
 // the workflow it starts — what Signal, Cancel and the result reads address —
-// or 0 when opts.DedupKey already exists.
+// or 0 when opts.DeduplicationKey already exists.
 //
 // One statement does all three. The wake CTE calls pg_notify only for a job
 // that is claimable now, so a delayed job and a job waiting for a signal do not
@@ -438,9 +439,9 @@ func Enqueue(ctx context.Context, db Conn, t *JobType, payload any, opts Enqueue
 	var id int64
 	err = db.QueryRow(ctx, `
 		WITH message AS (
-			INSERT INTO cb_messages (topic, payload, dedup_key)
+			INSERT INTO cb_messages (topic, payload, deduplication_key)
 			VALUES ($1, $2, $3)
-			ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
+			ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
 			RETURNING id
 		),
 		claim AS (
@@ -454,7 +455,7 @@ func Enqueue(ctx context.Context, db Conn, t *JobType, payload any, opts Enqueue
 			SELECT pg_notify('cb_queue_' || $4, '') FROM claim WHERE visible_at <= now()
 		)
 		SELECT message_id FROM claim LEFT JOIN wake ON true
-	`, topic, body, nullString(opts.DedupKey), t.queue.name, t.name, t.opts.Signal, opts.Delay).Scan(&id)
+	`, topic, body, nullString(opts.DeduplicationKey), t.queue.name, t.name, t.opts.Signal, opts.Delay).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil
 	}
@@ -463,8 +464,8 @@ func Enqueue(ctx context.Context, db Conn, t *JobType, payload any, opts Enqueue
 
 // EnqueueBatch appends messages and their claims for one job type in one
 // statement and wakes the queue's workers. Returns how many jobs it created: a
-// message whose DedupKey is already taken, or that repeats a key from its own
-// batch, gets neither a message nor a claim and is not counted.
+// message whose DeduplicationKey is already taken, or that repeats a key from
+// its own batch, gets neither a message nor a claim and is not counted.
 //
 // This is the volume path — what a trigger uses. Every job in the batch takes
 // the same options, and none of them starts a workflow or waits for anything: a
@@ -485,19 +486,19 @@ func EnqueueBatch(ctx context.Context, db Conn, t *JobType, msgs []BatchMessage,
 	if t.opts.Signal {
 		return 0, fmt.Errorf("catbird: job type %s waits for a signal and cannot be enqueued in a batch", t.name)
 	}
-	topics, payloads, dedupKeys, err := batchArrays(msgs)
+	topics, payloads, deduplicationKeys, err := batchArrays(msgs)
 	if err != nil {
 		return 0, err
 	}
 	var created int
 	err = db.QueryRow(ctx, `
 		WITH input AS (
-			SELECT * FROM unnest($1::text[], $2::jsonb[], $3::text[]) AS message (topic, payload, dedup_key)
+			SELECT * FROM unnest($1::text[], $2::jsonb[], $3::text[]) AS message (topic, payload, deduplication_key)
 		),
 		message AS (
-			INSERT INTO cb_messages (topic, payload, dedup_key)
-			SELECT topic, payload, dedup_key FROM input
-			ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
+			INSERT INTO cb_messages (topic, payload, deduplication_key)
+			SELECT topic, payload, deduplication_key FROM input
+			ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
 			RETURNING id
 		),
 		claim AS (
@@ -509,7 +510,7 @@ func EnqueueBatch(ctx context.Context, db Conn, t *JobType, msgs []BatchMessage,
 			SELECT pg_notify('cb_queue_' || $4, '') FROM (SELECT 1 FROM claim LIMIT 1) one WHERE $7
 		)
 		SELECT count(*) FROM claim LEFT JOIN wake ON true
-	`, topics, payloads, dedupKeys, t.queue.name, t.name, opts.Delay, opts.Delay <= 0).Scan(&created)
+	`, topics, payloads, deduplicationKeys, t.queue.name, t.name, opts.Delay, opts.Delay <= 0).Scan(&created)
 	return created, err
 }
 
@@ -769,18 +770,18 @@ func Outputs(ctx context.Context, db Conn, groupID int64, t *JobType) ([]json.Ra
 // batchArrays turns messages into the three parallel arrays the batch
 // statements unnest, so the number of messages is not limited by the number of
 // statement parameters.
-func batchArrays(msgs []BatchMessage) (topics []string, payloads [][]byte, dedupKeys []*string, err error) {
+func batchArrays(msgs []BatchMessage) (topics []string, payloads [][]byte, deduplicationKeys []*string, err error) {
 	topics = make([]string, len(msgs))
 	payloads = make([][]byte, len(msgs))
-	dedupKeys = make([]*string, len(msgs))
+	deduplicationKeys = make([]*string, len(msgs))
 	for i, msg := range msgs {
 		body, err := json.Marshal(msg.Payload)
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		topics[i], payloads[i], dedupKeys[i] = msg.Topic, body, nullString(msg.DedupKey)
+		topics[i], payloads[i], deduplicationKeys[i] = msg.Topic, body, nullString(msg.DeduplicationKey)
 	}
-	return topics, payloads, dedupKeys, nil
+	return topics, payloads, deduplicationKeys, nil
 }
 
 // newJobArrays turns a handler's buffer into the five parallel arrays the
