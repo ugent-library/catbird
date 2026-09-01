@@ -44,8 +44,8 @@ CREATE TABLE cb_cursors (
 -- visible_at is both the earliest start time and the lease deadline: a claimed
 -- job has visible_at in the future; when it passes, any worker may claim it again.
 --
--- Columns run widest first so the fixed-width ones pack without padding: 75
--- bytes a row instead of 79. Grouping them by role costs those 4 bytes on every
+-- Columns run widest first so the fixed-width ones pack without padding: 74
+-- bytes a row instead of 78. Grouping them by role costs those 4 bytes on every
 -- claim and retry, so the comments carry the grouping.
 CREATE TABLE cb_claims (
     message_id BIGINT PRIMARY KEY REFERENCES cb_messages (id) ON DELETE CASCADE,
@@ -56,13 +56,15 @@ CREATE TABLE cb_claims (
     -- coalesce(group_id, message_id).
     group_id BIGINT,
     visible_at TIMESTAMPTZ NOT NULL,
+    -- When the job died: it failed permanently or Cancel stopped it, and no
+    -- worker claims it again. NULL while the job lives. GC's age test runs from
+    -- it; reusing visible_at for that would never collect a canceled gated job,
+    -- which sits on 'infinity'. Not a state machine: what a job is doing is
+    -- stored nowhere, Status derives it from the columns here.
+    died_at TIMESTAMPTZ,
     attempts SMALLINT NOT NULL DEFAULT 0, -- incremented on claim; doubles as the lease token
     -- How many jobs this one is still waiting for; it runs when this reaches 0.
     dependencies SMALLINT NOT NULL DEFAULT 0,
-    -- No worker claims this job again: it failed permanently or Cancel stopped
-    -- it. One bit, not a state machine. What a job is doing is stored nowhere;
-    -- Status derives it from the columns here.
-    dead BOOLEAN NOT NULL DEFAULT false,
     -- This job waits for a signal; the payload arrives in signal below. It sits
     -- on visible_at = 'infinity', so the wait is a delay and needs no place in
     -- the ready index. Signal writes the payload and sets visible_at to now().
@@ -86,7 +88,7 @@ CREATE TABLE cb_claims (
     -- attempt is running; both are otherwise a live claim with visible_at in the
     -- future. Not a run history: the next failure overwrites it and completion
     -- deletes the row. A job that never failed pays nothing, and 256 characters
-    -- put the tuple at 336 bytes against 75 empty. Past about 1.9 kB every
+    -- put the tuple at 336 bytes against 74 empty. Past about 1.9 kB every
     -- failed attempt would compress the text and write it to a toast table.
     last_error TEXT
 ) WITH (
@@ -97,13 +99,13 @@ CREATE TABLE cb_claims (
 -- Only claimable rows are in the index; dead and waiting rows leave it on their
 -- own, and a job waiting for a signal sits at the far end on 'infinity' where
 -- the claim's LIMIT never reaches it.
-CREATE INDEX cb_claims_ready_idx ON cb_claims (queue, visible_at) WHERE NOT dead AND dependencies = 0;
+CREATE INDEX cb_claims_ready_idx ON cb_claims (queue, visible_at) WHERE died_at IS NULL AND dependencies = 0;
 -- What Cancel and Signal probe. A worker cancels the group of every job that
 -- dies in one, so without this a downstream outage runs one full scan of
 -- cb_claims per dead job: 834 buffers and 4.9 ms at 100k live claims, against 6
 -- buffers here. Jobs outside a workflow stay out of a structure that can never
 -- match them: 112 kB against 2128 kB with 1% of jobs grouped.
-CREATE INDEX cb_claims_group_idx ON cb_claims (group_id) WHERE NOT dead AND group_id IS NOT NULL;
+CREATE INDEX cb_claims_group_idx ON cb_claims (group_id) WHERE died_at IS NULL AND group_id IS NOT NULL;
 
 -- Optional result of a job. The handler records it with SetOutput and the
 -- completion writes it here, so a result cannot outlive an attempt that never

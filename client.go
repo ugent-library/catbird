@@ -561,7 +561,7 @@ func Complete(ctx context.Context, db Conn, job *Job) error {
 		dependent_job AS (
 		    UPDATE cb_claims SET dependencies = dependencies - 1
 		    WHERE message_id IN (SELECT unnest(dependent_job_ids) FROM claim)
-		      AND NOT dead AND dependencies > 0
+		      AND died_at IS NULL AND dependencies > 0
 		    RETURNING queue, dependencies, visible_at
 		),
 		new_job AS MATERIALIZED (
@@ -628,7 +628,7 @@ func Signal(ctx context.Context, db Conn, groupID int64, t *JobType, payload any
 		WITH gated AS (
 			UPDATE cb_claims SET signal = $3, visible_at = now()
 			WHERE (group_id = $1 OR message_id = $1) AND job_type = $2
-			  AND NOT dead AND awaits_signal AND signal IS NULL
+			  AND died_at IS NULL AND awaits_signal AND signal IS NULL
 			RETURNING queue, dependencies
 		),
 		wake AS (
@@ -650,8 +650,8 @@ func Signal(ctx context.Context, db Conn, groupID int64, t *JobType, payload any
 // starting.
 func Cancel(ctx context.Context, db Conn, groupID int64) error {
 	_, err := db.Exec(ctx, `
-		UPDATE cb_claims SET dead = true
-		WHERE (group_id = $1 OR message_id = $1) AND NOT dead
+		UPDATE cb_claims SET died_at = now()
+		WHERE (group_id = $1 OR message_id = $1) AND died_at IS NULL
 	`, groupID)
 	return err
 }
@@ -671,7 +671,7 @@ func Status(ctx context.Context, db Conn, id int64) (status JobStatus, attempts 
 	err = db.QueryRow(ctx, `
 		SELECT CASE
 		           WHEN claim.message_id IS NULL THEN 'completed'
-		           WHEN claim.dead THEN 'dead'
+		           WHEN claim.died_at IS NOT NULL THEN 'dead'
 		           WHEN claim.awaits_signal AND claim.signal IS NULL THEN 'waiting for signal'
 		           WHEN claim.dependencies > 0 THEN 'waiting for jobs'
 		           WHEN claim.visible_at <= now() THEN 'queued'
@@ -701,12 +701,13 @@ func Status(ctx context.Context, db Conn, id int64) (status JobStatus, attempts 
 	return 0, 0, "", fmt.Errorf("catbird: unknown job status %q", name)
 }
 
-// GC deletes dead claims and messages older than retention. A message that
-// still has a claim is kept, however old it is. Results go with their message.
+// GC deletes claims dead longer than retention and messages older than
+// retention. A message that still has a claim is kept, however old it is.
+// Results go with their message.
 func GC(ctx context.Context, db Conn, retention time.Duration) error {
 	_, err := db.Exec(ctx, `
 		DELETE FROM cb_claims
-		WHERE dead AND visible_at < now() - $1::interval
+		WHERE died_at < now() - $1::interval
 	`, retention)
 	if err != nil {
 		return err

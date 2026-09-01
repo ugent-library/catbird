@@ -178,7 +178,7 @@ func (w *worker) run(ctx context.Context, job *Job) {
 func (w *worker) interrupted(ctx context.Context, job *Job, cause error) {
 	_, err := w.runtime.pool.Exec(ctx, `
 		UPDATE cb_claims SET attempts = attempts - 1, visible_at = now()
-		WHERE message_id = $1 AND attempts = $2 AND NOT dead
+		WHERE message_id = $1 AND attempts = $2 AND died_at IS NULL
 	`, job.ID, job.Attempts)
 	if err != nil {
 		w.logger.Error("catbird: returning an interrupted job failed", "queue", w.queue.name, "job_id", job.ID, "err", err, "cause", cause)
@@ -213,7 +213,7 @@ func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) 
 			SET visible_at = now() + $3::interval
 			    + (least($3::interval * 2 ^ least(attempts - 1, 20), $4::interval) - $3::interval) * random(),
 			    last_error = left($5, 256)
-			WHERE message_id = $1 AND attempts = $2 AND NOT dead
+			WHERE message_id = $1 AND attempts = $2 AND died_at IS NULL
 		`, job.ID, job.Attempts, t.opts.MinBackoff, t.opts.MaxBackoff, cause.Error())
 		switch {
 		case err != nil:
@@ -227,7 +227,7 @@ func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) 
 	}
 
 	tag, err := w.runtime.pool.Exec(ctx, `
-		UPDATE cb_claims SET dead = true, last_error = left($3, 256)
+		UPDATE cb_claims SET died_at = now(), last_error = left($3, 256)
 		WHERE message_id = $1 AND attempts = $2
 	`, job.ID, job.Attempts, cause.Error())
 	if err != nil {
@@ -260,7 +260,7 @@ func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) 
 // waiting to retry and never to the one running. That is what Status reads to
 // tell them apart. Clearing a NULL column is free: 372 bytes of WAL per row with
 // the clause and without it. On rows that do carry text it saves, 372 against
-// 629, because the claim writes a 75-byte tuple instead of a 336-byte one.
+// 629, because the claim writes a 74-byte tuple instead of a 336-byte one.
 func (w *worker) claimBatch(ctx context.Context, limit int) ([]*Job, error) {
 	rows, err := w.runtime.pool.Query(ctx, `
 		WITH leased AS (
@@ -268,7 +268,7 @@ func (w *worker) claimBatch(ctx context.Context, limit int) ([]*Job, error) {
 			SET visible_at = now() + $2::interval, attempts = attempts + 1, last_error = NULL
 			WHERE message_id IN (
 				SELECT message_id FROM cb_claims
-				WHERE queue = $1 AND NOT dead AND dependencies = 0 AND visible_at <= now()
+				WHERE queue = $1 AND died_at IS NULL AND dependencies = 0 AND visible_at <= now()
 				  AND job_type = ANY($4)
 				ORDER BY visible_at ASC LIMIT $3
 				FOR UPDATE SKIP LOCKED

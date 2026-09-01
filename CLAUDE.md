@@ -88,8 +88,8 @@ Five files, one migration, no packages:
 one row, written once. `cb_claims` holds one narrow row per job that still has
 to run, rewritten on every claim and retry, deleted on completion; it carries
 the queue, the job type, the workflow, what the job waits for, the signal
-payload once one arrives, whether any worker will claim it again, and what the
-last failed attempt returned. `cb_cursors` and `cb_outputs` are one row each per
+payload once one arrives, when it died if no worker will claim it again, and
+what the last failed attempt returned. `cb_cursors` and `cb_outputs` are one row each per
 stream consumer and per job result.
 
 **Queue and job type are two things.** The queue is the claim key and the
@@ -129,14 +129,15 @@ client exists.
 - A job waiting for a signal has `visible_at = 'infinity'`, so waiting is a
   delay and needs no place in the ready index. `Signal` writes the payload and
   sets `visible_at` to `now()`.
-- What a job is doing is not stored. `cb_claims.dead` is one bit — no worker
-  will claim this job again — and `Status` derives the eight states a caller
+- What a job is doing is not stored. `cb_claims.died_at` is one timestamp —
+  when the job died, never to be claimed again, and what `GC`'s age test runs
+  from; NULL while it lives — and `Status` derives the eight states a caller
   sees from `visible_at`, `attempts`, `dependencies`, `awaits_signal` and
   `last_error`. There is deliberately no `status` column: the word names the
   derived answer, and a column of the same name meant something narrower in the
   same statement, which is what a second client stumbles over.
 - `cb_claims` declares its columns widest first, so the fixed-width ones pack
-  with no padding between them: 75 bytes against 79, on the row every claim and
+  with no padding between them: 74 bytes against 78, on the row every claim and
   retry rewrites. A column added in the middle by role rather than by width
   costs padding.
 - The failure writes `last_error` and the claim clears it, which is the only
