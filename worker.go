@@ -41,7 +41,7 @@ type inFlightJob struct {
 // job type says how a run of it is retried; the function is this process's own.
 type registration struct {
 	jobType *JobType
-	handle  Handler
+	handler Handler
 }
 
 // waitForSlots is how long the claim loop waits for more slots to free before
@@ -171,7 +171,7 @@ func (w *worker) run(ctx context.Context, job *Job) {
 
 	tracked := &inFlightJob{id: job.ID, attempts: job.Attempts, ctx: handlerCtx, cancel: cancelLost}
 	w.track(tracked)
-	err := registered.handle(handlerCtx, job)
+	err := registered.handler.HandleJob(handlerCtx, job)
 	w.untrack(tracked)
 
 	// The statements after the handler run on a context detached from the
@@ -277,7 +277,7 @@ func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) 
 		log.Error("catbird: cancel failed", "group_id", job.GroupID, "err", err)
 	}
 	if t.opts.OnDead != nil {
-		if err := t.opts.OnDead(ctx, job); err != nil {
+		if err := t.opts.OnDead.HandleJob(ctx, job); err != nil {
 			log.Error("catbird: OnDead failed", "err", err)
 		}
 	}

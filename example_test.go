@@ -47,12 +47,12 @@ func Example_workflow() {
 	// What this process runs. A process that only enqueues registers nothing
 	// and links none of these functions.
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(submitted, handleSubmitted)
-	rt.Handle(extract, handleExtract)
-	rt.Handle(scan, handleScan)
-	rt.Handle(review, handleReview)
-	rt.Handle(publish, handlePublish)
-	rt.Handle(archive, handleArchive)
+	rt.Handle(submitted, catbird.JobHandler(handleSubmitted))
+	rt.HandleFunc(extract, handleExtract)
+	rt.Handle(scan, catbird.JobHandler(handleScan))
+	rt.Handle(review, catbird.JobHandler(handleReview))
+	rt.HandleFunc(publish, handlePublish)
+	rt.HandleFunc(archive, handleArchive)
 	go rt.Start(ctx)
 
 	// Starting one workflow. The id it returns is the workflow: signal it,
@@ -85,11 +85,8 @@ type scanResult struct {
 // handleSubmitted fans the workflow out. What it asks for is written by the
 // statement that ends this job, so a crash in between cannot leave a submitted
 // deposit with nothing started for it, and a retry starts with an empty buffer.
-func handleSubmitted(ctx context.Context, job *catbird.Job) error {
-	var depositID int
-	if err := json.Unmarshal(job.Payload, &depositID); err != nil {
-		return err
-	}
+// It is registered through JobHandler, so the payload arrives decoded.
+func handleSubmitted(ctx context.Context, depositID int, job *catbird.Job) error {
 	job.Enqueue(extract, depositID)
 	job.Enqueue(scan, depositID)
 	job.EnqueueAfter(review, depositID) // after both of the above
@@ -99,11 +96,7 @@ func handleSubmitted(ctx context.Context, job *catbird.Job) error {
 // handleScan records a result the review step reads later. It opens no
 // transaction: the worker completes the job, and the completion writes what
 // SetOutput recorded.
-func handleScan(ctx context.Context, job *catbird.Job) error {
-	var depositID int
-	if err := json.Unmarshal(job.Payload, &depositID); err != nil {
-		return err
-	}
+func handleScan(ctx context.Context, depositID int, job *catbird.Job) error {
 	finding := virusCheck(depositID)
 	return job.SetOutput(scanResult{Clean: finding == "", Finding: finding})
 }
@@ -111,11 +104,7 @@ func handleScan(ctx context.Context, job *catbird.Job) error {
 // handleReview runs when extraction and the scan finished and a decision
 // arrived. The gate guarantees the decision is here, so there is no case for
 // its absence.
-func handleReview(ctx context.Context, job *catbird.Job) error {
-	var depositID int
-	if err := json.Unmarshal(job.Payload, &depositID); err != nil {
-		return err
-	}
+func handleReview(ctx context.Context, depositID int, job *catbird.Job) error {
 	var d decision
 	if err := json.Unmarshal(job.Signal, &d); err != nil {
 		return err

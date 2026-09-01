@@ -89,7 +89,7 @@ func (r *Runtime) Handle(t *JobType, handle Handler) {
 	if _, taken := w.handlers[t.name]; taken {
 		panic("catbird: job type " + t.name + " is already registered on queue " + t.queue.name)
 	}
-	w.handlers[t.name] = registration{jobType: t, handle: handle}
+	w.handlers[t.name] = registration{jobType: t, handler: handle}
 	w.names = append(w.names, t.name)
 
 	// A type declared with Schedule is ticked by the processes that handle it,
@@ -100,6 +100,15 @@ func (r *Runtime) Handle(t *JobType, handle Handler) {
 		p := &periodic{runtime: r, jobType: t, logger: w.logger}
 		r.declareLocked("", p.start)
 	}
+}
+
+// HandleFunc registers a plain function the way Handle registers a Handler,
+// like http.ServeMux's HandleFunc.
+func (r *Runtime) HandleFunc(t *JobType, handle func(ctx context.Context, job *Job) error) {
+	if handle == nil {
+		panic("catbird: job type " + t.name + " registered with no handler")
+	}
+	r.Handle(t, HandlerFunc(handle))
 }
 
 // Start runs everything declared on the runtime until ctx is canceled, then

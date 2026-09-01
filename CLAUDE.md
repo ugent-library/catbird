@@ -68,7 +68,7 @@ Six files, one migration, no packages:
   `DependencyOutputs` as methods; and `Cursor`, a name and the patterns read
   under it, which carries `Read` and `Ack` as methods and holds no connection
   either.
-- `runtime.go` — `New`, `Handle`, `Start`, and the two loops every process runs
+- `runtime.go` — `New`, `Handle`, `HandleFunc`, `Start`, and the two loops every process runs
   whether or not anything is registered: the position assigner and the one
   `LISTEN` connection that wakes the rest. One `Runtime` per process owns the
   pool and one goroutine per queue and trigger.

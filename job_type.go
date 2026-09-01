@@ -2,6 +2,7 @@ package catbird
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"time"
 )
@@ -11,7 +12,36 @@ import (
 // nil without calling Complete leaves the job for the worker to complete
 // afterwards, which means its writes committed before the job ended and a crash
 // in between runs them again. See Complete.
-type Handler func(ctx context.Context, job *Job) error
+//
+// It is an interface for the reason http.Handler is: a handler with
+// dependencies is a struct implementing it instead of a closure over half the
+// application, and logging, metrics or panic recovery wrap every handler as a
+// func(Handler) Handler. A plain function registers with Runtime.HandleFunc, or
+// converts with HandlerFunc.
+type Handler interface {
+	HandleJob(ctx context.Context, job *Job) error
+}
+
+// HandlerFunc makes a plain function a Handler, like http.HandlerFunc.
+type HandlerFunc func(ctx context.Context, job *Job) error
+
+// HandleJob calls fn.
+func (fn HandlerFunc) HandleJob(ctx context.Context, job *Job) error { return fn(ctx, job) }
+
+// JobHandler is the Handler for a function that takes its payload decoded: it
+// unmarshals the job's payload into a T and passes it beside the job, so the
+// payload's shape is checked by the compiler instead of read off json.Unmarshal
+// calls at the top of the handler. A payload that does not unmarshal fails the
+// attempt like any other handler error.
+func JobHandler[T any](fn func(ctx context.Context, payload T, job *Job) error) Handler {
+	return HandlerFunc(func(ctx context.Context, job *Job) error {
+		var payload T
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			return err
+		}
+		return fn(ctx, payload, job)
+	})
+}
 
 // QueueOptions are the optional parts of NewQueue. Zero values take the
 // defaults. Lease and Timeout are the two durations to set with care, and how

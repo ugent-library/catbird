@@ -22,7 +22,7 @@ func TestPeriodicRuns(t *testing.T) {
 
 	var ran atomic.Int32
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(report, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(report, func(ctx context.Context, job *catbird.Job) error {
 		ran.Add(1)
 		return nil
 	})
@@ -50,7 +50,7 @@ func TestPeriodicSkipsWhileAJobLives(t *testing.T) {
 
 	var ran atomic.Int32
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(report, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(report, func(ctx context.Context, job *catbird.Job) error {
 		ran.Add(1)
 		return nil
 	})
@@ -89,7 +89,7 @@ func TestPeriodicOneJobAcrossProcesses(t *testing.T) {
 	}
 	for range 2 {
 		rt := catbird.New(pool, catbird.Options{})
-		rt.Handle(report, handle)
+		rt.HandleFunc(report, handle)
 		go rt.Start(ctx)
 	}
 

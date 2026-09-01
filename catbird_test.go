@@ -125,7 +125,7 @@ func TestTortureThroughput(t *testing.T) {
 	var workerWg sync.WaitGroup
 	for i := 0; i < 5; i++ {
 		rt := catbird.New(pool, catbird.Options{})
-		rt.Handle(task, handle)
+		rt.HandleFunc(task, handle)
 		workerWg.Add(1)
 		go func() {
 			defer workerWg.Done()
@@ -180,7 +180,7 @@ func TestLongJobDoesNotHoldUpTheQueue(t *testing.T) {
 	release := make(chan struct{})
 	done := make(chan string, 32)
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(long, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(long, func(ctx context.Context, job *catbird.Job) error {
 		select {
 		case <-release:
 		case <-ctx.Done():
@@ -189,7 +189,7 @@ func TestLongJobDoesNotHoldUpTheQueue(t *testing.T) {
 		done <- job.Type
 		return nil
 	})
-	rt.Handle(short, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(short, func(ctx context.Context, job *catbird.Job) error {
 		done <- job.Type
 		return nil
 	})
@@ -281,14 +281,14 @@ func TestHandlerFansOutAndJoins(t *testing.T) {
 	branchesDone := make(chan int, 8)
 
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(root, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(root, func(ctx context.Context, job *catbird.Job) error {
 		job.Enqueue(branch, 1)
 		job.Enqueue(branch, 2)
 		job.Enqueue(branch, 3)
 		job.EnqueueAfter(join, "after all three")
 		return nil
 	})
-	rt.Handle(branch, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(branch, func(ctx context.Context, job *catbird.Job) error {
 		var n int
 		if err := json.Unmarshal(job.Payload, &n); err != nil {
 			return err
@@ -296,7 +296,7 @@ func TestHandlerFansOutAndJoins(t *testing.T) {
 		branchesDone <- n
 		return job.SetOutput(n * 10)
 	})
-	rt.Handle(join, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(join, func(ctx context.Context, job *catbird.Job) error {
 		joined <- job
 		return nil
 	})
@@ -390,7 +390,7 @@ func TestDependencyOutputs(t *testing.T) {
 	}
 
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(root, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(root, func(ctx context.Context, job *catbird.Job) error {
 		if err := read(job, rootRound); err != nil {
 			return err
 		}
@@ -400,7 +400,7 @@ func TestDependencyOutputs(t *testing.T) {
 		job.EnqueueAfter(join, nil)
 		return nil
 	})
-	rt.Handle(branch, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(branch, func(ctx context.Context, job *catbird.Job) error {
 		var n int
 		if err := json.Unmarshal(job.Payload, &n); err != nil {
 			return err
@@ -410,7 +410,7 @@ func TestDependencyOutputs(t *testing.T) {
 		}
 		return job.SetOutput(n * 10)
 	})
-	rt.Handle(join, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(join, func(ctx context.Context, job *catbird.Job) error {
 		if job.Attempts == 1 {
 			if err := read(job, firstAttempt); err != nil {
 				return err
@@ -425,7 +425,7 @@ func TestDependencyOutputs(t *testing.T) {
 		job.EnqueueAfter(rejoin, nil)
 		return nil
 	})
-	rt.Handle(rejoin, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(rejoin, func(ctx context.Context, job *catbird.Job) error {
 		return read(job, secondRound)
 	})
 
@@ -505,7 +505,7 @@ func TestAFailedAttemptAsksForNothing(t *testing.T) {
 	flaky := catbird.NewJobType("flaky", queue, catbird.JobTypeOptions{MinBackoff: 50 * time.Millisecond})
 
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(flaky, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(flaky, func(ctx context.Context, job *catbird.Job) error {
 		job.Enqueue(next, job.Attempts)
 		if job.Attempts == 1 {
 			return errors.New("the first attempt fails after asking for more work")
@@ -561,11 +561,11 @@ func TestSignalGatesAJob(t *testing.T) {
 
 	ran := make(chan *catbird.Job, 2)
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(gate, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(gate, func(ctx context.Context, job *catbird.Job) error {
 		ran <- job
 		return nil
 	})
-	rt.Handle(plain, func(ctx context.Context, job *catbird.Job) error { return nil })
+	rt.HandleFunc(plain, func(ctx context.Context, job *catbird.Job) error { return nil })
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	go rt.Start(runCtx)
@@ -617,11 +617,11 @@ func TestSignalAddressesAGateInsideAWorkflow(t *testing.T) {
 
 	ran := make(chan *catbird.Job, 2)
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(start, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(start, func(ctx context.Context, job *catbird.Job) error {
 		job.EnqueueAfter(approve, "decide on me")
 		return nil
 	})
-	rt.Handle(approve, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(approve, func(ctx context.Context, job *catbird.Job) error {
 		ran <- job
 		return nil
 	})
@@ -672,7 +672,7 @@ func TestAProcessClaimsOnlyWhatItHandles(t *testing.T) {
 
 	ran := make(chan string, 4)
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(known, func(ctx context.Context, job *catbird.Job) error { // and not unknown
+	rt.HandleFunc(known, func(ctx context.Context, job *catbird.Job) error { // and not unknown
 		ran <- job.Type
 		return nil
 	})
@@ -736,7 +736,7 @@ func TestLeaseExpiryFence(t *testing.T) {
 	// another worker's hands while the first is still running.
 	for range 2 {
 		rt := catbird.New(pool, catbird.Options{})
-		rt.Handle(slow, handle)
+		rt.HandleFunc(slow, handle)
 		go rt.Start(ctx)
 	}
 
@@ -778,7 +778,7 @@ func TestTriggerBridgesPayloadUnchanged(t *testing.T) {
 	got := make(chan catbird.Job, 16)
 	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
 	rt.Trigger("img", []string{"image.#"}, process, catbird.TriggerOptions{PollInterval: 50 * time.Millisecond})
-	rt.Handle(process, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(process, func(ctx context.Context, job *catbird.Job) error {
 		got <- *job
 		return nil
 	})
@@ -952,7 +952,7 @@ func TestOutputAndStreamNotify(t *testing.T) {
 	}
 
 	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
-	rt.Handle(sum, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(sum, func(ctx context.Context, job *catbird.Job) error {
 		var in []int
 		json.Unmarshal(job.Payload, &in)
 		total := 0
@@ -1016,7 +1016,7 @@ func TestFailedAttemptWritesNoOutput(t *testing.T) {
 	}
 
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(flaky, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(flaky, func(ctx context.Context, job *catbird.Job) error {
 		if err := job.SetOutput(job.Attempts); err != nil {
 			return err
 		}
@@ -1285,7 +1285,7 @@ func TestCreatedAtIsSetOnStreamAndJobMessages(t *testing.T) {
 
 	jobCreatedAt := make(chan time.Time, 1)
 	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
-	rt.Handle(age, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(age, func(ctx context.Context, job *catbird.Job) error {
 		jobCreatedAt <- job.CreatedAt
 		return nil
 	})
@@ -1339,7 +1339,7 @@ func TestShutdownReturnsTheJob(t *testing.T) {
 
 	started := make(chan struct{})
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(slow, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(slow, func(ctx context.Context, job *catbird.Job) error {
 		close(started)
 		<-ctx.Done()
 		return ctx.Err()
@@ -1406,7 +1406,7 @@ func TestTimeoutCountsTheAttemptAsFailed(t *testing.T) {
 
 	var calls int32
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(hangs, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(hangs, func(ctx context.Context, job *catbird.Job) error {
 		atomic.AddInt32(&calls, 1)
 		<-ctx.Done() // the queue's Timeout, with the runtime still running
 		return ctx.Err()
@@ -1471,7 +1471,7 @@ func TestRenewalKeepsALongJobClaimed(t *testing.T) {
 	// worker's hands.
 	for range 2 {
 		rt := catbird.New(pool, catbird.Options{})
-		rt.Handle(long, handle)
+		rt.HandleFunc(long, handle)
 		go rt.Start(ctx)
 	}
 
@@ -1512,7 +1512,7 @@ func TestRenewalStopsAtTimeout(t *testing.T) {
 		return nil
 	}
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(hangs, handle)
+	rt.HandleFunc(hangs, handle)
 	runCtx, stop := context.WithCancel(ctx)
 	stopped := make(chan struct{})
 	go func() {
@@ -1560,7 +1560,7 @@ func TestCancelStopsARenewingHandler(t *testing.T) {
 	started := make(chan struct{})
 	causes := make(chan error, 1)
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(waits, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(waits, func(ctx context.Context, job *catbird.Job) error {
 		if atomic.AddInt32(&runs, 1) == 1 {
 			close(started)
 		}
@@ -1619,7 +1619,7 @@ func TestCompletedJobIsNotRetriedAfterAnError(t *testing.T) {
 	var calls int32
 	ran := make(chan struct{}, 4)
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(done, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(done, func(ctx context.Context, job *catbird.Job) error {
 		atomic.AddInt32(&calls, 1)
 		tx, err := pool.Begin(ctx)
 		if err != nil {
@@ -1674,7 +1674,7 @@ func TestHandlerErrorSchedulesARetryAfterBackoff(t *testing.T) {
 
 	var calls int32
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(flaky, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(flaky, func(ctx context.Context, job *catbird.Job) error {
 		atomic.AddInt32(&calls, 1)
 		if job.Attempts == 1 {
 			return errors.New("the first attempt fails")
@@ -1725,7 +1725,7 @@ func TestMaxBackoffCapsTheGrowingWait(t *testing.T) {
 	}
 
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(flaky, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(flaky, func(ctx context.Context, job *catbird.Job) error {
 		return errors.New("every attempt fails")
 	})
 	runCtx, stop := context.WithCancel(ctx)
@@ -1754,10 +1754,10 @@ func TestMaxAttemptsMarksTheJobDeadAndRunsOnDead(t *testing.T) {
 	doomed := catbird.NewJobType("doomed", queue, catbird.JobTypeOptions{
 		MaxAttempts: 3,
 		MinBackoff:  20 * time.Millisecond,
-		OnDead: func(ctx context.Context, job *catbird.Job) error {
+		OnDead: catbird.HandlerFunc(func(ctx context.Context, job *catbird.Job) error {
 			dead <- job
 			return nil
-		},
+		}),
 	})
 	patient := catbird.NewJobType("patient", queue, catbird.JobTypeOptions{
 		MaxAttempts: 10, MinBackoff: 20 * time.Millisecond,
@@ -1773,11 +1773,11 @@ func TestMaxAttemptsMarksTheJobDeadAndRunsOnDead(t *testing.T) {
 
 	var calls, patientCalls int32
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(doomed, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(doomed, func(ctx context.Context, job *catbird.Job) error {
 		atomic.AddInt32(&calls, 1)
 		return errors.New("this handler never succeeds")
 	})
-	rt.Handle(patient, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(patient, func(ctx context.Context, job *catbird.Job) error {
 		atomic.AddInt32(&patientCalls, 1)
 		return errors.New("this one is allowed more tries")
 	})
@@ -1835,12 +1835,12 @@ func TestADeadJobCancelsItsWorkflow(t *testing.T) {
 	}
 
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(root, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(root, func(ctx context.Context, job *catbird.Job) error {
 		job.Enqueue(failing, nil)
 		job.Enqueue(sibling, nil)
 		return nil
 	})
-	rt.Handle(failing, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(failing, func(ctx context.Context, job *catbird.Job) error {
 		return errors.New("the first step fails")
 	})
 	runCtx, stop := context.WithCancel(ctx)
@@ -1883,12 +1883,12 @@ func TestCancelStopsWaitingJobsAndLetsARunningOneFinish(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(root, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(root, func(ctx context.Context, job *catbird.Job) error {
 		job.Enqueue(running, nil)
 		job.Enqueue(waiting, nil)
 		return nil
 	})
-	rt.Handle(running, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(running, func(ctx context.Context, job *catbird.Job) error {
 		close(started)
 		<-release
 		return nil
@@ -2101,7 +2101,7 @@ func TestListenReconnectsAfterTheConnectionDrops(t *testing.T) {
 
 	ran := make(chan int64, 4)
 	rt := catbird.New(pool, catbird.Options{ReconnectAfter: 100 * time.Millisecond})
-	rt.Handle(after, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(after, func(ctx context.Context, job *catbird.Job) error {
 		ran <- job.ID
 		return nil
 	})
@@ -2231,9 +2231,9 @@ func TestStatusReportsWhatAJobIsDoing(t *testing.T) {
 	// A completed job is a message whose claim is gone.
 	var fansOut int64
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(plain, func(ctx context.Context, job *catbird.Job) error { return nil })
-	rt.Handle(joins, func(ctx context.Context, job *catbird.Job) error { return nil })
-	rt.Handle(gate, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(plain, func(ctx context.Context, job *catbird.Job) error { return nil })
+	rt.HandleFunc(joins, func(ctx context.Context, job *catbird.Job) error { return nil })
+	rt.HandleFunc(gate, func(ctx context.Context, job *catbird.Job) error {
 		job.Enqueue(stuck, nil)
 		job.Enqueue(stuck, nil)
 		job.EnqueueAfter(joins, nil)
@@ -2280,7 +2280,7 @@ func TestStatusTellsARunningJobFromOneWaitingToRetry(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{}, 2)
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(flaky, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(flaky, func(ctx context.Context, job *catbird.Job) error {
 		started <- struct{}{}
 		<-release
 		return errors.New("the service is down")
@@ -2335,7 +2335,7 @@ func TestADeadJobKeepsItsLastError(t *testing.T) {
 
 	long := strings.Repeat("a wrapped error chain, ", 40) // 920 characters
 	rt := catbird.New(pool, catbird.Options{})
-	rt.Handle(doomed, func(ctx context.Context, job *catbird.Job) error {
+	rt.HandleFunc(doomed, func(ctx context.Context, job *catbird.Job) error {
 		return errors.New(long)
 	})
 	runCtx, stop := context.WithCancel(ctx)
@@ -2354,5 +2354,55 @@ func TestADeadJobKeepsItsLastError(t *testing.T) {
 	}
 	if len(lastError) != 256 || lastError != long[:256] {
 		t.Errorf("error text is %d characters, want the first 256 of what the handler returned", len(lastError))
+	}
+}
+
+// JobHandler decodes the payload before the handler runs: the function takes
+// it as a parameter of its own, so its shape is checked by the compiler
+// instead of read off an Unmarshal call at the top of the handler. A payload
+// that does not unmarshal never reaches the function and fails the attempt
+// like any other handler error.
+func TestJobHandlerDecodesThePayload(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	type report struct {
+		Year   int    `json:"year"`
+		Format string `json:"format"`
+	}
+
+	queue := catbird.NewQueue("typed", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	build := catbird.NewJobType("typed.build", queue, catbird.JobTypeOptions{MaxAttempts: 1})
+
+	got := make(chan report, 2)
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Handle(build, catbird.JobHandler(func(ctx context.Context, payload report, job *catbird.Job) error {
+		got <- payload
+		return nil
+	}))
+	go rt.Start(ctx)
+
+	if _, err := catbird.Enqueue(ctx, pool, build, report{Year: 2026, Format: "pdf"}, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case p := <-got:
+		if p.Year != 2026 || p.Format != "pdf" {
+			t.Errorf("payload arrived as %+v", p)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the typed handler never ran")
+	}
+
+	id, err := catbird.Enqueue(ctx, pool, build, "not a report", catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "the job with the bad payload never failed", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE message_id = $1 AND died_at IS NOT NULL", id) == 1
+	})
+	if len(got) != 0 {
+		t.Error("the handler ran on a payload that does not unmarshal")
 	}
 }
