@@ -98,7 +98,12 @@ CREATE TABLE cb_claims (
 );
 -- Only claimable rows are in the index; dead and waiting rows leave it on their
 -- own, and a job waiting for a signal sits at the far end on 'infinity' where
--- the claim's LIMIT never reaches it.
+-- the claim's LIMIT never reaches it. The claim filters job_type on the heap,
+-- so ready jobs of a type no running process handles are walked by every claim
+-- on their queue: 1015 buffers and 7.2 ms per claim of 50 at 100k such rows,
+-- against 102 and 0.03 ms with none. A job type whose consumer runs
+-- occasionally, or can be down for a while, gets a queue of its own: the queue
+-- leads this index, so its backlog sits in a range no other claim scans.
 CREATE INDEX cb_claims_ready_idx ON cb_claims (queue, visible_at) WHERE died_at IS NULL AND dependencies = 0;
 -- What Cancel and Signal probe. A worker cancels the group of every job that
 -- dies in one, so without this a downstream outage runs one full scan of
