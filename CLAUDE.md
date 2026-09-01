@@ -87,14 +87,17 @@ Six files and one migration in the root package, and one package under it:
 - `migrations/00001_lite.sql` — the whole schema. Goose markers, no goose
   dependency; the tests split the file on `-- +goose down`.
 - `wire/` — the browser layer, a package of its own so the core keeps no
-  `net/http`; DESIGN.md's "Wire" section is its spec and only the renderer
-  exists so far. `renderer.go` holds `Renderer`, a process-global mux from
-  topic patterns to handlers: the pattern grammar is the stream's plus
-  `{name}`, which matches one segment in Go and never reaches SQL, and
-  dispatch runs each rule once per distinct variable binding with that
-  binding's messages, so a batch of fifty edits renders a record once. A
-  handler error drops that call's fragments and the rest still go out. The
-  transports — `ServePoll` with the signed token, SSE — are not built yet.
+  `net/http`; DESIGN.md's "Wire" section is its spec. `renderer.go` holds
+  `Renderer`, a process-global mux from topic patterns to handlers: the
+  pattern grammar is the stream's plus `{name}`, which matches one segment in
+  Go and never reaches SQL, and dispatch runs each rule once per distinct
+  variable binding with that binding's messages, so a batch of fifty edits
+  renders a record once. A handler error drops that call's fragments and the
+  rest still go out. `wire.go` holds the `Wire` value — pool, renderer, token
+  secret, one per process — and the token: `Token` signs the cursor a page
+  acks and the topics it may read, HMAC-SHA256 over the JSON, base64url, no
+  expiry; `Verify` answers `ErrInvalidToken` for everything else, one error on
+  purpose. The transports — `ServePoll`, SSE — are not built yet.
 
 ## Architecture
 
