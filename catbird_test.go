@@ -11,11 +11,31 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ugent-library/catbird"
 )
 
 const testDSN = "postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable"
+
+// TestMain holds an advisory lock for the life of the test binary. The wire
+// package's tests use the same database, and go test runs the two packages'
+// binaries at once — without the lock each drops the tables under the other
+// mid-test. Session lock 2 under catbird's namespace; the assigner's
+// transaction lock is 1.
+func TestMain(m *testing.M) {
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, testDSN)
+	if err != nil {
+		panic(err)
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtext('catbird'), 2)`); err != nil {
+		panic(err)
+	}
+	code := m.Run()
+	conn.Close(ctx)
+	os.Exit(code)
+}
 
 // setupTestDB connects and recreates the schema from the migration file.
 func setupTestDB(t *testing.T) *pgxpool.Pool {

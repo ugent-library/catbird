@@ -39,7 +39,11 @@ go test ./... -run TestEnqueueBatch
 Tests use a hardcoded DSN, `postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable`,
 and no env vars. The compose file creates no database, so `cb_tst` is made once
 by hand. `setupTestDB` drops the four tables and applies
-`migrations/00001_lite.sql` on every test, so tests do not share state.
+`migrations/00001_lite.sql` on every test, so tests do not share state. The
+root and wire packages test against the same database and `go test ./...` runs
+their binaries at once, so each `TestMain` holds advisory lock
+`(hashtext('catbird'), 2)` for the binary's life and the two suites take
+turns.
 
 `bench_hot.sh` measures index bloat on `cb_claims` under sustained update churn.
 It talks to the same database directly and needs no Go build.
@@ -97,7 +101,14 @@ Six files and one migration in the root package, and one package under it:
   secret, one per process — and the token: `Token` signs the cursor a page
   acks and the topics it may read, HMAC-SHA256 over the JSON, base64url, no
   expiry; `Verify` answers `ErrInvalidToken` for everything else, one error on
-  purpose. The transports — `ServePoll`, SSE — are not built yet.
+  purpose. `serve.go` holds the first transport: `ServePoll` verifies — 401
+  otherwise — and hands the grant to `Serve`, which reads after the token's
+  cursor with the token's topics, dispatches through the renderer, writes
+  every fragment as one HTML response or a 204 when nothing came out, and
+  acks the last position read. The ack comes after the response on a context
+  the client cannot cancel — sent is seen — and an empty poll acks nothing,
+  so idle pages write no rows. The form without a cursor, where the page
+  holds the position and polls with `?after=`, and SSE are not built yet.
 
 ## Architecture
 
