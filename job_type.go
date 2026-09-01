@@ -15,7 +15,7 @@ type Handler func(ctx context.Context, job *Job) error
 
 // QueueOptions are the optional parts of NewQueue. Zero values take the defaults.
 type QueueOptions struct {
-	BatchSize    int           // jobs running at once; default 50
+	BatchSize    int           // jobs running at once in this process; default 50
 	Lease        time.Duration // how long one attempt keeps its claim; default 5 minutes
 	PollInterval time.Duration // wake-up interval when no notification arrives; default 5 seconds
 
