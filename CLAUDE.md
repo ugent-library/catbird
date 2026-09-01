@@ -4,9 +4,10 @@ Guidance for Claude Code (claude.ai/code) working in this repository.
 
 ## What is Catbird Lite?
 
-A PostgreSQL-backed job queue, stream, and small workflow engine. Four tables,
-plain SQL, no PL/pgSQL, no extensions, one dependency (pgx). Postgres is the
-only coordinator; workers scale by starting more processes.
+A PostgreSQL-backed job queue, stream, and small workflow engine. Four tables
+plus a migrations record, plain SQL, no PL/pgSQL, no extensions, one dependency
+(pgx). Postgres is the only coordinator; workers scale by starting more
+processes.
 
 `DESIGN.md` is the specification and the first thing to read. It describes what
 is built and, under "Planned additions", what is not — do not treat anything in
@@ -38,8 +39,8 @@ go test ./... -run TestEnqueueBatch
 
 Tests use a hardcoded DSN, `postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable`,
 and no env vars. The compose file creates no database, so `cb_tst` is made once
-by hand. `setupTestDB` drops the four tables and applies
-`migrations/00001_lite.sql` on every test, so tests do not share state. The
+by hand. `setupTestDB` runs `MigrateDownTo(0)` and `MigrateUp` on every test,
+so tests do not share state and every down section is exercised. The
 root and wire packages test against the same database and `go test ./...` runs
 their binaries at once, so each `TestMain` holds advisory lock
 `(hashtext('catbird'), 2)` for the binary's life and the two suites take
@@ -50,7 +51,7 @@ It talks to the same database directly and needs no Go build.
 
 ## Layout
 
-Six files and one migration in the root package, and one package under it:
+Seven files and one migration in the root package, and one package under it:
 
 - `job_type.go` — the two declarations an application writes. `Queue` is a name
   and how work runs under it: `BatchSize`, `Lease`, `Timeout`, `PollInterval`.
@@ -88,8 +89,16 @@ Six files and one migration in the root package, and one package under it:
   job type declared with `Schedule`, so a scheduled type ticks in the
   processes that can run it. Its statement lives in `client.go` with the
   others.
+- `migrate.go` — the runner and the three ways a caller applies the schema:
+  `MigrateUp`/`MigrateDownTo` for a caller with nothing, `MigrationsFS` for a
+  caller with goose, `Migrations()` (parsed up and down sections) for any
+  other tool. Each migration runs in its own transaction with its
+  `cb_migrations` row; concurrency is an advisory lock (key 3 under
+  `hashtext('catbird')`) plus the insert guard. The parser is `strings.Cut`
+  on the two markers, which works only while the schema has no PL/pgSQL.
 - `migrations/00001_lite.sql` — the whole schema. Goose markers, no goose
-  dependency; the tests split the file on `-- +goose down`.
+  dependency; goose reads them as they stand (its comparison is
+  case-insensitive).
 - `wire/` — the browser layer, a package of its own so the core keeps no
   `net/http`; DESIGN.md's "Wire" section is its spec. `renderer.go` holds
   `Renderer`, a process-global mux from topic patterns to handlers: the
@@ -119,7 +128,9 @@ to run, rewritten on every claim and retry, deleted on completion; it carries
 the queue, the job type, the workflow, what the job waits for, the signal
 payload once one arrives, when it died if no worker will claim it again, and
 what the last failed attempt returned. `cb_cursors` and `cb_outputs` are one row each per
-stream consumer and per job result.
+stream consumer and per job result. `cb_migrations` is one row per schema
+change that ran, created by the runner rather than by a migration, and touches
+no hot path.
 
 **Queue and job type are two things.** The queue is the claim key and the
 concurrency bound — it decides who competes with whom for `BatchSize` slots.

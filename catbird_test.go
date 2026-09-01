@@ -37,7 +37,8 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// setupTestDB connects and recreates the schema from the migration file.
+// setupTestDB connects and recreates the schema through the runner, so tests
+// share no state and every down section is exercised on every test.
 func setupTestDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
@@ -47,21 +48,11 @@ func setupTestDB(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	b, err := os.ReadFile("migrations/00001_lite.sql")
-	if err != nil {
-		t.Fatalf("read schema: %v", err)
+	if err := catbird.MigrateDownTo(ctx, pool, 0); err != nil {
+		t.Fatalf("migrate down: %v", err)
 	}
-	up := strings.Split(string(b), "-- +goose down")[0]
-
-	_, err = pool.Exec(ctx, `
-		DROP TABLE IF EXISTS cb_outputs, cb_claims, cb_cursors, cb_messages CASCADE;
-		DROP SEQUENCE IF EXISTS cb_position_seq;
-	`)
-	if err != nil {
-		t.Fatalf("drop: %v", err)
-	}
-	if _, err = pool.Exec(ctx, up); err != nil {
-		t.Fatalf("schema: %v", err)
+	if err := catbird.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("migrate up: %v", err)
 	}
 	return pool
 }

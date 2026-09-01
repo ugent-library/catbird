@@ -1,6 +1,6 @@
 # Catbird Lite
 
-A PostgreSQL-backed job queue, stream, and small workflow engine. Four tables, plain SQL, no PL/pgSQL, no extensions. All logic lives in the client statements (Go today; other languages follow the same statements), so the whole system is the schema in `migrations/00001_lite.sql` plus the declarations in `job_type.go` and the statements in `client.go`, `worker.go` and `trigger.go`.
+A PostgreSQL-backed job queue, stream, and small workflow engine. Four tables plus a migrations record, plain SQL, no PL/pgSQL, no extensions. All logic lives in the client statements (Go today; other languages follow the same statements), so the whole system is the schema in `migrations/` plus the declarations in `job_type.go` and the statements in `client.go`, `worker.go` and `trigger.go`.
 
 ## Tables
 
@@ -10,6 +10,7 @@ A PostgreSQL-backed job queue, stream, and small workflow engine. Four tables, p
   What a job is doing is not a column. `died_at` is one timestamp — when this job died, never to be claimed again, which is also what `GC`'s age test runs from; NULL while it lives — and everything else a caller wants to know is derived from `visible_at`, `attempts`, `dependencies`, `awaits_signal` and `last_error` by `Status`. That is why the schema has no `status`: the word belongs to the derived answer, and a stored column of the same name would mean something narrower in the same statement.
 - `cb_cursors` — one row per stream consumer: the highest position it processed.
 - `cb_outputs` — optional job results. A handler records one with `SetOutput` and the completion writes it, in the statement that deletes the claim, so a result cannot outlive an attempt that never finished. `group_id` and `job_type` are copied from the claim beside it, so a later job of the same workflow reads an earlier one's result by what produced it. Read with `Output` and `Outputs`.
+- `cb_migrations` — one row per schema change that ran. The runner creates it on first use, so no migration has to; it is written once per schema change and read by nothing on a hot path. See "Migrations" below.
 
 A partial index on `cb_claims (queue, visible_at) WHERE died_at IS NULL AND dependencies = 0` holds only claimable rows. Dead rows and rows waiting on other jobs are not in it, and a job waiting for a signal sits at the far end on `'infinity'`, where the claim's `LIMIT` never reaches it.
 
@@ -182,7 +183,11 @@ A scheduled type cannot also declare `Signal`: a gated job never becomes claimab
 
 `GC(retention)` deletes claims dead longer than `retention` — the age runs from `died_at` — and then messages older than `retention` that have no claim. A delayed or waiting job keeps its message however old it is. `cb_claims` and `cb_outputs` reference `cb_messages` with `ON DELETE CASCADE`, so nothing is orphaned.
 
-## Known limits
+## Migrations
+
+The schema ships as `.sql` files in `migrations/`, named `<number>_<name>.sql` with `-- +goose up` and `-- +goose down` markers, and one format serves three kinds of caller. A caller with nothing runs `MigrateUp(ctx, db)` at startup: it applies every migration not yet applied, in version order, each in its own transaction together with its `cb_migrations` row. Two processes deploying at once queue on an advisory lock inside that transaction — key 3 under `hashtext('catbird')` — and the one that waited sees the row and skips, so the insert guard is the whole concurrency story. `MigrateDownTo(ctx, db, version)` reverts the other way, newest first, and every migration's down section drops what its up created. Both take anything with `Begin` — a pool, a connection, or a transaction — because `BEGIN` as a plain statement on a pool may land on a different connection than the statements after it.
+
+A caller with goose points a provider with its own table name at `MigrationsFS`; the markers are valid goose annotations as they stand, and goose compares them case-insensitively. A caller with any other tool takes `Migrations()` — version, name, up SQL, down SQL — and registers the sections with it. Because the schema has no PL/pgSQL, no statement holds a semicolon inside a body, so each section runs as one script and the markers are all a parser needs; that property is what keeps the runner at one file and the format portable, and a schema change that breaks it buys the parser goose replaced.
 
 What this design does not do, or does at a price. A caller has to know about these now.
 
@@ -220,7 +225,7 @@ What this design does not do, or does at a price. A caller has to know about the
 
 **No partitioning.** `cb_messages` is one table for the whole database, and retention is a row-by-row `DELETE` with the index churn that implies rather than dropping a partition.
 
-**No schema versioning and no migration path.** One `.sql` file with goose markers, no runner, no version table, and no route from an installation of the earlier catbird. The second schema change has to invent all of it; building that is on the build list below.
+**No migration path from the earlier catbird, and no out-of-transaction migrations.** There is no route from an installation of the earlier catbird; its databases are rebuilt, not migrated. And every migration runs in a transaction with its `cb_migrations` row, so none can use `CREATE INDEX CONCURRENTLY` until the runner grows a marker for it — goose's `NO TRANSACTION` annotation is the shape to copy when one does.
 
 **Positions follow insert order inside a tick.** The assigner orders its batch by `id`, so two messages that commit within one window can get positions in insert order rather than commit order. Commit order is what holds across ticks, which is what a reader depends on.
 
@@ -245,7 +250,7 @@ The rule for everything below: a change leaves the core easier to read than it f
 6. ~~**Lease extension.**~~ Built, as renewal in the worker rather than an `ExtendLease` the handler calls; see "Lease and Timeout rule" above and "Extending a lease" below.
 7. ~~**Wire**, a package of its own: hypermedia delivery of stream messages to browsers, a polled GET first and SSE later on the same renderer; see "Wire" below. It uses only the exported stream reads, so the core does not change for it.~~ Built, as the `wire` package — the renderer, the token, `ServePoll` and `Serve` — on the exported stream reads alone, so the core did not change. SSE and the form without a cursor are deferred until a page needs them; each carries its ruling under "Wire" below.
 8. ~~**`Handler` as an interface, and typed payloads as an adapter.**~~ Built, as `Handler`, `HandlerFunc`, `Runtime.HandleFunc` and `JobHandler`; see "Declarations" above. `(Out, error)` is still the shape not to take: a handler that completes in its own transaction cannot return an output the completion already wrote, so `SetOutput` stays beside it. Wire's renderer registers handlers the same way, so one idiom covers both.
-9. **A migration runner and schema versioning.** One `.sql` file, no version table, no path from an installation of the earlier catbird — the known limit above. The second schema change needs all of it, so it is built before that change and not during it.
+9. ~~**A migration runner and schema versioning.**~~ Built, as `migrate.go`: `MigrateUp`, `MigrateDownTo`, and the files and their parsed form exported for a caller who runs goose or a tool of their own; see "Migrations" above. What remains — no path from the earlier catbird, no out-of-transaction migrations — is a known limit above.
 10. **Metrics and telemetry.** What the queues are doing, readable without writing SQL: depth and age of the oldest ready job per queue, throughput, failures, dead jobs. The shape is undecided — counters the process exports, a read like `Status` for a whole queue, or a documented set of queries — and deciding that is part of the item.
 11. **A review of what lives in Go but belongs in the database.** Every statement lives in `client.go`, so a second client reimplements them all — including the ones the known limits call fragile, where the SQL has to be reproduced exactly. Walk the statements and decide which should become SQL functions that clients call instead. The review is the item; moving anything is its own decision.
 12. **Workflow progress and results.** A caller holding only the id `Enqueue` returned can ask nothing of the whole workflow: is anything still going to run, did anything die, what results are there. The reads are settled and cheap; the API shape is not, and deciding it is part of the item. See "Workflow progress and results" below.

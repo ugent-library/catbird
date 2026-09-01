@@ -38,8 +38,8 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// setupTestDB mirrors the root package's: drop the four tables and apply the
-// migration, so tests share no state.
+// setupTestDB mirrors the root package's: revert and reapply the migrations
+// through the runner, so tests share no state.
 func setupTestDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
@@ -49,21 +49,11 @@ func setupTestDB(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	b, err := os.ReadFile("../migrations/00001_lite.sql")
-	if err != nil {
-		t.Fatalf("read schema: %v", err)
+	if err := catbird.MigrateDownTo(ctx, pool, 0); err != nil {
+		t.Fatalf("migrate down: %v", err)
 	}
-	up, _, _ := strings.Cut(string(b), "-- +goose down")
-
-	_, err = pool.Exec(ctx, `
-		DROP TABLE IF EXISTS cb_outputs, cb_claims, cb_cursors, cb_messages CASCADE;
-		DROP SEQUENCE IF EXISTS cb_position_seq;
-	`)
-	if err != nil {
-		t.Fatalf("drop: %v", err)
-	}
-	if _, err = pool.Exec(ctx, up); err != nil {
-		t.Fatalf("schema: %v", err)
+	if err := catbird.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("migrate up: %v", err)
 	}
 	return pool
 }
