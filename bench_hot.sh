@@ -75,7 +75,7 @@ iter=0
 printf "%-12d %-15s %-15s\n" "$iter" "$start_idx_size" "$(measure_table_size)"
 
 for iter in $(seq 1 $CHURN_ITERATIONS); do
-    # 1. Lease rows (status 0 -> 1)
+    # 1. Claim rows (status 0 -> 1)
     psql "$DB_URL" -q << SQL
     UPDATE cb_claims_test
     SET status = 1, visible_at = NOW() + interval '5 minutes'

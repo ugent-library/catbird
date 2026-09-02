@@ -44,38 +44,45 @@ func JobHandler[T any](fn func(ctx context.Context, payload T, job *Job) error) 
 }
 
 // QueueOptions are the optional parts of NewQueue. Zero values take the
-// defaults. Lease and Timeout are the two durations to set with care, and how
-// they compare is itself a setting: with Timeout inside Lease — the default —
-// a handler must finish within the lease, and with Timeout above Lease the
-// worker renews the leases of its running jobs, so a handler may run to
-// Timeout while a crashed worker's job still comes back within Lease.
+// defaults. ClaimDuration and HandlerTimeout are the two durations to set with
+// care; each one left unset defaults from the other so that the claim covers
+// the handler, and both unset they are five minutes and a few seconds inside
+// it. How they compare is itself a setting: with HandlerTimeout inside
+// ClaimDuration a handler must finish within its claim, and with
+// HandlerTimeout above ClaimDuration the worker renews the claims of its
+// running jobs, so a handler may run to HandlerTimeout while a crashed
+// worker's job still comes back within ClaimDuration.
 type QueueOptions struct {
 	BatchSize int // jobs running at once in this process; default 50
 
-	// Lease is how long one attempt keeps its claim before any worker may take
-	// the job again — and so how long a job stays stuck when the process
-	// running it crashes. It bounds the handler only on a queue that does not
-	// renew; see Timeout. Default 5 minutes.
-	Lease time.Duration
+	// ClaimDuration is how long one attempt keeps its claim before any worker
+	// may take the job again — and so how long a job stays stuck when the
+	// process running it crashes. It bounds the handler only on a queue that
+	// does not renew; see HandlerTimeout. Unset, it is HandlerTimeout plus the
+	// few seconds the completion needs, so the claim covers the handler and a
+	// queue of short jobs recovers a crashed worker's jobs quickly; five
+	// minutes when neither is set.
+	ClaimDuration time.Duration
 
 	PollInterval time.Duration // wake-up interval when no notification arrives; default 5 seconds
 
-	// Timeout bounds one attempt: the handler's context is cancelled when it
+	// HandlerTimeout bounds one attempt: the handler's context is cancelled when it
 	// passes and the attempt counts as failed like any other. It ends the
 	// attempt and not the goroutine — a handler that never looks at its context
 	// keeps its slot until it returns. The default keeps the completion's few
-	// seconds inside the lease, which makes the lease the bound a handler must
+	// seconds inside the claim, which makes the claim the bound a handler must
 	// finish within: past it another worker may hold the claim, and the late
 	// attempt's writes match no row.
 	//
-	// A Timeout above Lease is how a queue runs jobs longer than its lease: the
-	// worker then renews the leases of its running jobs every half Lease, so
-	// Timeout alone bounds an attempt and Lease decides how soon a crashed
-	// worker's job is claimed again — a queue of hour-long jobs keeps a lease
-	// of minutes. Renewal follows the handler's context: a handler that hangs
-	// past Timeout is renewed no further, and its job comes back about a lease
+	// A HandlerTimeout above ClaimDuration is how a queue runs jobs longer
+	// than its claim: the worker then renews the claims of its running jobs
+	// every half ClaimDuration, so HandlerTimeout alone bounds an attempt and
+	// ClaimDuration decides how soon a crashed worker's job is claimed again —
+	// a queue of hour-long jobs keeps a ClaimDuration of minutes. Renewal
+	// follows the handler's context: a handler that hangs past HandlerTimeout
+	// is renewed no further, and its job comes back about a ClaimDuration
 	// later like any other overrun.
-	Timeout time.Duration
+	HandlerTimeout time.Duration
 
 	Logger *slog.Logger // default: the runtime's logger
 }
@@ -84,16 +91,23 @@ func (o QueueOptions) withDefaults() QueueOptions {
 	if o.BatchSize <= 0 {
 		o.BatchSize = 50
 	}
-	if o.Lease <= 0 {
-		o.Lease = 5 * time.Minute
-	}
 	if o.PollInterval <= 0 {
 		o.PollInterval = 5 * time.Second
 	}
-	if o.Timeout <= 0 {
-		// Room for the completion inside the lease, and never less than half of
-		// it, so a short lease still leaves the handler most of its time.
-		o.Timeout = max(o.Lease-afterHandlerTimeout, o.Lease/2)
+	// The two durations default from each other. With only HandlerTimeout set,
+	// the claim covers the handler and the completion's few seconds after it:
+	// nothing renews, and a crashed worker's job is claimed again as soon as
+	// its handler could no longer be running.
+	if o.ClaimDuration <= 0 && o.HandlerTimeout > 0 {
+		o.ClaimDuration = o.HandlerTimeout + afterHandlerTimeout
+	}
+	if o.ClaimDuration <= 0 {
+		o.ClaimDuration = 5 * time.Minute
+	}
+	if o.HandlerTimeout <= 0 {
+		// Room for the completion inside the claim, and never less than half of
+		// it, so a short claim still leaves the handler most of its time.
+		o.HandlerTimeout = max(o.ClaimDuration-afterHandlerTimeout, o.ClaimDuration/2)
 	}
 	return o
 }
@@ -104,9 +118,9 @@ func (o QueueOptions) withDefaults() QueueOptions {
 // same BatchSize — and it is the claim key, the single value a worker probes the
 // ready index with.
 //
-// Lease is here rather than on the job type because the claim sets it for a
-// whole batch in one statement, and the renewal, on a queue whose Timeout
-// exceeds its Lease, renews a whole batch the same way. A job type whose
+// ClaimDuration is here rather than on the job type because the claim sets it
+// for a whole batch in one statement, and the renewal, on a queue whose
+// HandlerTimeout exceeds its ClaimDuration, renews a whole batch the same way. A job type whose
 // handler runs much longer than its neighbours wants its own queue, which is
 // also what its handler holding a slot for that long already argues for.
 type Queue struct {

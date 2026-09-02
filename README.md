@@ -6,7 +6,7 @@
 
 Catbird is a PostgreSQL-backed stream for Go. Jobs, queues, and small workflows are built on the same immutable message substrate.
 
-Published messages receive positions and form the stream. A job pairs a message with a claim, which gives workers leases, retries, signals, and dependencies. PostgreSQL is the only coordinator; plain SQL migrations define the schema; workers scale by starting more processes.
+Published messages receive positions and form the stream. A job pairs a message with a claim, which gives workers claims, retries, signals, and dependencies. PostgreSQL is the only coordinator; plain SQL migrations define the schema; workers scale by starting more processes.
 
 ## Why this exists
 
@@ -65,8 +65,8 @@ type welcomeEmail struct {
 
 var (
 	notifications = catbird.NewQueue("notifications", catbird.QueueOptions{
-		BatchSize: 20,
-		Lease:     time.Minute,
+		BatchSize:     20,
+		ClaimDuration: time.Minute,
 	})
 
 	sendWelcome = catbird.NewJobType("send-welcome-email", notifications, catbird.JobTypeOptions{
@@ -144,8 +144,8 @@ type scanOutput struct {
 }
 
 var (
-	ingestQ  = catbird.NewQueue("ingest", catbird.QueueOptions{BatchSize: 8, Lease: 30 * time.Minute})
-	depositQ = catbird.NewQueue("deposit", catbird.QueueOptions{BatchSize: 50, Lease: time.Minute})
+	ingestQ  = catbird.NewQueue("ingest", catbird.QueueOptions{BatchSize: 8, ClaimDuration: 30 * time.Minute})
+	depositQ = catbird.NewQueue("deposit", catbird.QueueOptions{BatchSize: 50, ClaimDuration: time.Minute})
 
 	submitted = catbird.NewJobType("submitted", depositQ, catbird.JobTypeOptions{})
 	extract   = catbird.NewJobType("extract", ingestQ, catbird.JobTypeOptions{MaxAttempts: 3})
@@ -252,7 +252,7 @@ import (
 )
 
 var (
-	queue = catbird.NewQueue("tx-example", catbird.QueueOptions{Lease: time.Minute})
+	queue = catbird.NewQueue("tx-example", catbird.QueueOptions{ClaimDuration: time.Minute})
 	task  = catbird.NewJobType("tx-task", queue, catbird.JobTypeOptions{})
 )
 

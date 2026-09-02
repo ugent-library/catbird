@@ -20,10 +20,10 @@ var ErrNotFound = errors.New("catbird: not found")
 // for recorded outputs. Read them with GetAll.
 var ErrAmbiguous = errors.New("catbird: several results")
 
-// ErrLeaseExpired is returned by Complete when the job's lease ran out and
-// another worker claimed it. The work of the late attempt is not the queue's any
+// ErrClaimLost is returned by Complete when the job's claim expired and
+// another worker took it. The work of the late attempt is not the queue's any
 // more: roll its transaction back.
-var ErrLeaseExpired = errors.New("catbird: lease expired before completion")
+var ErrClaimLost = errors.New("catbird: claim lost before completion")
 
 // ErrBadPattern is returned by the stream reads when a pattern is not a topic,
 // a prefix followed by ".#", or "#".
@@ -38,7 +38,7 @@ type State int
 const (
 	StateQueued           State = iota // ready, waiting for a worker to take it
 	StateScheduled                     // never claimed, the start time is still ahead
-	StateRunning                       // a worker holds the lease; for a workflow: jobs remain
+	StateRunning                       // a worker holds the claim; for a workflow: jobs remain
 	StateWaitingToRetry                // an attempt failed, the retry is scheduled
 	StateWaitingForSignal              // waiting for Signal to deliver a payload
 	StateWaitingForJobs                // waiting for the jobs it was enqueued after
@@ -566,14 +566,14 @@ func enqueuePeriodic(ctx context.Context, db Conn, t *JobType, minute time.Time)
 // creates the jobs the handler recorded with Enqueue and EnqueueAfter. A worker
 // does this itself when the handler returns nil, so a handler only calls it to
 // put the completion in the same transaction as its own writes, which is what
-// makes the job's work and the job's end one commit. attempts is the lease
-// token: if the lease ran out and another worker claimed the job, attempts moved
-// on, nothing is deleted, and this returns ErrLeaseExpired — the caller rolls
+// makes the job's work and the job's end one commit. The delete matches on
+// attempts: if the claim expired and another worker took the job, attempts moved
+// on, nothing is deleted, and this returns ErrClaimLost — the caller rolls
 // back and the work of the late attempt is discarded.
 //
 // It is one statement, so a job costs one round trip to finish however much it
 // asked for. Everything in it hangs off the claim the delete returned, so an
-// attempt that lost its lease writes no result, counts nothing down and creates no
+// attempt that lost its claim writes no result, counts nothing down and creates no
 // jobs.
 //
 // The new jobs get their ids from the sequence inside the statement, which is
@@ -590,7 +590,7 @@ func enqueuePeriodic(ctx context.Context, db Conn, t *JobType, minute time.Time)
 // second time. The mark records that the statement succeeded, not that the
 // caller's transaction committed: a handler that completes the job, rolls the
 // transaction back, and then returns nil leaves a claim nothing deletes until
-// the lease runs out and the job runs again.
+// the claim expires and the job runs again.
 func Complete(ctx context.Context, db Conn, job *Job) error {
 	if job.payloadErr != nil {
 		return job.payloadErr
@@ -650,7 +650,7 @@ func Complete(ctx context.Context, db Conn, job *Job) error {
 		return err
 	}
 	if completed == 0 {
-		return ErrLeaseExpired
+		return ErrClaimLost
 	}
 	job.completed = true
 	return nil

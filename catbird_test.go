@@ -699,20 +699,20 @@ func TestAProcessClaimsOnlyWhatItHandles(t *testing.T) {
 	}
 }
 
-// A handler that outlives its lease loses its work; the attempt that holds the
-// lease commits.
-func TestLeaseExpiryFence(t *testing.T) {
+// A handler that outlives its claim loses its work; the attempt that holds the
+// claim commits.
+func TestOnlyTheClaimHolderCommits(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if _, err := pool.Exec(ctx, "CREATE TABLE IF NOT EXISTS lease_test (attempt INT)"); err != nil {
+	if _, err := pool.Exec(ctx, "CREATE TABLE IF NOT EXISTS claim_test (attempt INT)"); err != nil {
 		t.Fatal(err)
 	}
-	pool.Exec(ctx, "TRUNCATE lease_test")
+	pool.Exec(ctx, "TRUNCATE claim_test")
 
-	queue := catbird.NewQueue("lease_queue", catbird.QueueOptions{
-		Lease: 200 * time.Millisecond, PollInterval: 50 * time.Millisecond,
+	queue := catbird.NewQueue("claim_queue", catbird.QueueOptions{
+		ClaimDuration: 200 * time.Millisecond, PollInterval: 50 * time.Millisecond,
 	})
 	slow := catbird.NewJobType("slow", queue, catbird.JobTypeOptions{})
 
@@ -724,18 +724,18 @@ func TestLeaseExpiryFence(t *testing.T) {
 	handle := func(ctx context.Context, job *catbird.Job) error {
 		atomic.AddInt32(&calls, 1)
 		if job.Attempts == 1 {
-			time.Sleep(800 * time.Millisecond) // past the lease
+			time.Sleep(800 * time.Millisecond) // past the claim
 		}
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback(ctx)
-		if _, err := tx.Exec(ctx, "INSERT INTO lease_test (attempt) VALUES ($1)", job.Attempts); err != nil {
+		if _, err := tx.Exec(ctx, "INSERT INTO claim_test (attempt) VALUES ($1)", job.Attempts); err != nil {
 			return err
 		}
 		if err := catbird.Complete(ctx, tx, job); err != nil {
-			return err // the late attempt gets ErrLeaseExpired and its insert is rolled back
+			return err // the late attempt gets ErrClaimLost and its insert is rolled back
 		}
 		return tx.Commit(ctx)
 	}
@@ -760,10 +760,10 @@ func TestLeaseExpiryFence(t *testing.T) {
 	if n := atomic.LoadInt32(&calls); n != 2 {
 		t.Errorf("expected 2 handler calls, got %d", n)
 	}
-	if n := count(t, pool, "SELECT count(*) FROM lease_test"); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM claim_test"); n != 1 {
 		t.Errorf("expected exactly one committed attempt, got %d", n)
 	}
-	if n := count(t, pool, "SELECT count(*) FROM lease_test WHERE attempt = 2"); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM claim_test WHERE attempt = 2"); n != 1 {
 		t.Errorf("expected attempt 2 to be the one committed")
 	}
 }
@@ -1348,7 +1348,7 @@ func TestCreatedAtIsSetOnStreamAndJobMessages(t *testing.T) {
 
 // Shutdown does not spend an attempt. A job stopped in the middle of its
 // handler is handed back: the attempt is returned and the job is claimable
-// again at once, so a rolling deploy costs neither retries nor lease time.
+// again at once, so a rolling deploy costs neither retries nor claim time.
 func TestShutdownReturnsTheJob(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1400,27 +1400,28 @@ func TestShutdownReturnsTheJob(t *testing.T) {
 		t.Errorf("attempts = %d, want 0: shutdown spent an attempt on a job that did not fail", attempts)
 	}
 	if !claimable {
-		t.Error("the job is not claimable again: shutdown left the lease deadline in place")
+		t.Error("the job is not claimable again: shutdown left the claim deadline in place")
 	}
 }
 
-// A handler that runs past the queue's Timeout has its context cancelled, and
-// the attempt is counted as a failure like any other: the retry waits MinBackoff
-// and the attempt is not given back. What decides that is the worker's own
-// context, which the timeout does not touch. A timeout that cancelled it would
-// look like a shutdown, and a handler that always times out would be given its
-// attempt back and claimed again at once, forever.
+// A handler that runs past the queue's HandlerTimeout has its context
+// cancelled, and the attempt is counted as a failure like any other: the
+// retry waits MinBackoff and the attempt is not given back. What decides that
+// is the worker's own context, which the timeout does not touch. A timeout
+// that cancelled it would look like a shutdown, and a handler that always
+// times out would be given its attempt back and claimed again at once,
+// forever.
 func TestTimeoutCountsTheAttemptAsFailed(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	const backoff = 500 * time.Millisecond
-	// The lease is far enough from the backoff to tell the two apart below.
+	// The claim is far enough from the backoff to tell the two apart below.
 	queue := catbird.NewQueue("timeouts", catbird.QueueOptions{
-		Lease:        5 * time.Second,
-		Timeout:      100 * time.Millisecond,
-		PollInterval: 25 * time.Millisecond,
+		ClaimDuration:  5 * time.Second,
+		HandlerTimeout: 100 * time.Millisecond,
+		PollInterval:   25 * time.Millisecond,
 	})
 	hangs := catbird.NewJobType("hangs", queue, catbird.JobTypeOptions{MinBackoff: backoff})
 
@@ -1432,7 +1433,7 @@ func TestTimeoutCountsTheAttemptAsFailed(t *testing.T) {
 	rt := catbird.New(pool, catbird.Options{})
 	rt.HandleFunc(hangs, func(ctx context.Context, job *catbird.Job) error {
 		atomic.AddInt32(&calls, 1)
-		<-ctx.Done() // the queue's Timeout, with the runtime still running
+		<-ctx.Done() // the queue's HandlerTimeout, with the runtime still running
 		return ctx.Err()
 	})
 	runCtx, stop := context.WithCancel(ctx)
@@ -1451,9 +1452,10 @@ func TestTimeoutCountsTheAttemptAsFailed(t *testing.T) {
 	// The wait is read in the database's clock, like the backoff test below: the
 	// retry is an interval added to the server's now(). It is a band and not
 	// "some time from now" because a running job also has visible_at in the
-	// future: the claim set it a lease ahead. The first retry of a failed
-	// attempt is MinBackoff exactly, a give-back leaves visible_at at now()
-	// below the band, and a running attempt leaves it a lease ahead, above it.
+	// future: the claim set it a ClaimDuration ahead. The first retry of a
+	// failed attempt is MinBackoff exactly, a give-back leaves visible_at at
+	// now() below the band, and a running attempt leaves it a ClaimDuration
+	// ahead, above it.
 	waitFor(t, 5*time.Second, "no retry a backoff away: the timed-out attempt was not counted as a failure", func() bool {
 		return count(t, pool, `
 			SELECT count(*) FROM cb_claims
@@ -1466,18 +1468,76 @@ func TestTimeoutCountsTheAttemptAsFailed(t *testing.T) {
 	}
 }
 
-// A queue whose Timeout exceeds its Lease renews the leases of its running
-// jobs, so a handler may run for several leases without another worker taking
-// the job.
+// A queue that sets only HandlerTimeout gets a claim that covers it: the
+// default ClaimDuration is HandlerTimeout plus the completion's few seconds,
+// so a queue of short jobs recovers a crashed worker's jobs quickly instead of
+// holding them for the five-minute fallback.
+func TestClaimDurationDefaultsFromHandlerTimeout(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("covered", catbird.QueueOptions{
+		HandlerTimeout: 3 * time.Second,
+		PollInterval:   50 * time.Millisecond,
+	})
+	short := catbird.NewJobType("short", queue, catbird.JobTypeOptions{})
+
+	if _, err := catbird.Enqueue(ctx, pool, short, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(short, func(ctx context.Context, job *catbird.Job) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	stopped := make(chan struct{})
+	go func() {
+		rt.Start(runCtx)
+		close(stopped)
+	}()
+	t.Cleanup(func() {
+		stop()
+		<-stopped
+	})
+
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("the job never started")
+	}
+	// The claim set visible_at 8 seconds ahead: HandlerTimeout plus the
+	// completion's five. Read moments after the handler started, anything close
+	// to that tells this default from the five-minute fallback (about 300) and
+	// from a claim of HandlerTimeout alone (about 3).
+	var claimedFor float64
+	err := pool.QueryRow(ctx, `
+		SELECT extract(epoch FROM visible_at - now()) FROM cb_claims WHERE queue = 'covered'
+	`).Scan(&claimedFor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimedFor < 5 || claimedFor > 8 {
+		t.Errorf("claimed for %.1fs, want about 8s: ClaimDuration did not default to HandlerTimeout plus the completion margin", claimedFor)
+	}
+}
+
+// A queue whose HandlerTimeout exceeds its ClaimDuration renews the claims of
+// its running jobs, so a handler may run for several ClaimDurations without
+// another worker taking the job.
 func TestRenewalKeepsALongJobClaimed(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	queue := catbird.NewQueue("renews", catbird.QueueOptions{
-		Lease:        300 * time.Millisecond,
-		Timeout:      5 * time.Second,
-		PollInterval: 50 * time.Millisecond,
+		ClaimDuration:  300 * time.Millisecond,
+		HandlerTimeout: 5 * time.Second,
+		PollInterval:   50 * time.Millisecond,
 	})
 	long := catbird.NewJobType("long", queue, catbird.JobTypeOptions{})
 
@@ -1488,10 +1548,10 @@ func TestRenewalKeepsALongJobClaimed(t *testing.T) {
 	var calls int32
 	handle := func(ctx context.Context, job *catbird.Job) error {
 		atomic.AddInt32(&calls, 1)
-		time.Sleep(900 * time.Millisecond) // three leases
+		time.Sleep(900 * time.Millisecond) // three ClaimDurations
 		return nil
 	}
-	// Two processes, so a lease that lapsed would put the job in the other
+	// Two processes, so a claim that lapsed would put the job in the other
 	// worker's hands.
 	for range 2 {
 		rt := catbird.New(pool, catbird.Options{})
@@ -1504,23 +1564,24 @@ func TestRenewalKeepsALongJobClaimed(t *testing.T) {
 	})
 	time.Sleep(500 * time.Millisecond) // room for a wrongly claimed second attempt to surface
 	if n := atomic.LoadInt32(&calls); n != 1 {
-		t.Errorf("the handler ran %d times, want 1: the lease was not renewed", n)
+		t.Errorf("the handler ran %d times, want 1: the claim was not renewed", n)
 	}
 }
 
-// Renewal follows the handler's context: a handler that hangs past Timeout is
-// renewed no further, so its job is claimed again about a lease later even
-// though the hung goroutine never returns its slot, and the attempts token
-// fences whatever the hung attempt does afterwards.
+// Renewal follows the handler's context: a handler that hangs past
+// HandlerTimeout is renewed no further, so its job is claimed again about a
+// ClaimDuration later even though the hung goroutine never returns its slot,
+// and whatever the hung attempt writes afterwards matches no row: attempts
+// has moved on.
 func TestRenewalStopsAtTimeout(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	queue := catbird.NewQueue("renews_hang", catbird.QueueOptions{
-		Lease:        300 * time.Millisecond,
-		Timeout:      600 * time.Millisecond,
-		PollInterval: 50 * time.Millisecond,
+		ClaimDuration:  300 * time.Millisecond,
+		HandlerTimeout: 600 * time.Millisecond,
+		PollInterval:   50 * time.Millisecond,
 	})
 	hangs := catbird.NewJobType("hangs", queue, catbird.JobTypeOptions{})
 
@@ -1531,7 +1592,7 @@ func TestRenewalStopsAtTimeout(t *testing.T) {
 	var calls int32
 	handle := func(ctx context.Context, job *catbird.Job) error {
 		if atomic.AddInt32(&calls, 1) == 1 {
-			time.Sleep(1500 * time.Millisecond) // ignores its context well past Timeout
+			time.Sleep(1500 * time.Millisecond) // ignores its context well past HandlerTimeout
 		}
 		return nil
 	}
@@ -1550,7 +1611,7 @@ func TestRenewalStopsAtTimeout(t *testing.T) {
 		<-stopped
 	})
 
-	waitFor(t, 5*time.Second, "the hung attempt kept its lease: the job was never claimed again", func() bool {
+	waitFor(t, 5*time.Second, "the hung attempt kept its claim: the job was never claimed again", func() bool {
 		return atomic.LoadInt32(&calls) == 2
 	})
 	waitFor(t, 5*time.Second, "the second attempt did not complete", func() bool {
@@ -1560,18 +1621,18 @@ func TestRenewalStopsAtTimeout(t *testing.T) {
 
 // On a renewing queue a renewal that matches no row cancels the handler:
 // Cancel marks the claim dead, the next renewal misses it, and the running
-// handler's context ends with ErrLeaseExpired as its cause — so a cancelled
-// job stops holding its slot within about half a lease instead of running to
-// Timeout.
+// handler's context ends with ErrClaimLost as its cause — so a cancelled
+// job stops holding its slot within about half a ClaimDuration instead of
+// running to HandlerTimeout.
 func TestCancelStopsARenewingHandler(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	queue := catbird.NewQueue("renews_cancel", catbird.QueueOptions{
-		Lease:        300 * time.Millisecond,
-		Timeout:      10 * time.Second,
-		PollInterval: 50 * time.Millisecond,
+		ClaimDuration:  300 * time.Millisecond,
+		HandlerTimeout: 10 * time.Second,
+		PollInterval:   50 * time.Millisecond,
 	})
 	waits := catbird.NewJobType("waits", queue, catbird.JobTypeOptions{})
 
@@ -1609,8 +1670,8 @@ func TestCancelStopsARenewingHandler(t *testing.T) {
 	}
 	select {
 	case cause := <-causes:
-		if !errors.Is(cause, catbird.ErrLeaseExpired) {
-			t.Errorf("handler cancelled with cause %v, want ErrLeaseExpired", cause)
+		if !errors.Is(cause, catbird.ErrClaimLost) {
+			t.Errorf("handler cancelled with cause %v, want ErrClaimLost", cause)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Cancel did not reach the running handler")
@@ -1626,8 +1687,8 @@ func TestCancelStopsARenewingHandler(t *testing.T) {
 }
 
 // A handler that completes the job and then returns an error is not retried:
-// the completion committed, and the retry carries the attempts lease token, so
-// it finds no claim to correct.
+// the completion committed, and the retry matches on attempts, so it finds no
+// claim to correct.
 func TestCompletedJobIsNotRetriedAfterAnError(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -2524,8 +2585,8 @@ func TestQueuesReportsWhatEveryQueueIsDoing(t *testing.T) {
 	}
 	// One job of every state on the first queue. Running, waiting to retry and
 	// waiting for jobs are written directly, as the claim, the failure and the
-	// completion write them: an attempt spent with visible_at ahead is a lease,
-	// the error text is what tells a backoff from it, and a positive
+	// completion write them: an attempt spent with visible_at ahead is a held
+	// claim, the error text is what tells a backoff from it, and a positive
 	// dependencies count is a job waiting for others.
 	queued := enqueue(plain, catbird.EnqueueOptions{})
 	enqueue(plain, catbird.EnqueueOptions{Delay: time.Hour})

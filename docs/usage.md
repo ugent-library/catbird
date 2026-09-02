@@ -10,12 +10,14 @@ Use distinct queues when a job type has a materially different runtime, concurre
 
 Job types define retry behavior. The defaults are fifteen attempts, a one-second minimum backoff, and a ten-minute maximum backoff. Set `MinBackoff` and `MaxBackoff` to the same value for a fixed retry delay.
 
-## Choose lease and timeout together
+## Choose claim duration and handler timeout together
 
-`Lease` determines how quickly a crashed worker's job can be reclaimed. `Timeout` determines how long a handler is allowed to run.
+`ClaimDuration` determines how quickly a crashed worker's job can be reclaimed. `HandlerTimeout` determines how long a handler is allowed to run.
 
-- With `Timeout` at or below `Lease`, handlers must finish before their lease expires. This is the default shape.
-- With `Timeout` above `Lease`, Catbird renews leases while handlers run. Use it for long jobs that should still recover promptly after a process crash.
+- With `HandlerTimeout` at or below `ClaimDuration`, handlers must finish before their claim expires. This is the default shape.
+- With `HandlerTimeout` above `ClaimDuration`, Catbird renews claims while handlers run. Use it for long jobs that should still recover promptly after a process crash.
+
+Each value left unset defaults from the other. Set only `HandlerTimeout` and the claim covers it plus a few seconds for the completion, so a queue of short jobs recovers crashed work quickly without renewal. Set neither and both are about five minutes.
 
 Handlers must observe their context. A handler that ignores a timed-out context may keep its worker slot even after Catbird has retried the job elsewhere.
 
@@ -23,7 +25,7 @@ Handlers must observe their context. A handler that ignores a timed-out context 
 
 Workers do not hold a connection while a handler runs. A handler that begins a transaction does.
 
-Size `pgxpool` for the maximum number of concurrent handler transactions, plus the library's own database activity. Alternatively, limit `BatchSize` to the number of connections handlers can safely hold. Starting fifty handlers against an eight-connection pool lets jobs spend their leases waiting to begin a transaction.
+Size `pgxpool` for the maximum number of concurrent handler transactions, plus the library's own database activity. Alternatively, limit `BatchSize` to the number of connections handlers can safely hold. Starting fifty handlers against an eight-connection pool lets jobs spend their claims waiting to begin a transaction.
 
 ## Complete with application writes
 
@@ -45,9 +47,9 @@ if err := catbird.Complete(ctx, tx, job); err != nil {
 return tx.Commit(ctx)
 ```
 
-`Complete` can return `ErrLeaseExpired`. Roll back in that case: another worker owns the job, and none of this attempt's Catbird effects were committed.
+`Complete` can return `ErrClaimLost`. Roll back in that case: another worker owns the job, and none of this attempt's Catbird effects were committed.
 
-For effects outside PostgreSQL, use the idempotency mechanism supplied by the external system. Catbird can run a job more than once after a crash or lease expiry.
+For effects outside PostgreSQL, use the idempotency mechanism supplied by the external system. Catbird can run a job more than once after a crash or an expired claim.
 
 ## Model workflows as handlers
 

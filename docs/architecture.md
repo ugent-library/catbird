@@ -8,7 +8,7 @@ Catbird is a PostgreSQL-backed stream. Its immutable message storage is the base
 
 The package separates declarations, process machinery, and database operations.
 
-- A `Queue` names the work that competes for the same worker slots. Its settings are `BatchSize`, `Lease`, `Timeout`, and `PollInterval`.
+- A `Queue` names the work that competes for the same worker slots. Its settings are `BatchSize`, `ClaimDuration`, `HandlerTimeout`, and `PollInterval`.
 - A `JobType` names a kind of work and its retry policy. Its settings include `Signal`, `Schedule`, backoff, `MaxAttempts`, and `OnDead`.
 - A `Runtime` belongs to one process. It owns the PostgreSQL pool, one `LISTEN` connection, the stream position assigner, and the workers, periodic loops, and triggers registered in that process.
 - Package functions such as `Enqueue`, `Complete`, `Publish`, and `Status` hold no state. They accept a pool, connection, or transaction.
@@ -20,7 +20,7 @@ Queue and job-type declarations are plain Go values. They are not stored in the 
 The schema has five tables.
 
 - `cb_messages` is the immutable message substrate. It stores every job payload and published stream message. Published messages receive a stream position after commit; job messages do not, so a job never feeds back into the stream.
-- `cb_claims` stores the narrow, mutable state of each live job: queue, job type, lease, retry state, workflow dependencies, signal state, and death time. Completion deletes the claim.
+- `cb_claims` stores the narrow, mutable state of each live job: queue, job type, claim deadline, retry state, workflow dependencies, signal state, and death time. Completion deletes the claim.
 - `cb_cursors` stores the most recently acknowledged stream position for a named consumer.
 - `cb_outputs` stores optional job results. Results are written as part of job completion.
 - `cb_migrations` records applied schema migrations.
@@ -29,13 +29,13 @@ The hot ready index includes only live claims with no unresolved dependencies. J
 
 ## Job delivery
 
-Workers claim jobs with PostgreSQL row locks and leases. A claim increments `Attempts` and moves the job's visibility time into the future. If the process crashes or a lease expires, another worker can claim the job.
+Workers claim jobs with PostgreSQL row locks. A claim increments `Attempts` and moves the job's visibility time a `ClaimDuration` into the future. If the process crashes or a claim expires, another worker can claim the job.
 
 Jobs are at-least-once. Handlers that write application data should either make the write idempotent using `Job.ID`, or call `Complete` in the same transaction as the application write. External effects need their provider's idempotency mechanism as well.
 
-Completion is the central atomic operation. It deletes the claim under its attempt token and, in the same statement, writes any output, releases dependent jobs, and inserts jobs buffered through `Job.Enqueue` or `Job.EnqueueAfter`. An attempt that lost its lease cannot perform any of those effects.
+Completion is the central atomic operation. It deletes the claim by matching on `Attempts` and, in the same statement, writes any output, releases dependent jobs, and inserts jobs buffered through `Job.Enqueue` or `Job.EnqueueAfter`. An attempt that lost its claim cannot perform any of those effects.
 
-`Timeout` bounds a handler context. When `Timeout` exceeds `Lease`, the worker renews live leases until that context expires; this keeps crash recovery bounded by the shorter lease while allowing longer handlers.
+`HandlerTimeout` bounds a handler context. When `HandlerTimeout` exceeds `ClaimDuration`, the worker renews the claims of its running jobs until that context expires; this keeps crash recovery bounded by the shorter `ClaimDuration` while allowing longer handlers.
 
 ## Workflows
 

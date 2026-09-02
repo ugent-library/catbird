@@ -53,7 +53,7 @@ It talks to the same database directly and needs no Go build.
 Seven files and one migration in the root package, and one package under it:
 
 - `job_type.go` — the two declarations an application writes. `Queue` is a name
-  and how work runs under it: `BatchSize`, `Lease`, `Timeout`, `PollInterval`.
+  and how work runs under it: `BatchSize`, `ClaimDuration`, `HandlerTimeout`, `PollInterval`.
   It decides who competes with whom, and it is the claim key. `JobType` is a kind of job:
   its name, its queue, and how a run of it is retried (`Signal`, `Schedule`,
   `MaxAttempts`, `MinBackoff`, `MaxBackoff`, `OnDead`). Both are plain Go values; nothing about
@@ -79,9 +79,9 @@ Seven files and one migration in the root package, and one package under it:
   `LISTEN` connection that wakes the rest. One `Runtime` per process owns the
   pool and one goroutine per queue and trigger.
 - `worker.go` — the claim loop, dispatch by job type, completion, retries,
-  `OnDead`, and the lease renewal a queue with `Timeout` above `Lease` runs.
+  `OnDead`, and the claim renewal a queue with `HandlerTimeout` above `ClaimDuration` runs.
   One worker per queue, however many job types run on it. The handler
-  runs on a context of its own carrying the queue's `Timeout`; the worker's own
+  runs on a context of its own carrying the queue's `HandlerTimeout`; the worker's own
   context is what tells a shutdown from a failure, so the two are never the same
   variable.
 - `trigger.go` — `Runtime.Trigger`: the loop that turns stream messages into
@@ -149,8 +149,8 @@ client exists.
 **Invariants that edits must not break:**
 
 - A job's completion is `DELETE FROM cb_claims WHERE message_id = $1 AND attempts = $2`.
-  `attempts` is the lease token. Two workers may run the same job; only the
-  lease holder deletes the claim. A handler is given no connection: it runs
+  The delete matches on `attempts`, so two workers may run the same job and
+  only the attempt that still holds the claim deletes it. A handler is given no connection: it runs
   `Complete` in its own transaction to end the job in the same commit as its
   writes, or returns `nil` and lets the worker complete it afterwards. The
   worker holds no transaction and no connection while a handler runs.
@@ -158,7 +158,7 @@ client exists.
   statement: the result `SetOutput` recorded, the countdown of the jobs waiting
   for this one, and the jobs `Enqueue` and `EnqueueAfter` recorded. All three are
   buffered on `Job` and written by the completion, so an attempt that lost its
-  lease writes no result, counts nothing down and creates no jobs, and a handler
+  claim writes no result, counts nothing down and creates no jobs, and a handler
   that fails halfway retries with an empty buffer.
 - Nothing outside catbird holds a dependency count. `EnqueueAfter` takes the
   count of the buffer's other jobs and their ids in `dependency_job_ids`, and each
@@ -185,7 +185,7 @@ client exists.
 - The failure writes `last_error` and the claim clears it, which is the only
   thing that tells `StateRunning` from `StateWaitingToRetry`: both are a live
   claim with `visible_at` in the future and an attempt spent. The write carries
-  the `attempts` lease token like the retry it rides on, so a late attempt
+  matches on `attempts` like the retry it rides on, so a late attempt
   records no error text either, and the 256-character cut keeps a claim row out
   of TOAST. It is not a run history: the next failure overwrites it and the
   completion deletes it with the row.
@@ -206,15 +206,17 @@ client exists.
   outlives its schedule swallows the ticks it covers rather than queueing
   them. The guard repeats `dependencies = 0` so its probe stays on the ready
   index instead of scanning the heap.
-- `BatchSize`, `Lease` and `Timeout` are queue settings; `Schedule`,
-  `MaxAttempts`, `MinBackoff`, `MaxBackoff` and `OnDead` are job type settings. `Lease` is on
+- `BatchSize`, `ClaimDuration` and `HandlerTimeout` are queue settings; `Schedule`,
+  `MaxAttempts`, `MinBackoff`, `MaxBackoff` and `OnDead` are job type settings. `ClaimDuration` is on
   the queue because the claim sets it for a whole batch in one statement, and
-  `Timeout` because its comparison with `Lease` is itself a setting: `Timeout`
-  above `Lease` makes the worker renew the leases of its running jobs every
-  half `Lease`, which is how a queue runs jobs longer than its lease. Renewal
-  follows the handler's context — past `Timeout` a job is renewed no further —
-  carries the `attempts` token like every write, and cancels the handler with
-  `ErrLeaseExpired` when it matches no row. The handler belongs to
+  `HandlerTimeout` because its comparison with `ClaimDuration` is itself a setting: `HandlerTimeout`
+  above `ClaimDuration` makes the worker renew the claims of its running jobs every
+  half `ClaimDuration`, which is how a queue runs jobs longer than its claim. Renewal
+  follows the handler's context — past `HandlerTimeout` a job is renewed no further —
+  matches on `attempts` like every write, and cancels the handler with
+  `ErrClaimLost` when it matches no row. Each duration left unset defaults
+  from the other so the claim covers the handler; renewal only ever runs on a
+  queue that set both. The handler belongs to
   neither: it is the process's, and `rt.Handle(jobType, handler)` is where the
   two meet.
 - Hot-path SQL takes no joins, no advisory locks (the assigner's is the one

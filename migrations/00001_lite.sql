@@ -41,7 +41,7 @@ CREATE TABLE cb_cursors (
 ) WITH (fillfactor = 90);
 
 -- One row per job that still has to run. Deleted when the job completes.
--- visible_at is both the earliest start time and the lease deadline: a claimed
+-- visible_at is both the earliest start time and the claim deadline: a claimed
 -- job has visible_at in the future; when it passes, any worker may claim it again.
 --
 -- Columns run widest first so the fixed-width ones pack without padding: 74
@@ -62,7 +62,9 @@ CREATE TABLE cb_claims (
     -- which sits on 'infinity'. Not a state machine: what a job is doing is
     -- stored nowhere, Status derives it from the columns here.
     died_at TIMESTAMPTZ,
-    attempts SMALLINT NOT NULL DEFAULT 0, -- incremented on claim; doubles as the lease token
+    -- Incremented on claim, and every write matches on it, so an attempt that
+    -- lost its claim writes nothing.
+    attempts SMALLINT NOT NULL DEFAULT 0,
     -- How many jobs this one is still waiting for; it runs when this reaches 0.
     dependencies SMALLINT NOT NULL DEFAULT 0,
     -- This job waits for a signal; the payload arrives in signal below. It sits

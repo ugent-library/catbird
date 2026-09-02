@@ -14,8 +14,8 @@ import (
 // attempt may run. Extraction is slow and bursty, so it does not take slots
 // from the short jobs that run once a deposit has been decided.
 var (
-	ingest  = catbird.NewQueue("ingest", catbird.QueueOptions{BatchSize: 8, Lease: 30 * time.Minute})
-	deposit = catbird.NewQueue("deposit", catbird.QueueOptions{BatchSize: 50, Lease: time.Minute})
+	ingest  = catbird.NewQueue("ingest", catbird.QueueOptions{BatchSize: 8, ClaimDuration: 30 * time.Minute})
+	deposit = catbird.NewQueue("deposit", catbird.QueueOptions{BatchSize: 50, ClaimDuration: time.Minute})
 )
 
 // A job type decides what kind of work a job is and how a run of it is retried.

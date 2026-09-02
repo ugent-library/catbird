@@ -36,9 +36,9 @@ This document records the current boundaries of Catbird. Revisit a decision when
 
 ## Cursor consumers are single-process
 
-**Decision:** General stream cursors have no lease. Run one consumer per cursor. Use a trigger and worker when work must be distributed across processes.
+**Decision:** General stream cursors have no claim. Run one consumer per cursor. Use a trigger and worker when work must be distributed across processes.
 
-**Why:** A cursor lease would duplicate job lease and retry machinery. Triggers already make cross-process handling safe through atomic enqueue and deduplication.
+**Why:** A claimed cursor would duplicate the job claim and retry machinery. Triggers already make cross-process handling safe through atomic enqueue and deduplication.
 
 **Revisit when:** A real consumer needs ordered, once-per-message batch handling across several processes.
 
