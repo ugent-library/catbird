@@ -2,2236 +2,449 @@ package catbird
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
-	"reflect"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
-
-	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// defaultPollTimeout bounds the periodic background queries a worker runs
-// (claim polls, hiding, heartbeat, schedule ticks, stop checks). It only
-// matters when a connection has stopped responding without failing — a
-// half-open socket where a read blocks forever and no error ever comes back.
-// Without it such a poll blocks its goroutine and leaks a pooled connection,
-// and nothing is ever logged; with it the poll returns an error, gets logged,
-// and the loop retries on a fresh connection.
-const defaultPollTimeout = 30 * time.Second
+// worker claims one queue's jobs and runs the job types registered on it. A
+// process runs one per queue however many types it handles, so the claim loop,
+// the goroutine and the notification channel are per queue and not per kind of
+// work.
+type worker struct {
+	runtime  *Runtime
+	queue    *Queue
+	handlers map[string]registration
+	names    []string // what the claim filters on, so a process takes no job it cannot run
+	logger   *slog.Logger
 
-type WorkerInfo struct {
-	ID              string             `json:"id"`
-	TaskHandlers    []*TaskHandlerInfo `json:"task_handlers"`
-	StepHandlers    []*StepHandlerInfo `json:"step_handlers"`
-	StartedAt       time.Time          `json:"started_at"`
-	LastHeartbeatAt time.Time          `json:"last_heartbeat_at"`
+	// The jobs whose claims the renewal loop keeps alive, by job id. Nil on a
+	// queue whose HandlerTimeout fits inside its ClaimDuration: every attempt
+	// there is over before its claim is, so there is nothing to renew, and
+	// track and untrack do nothing. See renewClaims.
+	mu       sync.Mutex
+	inFlight map[int64]*inFlightJob
 }
 
-type TaskHandlerInfo struct {
-	TaskName string `json:"task_name"`
+// inFlightJob is one running job as the renewal loop sees it: the attempts the
+// claim was taken with, the handler's context, whose end stops renewal, and the
+// cancel that ends the handler when the claim is not this attempt's any more.
+type inFlightJob struct {
+	id       int64
+	attempts int
+	ctx      context.Context
+	cancel   context.CancelCauseFunc
 }
 
-type StepHandlerInfo struct {
-	FlowName string `json:"flow_name"`
-	StepName string `json:"step_name"`
+// registration is a job type and the function this process runs it with. The
+// job type says how a run of it is retried; the function is this process's own.
+type registration struct {
+	jobType *JobType
+	handler Handler
 }
 
-type taskRunScope struct {
-	conn   Conn
-	name   string
-	runID  int64
-	cancel context.CancelFunc
-}
+// waitForSlots is how long the claim loop waits for more slots to free before
+// it claims, while jobs are still waiting. Without the wait a worker running
+// short jobs claims one or two of them per statement instead of a full batch.
+const waitForSlots = 5 * time.Millisecond
 
-type flowRunScope struct {
-	conn   Conn
-	name   string
-	runID  int64
-	cancel context.CancelFunc
-}
+// afterHandlerTimeout limits the statements that run once the handler has
+// returned: the completion, the retry, the give-back. They run on a context of
+// their own, so nothing else stops them, and it is short because Start waits
+// for the jobs in flight and a longer wait would hold a stopping process.
+const afterHandlerTimeout = 5 * time.Second
 
-type taskRunScopeContextKey struct{}
-type flowRunScopeContextKey struct{}
+// start keeps up to BatchSize jobs running at once: it claims as many jobs as it
+// has free slots, hands each to a goroutine, and claims again as soon as a slot
+// frees, so one long job does not hold up the jobs beside it. When a claim comes
+// back short the queue is empty and it waits for a NOTIFY or for PollInterval.
+func (w *worker) start(ctx context.Context) {
+	wake, unsubscribe := w.runtime.subscribe("cb_queue_" + w.queue.name)
+	defer unsubscribe()
 
-func withTaskRunScope(ctx context.Context, conn Conn, taskName string, runID int64, cancel context.CancelFunc) context.Context {
-	return context.WithValue(ctx, taskRunScopeContextKey{}, &taskRunScope{
-		conn:   conn,
-		name:   taskName,
-		runID:  runID,
-		cancel: cancel,
-	})
-}
-
-func withFlowRunScope(ctx context.Context, conn Conn, flowName string, runID int64, cancel context.CancelFunc) context.Context {
-	return context.WithValue(ctx, flowRunScopeContextKey{}, &flowRunScope{
-		conn:   conn,
-		name:   flowName,
-		runID:  runID,
-		cancel: cancel,
-	})
-}
-
-// ListWorkers returns all registered workers.
-func ListWorkers(ctx context.Context, conn Conn) ([]*WorkerInfo, error) {
-	q := `SELECT id, started_at, last_heartbeat_at, task_handlers, step_handlers FROM cb_worker_info ORDER BY last_heartbeat_at DESC;`
-	rows, err := conn.Query(ctx, q)
-	if err != nil {
-		return nil, err
+	// One slot per job that may run at the same time: a claim takes a slot per
+	// job it claims, a finished job puts its slot back.
+	free := make(chan struct{}, w.queue.opts.BatchSize)
+	for range w.queue.opts.BatchSize {
+		free <- struct{}{}
 	}
-	return pgx.CollectRows(rows, scanCollectibleWorker)
+	var running sync.WaitGroup
+	defer running.Wait() // on shutdown, return when the jobs in flight are done
 
-}
-
-// Worker processes tasks and flows from the queue
-type Worker struct {
-	id              string
-	pool            *pgxpool.Pool
-	logger          *slog.Logger
-	tasks           []*Task
-	flows           []*Flow
-	shutdownTimeout time.Duration
-}
-
-// NewWorker creates a new worker with the given connection pool.
-// Use builder methods (AddTask, AddFlow, etc.) to configure the worker.
-// Call Start(ctx) to begin processing tasks and flows.
-func NewWorker(pool *pgxpool.Pool) *Worker {
-	return &Worker{
-		id:              uuid.NewString(),
-		pool:            pool,
-		logger:          slog.Default(),
-		shutdownTimeout: 5 * time.Second,
-	}
-}
-
-// WithLogger sets the worker logger.
-func (w *Worker) WithLogger(logger *slog.Logger) *Worker {
-	w.logger = logger
-	return w
-}
-
-// WithShutdownTimeout sets the graceful shutdown timeout.
-// A value <= 0 disables graceful waiting and cancels handlers immediately.
-func (w *Worker) WithShutdownTimeout(timeout time.Duration) *Worker {
-	w.shutdownTimeout = timeout
-	return w
-}
-
-// AddTask registers a task with the worker.
-func (w *Worker) AddTask(t *Task) *Worker {
-	w.tasks = append(w.tasks, t)
-	return w
-}
-
-// AddFlow registers a flow with the worker.
-func (w *Worker) AddFlow(f *Flow) *Worker {
-	w.flows = append(w.flows, f)
-	return w
-}
-
-func (w *Worker) validateRegisteredHandlers() error {
-	for _, t := range w.tasks {
-		if t.configErr != nil {
-			return fmt.Errorf("task %q configuration error: %w", t.name, t.configErr)
-		}
-		if t.handlerOpts != nil {
-			if err := t.handlerOpts.validate(); err != nil {
-				return fmt.Errorf("task %q has invalid handler options: %w", t.name, err)
-			}
-		}
-		if t.onFailOpts != nil {
-			if err := t.onFailOpts.validate(); err != nil {
-				return fmt.Errorf("task %q has invalid on-fail options: %w", t.name, err)
-			}
-		}
+	// A HandlerTimeout above ClaimDuration means an attempt may outlive its
+	// claim, so this worker renews the claims of its running jobs; see
+	// renewClaims.
+	if w.queue.opts.HandlerTimeout > w.queue.opts.ClaimDuration {
+		w.inFlight = map[int64]*inFlightJob{}
+		running.Go(func() { w.renewClaims(ctx) })
 	}
 
-	for _, f := range w.flows {
-		if f.configErr != nil {
-			return fmt.Errorf("flow %q configuration error: %w", f.name, f.configErr)
-		}
-		if f.onFailOpts != nil {
-			if err := f.onFailOpts.validate(); err != nil {
-				return fmt.Errorf("flow %q has invalid on-fail options: %w", f.name, err)
-			}
-		}
-		for _, s := range f.steps {
-			if s.handlerOpts != nil {
-				if err := s.handlerOpts.validate(); err != nil {
-					return fmt.Errorf("flow %q step %q has invalid handler options: %w", f.name, s.name, err)
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-func shouldStartStepWorker(step *Step) bool {
-	if step.stepType == StepTypeReducer {
-		return true
-	}
-	return step.stepType == StepTypeGenerator || step.stepType != StepTypeMapper
-}
-
-func shouldStartMapStepWorker(step *Step) bool {
-	return step.stepType == StepTypeGenerator || step.stepType == StepTypeMapper
-}
-
-func (w *Worker) startTaskWorkers(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup, n *workerNotifier, schema string) []*TaskHandlerInfo {
-	taskHandlers := make([]*TaskHandlerInfo, 0)
-
-	for _, t := range w.tasks {
-		if t.handlerOpts != nil {
-			taskHandlers = append(taskHandlers, &TaskHandlerInfo{TaskName: t.name})
-			wakeup := make(chan struct{}, 1)
-			n.subscribe(channelName(schema, "cb_t_", t.name), wakeup)
-			worker := newTaskWorker(w.pool, w.logger, t, wakeup)
-			worker.start(shutdownCtx, handlerCtx, wg)
-		}
-
-		if t.onFailOpts != nil {
-			wakeup := make(chan struct{}, 1)
-			n.subscribe(channelName(schema, "cb_t_onfail_", t.name), wakeup)
-			onFailWorker := newTaskOnFailWorker(w.pool, w.logger, t, wakeup)
-			onFailWorker.start(shutdownCtx, handlerCtx, wg)
-		}
-	}
-
-	return taskHandlers
-}
-
-func (w *Worker) startFlowWorkers(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup, n *workerNotifier, schema string) []*StepHandlerInfo {
-	stepHandlers := make([]*StepHandlerInfo, 0)
-
-	for _, f := range w.flows {
-		if f.onFailOpts != nil {
-			wakeup := make(chan struct{}, 1)
-			n.subscribe(channelName(schema, "cb_f_onfail_", f.name), wakeup)
-			onFailWorker := newFlowOnFailWorker(w.pool, w.logger, f, wakeup)
-			onFailWorker.start(shutdownCtx, handlerCtx, wg)
-		}
-
-		stepChannel := channelName(schema, "cb_s_", f.name)
-		stopChannel := channelName(schema, "cb_flow_stop_", f.name)
-
-		for _, s := range f.steps {
-			if s.handlerOpts == nil {
-				continue
-			}
-
-			stepHandlers = append(stepHandlers, &StepHandlerInfo{FlowName: f.name, StepName: s.name})
-
-			if shouldStartStepWorker(s) {
-				wakeup := make(chan struct{}, 1)
-				stop := make(chan struct{}, 1)
-				n.subscribe(stepChannel, wakeup)
-				n.subscribe(stopChannel, stop)
-				newStepWorker(w.pool, w.logger, f.name, s, wakeup, stop).start(shutdownCtx, handlerCtx, wg)
-			}
-
-			if shouldStartMapStepWorker(s) {
-				wakeup := make(chan struct{}, 1)
-				stop := make(chan struct{}, 1)
-				n.subscribe(stepChannel, wakeup)
-				n.subscribe(stopChannel, stop)
-				newMapStepWorker(w.pool, w.logger, f.name, s, wakeup, stop).start(shutdownCtx, handlerCtx, wg)
-			}
-		}
-	}
-
-	return stepHandlers
-}
-
-// Start begins processing tasks and flows.
-//
-// The worker will:
-//   - poll for new work and execute task and flow step handlers while ctx is active
-//   - run any configured cron-style task and flow schedules
-//   - send periodic heartbeats while it is running
-//   - register built-in garbage collection task running every 5 minutes
-//
-// Shutdown behaviour:
-//   - when ctx is cancelled the worker immediately stops reading new work and
-//     begins shutting down
-//   - if WithShutdownTimeout is set to a value > 0, that duration is used as a
-//     grace period for in‑flight handlers after ctx is cancelled; once the
-//     grace period expires the handler context is cancelled and remaining
-//     handlers are asked to stop. The default graceful shutdown timeout is 5 seconds.
-//   - if WithShutdownTimeout is not set or set to 0, there is no grace period:
-//     the handler context is cancelled immediately once ctx is cancelled and
-//     Start returns after all goroutines finish
-func (w *Worker) Start(ctx context.Context) error {
-	if err := w.validateRegisteredHandlers(); err != nil {
-		return err
-	}
-
-	// Discover the schema from the pool's search_path so NOTIFY channels
-	// match the schema-qualified names used by SQL functions.
-	var schema string
-	if err := w.pool.QueryRow(ctx, "SELECT current_schema").Scan(&schema); err != nil {
-		return fmt.Errorf("cannot determine current schema: %w", err)
-	}
-
-	// Create tasks in database
-	for _, task := range w.tasks {
-		if err := CreateTask(ctx, w.pool, task); err != nil {
-			return err
-		}
-	}
-
-	// Create flows in database
-	for _, flow := range w.flows {
-		if err := CreateFlow(ctx, w.pool, flow); err != nil {
-			return err
-		}
-	}
-
-	var wg sync.WaitGroup
-	var taskHandlers = make([]*TaskHandlerInfo, 0)
-	var stepHandlers = make([]*StepHandlerInfo, 0)
-
-	// handlerCtx is used for in-flight handler execution so that when the
-	// worker's context is cancelled we can stop reading new work while still
-	// giving existing handlers a grace period to finish.
-	handlerCtx, handlerCancel := context.WithCancel(context.Background())
-	defer handlerCancel()
-
-	// Set up NOTIFY listener for wakeup and cancel signals.
-	// Subscriptions are registered in startTaskWorkers/startFlowWorkers,
-	// then listen() establishes LISTEN before claim loops begin.
-	n := newWorkerNotifier(w.pool, w.logger)
-
-	wg.Go(func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				hbCtx, cancel := context.WithTimeout(ctx, defaultPollTimeout)
-				_, err := w.pool.Exec(hbCtx, `SELECT * FROM cb_worker_heartbeat(id => $1);`, w.id)
-				cancel()
-				if err != nil && ctx.Err() == nil {
-					w.logger.ErrorContext(ctx, "worker: cannot send heartbeat", "error", err)
-				}
-			}
-		}
-	})
-
-	// Register subscriptions and start claim loops
-	taskHandlers = w.startTaskWorkers(ctx, handlerCtx, &wg, n, schema)
-	stepHandlers = w.startFlowWorkers(ctx, handlerCtx, &wg, n, schema)
-
-	// Establish LISTEN on dedicated connection, then start notification read loop.
-	// This runs synchronously so LISTEN is active before any NOTIFY can fire.
-	notifyLoop, listenErr := n.listen(ctx)
-	if listenErr != nil {
-		w.logger.WarnContext(ctx, "worker notifier: failed to establish listener, falling back to polling", "error", listenErr)
-		notifyLoop = func() {} // no-op; workers fall back to timer
-	}
-	wg.Go(notifyLoop)
-
-	// Start schedule polling goroutine for all schedules (both tasks and flows)
-	wg.Go(func() {
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-
-		runDue := func(query, kind string) {
-			runCtx, cancel := context.WithTimeout(ctx, defaultPollTimeout)
-			defer cancel()
-			var count int
-			if err := w.pool.QueryRow(runCtx, query).Scan(&count); err != nil && ctx.Err() == nil {
-				w.logger.ErrorContext(ctx, "worker: cannot run due schedules", "kind", kind, "error", err)
-			}
-		}
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				runDue(`SELECT cb_execute_due_task_schedules(array(SELECT task_name FROM cb_task_schedules WHERE enabled), 32)`, "task")
-				runDue(`SELECT cb_execute_due_flow_schedules(array(SELECT flow_name FROM cb_flow_schedules WHERE enabled), 32)`, "flow")
-			}
-		}
-	})
-
-	tb, err := json.Marshal(taskHandlers)
-	if err != nil {
-		return err
-	}
-	sb, err := json.Marshal(stepHandlers)
-	if err != nil {
-		return err
-	}
-	if _, err := w.pool.Exec(ctx, `SELECT * FROM cb_worker_started(id => $1, task_handlers => coalesce($2, '[]'::jsonb), step_handlers => coalesce($3, '[]'::jsonb));`, w.id, tb, sb); err != nil {
-		return fmt.Errorf("worker: cannot mark as started: %w", err)
-	}
-
-	return w.waitForShutdown(ctx, handlerCancel, &wg)
-}
-
-// waitForShutdown blocks until all worker goroutines have finished.
-// When ctx is cancelled it optionally gives handlers a grace period according
-// to w.shutdownTimeout before cancelling the handler context.
-func (w *Worker) waitForShutdown(ctx context.Context, handlerCancel context.CancelFunc, wg *sync.WaitGroup) error {
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		// Shutdown requested. If a graceful shutdown timeout is configured, give
-		// handlers a grace period to finish. Otherwise cancel them
-		// immediately.
-		if w.shutdownTimeout > 0 {
-			select {
-			case <-done:
-				return nil
-			case <-time.After(w.shutdownTimeout):
-				handlerCancel()
-				<-done
-				return nil
-			}
-		}
-
-		// No grace period configured: cancel handlers right away and wait
-		// for all goroutines to finish.
-		handlerCancel()
-		<-done
-		return nil
-	}
-}
-
-func scanCollectibleWorker(row pgx.CollectableRow) (*WorkerInfo, error) {
-	return scanWorker(row)
-}
-
-func scanWorker(row pgx.Row) (*WorkerInfo, error) {
-	rec := WorkerInfo{}
-
-	var taskHandlers json.RawMessage
-	var stepHandlers json.RawMessage
-
-	if err := row.Scan(
-		&rec.ID,
-		&rec.StartedAt,
-		&rec.LastHeartbeatAt,
-		&taskHandlers,
-		&stepHandlers,
-	); err != nil {
-		return nil, err
-	}
-
-	if taskHandlers != nil {
-		if err := json.Unmarshal(taskHandlers, &rec.TaskHandlers); err != nil {
-			return nil, err
-		}
-	}
-	if stepHandlers != nil {
-		if err := json.Unmarshal(stepHandlers, &rec.StepHandlers); err != nil {
-			return nil, err
-		}
-	}
-
-	return &rec, nil
-}
-
-// taskWorker processes one task type
-type taskWorker struct {
-	conn   Conn
-	logger *slog.Logger
-	task   *Task
-	wakeup chan struct{}
-
-	tracker *inFlightTracker
-}
-
-func newTaskWorker(conn Conn, logger *slog.Logger, task *Task, wakeup chan struct{}) *taskWorker {
-	return &taskWorker{
-		conn:    conn,
-		logger:  logger,
-		task:    task,
-		wakeup:  wakeup,
-		tracker: newInFlightTracker(),
-	}
-}
-
-func (w *taskWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup) {
-	startInFlightHider(handlerCtx, wg, 30*time.Second, w.hideInFlight)
-
-	// Start consumers
-	h := w.task.handlerOpts
-	if h == nil {
-		w.logger.WarnContext(shutdownCtx, "task handler has no options (definition-only)", "task", w.task.name)
-		return
-	}
-
-	runClaimLoop(shutdownCtx, handlerCtx, wg, claimLoopConfig[taskClaim]{
-		concurrency: h.concurrency,
-		pollClaims:  w.pollClaims,
-		handleClaim: w.handle,
-		onPolled:    w.markInFlight,
-		wakeup:      w.wakeup,
-		logPollError: func(ctx context.Context, err error) {
-			w.logger.ErrorContext(ctx, "worker: cannot poll task claims", "task", w.task.name, "error", err)
-		},
-	})
-}
-
-func (w *taskWorker) markInFlight(msgs []taskClaim) {
-	markClaimsInFlight(w.tracker, msgs, func(msg taskClaim) int64 { return msg.ID })
-}
-
-func (w *taskWorker) removeInFlight(id int64) {
-	w.tracker.remove(id)
-}
-
-func (w *taskWorker) hideInFlight(ctx context.Context) {
-	ids := w.tracker.list()
-	if len(ids) == 0 {
-		return
-	}
-	hideTaskRuns(ctx, w.conn, w.logger, w.task.name, ids, (10 * time.Minute).Milliseconds(), "worker: cannot hide in-flight tasks")
-}
-
-func (w *taskWorker) pollClaims(ctx context.Context) ([]taskClaim, error) {
-	h := w.task.handlerOpts
-	if h == nil {
-		return nil, nil
-	}
-
-	q := `SELECT id, attempts, input FROM cb_claim_tasks(name => $1, quantity => $2, hide_for => $3);`
-
-	rows, err := w.conn.Query(ctx, q, w.task.name, h.batchSize, (10 * time.Minute).Milliseconds())
-	if err != nil {
-		return nil, err
-	}
-
-	return pgx.CollectRows(rows, scanCollectibleTaskClaim)
-}
-
-func (w *taskWorker) handle(ctx context.Context, msg taskClaim) {
-	defer w.removeInFlight(msg.ID)
-
-	claimCtx, claimCancel := context.WithCancel(ctx)
-	defer claimCancel()
-
-	handlerCtx := withTaskRunScope(claimCtx, w.conn, w.task.name, msg.ID, claimCancel)
-
-	isCanceled := func() bool {
-		requested, err := isTaskCancelRequestedBestEffort(ctx, w.conn, w.task.name, msg.ID)
-		if err == nil && requested {
-			claimCancel()
-			return true
-		}
-		return false
-	}
-
-	h := w.task.handlerOpts
-	if h == nil {
-		w.logger.ErrorContext(ctx, "worker: failed", "task", w.task.name, "error", "no handler options (definition-only)")
-		return
-	}
-
-	if isCanceled() {
-		return
-	}
-
-	if h.circuitBreaker != nil {
-		allowed, delay := h.circuitBreaker.Allow(time.Now())
-		if !allowed {
-			if delay <= 0 {
-				delay = time.Second
-			}
-			w.logger.WarnContext(ctx, "worker: circuit breaker open", "task", w.task.name, "retry_in", delay)
-			delayMs := ensurePositiveDelayMs(delay)
-			hideTaskRuns(ctx, w.conn, w.logger, w.task.name, []int64{msg.ID}, delayMs, "worker: cannot delay task due to open circuit")
-
+	backlog := false // the last claim came back full, so jobs are still waiting
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case <-free:
 		}
-	}
+		slots := 1 + w.takeFreeSlots(free, backlog)
 
-	w.logger.DebugContext(handlerCtx, "worker: handleTask",
-		"task", w.task.name,
-		"id", msg.ID,
-		"attempts", msg.Attempts,
-		"input", string(msg.Input),
-	)
-
-	out, err := runWithTimeout(handlerCtx, h.timeout, func(fnCtx context.Context) ([]byte, error) {
-		return runSafely("task handler panic", func() ([]byte, error) {
-			inputJSON, marshalErr := json.Marshal(msg.Input)
-			if marshalErr != nil {
-				return nil, fmt.Errorf("marshal input: %w", marshalErr)
-			}
-			return w.task.handler(fnCtx, inputJSON)
-		})
-	})
-
-	// Handle result
-	if err != nil {
-		if cancelRequested, cancelErr := isTaskCancelRequestedBestEffort(ctx, w.conn, w.task.name, msg.ID); cancelErr == nil && cancelRequested {
-			return
+		jobs, err := w.claimBatch(ctx, slots)
+		if err != nil && ctx.Err() == nil {
+			w.logger.Error("catbird: claim failed", "queue", w.queue.name, "err", err)
 		}
-
-		if h.circuitBreaker != nil {
-			h.circuitBreaker.RecordFailure(time.Now())
-		}
-		w.logger.ErrorContext(ctx, "worker: failed", "task", w.task.name, "error", err)
-
-		if msg.Attempts > h.maxRetries {
-			failTaskRun(ctx, w.conn, w.logger, w.task.name, msg.ID, err.Error())
-		} else {
-			delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
-			hideTaskRuns(ctx, w.conn, w.logger, w.task.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay next task run")
-
-		}
-	} else {
-		if isCanceled() {
-			return
-		}
-		if h.circuitBreaker != nil {
-			h.circuitBreaker.RecordSuccess()
-		}
-		completeTaskRun(ctx, w.conn, w.logger, w.task.name, msg.ID, out)
-	}
-}
-
-func scanCollectibleTaskClaim(row pgx.CollectableRow) (taskClaim, error) {
-	return scanTaskClaim(row)
-}
-
-func scanTaskClaim(row pgx.Row) (taskClaim, error) {
-	rec := taskClaim{}
-
-	if err := row.Scan(
-		&rec.ID,
-		&rec.Attempts,
-		&rec.Input,
-	); err != nil {
-		return rec, err
-	}
-
-	return rec, nil
-}
-
-// stepWorker processes one flow step
-type stepWorker struct {
-	conn       Conn
-	logger     *slog.Logger
-	flowName   string
-	step       *Step
-	wakeup     chan struct{} // claim wakeup (step ready)
-	stopWakeup chan struct{} // cancel/fail signal
-
-	tracker *inFlightTracker
-}
-
-func newStepWorker(conn Conn, logger *slog.Logger, flowName string, step *Step, wakeup, stopWakeup chan struct{}) *stepWorker {
-	return &stepWorker{
-		conn:       conn,
-		logger:     logger,
-		flowName:   flowName,
-		step:       step,
-		wakeup:     wakeup,
-		stopWakeup: stopWakeup,
-		tracker:    newInFlightTracker(),
-	}
-}
-
-func (w *stepWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup) {
-	startInFlightHider(handlerCtx, wg, 30*time.Second, w.hideInFlight)
-
-	// Start consumers
-	h := w.step.handlerOpts
-
-	runClaimLoop(shutdownCtx, handlerCtx, wg, claimLoopConfig[stepClaim]{
-		concurrency: h.concurrency,
-		pollClaims:  w.pollClaims,
-		handleClaim: w.handle,
-		onPolled:    w.markInFlight,
-		wakeup:      w.wakeup,
-		logPollError: func(ctx context.Context, err error) {
-			w.logger.ErrorContext(ctx, "worker: cannot poll step claims", "flow", w.flowName, "step", w.step.name, "error", err)
-		},
-	})
-}
-
-func (w *stepWorker) markInFlight(msgs []stepClaim) {
-	markClaimsInFlight(w.tracker, msgs, func(msg stepClaim) int64 { return msg.ID })
-}
-
-func (w *stepWorker) removeInFlight(id int64) {
-	w.tracker.remove(id)
-}
-
-func (w *stepWorker) hideInFlight(ctx context.Context) {
-	ids := w.tracker.list()
-	if len(ids) == 0 {
-		return
-	}
-	hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, ids, (10 * time.Minute).Milliseconds(), "worker: cannot hide in-flight steps")
-}
-
-func (w *stepWorker) pollClaims(ctx context.Context) ([]stepClaim, error) {
-	h := w.step.handlerOpts
-
-	q := `SELECT id, flow_run_id, attempts, input, step_outputs, signal_input FROM cb_claim_steps(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4);`
-
-	rows, err := w.conn.Query(ctx, q, w.flowName, w.step.name, h.batchSize, (10 * time.Minute).Milliseconds())
-	if err != nil {
-		return nil, err
-	}
-
-	return pgx.CollectRows(rows, scanCollectibleStepClaim)
-}
-
-func (w *stepWorker) handle(ctx context.Context, msg stepClaim) {
-	defer w.removeInFlight(msg.ID)
-
-	h := w.step.handlerOpts
-	flowRunID := msg.FlowRunID
-	cancelRequested := false
-	var stopRequested atomic.Bool
-
-	claimCtx, claimCancel := context.WithCancel(ctx)
-	defer claimCancel()
-
-	handlerCtx := withFlowRunScope(claimCtx, w.conn, w.flowName, flowRunID, claimCancel)
-	defer finalizeFlowCancelIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, &cancelRequested)
-
-	stopIfRequested := newFlowStopChecker(
-		ctx,
-		w.conn,
-		w.logger,
-		w.flowName,
-		flowRunID,
-		claimCancel,
-		&cancelRequested,
-		&stopRequested,
-		func() {
-			cancelStepRun(ctx, w.conn, w.logger, w.flowName, msg.ID)
-		},
-	)
-
-	if stopIfRequested() {
-		return
-	}
-
-	stopWatcher := watchFlowStop(claimCtx, w.stopWakeup, 0, stopIfRequested)
-	defer stopWatcher()
-
-	if h.circuitBreaker != nil {
-		allowed, delay := h.circuitBreaker.Allow(time.Now())
-		if !allowed {
-			if delay <= 0 {
-				delay = time.Second
-			}
-			w.logger.WarnContext(ctx, "worker: circuit breaker open", "flow", w.flowName, "step", w.step.name, "retry_in", delay)
-			hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay step due to open circuit")
-
-			return
-		}
-	}
-
-	if w.logger.Enabled(handlerCtx, slog.LevelDebug) {
-		stepOutputsJSON, _ := json.Marshal(msg.StepOutputs)
-		w.logger.DebugContext(handlerCtx, "worker: handleStep",
-			"flow", w.flowName,
-			"step", w.step.name,
-			"id", msg.ID,
-			"attempts", msg.Attempts,
-			"input", string(msg.Input),
-			"step_outputs", string(stepOutputsJSON),
-		)
-	}
-
-	if w.step.stepType == StepTypeReducer {
-		if stopIfRequested() {
-			return
-		}
-
-		err := runWithTimeoutErr(handlerCtx, h.timeout, func(fnCtx context.Context) error {
-			_, reduceErr := runSafely("reducer panic", func() (struct{}, error) {
-				return struct{}{}, finalizeStepReduction(fnCtx, w.conn, w.logger, w.flowName, w.step, msg.ID)
+		for _, job := range jobs {
+			running.Go(func() {
+				defer func() { free <- struct{}{} }()
+				w.run(ctx, job)
 			})
-			return reduceErr
-		})
+		}
+		for range slots - len(jobs) { // the slots the queue could not fill
+			free <- struct{}{}
+		}
 
-		if err != nil {
-			if stopIfRequested() {
-				return
-			}
-
-			if h.circuitBreaker != nil {
-				h.circuitBreaker.RecordFailure(time.Now())
-			}
-
-			if msg.Attempts > h.maxRetries {
-				failStepRun(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, err.Error())
-			} else {
-				delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
-				hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay reduced map step retry")
-
-			}
+		backlog = len(jobs) == slots
+		if backlog {
+			continue // claim again; the loop above waits for the next free slot
+		}
+		select {
+		case <-ctx.Done():
 			return
+		case <-wake:
+		case <-time.After(w.queue.opts.PollInterval):
 		}
-
-		if h.circuitBreaker != nil {
-			h.circuitBreaker.RecordSuccess()
-		}
-		return
-	}
-
-	if w.step.stepType == StepTypeGenerator {
-		if stopIfRequested() {
-			return
-		}
-
-		err := runWithTimeoutErr(handlerCtx, h.timeout, func(fnCtx context.Context) error {
-			_, genErr := runSafely("generator handler panic", func() (struct{}, error) {
-				return struct{}{}, w.handleGeneratorClaim(fnCtx, msg)
-			})
-			return genErr
-		})
-
-		if err != nil {
-			if stopIfRequested() {
-				return
-			}
-
-			if h.circuitBreaker != nil {
-				h.circuitBreaker.RecordFailure(time.Now())
-			}
-			w.logger.ErrorContext(ctx, "worker: generator failed", "flow", w.flowName, "step", w.step.name, "error", err)
-
-			if msg.Attempts > h.maxRetries {
-				failGeneratorStep(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, err.Error())
-			} else {
-				delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
-				hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay generator step retry")
-
-			}
-			return
-		}
-
-		if h.circuitBreaker != nil {
-			h.circuitBreaker.RecordSuccess()
-		}
-		return
-	}
-
-	out, err := runWithTimeout(handlerCtx, h.timeout, func(fnCtx context.Context) ([]byte, error) {
-		return runSafely("step handler panic", func() ([]byte, error) {
-			inputJSON, marshalErr := json.Marshal(msg.Input)
-			if marshalErr != nil {
-				return nil, fmt.Errorf("marshal input: %w", marshalErr)
-			}
-			signalInputJSON, marshalErr := json.Marshal(msg.SignalInput)
-			if marshalErr != nil {
-				return nil, fmt.Errorf("marshal signal input: %w", marshalErr)
-			}
-			depsJSON := make(map[string][]byte)
-			for name, depOut := range msg.StepOutputs {
-				depJSON, marshalErr := json.Marshal(depOut)
-				if marshalErr != nil {
-					return nil, fmt.Errorf("marshal dependency %s output: %w", name, marshalErr)
-				}
-				depsJSON[name] = depJSON
-			}
-			if w.step.handler == nil {
-				return nil, fmt.Errorf("step %s has no handler (definition-only)", w.step.name)
-			}
-			return w.step.handler(fnCtx, inputJSON, depsJSON, signalInputJSON)
-		})
-	})
-
-	// Handle result
-	if err != nil {
-		if completion, ok := asEarlyCompletion(err); ok {
-			if completion.flowName != w.flowName || completion.flowRunID != flowRunID {
-				w.logger.ErrorContext(ctx, "worker: early completion scope mismatch", "flow", w.flowName, "step", w.step.name)
-				return
-			}
-
-			applied, completeErr := completeFlowEarly(ctx, w.conn, w.flowName, flowRunID, w.step.name, completion.output, completion.reason)
-			if completeErr != nil {
-				w.logger.ErrorContext(ctx, "worker: cannot complete flow early", "flow", w.flowName, "step", w.step.name, "error", completeErr)
-				if msg.Attempts > h.maxRetries {
-					failStepRun(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, completeErr.Error())
-				} else {
-					delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
-					hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay step after early completion error")
-
-				}
-				return
-			}
-
-			if applied {
-				stopRequested.Store(true)
-				claimCancel()
-			}
-			return
-		}
-
-		if stopIfRequested() {
-			return
-		}
-
-		if h.circuitBreaker != nil {
-			h.circuitBreaker.RecordFailure(time.Now())
-		}
-		w.logger.ErrorContext(ctx, "worker: failed", "flow", w.flowName, "step", w.step.name, "error", err)
-
-		if msg.Attempts > h.maxRetries {
-			failStepRun(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, err.Error())
-		} else {
-			delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
-			hideStepRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay next step run")
-
-		}
-	} else {
-		if stopIfRequested() {
-			return
-		}
-		if h.circuitBreaker != nil {
-			h.circuitBreaker.RecordSuccess()
-		}
-		completeStepRun(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, out)
 	}
 }
 
-func (w *stepWorker) handleGeneratorClaim(ctx context.Context, msg stepClaim) error {
-	if w.step.generatorFn == nil {
-		return fmt.Errorf("step %s has no generator function", w.step.name)
-	}
-
-	fnVal := reflect.ValueOf(w.step.generatorFn)
-	fnType := fnVal.Type()
-
-	args := make([]reflect.Value, 0, fnType.NumIn())
-	args = append(args, reflect.ValueOf(ctx))
-
-	flowInputPtr := reflect.New(fnType.In(1))
-	if err := json.Unmarshal(msg.Input, flowInputPtr.Interface()); err != nil {
-		return fmt.Errorf("unmarshal flow input: %w", err)
-	}
-	args = append(args, flowInputPtr.Elem())
-
-	depStartIdx := 2
-	if w.step.signal {
-		signalPtr := reflect.New(fnType.In(2))
-		if len(msg.SignalInput) > 0 {
-			if err := json.Unmarshal(msg.SignalInput, signalPtr.Interface()); err != nil {
-				return fmt.Errorf("unmarshal signal input: %w", err)
-			}
-		}
-		args = append(args, signalPtr.Elem())
-		depStartIdx = 3
-	}
-
-	isOptionalType := func(t reflect.Type) bool {
-		return t.Kind() == reflect.Struct &&
-			t.NumField() >= 2 &&
-			t.Field(0).Name == "IsSet" &&
-			t.Field(0).Type.Kind() == reflect.Bool &&
-			t.Field(1).Name == "Value"
-	}
-
-	for idx, depName := range w.step.dependencies {
-		paramType := fnType.In(depStartIdx + idx)
-		depRaw, ok := msg.StepOutputs[depName]
-
-		if isOptionalType(paramType) {
-			optVal := reflect.New(paramType).Elem()
-			if ok && len(depRaw) > 0 {
-				optVal.FieldByName("IsSet").SetBool(true)
-				valueField := optVal.FieldByName("Value")
-				valuePtr := reflect.New(valueField.Type())
-				if err := json.Unmarshal(depRaw, valuePtr.Interface()); err != nil {
-					return fmt.Errorf("unmarshal optional dependency %s: %w", depName, err)
-				}
-				valueField.Set(valuePtr.Elem())
-			}
-			args = append(args, optVal)
-			continue
-		}
-
-		if !ok {
-			return fmt.Errorf("step %s missing dependency output %q", w.step.name, depName)
-		}
-
-		depPtr := reflect.New(paramType)
-		if err := json.Unmarshal(depRaw, depPtr.Interface()); err != nil {
-			return fmt.Errorf("unmarshal dependency %s output: %w", depName, err)
-		}
-		args = append(args, depPtr.Elem())
-	}
-
-	batchSize := w.step.handlerOpts.batchSize
-	if batchSize <= 0 {
-		batchSize = 100
-	}
-
-	errorType := reflect.TypeOf((*error)(nil)).Elem()
-	zeroErr := reflect.Zero(errorType)
-	batch := make([]json.RawMessage, 0, batchSize)
-
-	flush := func() error {
-		if len(batch) == 0 {
-			return nil
-		}
-
-		items, err := json.Marshal(batch)
-		if err != nil {
-			return fmt.Errorf("marshal generator batch: %w", err)
-		}
-
-		if _, err := spawnGeneratorMapTasks(ctx, w.conn, w.flowName, w.step.name, msg.ID, items); err != nil {
-			return err
-		}
-
-		batch = batch[:0]
-		return nil
-	}
-
-	yieldParamType := fnType.In(fnType.NumIn() - 1)
-	yieldItemType := yieldParamType.In(0)
-	yieldType := reflect.FuncOf([]reflect.Type{yieldItemType}, []reflect.Type{errorType}, false)
-	yieldFn := reflect.MakeFunc(yieldType, func(args []reflect.Value) []reflect.Value {
-		if err := ctx.Err(); err != nil {
-			return []reflect.Value{reflect.ValueOf(err)}
-		}
-
-		itemJSON, err := json.Marshal(args[0].Interface())
-		if err != nil {
-			return []reflect.Value{reflect.ValueOf(fmt.Errorf("marshal yielded item: %w", err))}
-		}
-
-		batch = append(batch, itemJSON)
-		if len(batch) < batchSize {
-			return []reflect.Value{zeroErr}
-		}
-
-		if err := flush(); err != nil {
-			return []reflect.Value{reflect.ValueOf(err)}
-		}
-
-		return []reflect.Value{zeroErr}
-	})
-	args = append(args, yieldFn)
-
-	results := fnVal.Call(args)
-
-	if !results[0].IsNil() {
-		return results[0].Interface().(error)
-	}
-
-	if err := flush(); err != nil {
-		return err
-	}
-
-	return completeGeneratorStep(ctx, w.conn, w.flowName, w.step.name, msg.ID)
-}
-
-func scanCollectibleStepClaim(row pgx.CollectableRow) (stepClaim, error) {
-	return scanStepClaim(row)
-}
-
-func scanStepClaim(row pgx.Row) (stepClaim, error) {
-	rec := stepClaim{}
-
-	var stepOutputs *map[string]json.RawMessage
-
-	if err := row.Scan(
-		&rec.ID,
-		&rec.FlowRunID,
-		&rec.Attempts,
-		&rec.Input,
-		&stepOutputs,
-		&rec.SignalInput,
-	); err != nil {
-		return rec, err
-	}
-
-	if stepOutputs != nil {
-		rec.StepOutputs = *stepOutputs
-	}
-
-	return rec, nil
-}
-
-type mapTaskClaim struct {
-	ID          int64                      `json:"id"`
-	FlowRunID   int64                      `json:"flow_run_id"`
-	Attempts    int                        `json:"attempts"`
-	Input       json.RawMessage            `json:"input"`
-	StepOutputs map[string]json.RawMessage `json:"step_outputs"`
-	SignalInput json.RawMessage            `json:"signal_input"`
-	Item        json.RawMessage            `json:"item"`
-}
-
-type mapStepWorker struct {
-	conn       Conn
-	logger     *slog.Logger
-	flowName   string
-	step       *Step
-	wakeup     chan struct{}
-	stopWakeup chan struct{}
-
-	tracker *inFlightTracker
-}
-
-func newMapStepWorker(conn Conn, logger *slog.Logger, flowName string, step *Step, wakeup, stopWakeup chan struct{}) *mapStepWorker {
-	return &mapStepWorker{
-		conn:       conn,
-		logger:     logger,
-		flowName:   flowName,
-		step:       step,
-		wakeup:     wakeup,
-		stopWakeup: stopWakeup,
-		tracker:    newInFlightTracker(),
-	}
-}
-
-func (w *mapStepWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup) {
-	startInFlightHider(handlerCtx, wg, 30*time.Second, w.hideInFlight)
-
-	h := w.step.handlerOpts
-
-	runClaimLoop(shutdownCtx, handlerCtx, wg, claimLoopConfig[mapTaskClaim]{
-		concurrency: h.concurrency,
-		pollClaims:  w.pollClaims,
-		handleClaim: w.handle,
-		onPolled:    w.markInFlight,
-		wakeup:      w.wakeup,
-		logPollError: func(ctx context.Context, err error) {
-			w.logger.ErrorContext(ctx, "worker: cannot poll map task claims", "flow", w.flowName, "step", w.step.name, "error", err)
-		},
-	})
-}
-
-func (w *mapStepWorker) markInFlight(msgs []mapTaskClaim) {
-	markClaimsInFlight(w.tracker, msgs, func(msg mapTaskClaim) int64 { return msg.ID })
-}
-
-func (w *mapStepWorker) removeInFlight(id int64) {
-	w.tracker.remove(id)
-}
-
-func (w *mapStepWorker) hideInFlight(ctx context.Context) {
-	ids := w.tracker.list()
-	if len(ids) == 0 {
-		return
-	}
-	hideMapTaskRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, ids, (10 * time.Minute).Milliseconds(), "worker: cannot hide in-flight map tasks")
-}
-
-func (w *mapStepWorker) pollClaims(ctx context.Context) ([]mapTaskClaim, error) {
-	h := w.step.handlerOpts
-	q := `SELECT id, flow_run_id, attempts, input, step_outputs, signal_input, item FROM cb_claim_map_tasks(flow_name => $1, step_name => $2, quantity => $3, hide_for => $4);`
-
-	rows, err := w.conn.Query(ctx, q, w.flowName, w.step.name, h.batchSize, (10 * time.Minute).Milliseconds())
-	if err != nil {
-		return nil, err
-	}
-
-	return pgx.CollectRows(rows, scanCollectibleMapTaskClaim)
-}
-
-func (w *mapStepWorker) handle(ctx context.Context, msg mapTaskClaim) {
-	defer w.removeInFlight(msg.ID)
-
-	h := w.step.handlerOpts
-	flowRunID := msg.FlowRunID
-	cancelRequested := false
-	var stopRequested atomic.Bool
-
-	claimCtx, claimCancel := context.WithCancel(ctx)
-	defer claimCancel()
-
-	handlerCtx := withFlowRunScope(claimCtx, w.conn, w.flowName, flowRunID, claimCancel)
-	defer finalizeFlowCancelIfRequested(ctx, w.conn, w.logger, w.flowName, flowRunID, &cancelRequested)
-
-	stopIfRequested := newFlowStopChecker(
-		ctx,
-		w.conn,
-		w.logger,
-		w.flowName,
-		flowRunID,
-		claimCancel,
-		&cancelRequested,
-		&stopRequested,
-		func() {
-			cancelMapTaskRun(ctx, w.conn, w.logger, w.flowName, msg.ID)
-		},
-	)
-
-	if stopIfRequested() {
-		return
-	}
-
-	stopWatcher := watchFlowStop(claimCtx, w.stopWakeup, 0, stopIfRequested)
-	defer stopWatcher()
-
-	if h.circuitBreaker != nil {
-		allowed, delay := h.circuitBreaker.Allow(time.Now())
-		if !allowed {
-			if delay <= 0 {
-				delay = time.Second
-			}
-			hideMapTaskRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay map task due to open circuit")
-
-			return
-		}
-	}
-
-	itemOutput, err := runWithTimeout(handlerCtx, h.timeout, func(fnCtx context.Context) (json.RawMessage, error) {
-		return runSafely("step handler panic", func() (json.RawMessage, error) {
-			if w.step.stepType == StepTypeGenerator {
-				if w.step.generatorHandler == nil {
-					return nil, fmt.Errorf("step %s has no generator handler", w.step.name)
-				}
-
-				itemPtr := reflect.New(w.step.generatorItemType)
-				if err := json.Unmarshal(msg.Item, itemPtr.Interface()); err != nil {
-					return nil, fmt.Errorf("unmarshal generator item: %w", err)
-				}
-
-				results := reflect.ValueOf(w.step.generatorHandler).Call([]reflect.Value{
-					reflect.ValueOf(fnCtx),
-					itemPtr.Elem(),
-				})
-				if !results[1].IsNil() {
-					return nil, results[1].Interface().(error)
-				}
-
-				outJSON, err := json.Marshal(results[0].Interface())
-				if err != nil {
-					return nil, fmt.Errorf("marshal generator handler output: %w", err)
-				}
-
-				return outJSON, nil
-			}
-
-			flowInputJSON, marshalErr := json.Marshal(msg.Input)
-			if marshalErr != nil {
-				return nil, fmt.Errorf("marshal flow input: %w", marshalErr)
-			}
-
-			signalInputJSON, marshalErr := json.Marshal(msg.SignalInput)
-			if marshalErr != nil {
-				return nil, fmt.Errorf("marshal signal input: %w", marshalErr)
-			}
-
-			depsJSON := make(map[string][]byte)
-			for name, depOut := range msg.StepOutputs {
-				depJSON, marshalErr := json.Marshal(depOut)
-				if marshalErr != nil {
-					return nil, fmt.Errorf("marshal dependency %s output: %w", name, marshalErr)
-				}
-				depsJSON[name] = depJSON
-			}
-
-			singleItemArrayJSON, marshalErr := json.Marshal([]json.RawMessage{msg.Item})
-			if marshalErr != nil {
-				return nil, fmt.Errorf("marshal map item wrapper: %w", marshalErr)
-			}
-
-			if w.step.mapSource == "" {
-				flowInputJSON = singleItemArrayJSON
-			} else {
-				depsJSON[w.step.mapSource] = singleItemArrayJSON
-			}
-
-			if w.step.handler == nil {
-				return nil, fmt.Errorf("step %s has no handler", w.step.name)
-			}
-
-			out, handlerErr := w.step.handler(fnCtx, flowInputJSON, depsJSON, signalInputJSON)
-			if handlerErr != nil {
-				return nil, handlerErr
-			}
-
-			var arr []json.RawMessage
-			if unmarshalErr := json.Unmarshal(out, &arr); unmarshalErr != nil {
-				return nil, fmt.Errorf("unmarshal map step output array: %w", unmarshalErr)
-			}
-			if len(arr) != 1 {
-				return nil, fmt.Errorf("map step handler must produce exactly one output item per map task, got %d", len(arr))
-			}
-
-			return arr[0], nil
-		})
-	})
-
-	if err != nil {
-		if completion, ok := asEarlyCompletion(err); ok {
-			if completion.flowName != w.flowName || completion.flowRunID != flowRunID {
-				w.logger.ErrorContext(ctx, "worker: early completion scope mismatch", "flow", w.flowName, "step", w.step.name)
-				return
-			}
-
-			applied, completeErr := completeFlowEarly(ctx, w.conn, w.flowName, flowRunID, w.step.name, completion.output, completion.reason)
-			if completeErr != nil {
-				w.logger.ErrorContext(ctx, "worker: cannot complete flow early", "flow", w.flowName, "step", w.step.name, "error", completeErr)
-				if msg.Attempts > h.maxRetries {
-					failMapTaskRun(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, completeErr.Error())
-				} else {
-					delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
-					hideMapTaskRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay map task after early completion error")
-
-				}
-				return
-			}
-
-			if applied {
-				stopRequested.Store(true)
-				claimCancel()
-			}
-			return
-		}
-
-		if stopIfRequested() {
-			return
-		}
-
-		if h.circuitBreaker != nil {
-			h.circuitBreaker.RecordFailure(time.Now())
-		}
-
-		if msg.Attempts > h.maxRetries {
-			failMapTaskRun(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, err.Error())
-		} else {
-			delay := nextRetryDelay(msg.Attempts-1, h.backoff, 0, 0)
-			hideMapTaskRuns(ctx, w.conn, w.logger, w.flowName, w.step.name, []int64{msg.ID}, delay.Milliseconds(), "worker: cannot delay map task retry")
-
-		}
-		return
-	}
-
-	if h.circuitBreaker != nil {
-		h.circuitBreaker.RecordSuccess()
-	}
-
-	if stopIfRequested() {
-		return
-	}
-
-	completeMapTaskRun(ctx, w.conn, w.logger, w.flowName, w.step.name, msg.ID, itemOutput)
-}
-
-func scanCollectibleMapTaskClaim(row pgx.CollectableRow) (mapTaskClaim, error) {
-	return scanMapTaskClaim(row)
-}
-
-func scanMapTaskClaim(row pgx.Row) (mapTaskClaim, error) {
-	rec := mapTaskClaim{}
-	var stepOutputs *map[string]json.RawMessage
-
-	if err := row.Scan(
-		&rec.ID,
-		&rec.FlowRunID,
-		&rec.Attempts,
-		&rec.Input,
-		&stepOutputs,
-		&rec.SignalInput,
-		&rec.Item,
-	); err != nil {
-		return rec, err
-	}
-
-	if stepOutputs != nil {
-		rec.StepOutputs = *stepOutputs
-	}
-
-	return rec, nil
-}
-
-type claimLoopConfig[C any] struct {
-	concurrency   int
-	pollClaims    func(context.Context) ([]C, error)
-	handleClaim   func(context.Context, C)
-	onPolled      func([]C)
-	wakeup        <-chan struct{} // NOTIFY signal; nil = timer-only fallback
-	fallbackDelay time.Duration   // poll interval when no NOTIFY arrives (default 2s)
-	logPollError  func(context.Context, error)
-	pollTimeout   time.Duration // per-poll deadline; 0 = defaultPollTimeout
-}
-
-func runClaimLoop[C any](shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup, cfg claimLoopConfig[C]) {
-	claims := make(chan C)
-
-	timeout := cfg.pollTimeout
-	if timeout <= 0 {
-		timeout = defaultPollTimeout
-	}
-
-	wg.Go(func() {
-		defer close(claims)
-
-		retryAttempt := 0
-		for {
+// takeFreeSlots takes the slots that are free besides the one the caller holds,
+// and returns how many. With jobs still waiting it gives slots waitForSlots to
+// free, so a busy queue is claimed by one bigger statement instead of one
+// statement per finished job; with an empty queue it takes what is free now and
+// leaves the claim undelayed.
+func (w *worker) takeFreeSlots(free chan struct{}, backlog bool) int {
+	taken := 0
+	batchSize := w.queue.opts.BatchSize
+	if !backlog {
+		for taken < batchSize-1 {
 			select {
-			case <-shutdownCtx.Done():
-				return
+			case <-free:
+				taken++
 			default:
-			}
-
-			pollCtx, cancel := context.WithTimeout(shutdownCtx, timeout)
-			msgs, err := cfg.pollClaims(pollCtx)
-			cancel()
-			if err != nil {
-				// Only a shutdown of the whole worker ends the loop. A poll that
-				// hit the deadline above (or failed for any other reason) is a
-				// fault to log and retry on a fresh connection, not a reason to
-				// quit — checking the parent context tells the two apart.
-				if shutdownCtx.Err() != nil {
-					return
-				}
-
-				if cfg.logPollError != nil {
-					cfg.logPollError(shutdownCtx, err)
-				}
-
-				delay := backoffWithFullJitter(retryAttempt, 250*time.Millisecond, 5*time.Second)
-				retryAttempt++
-				timer := time.NewTimer(delay)
-				select {
-				case <-shutdownCtx.Done():
-					timer.Stop()
-					return
-				case <-timer.C:
-				}
-				continue
-			}
-
-			retryAttempt = 0
-			if len(msgs) == 0 {
-				delay := cfg.fallbackDelay
-				if delay <= 0 {
-					delay = 2 * time.Second
-				}
-				timer := time.NewTimer(delay)
-				select {
-				case <-shutdownCtx.Done():
-					timer.Stop()
-					return
-				case <-cfg.wakeup:
-					timer.Stop()
-				case <-timer.C:
-				}
-				continue
-			}
-
-			if cfg.onPolled != nil {
-				cfg.onPolled(msgs)
-			}
-
-			for _, msg := range msgs {
-				select {
-				case <-shutdownCtx.Done():
-					return
-				case claims <- msg:
-				}
+				return taken
 			}
 		}
-	})
+		return taken
+	}
+	wait := time.NewTimer(waitForSlots)
+	defer wait.Stop()
+	for taken < batchSize-1 {
+		select {
+		case <-free:
+			taken++
+		case <-wait.C:
+			return taken
+		}
+	}
+	return taken
+}
 
-	for i := 0; i < cfg.concurrency; i++ {
-		wg.Go(func() {
-			for msg := range claims {
-				cfg.handleClaim(handlerCtx, msg)
-			}
-		})
+// run executes one job. The worker holds nothing while the handler runs: no
+// transaction, no connection. When the handler returns nil and did not complete
+// the job in a transaction of its own, the worker completes it with one
+// statement; an error schedules a retry or marks the job dead, and a shutdown
+// hands the job back. An attempt that runs past the queue's HandlerTimeout is
+// a failed attempt like any other.
+func (w *worker) run(ctx context.Context, job *Job) {
+	registered := w.handlers[job.Type]
+
+	// The handler's context carries the queue's HandlerTimeout and is never a
+	// shadow of ctx: the switch below tells a shutdown from a failure by the
+	// worker's context, and a timeout that had cancelled that one would give
+	// the attempt back instead of counting it, so a handler that always times
+	// out would be claimed again at once, forever. The cause layer underneath
+	// is for the renewal loop: it cancels through it with ErrClaimLost when
+	// the claim is not this attempt's any more, and the switch reads the
+	// cause, so the attempt is discarded rather than retried on a claim it
+	// lost.
+	lost, cancelLost := context.WithCancelCause(ctx)
+	defer cancelLost(nil)
+	handlerCtx, cancelHandler := context.WithTimeout(lost, w.queue.opts.HandlerTimeout)
+	defer cancelHandler()
+
+	tracked := &inFlightJob{id: job.ID, attempts: job.Attempts, ctx: handlerCtx, cancel: cancelLost}
+	w.track(tracked)
+	err := registered.handler.HandleJob(handlerCtx, job)
+	w.untrack(tracked)
+
+	// The statements after the handler run on a context detached from the
+	// worker's, with a bound of their own. At shutdown the worker's context is
+	// canceled by the time the handler returns and pgx would reject them
+	// locally: the completion of finished work would be lost and the job would
+	// run a second time, and a job that has to come back would keep the full
+	// ClaimDuration its claim set with the attempt already spent.
+	after, cancel := context.WithTimeout(context.WithoutCancel(ctx), afterHandlerTimeout)
+	defer cancel()
+
+	if err == nil && !job.completed {
+		err = Complete(after, w.runtime.pool, job)
+	}
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrClaimLost), errors.Is(context.Cause(handlerCtx), ErrClaimLost):
+		w.logger.Warn("catbird: claim lost before completion, work discarded", "queue", w.queue.name, "job_type", job.Type, "job_id", job.ID, "attempt", job.Attempts)
+	case ctx.Err() != nil:
+		w.interrupted(after, job, err)
+	default:
+		w.failed(after, registered.jobType, job, err)
 	}
 }
 
-func hideTaskRuns(ctx context.Context, conn Conn, logger *slog.Logger, taskName string, ids []int64, hideForMs int64, errorMsg string) {
-	q := `SELECT * FROM cb_hide_tasks(name => $1, ids => $2, hide_for => $3);`
-	_, err := execWithRetry(ctx, conn, q, taskName, ids, hideForMs)
-	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		logger.ErrorContext(ctx, errorMsg, "task", taskName, "error", err)
-	}
-}
-
-func completeTaskRun(ctx context.Context, conn Conn, logger *slog.Logger, taskName string, runID int64, output []byte) {
-	q := `SELECT * FROM cb_complete_task(name => $1, run_id => $2, output => $3);`
-	if _, err := execWithRetry(ctx, conn, q, taskName, runID, output); err != nil {
-		logger.ErrorContext(ctx, "worker: cannot mark task as completed", "task", taskName, "error", err)
-	}
-}
-
-func failTaskRun(ctx context.Context, conn Conn, logger *slog.Logger, taskName string, runID int64, errorMessage string) {
-	q := `SELECT * FROM cb_fail_task(name => $1, run_id => $2, error_message => $3);`
-	if _, err := execWithRetry(ctx, conn, q, taskName, runID, errorMessage); err != nil {
-		logger.ErrorContext(ctx, "worker: cannot mark task as failed", "task", taskName, "error", err)
-	}
-}
-
-func hideStepRuns(ctx context.Context, conn Conn, logger *slog.Logger, flowName, stepName string, ids []int64, hideForMs int64, errorMsg string) {
-	q := `SELECT * FROM cb_hide_steps(flow_name => $1, step_name => $2, ids => $3, hide_for => $4);`
-	_, err := execWithRetry(ctx, conn, q, flowName, stepName, ids, hideForMs)
-	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		logger.ErrorContext(ctx, errorMsg, "flow", flowName, "step", stepName, "error", err)
-	}
-}
-
-func completeStepRun(ctx context.Context, conn Conn, logger *slog.Logger, flowName, stepName string, stepID int64, output []byte) {
-	q := `SELECT * FROM cb_complete_step(flow_name => $1, step_name => $2, id => $3, output => $4);`
-	if _, err := execWithRetry(ctx, conn, q, flowName, stepName, stepID, output); err != nil {
-		logger.ErrorContext(ctx, "worker: cannot mark step as completed", "flow", flowName, "step", stepName, "error", err)
-	}
-}
-
-func failStepRun(ctx context.Context, conn Conn, logger *slog.Logger, flowName, stepName string, stepID int64, errorMessage string) {
-	q := `SELECT * FROM cb_fail_step(flow_name => $1, step_name => $2, id => $3, error_message => $4);`
-	if _, err := execWithRetry(ctx, conn, q, flowName, stepName, stepID, errorMessage); err != nil {
-		logger.ErrorContext(ctx, "worker: cannot mark step as failed", "flow", flowName, "step", stepName, "error", err)
-	}
-}
-
-func completeMapTaskRun(ctx context.Context, conn Conn, logger *slog.Logger, flowName, stepName string, mapTaskID int64, output []byte) {
-	q := `SELECT * FROM cb_complete_map_tasks(flow_name => $1, step_name => $2, ids => $3, outputs => $4);`
-	if _, err := execWithRetry(ctx, conn, q, flowName, stepName, []int64{mapTaskID}, []json.RawMessage{output}); err != nil {
-		logger.ErrorContext(ctx, "worker: cannot mark map task as completed", "flow", flowName, "step", stepName, "error", err)
-	}
-}
-
-func hideMapTaskRuns(ctx context.Context, conn Conn, logger *slog.Logger, flowName, stepName string, ids []int64, hideForMs int64, errorMsg string) {
-	q := `SELECT * FROM cb_hide_map_tasks(flow_name => $1, step_name => $2, ids => $3, hide_for => $4);`
-	_, err := execWithRetry(ctx, conn, q, flowName, stepName, ids, hideForMs)
-	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		logger.ErrorContext(ctx, errorMsg, "flow", flowName, "step", stepName, "error", err)
-	}
-}
-
-func failMapTaskRun(ctx context.Context, conn Conn, logger *slog.Logger, flowName, stepName string, mapTaskID int64, errorMessage string) {
-	q := `SELECT * FROM cb_fail_map_task(flow_name => $1, step_name => $2, id => $3, error_message => $4);`
-	if _, err := execWithRetry(ctx, conn, q, flowName, stepName, mapTaskID, errorMessage); err != nil {
-		logger.ErrorContext(ctx, "worker: cannot mark map task as failed", "flow", flowName, "step", stepName, "error", err)
-	}
-}
-
-func spawnGeneratorMapTasks(ctx context.Context, conn Conn, flowName, stepName string, stepID int64, items []byte) (int, error) {
-	q := `SELECT * FROM cb_spawn_generator_map_tasks(flow_name => $1, step_name => $2, id => $3, items => $4);`
-	var spawned int
-	if err := conn.QueryRow(ctx, q, flowName, stepName, stepID, items).Scan(&spawned); err != nil {
-		return 0, fmt.Errorf("spawn generator map tasks: %w", err)
-	}
-	return spawned, nil
-}
-
-func completeGeneratorStep(ctx context.Context, conn Conn, flowName, stepName string, stepID int64) error {
-	q := `SELECT * FROM cb_complete_generator_step(flow_name => $1, step_name => $2, id => $3);`
-	if _, err := execWithRetry(ctx, conn, q, flowName, stepName, stepID); err != nil {
-		return fmt.Errorf("mark generator complete: %w", err)
-	}
-	return nil
-}
-
-func finalizeStepReduction(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, step *Step, stepID int64) error {
-	if step.reducerFn == nil {
-		return fmt.Errorf("step %s has no reducer", step.name)
-	}
-	if step.stepType != StepTypeReducer {
-		return fmt.Errorf("step %s is not a reducer step", step.name)
-	}
-	if strings.TrimSpace(step.reduceSourceStep) == "" {
-		return fmt.Errorf("step %s has no reduce source step", step.name)
-	}
-
-	flowRunID, err := getStepFlowRunIDForReduction(ctx, conn, flowName, step, stepID)
+// interrupted hands a job back after shutdown stopped it: the attempt is given
+// back and the job is visible again at once, because nothing about it failed.
+// Without this, three rolling deploys spend three attempts and 15 minutes of
+// claim time on a job that never ran wrong. The update matches on attempts:
+// if the claim had expired and another worker took the job, attempts has
+// moved on and this writes nothing. A worker that crashes writes nothing at
+// all, which is why the attempt is charged at claim time: it is the only thing
+// that counts an attempt nobody saw end, and without it a job that kills its
+// worker is retried forever. cause is what the handler returned: a real failure
+// inside the shutdown window cannot be told from an interruption, so it is
+// logged and the attempt is still given back.
+func (w *worker) interrupted(ctx context.Context, job *Job, cause error) {
+	_, err := w.runtime.pool.Exec(ctx, `
+		UPDATE cb_claims SET attempts = attempts - 1, visible_at = now()
+		WHERE message_id = $1 AND attempts = $2 AND died_at IS NULL
+	`, job.ID, job.Attempts)
 	if err != nil {
-		return err
+		w.logger.Error("catbird: returning an interrupted job failed", "queue", w.queue.name, "job_id", job.ID, "err", err, "cause", cause)
+		return
 	}
-	if flowRunID == 0 {
-		return nil
+	w.logger.Info("catbird: job stopped by shutdown, returned to the queue", "queue", w.queue.name, "job_id", job.ID, "err", cause)
+}
+
+// failed schedules a retry, or after the last attempt marks the job dead,
+// cancels its workflow, and runs OnDead. MaxAttempts, MinBackoff, MaxBackoff and
+// OnDead come from the job type, so two kinds of work sharing a queue are
+// retried on their own terms.
+//
+// The retry waits at least MinBackoff and at most what doubling that per attempt
+// has reached, up to MaxBackoff, and the wait itself is drawn at random between
+// the two, so the jobs of an outage come back apart instead of in one second at
+// a service that is still down. The exponent stops at 20 to keep the
+// multiplication inside an interval.
+//
+// Both writes match on attempts, and a write that finds no row
+// means the claim is not this attempt's any more: the handler completed the job
+// and then returned an error, or the claim expired and another worker has it.
+// Neither is this attempt's failure to record, and the cascade must not run for
+// a job that is finished or running elsewhere. The error text rides on the same
+// two writes, so an attempt that lost its claim records none.
+func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) {
+	log := w.logger.With("queue", w.queue.name, "job_type", job.Type, "job_id", job.ID, "attempt", job.Attempts)
+
+	if job.Attempts < t.opts.MaxAttempts {
+		tag, err := w.runtime.pool.Exec(ctx, `
+			UPDATE cb_claims
+			SET visible_at = now() + $3::interval
+			    + (least($3::interval * 2 ^ least(attempts - 1, 20), $4::interval) - $3::interval) * random(),
+			    last_error = left($5, 256)
+			WHERE message_id = $1 AND attempts = $2 AND died_at IS NULL
+		`, job.ID, job.Attempts, t.opts.MinBackoff, t.opts.MaxBackoff, cause.Error())
+		switch {
+		case err != nil:
+			log.Error("catbird: scheduling retry failed", "err", err, "cause", cause)
+		case tag.RowsAffected() == 0:
+			log.Warn("catbird: handler failed after the claim was gone, no retry scheduled", "err", cause)
+		default:
+			log.Warn("catbird: job failed, will retry", "err", cause)
+		}
+		return
 	}
 
-	accPtr := reflect.New(step.reducerAcc)
-	if err := json.Unmarshal(step.reducerInit, accPtr.Interface()); err != nil {
-		return fmt.Errorf("unmarshal reducer initial accumulator: %w", err)
-	}
-	acc := accPtr.Elem()
-
-	mapTable := fmt.Sprintf("cb_m_%s", strings.ToLower(flowName))
-	q := fmt.Sprintf(`SELECT output FROM %s WHERE flow_run_id = $1 AND step_name = $2 AND status = 'completed' ORDER BY item_idx`, mapTable)
-	rows, err := queryWithRetry(ctx, conn, q, flowRunID, step.reduceSourceStep)
+	tag, err := w.runtime.pool.Exec(ctx, `
+		UPDATE cb_claims SET died_at = now(), last_error = left($3, 256)
+		WHERE message_id = $1 AND attempts = $2
+	`, job.ID, job.Attempts, cause.Error())
 	if err != nil {
-		return fmt.Errorf("query reducer map outputs: %w", err)
+		log.Error("catbird: marking dead failed", "err", err, "cause", cause)
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		log.Warn("catbird: handler failed after the claim was gone, not marking it dead", "err", cause)
+		return
+	}
+
+	log.Error("catbird: job dead", "err", cause)
+	if err := Cancel(ctx, w.runtime.pool, job.GroupID); err != nil {
+		log.Error("catbird: cancel failed", "group_id", job.GroupID, "err", err)
+	}
+	if t.opts.OnDead != nil {
+		if err := t.opts.OnDead.HandleJob(ctx, job); err != nil {
+			log.Error("catbird: OnDead failed", "err", err)
+		}
+	}
+}
+
+// claimBatch claims up to limit ready jobs by moving visible_at a
+// ClaimDuration ahead, and returns them with their payloads and delivered
+// signals. The job_type
+// filter is what keeps a process from taking work it has no handler for: a job
+// of a type this process does not know is left for one that does, rather than
+// failing here.
+//
+// The claim clears last_error, so text on a row always belongs to the attempt
+// waiting to retry and never to the one running. That is what Status reads to
+// tell them apart. Clearing a NULL column is free: 372 bytes of WAL per row with
+// the clause and without it. On rows that do carry text it saves, 372 against
+// 629, because the claim writes a 74-byte tuple instead of a 336-byte one.
+func (w *worker) claimBatch(ctx context.Context, limit int) ([]*Job, error) {
+	rows, err := w.runtime.pool.Query(ctx, `
+		WITH claimed AS (
+			UPDATE cb_claims
+			SET visible_at = now() + $2::interval, attempts = attempts + 1, last_error = NULL
+			WHERE message_id IN (
+				SELECT message_id FROM cb_claims
+				WHERE queue = $1 AND died_at IS NULL AND dependencies = 0 AND visible_at <= now()
+				  AND job_type = ANY($4)
+				ORDER BY visible_at ASC LIMIT $3
+				FOR UPDATE SKIP LOCKED
+			)
+			RETURNING message_id, job_type, attempts, coalesce(group_id, message_id) AS group_id,
+			          signal, dependency_job_ids
+		)
+		SELECT m.id, m.topic, m.payload, m.created_at,
+		       c.job_type, c.attempts, c.group_id, c.signal, c.dependency_job_ids
+		FROM claimed c
+		JOIN cb_messages m ON m.id = c.message_id
+	`, w.queue.name, w.queue.opts.ClaimDuration, limit, w.names)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
 
-	reducerFn := reflect.ValueOf(step.reducerFn)
+	var jobs []*Job
 	for rows.Next() {
-		var outJSON json.RawMessage
-		if scanErr := rows.Scan(&outJSON); scanErr != nil {
-			return fmt.Errorf("scan reducer map output: %w", scanErr)
+		var job Job
+		if err := rows.Scan(&job.ID, &job.Topic, &job.Payload, &job.CreatedAt,
+			&job.Type, &job.Attempts, &job.GroupID, &job.Signal, &job.dependencyIDs); err != nil {
+			return nil, err
 		}
+		jobs = append(jobs, &job)
+	}
+	return jobs, rows.Err()
+}
 
-		itemPtr := reflect.New(step.reducerItem)
-		if unmarshalErr := json.Unmarshal(outJSON, itemPtr.Interface()); unmarshalErr != nil {
-			return fmt.Errorf("unmarshal reducer item output: %w", unmarshalErr)
+// track and untrack keep the set the renewal loop reads; on a queue that does
+// not renew they do nothing. untrack removes only its own entry: a handler
+// that hangs past HandlerTimeout loses its claim, and this process may claim
+// the job again while the hung handler still runs, so the id can be tracked
+// twice and the first return must not stop the renewal of the live attempt.
+func (w *worker) track(j *inFlightJob) {
+	if w.inFlight == nil {
+		return
+	}
+	w.mu.Lock()
+	w.inFlight[j.id] = j
+	w.mu.Unlock()
+}
+
+func (w *worker) untrack(j *inFlightJob) {
+	if w.inFlight == nil {
+		return
+	}
+	w.mu.Lock()
+	if w.inFlight[j.id] == j {
+		delete(w.inFlight, j.id)
+	}
+	w.mu.Unlock()
+}
+
+// running is the jobs the next renewal covers: the tracked jobs whose handler
+// contexts are still live. A spent context is skipped, which is what stops the
+// renewal of a handler that ran past HandlerTimeout.
+func (w *worker) running() []*inFlightJob {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	jobs := make([]*inFlightJob, 0, len(w.inFlight))
+	for _, j := range w.inFlight {
+		if j.ctx.Err() == nil {
+			jobs = append(jobs, j)
 		}
+	}
+	return jobs
+}
 
-		results := reducerFn.Call([]reflect.Value{
-			reflect.ValueOf(ctx),
-			acc,
-			itemPtr.Elem(),
-		})
-
-		if !results[1].IsNil() {
-			return results[1].Interface().(error)
+// renewClaims keeps the claims of running handlers from expiring, on a queue
+// whose HandlerTimeout lets an attempt outlive its ClaimDuration. Every half
+// ClaimDuration it moves visible_at a full ClaimDuration out for every job
+// whose handler context is still live, all in one statement, so one missed
+// tick — a network error, a slow statement — loses nothing. Renewal follows
+// the handler's context rather than the handler: past HandlerTimeout the
+// context is spent and the job is renewed no further, so a handler that hangs
+// there holding its goroutine still loses the job to another worker about a
+// ClaimDuration later. ClaimDuration is then how long a job stays stuck when
+// the process running it crashes, and HandlerTimeout alone bounds an attempt.
+//
+// The renewal matches on attempts like every other write. One
+// that matches no row means the claim is not this attempt's any more — the
+// claim lapsed and another worker took it, or Cancel marked the job dead —
+// so the handler is cancelled with ErrClaimLost to stop work nothing will
+// commit. That is also what lets Cancel reach a running handler on a renewing
+// queue, within about half a ClaimDuration.
+func (w *worker) renewClaims(ctx context.Context) {
+	tick := time.NewTicker(w.queue.opts.ClaimDuration / 2)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
 		}
-
-		acc = results[0]
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate reducer map outputs: %w", err)
-	}
-
-	output, err := json.Marshal(acc.Interface())
-	if err != nil {
-		return fmt.Errorf("marshal reducer output: %w", err)
-	}
-
-	completeStepRun(ctx, conn, logger, flowName, step.name, stepID, output)
-	return nil
-}
-
-func getStepFlowRunIDForReduction(ctx context.Context, conn Conn, flowName string, step *Step, stepID int64) (int64, error) {
-	tableName := fmt.Sprintf("cb_s_%s", strings.ToLower(flowName))
-	q := fmt.Sprintf(`SELECT flow_run_id FROM %s WHERE id = $1 AND step_name = $2 AND status IN ('%s', '%s')`, tableName, StatusQueued, StatusStarted)
-	var flowRunID int64
-	if err := conn.QueryRow(ctx, q, stepID, step.name).Scan(&flowRunID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, nil
+		running := w.running()
+		if len(running) == 0 {
+			continue
 		}
-		return 0, fmt.Errorf("get flow run for reducer: %w", err)
-	}
-	return flowRunID, nil
-}
-
-func failGeneratorStep(ctx context.Context, conn Conn, logger *slog.Logger, flowName, stepName string, stepID int64, errorMessage string) {
-	q := `SELECT * FROM cb_fail_generator_step(flow_name => $1, step_name => $2, id => $3, error_message => $4);`
-	if _, err := execWithRetry(ctx, conn, q, flowName, stepName, stepID, errorMessage); err != nil {
-		logger.ErrorContext(ctx, "worker: cannot fail generator step", "flow", flowName, "step", stepName, "id", stepID, "error", err)
-	}
-}
-
-func completeTaskOnFail(ctx context.Context, conn Conn, logger *slog.Logger, taskName string, runID int64) {
-	if _, err := execWithRetry(ctx, conn, `SELECT cb_complete_task_on_fail($1, $2);`, taskName, runID); err != nil {
-		logger.ErrorContext(ctx, "worker: cannot mark task on-fail as completed", "task", taskName, "id", runID, "error", err)
-	}
-}
-
-func failTaskOnFail(ctx context.Context, conn Conn, logger *slog.Logger, taskName string, runID int64, errorMessage string, exhausted bool, retryDelay int64) {
-	if _, err := execWithRetry(ctx, conn, `SELECT cb_fail_task_on_fail($1, $2, $3, $4, $5);`, taskName, runID, errorMessage, exhausted, retryDelay); err != nil {
-		logger.ErrorContext(ctx, "worker: cannot mark task on-fail as failed", "task", taskName, "id", runID, "error", err)
-	}
-}
-
-func completeFlowOnFail(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, runID int64) {
-	if _, err := execWithRetry(ctx, conn, `SELECT cb_complete_flow_on_fail($1, $2);`, flowName, runID); err != nil {
-		logger.ErrorContext(ctx, "worker: cannot mark flow on-fail as completed", "flow", flowName, "id", runID, "error", err)
-	}
-}
-
-func failFlowOnFail(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, runID int64, errorMessage string, exhausted bool, retryDelay int64) {
-	if _, err := execWithRetry(ctx, conn, `SELECT cb_fail_flow_on_fail($1, $2, $3, $4, $5);`, flowName, runID, errorMessage, exhausted, retryDelay); err != nil {
-		logger.ErrorContext(ctx, "worker: cannot mark flow on-fail as failed", "flow", flowName, "id", runID, "error", err)
-	}
-}
-
-func completeFlowEarly(ctx context.Context, conn Conn, flowName string, runID int64, stepName string, output any, reason string) (bool, error) {
-	payload, err := json.Marshal(output)
-	if err != nil {
-		return false, fmt.Errorf("marshal early completion output: %w", err)
-	}
-
-	q := `SELECT cb_complete_flow_early(flow_name => $1, run_id => $2, step_name => $3, output => $4, reason => $5);`
-	var applied bool
-	err = conn.QueryRow(ctx, q, flowName, runID, stepName, payload, reason).Scan(&applied)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return false, nil
+		ids := make([]int64, len(running))
+		attempts := make([]int32, len(running))
+		for i, j := range running {
+			ids[i], attempts[i] = j.id, int32(j.attempts)
 		}
-		return false, err
-	}
-
-	return applied, nil
-}
-
-func isTaskCancelRequested(ctx context.Context, conn Conn, taskName string, runID int64) (bool, error) {
-	tableName := fmt.Sprintf("cb_t_%s", strings.ToLower(taskName))
-	query := fmt.Sprintf("SELECT status IN ('canceling', 'canceled') FROM %s WHERE id = $1", pgx.Identifier{tableName}.Sanitize())
-	var requested bool
-	err := conn.QueryRow(ctx, query, runID).Scan(&requested)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return false, nil
-		}
-		return false, err
-	}
-	return requested, nil
-}
-
-func isTaskCancelRequestedBestEffort(ctx context.Context, conn Conn, taskName string, runID int64) (bool, error) {
-	primaryCtx := ctx
-	if ctx != nil {
-		var cancel context.CancelFunc
-		primaryCtx, cancel = context.WithTimeout(ctx, defaultPollTimeout)
-		defer cancel()
-	}
-
-	requested, err := isTaskCancelRequested(primaryCtx, conn, taskName, runID)
-	if err == nil || ctx == nil || ctx.Err() == nil {
-		return requested, err
-	}
-
-	retryCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	return isTaskCancelRequested(retryCtx, conn, taskName, runID)
-}
-
-func getFlowStatus(ctx context.Context, conn Conn, flowName string, runID int64) (string, error) {
-	if runID == 0 {
-		return "", nil
-	}
-
-	tableName := fmt.Sprintf("cb_f_%s", strings.ToLower(flowName))
-	query := fmt.Sprintf("SELECT status FROM %s WHERE id = $1", tableName)
-
-	var status string
-	err := conn.QueryRow(ctx, query, runID).Scan(&status)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return "", nil
-		}
-		return "", err
-	}
-
-	return status, nil
-}
-
-func getFlowStatusBestEffort(ctx context.Context, conn Conn, flowName string, runID int64) (string, error) {
-	primaryCtx := ctx
-	if ctx != nil {
-		var cancel context.CancelFunc
-		primaryCtx, cancel = context.WithTimeout(ctx, defaultPollTimeout)
-		defer cancel()
-	}
-
-	status, err := getFlowStatus(primaryCtx, conn, flowName, runID)
-	if err == nil || ctx == nil || ctx.Err() == nil {
-		return status, err
-	}
-
-	retryCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	return getFlowStatus(retryCtx, conn, flowName, runID)
-}
-
-func shouldStopFlow(status string) bool {
-	switch status {
-	case StatusCanceling, StatusCanceled, StatusFailed, StatusCompleted:
-		return true
-	default:
-		return false
-	}
-}
-
-func stopFlowIfRequested(
-	ctx context.Context,
-	conn Conn,
-	logger *slog.Logger,
-	flowName string,
-	flowRunID int64,
-	claimCancel context.CancelFunc,
-	cancelRequested *bool,
-	onCancel func(),
-) bool {
-	status, err := getFlowStatusBestEffort(ctx, conn, flowName, flowRunID)
-	if err != nil || !shouldStopFlow(status) {
-		return false
-	}
-
-	if cancelRequested != nil && (status == StatusCanceling || status == StatusCanceled) {
-		*cancelRequested = true
-	}
-
-	if claimCancel != nil {
-		claimCancel()
-	}
-	if onCancel != nil && (status == StatusCanceling || status == StatusCanceled) {
-		onCancel()
-	}
-	if logger != nil {
-		logger.DebugContext(ctx, "worker: flow stop observed", "flow", flowName, "flow_run_id", flowRunID, "status", status)
-	}
-
-	return true
-}
-
-func newFlowStopChecker(
-	ctx context.Context,
-	conn Conn,
-	logger *slog.Logger,
-	flowName string,
-	flowRunID int64,
-	claimCancel context.CancelFunc,
-	cancelRequested *bool,
-	stopRequested *atomic.Bool,
-	onCancel func(),
-) func() bool {
-	return func() bool {
-		if stopRequested != nil && stopRequested.Load() {
-			return true
-		}
-
-		if stopFlowIfRequested(ctx, conn, logger, flowName, flowRunID, claimCancel, cancelRequested, onCancel) {
-			if stopRequested != nil {
-				stopRequested.Store(true)
-			}
-			return true
-		}
-
-		return false
-	}
-}
-
-func watchFlowStop(ctx context.Context, wakeup <-chan struct{}, fallbackInterval time.Duration, stopIfRequested func() bool) func() {
-	if fallbackInterval <= 0 {
-		fallbackInterval = 5 * time.Second
-	}
-
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(fallbackInterval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-done:
-				return
-			case <-wakeup:
-				if stopIfRequested() {
-					return
+		renewed := map[int64]bool{}
+		rows, err := w.runtime.pool.Query(ctx, `
+			UPDATE cb_claims claim
+			SET visible_at = now() + $3::interval
+			FROM unnest($1::bigint[], $2::int[]) AS running (message_id, attempts)
+			WHERE claim.message_id = running.message_id AND claim.attempts = running.attempts
+			  AND claim.died_at IS NULL
+			RETURNING claim.message_id
+		`, ids, attempts, w.queue.opts.ClaimDuration)
+		if err == nil {
+			for rows.Next() {
+				var id int64
+				if err = rows.Scan(&id); err != nil {
+					break
 				}
-			case <-ticker.C:
-				if stopIfRequested() {
-					return
-				}
+				renewed[id] = true
+			}
+			rows.Close()
+			if err == nil {
+				err = rows.Err()
 			}
 		}
-	}()
-
-	return func() {
-		close(done)
-	}
-}
-
-func finalizeFlowCancel(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, runID int64) {
-	if runID == 0 {
-		return
-	}
-	if _, err := execWithRetry(ctx, conn, `SELECT cb_finalize_flow_cancellation(name => $1, run_id => $2);`, flowName, runID); err != nil {
-		logger.DebugContext(ctx, "worker: finalize flow canceled skipped", "flow", flowName, "id", runID, "error", err)
-	}
-}
-
-func finalizeFlowCancelIfRequested(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, runID int64, cancelRequested *bool) {
-	if cancelRequested == nil || !*cancelRequested {
-		return
-	}
-
-	finalizeCtx := ctx
-	if ctx == nil || ctx.Err() != nil {
-		retryCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		finalizeCtx = retryCtx
-	}
-
-	finalizeFlowCancel(finalizeCtx, conn, logger, flowName, runID)
-}
-
-func cancelStepRun(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, stepID int64) {
-	if _, err := execWithRetry(ctx, conn, `SELECT cb_cancel_step_run(flow_name => $1, id => $2);`, flowName, stepID); err != nil {
-		logger.DebugContext(ctx, "worker: cannot cancel step run", "flow", flowName, "step_id", stepID, "error", err)
-	}
-}
-
-func cancelMapTaskRun(ctx context.Context, conn Conn, logger *slog.Logger, flowName string, mapTaskID int64) {
-	if _, err := execWithRetry(ctx, conn, `SELECT cb_cancel_map_task_run(flow_name => $1, id => $2);`, flowName, mapTaskID); err != nil {
-		logger.DebugContext(ctx, "worker: cannot cancel map task run", "flow", flowName, "map_task_id", mapTaskID, "error", err)
-	}
-}
-
-func runWithTimeout[T any](ctx context.Context, timeout time.Duration, fn func(context.Context) (T, error)) (T, error) {
-	if timeout <= 0 {
-		return fn(ctx)
-	}
-
-	fnCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	return fn(fnCtx)
-}
-
-func runWithTimeoutErr(ctx context.Context, timeout time.Duration, fn func(context.Context) error) error {
-	_, err := runWithTimeout(ctx, timeout, func(fnCtx context.Context) (struct{}, error) {
-		return struct{}{}, fn(fnCtx)
-	})
-	return err
-}
-
-func runSafely[T any](panicPrefix string, fn func() (T, error)) (out T, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("%s: %v", panicPrefix, r)
+		if err != nil {
+			// Nothing is cancelled on an error: the claims may all still be
+			// this worker's, and the next tick renews them a full
+			// ClaimDuration deep.
+			if ctx.Err() == nil {
+				w.logger.Error("catbird: renewing claims failed", "queue", w.queue.name, "err", err)
+			}
+			continue
 		}
-	}()
-	return fn()
-}
-
-func nextRetryDelay(attempt int, backoff BackoffStrategy, defaultMin, defaultMax time.Duration) time.Duration {
-	if backoff != nil {
-		return backoff.NextDelay(attempt)
-	}
-	return backoffWithFullJitter(attempt, defaultMin, defaultMax)
-}
-
-func ensurePositiveDelayMs(delay time.Duration) int64 {
-	ms := delay.Milliseconds()
-	if ms <= 0 {
-		return 1
-	}
-	return ms
-}
-
-type inFlightTracker struct {
-	mu  sync.Mutex
-	ids map[int64]struct{}
-}
-
-func newInFlightTracker() *inFlightTracker {
-	return &inFlightTracker{ids: make(map[int64]struct{})}
-}
-
-func (t *inFlightTracker) mark(id int64) {
-	t.mu.Lock()
-	t.ids[id] = struct{}{}
-	t.mu.Unlock()
-}
-
-func (t *inFlightTracker) remove(id int64) {
-	t.mu.Lock()
-	delete(t.ids, id)
-	t.mu.Unlock()
-}
-
-func (t *inFlightTracker) list() []int64 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	ids := make([]int64, 0, len(t.ids))
-	for id := range t.ids {
-		ids = append(ids, id)
-	}
-
-	return ids
-}
-
-func markClaimsInFlight[T any](tracker *inFlightTracker, claims []T, idFn func(T) int64) {
-	for _, claim := range claims {
-		tracker.mark(idFn(claim))
-	}
-}
-
-func startInFlightHider(handlerCtx context.Context, wg *sync.WaitGroup, interval time.Duration, hideFn func(context.Context)) {
-	wg.Go(func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-handlerCtx.Done():
-				return
-			case <-ticker.C:
-				hideCtx, cancel := context.WithTimeout(handlerCtx, defaultPollTimeout)
-				hideFn(hideCtx)
-				cancel()
+		for _, j := range running {
+			if !renewed[j.id] {
+				w.logger.Warn("catbird: claim lost, cancelling the handler", "queue", w.queue.name, "job_id", j.id, "attempt", j.attempts)
+				j.cancel(ErrClaimLost)
 			}
 		}
-	})
-}
-
-type taskOnFailClaim struct {
-	ID             int64           `json:"id"`
-	Input          json.RawMessage `json:"input"`
-	ErrorMessage   string          `json:"error_message"`
-	Attempts       int             `json:"attempts"`
-	OnFailAttempts int             `json:"on_fail_attempts"`
-	StartedAt      time.Time       `json:"started_at"`
-	FailedAt       time.Time       `json:"failed_at"`
-	ConcurrencyKey string          `json:"concurrency_key,omitempty"`
-}
-
-type taskOnFailWorker struct {
-	conn   Conn
-	logger *slog.Logger
-	task   *Task
-	wakeup chan struct{}
-}
-
-func newTaskOnFailWorker(conn Conn, logger *slog.Logger, task *Task, wakeup chan struct{}) *taskOnFailWorker {
-	return &taskOnFailWorker{conn: conn, logger: logger, task: task, wakeup: wakeup}
-}
-
-func (w *taskOnFailWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup) {
-	h := w.task.onFailOpts
-
-	runClaimLoop(shutdownCtx, handlerCtx, wg, claimLoopConfig[taskOnFailClaim]{
-		concurrency:   h.concurrency,
-		pollClaims:    w.pollClaims,
-		handleClaim:   w.handle,
-		wakeup:        w.wakeup,
-		fallbackDelay: 500 * time.Millisecond,
-		logPollError: func(ctx context.Context, err error) {
-			w.logger.ErrorContext(ctx, "worker: cannot poll task on-fail claims", "task", w.task.name, "error", err)
-		},
-	})
-}
-
-func (w *taskOnFailWorker) pollClaims(ctx context.Context) ([]taskOnFailClaim, error) {
-	h := w.task.onFailOpts
-	q := `SELECT * FROM cb_claim_task_on_fail($1, $2);`
-
-	rows, err := queryWithRetry(ctx, w.conn, q, w.task.name, h.batchSize)
-	if err != nil {
-		return nil, err
 	}
-
-	return pgx.CollectRows(rows, scanCollectibleTaskOnFailClaim)
-}
-
-func (w *taskOnFailWorker) handle(ctx context.Context, claim taskOnFailClaim) {
-	h := w.task.onFailOpts
-
-	failure := TaskFailure{
-		TaskName:       w.task.name,
-		TaskRunID:      claim.ID,
-		ErrorMessage:   claim.ErrorMessage,
-		Attempts:       claim.Attempts,
-		OnFailAttempts: claim.OnFailAttempts,
-		StartedAt:      claim.StartedAt,
-		FailedAt:       claim.FailedAt,
-		ConcurrencyKey: claim.ConcurrencyKey,
-	}
-
-	err := runWithTimeoutErr(ctx, h.timeout, func(fnCtx context.Context) error {
-		return w.task.onFail(fnCtx, claim.Input, failure)
-	})
-
-	if err == nil {
-		completeTaskOnFail(ctx, w.conn, w.logger, w.task.name, claim.ID)
-		return
-	}
-
-	exhausted := claim.OnFailAttempts > h.maxRetries
-	delay := nextRetryDelay(claim.OnFailAttempts-1, h.backoff, 250*time.Millisecond, 5*time.Second)
-	failTaskOnFail(ctx, w.conn, w.logger, w.task.name, claim.ID, err.Error(), exhausted, delay.Milliseconds())
-}
-
-func scanCollectibleTaskOnFailClaim(row pgx.CollectableRow) (taskOnFailClaim, error) {
-	return scanTaskOnFailClaim(row)
-}
-
-func scanTaskOnFailClaim(row pgx.Row) (taskOnFailClaim, error) {
-	rec := taskOnFailClaim{}
-	var concurrencyKey *string
-	var startedAt *time.Time
-	var failedAt *time.Time
-
-	if err := row.Scan(
-		&rec.ID,
-		&rec.Input,
-		&rec.ErrorMessage,
-		&rec.Attempts,
-		&rec.OnFailAttempts,
-		&startedAt,
-		&failedAt,
-		&concurrencyKey,
-	); err != nil {
-		return rec, err
-	}
-
-	if startedAt != nil {
-		rec.StartedAt = *startedAt
-	}
-	if failedAt != nil {
-		rec.FailedAt = *failedAt
-	}
-	if concurrencyKey != nil {
-		rec.ConcurrencyKey = *concurrencyKey
-	}
-
-	return rec, nil
-}
-
-type flowOnFailClaim struct {
-	ID                    int64           `json:"id"`
-	Input                 json.RawMessage `json:"input"`
-	ErrorMessage          string          `json:"error_message"`
-	OnFailAttempts        int             `json:"on_fail_attempts"`
-	StartedAt             time.Time       `json:"started_at"`
-	FailedAt              time.Time       `json:"failed_at"`
-	ConcurrencyKey        string          `json:"concurrency_key,omitempty"`
-	FailedStepName        string          `json:"failed_step_name,omitempty"`
-	FailedStepInput       json.RawMessage `json:"failed_step_input,omitempty"`
-	FailedStepSignalInput json.RawMessage `json:"failed_step_signal_input,omitempty"`
-	FailedStepAttempts    int             `json:"failed_step_attempts"`
-}
-
-type flowOnFailWorker struct {
-	conn   Conn
-	logger *slog.Logger
-	flow   *Flow
-	wakeup chan struct{}
-}
-
-func newFlowOnFailWorker(conn Conn, logger *slog.Logger, flow *Flow, wakeup chan struct{}) *flowOnFailWorker {
-	return &flowOnFailWorker{conn: conn, logger: logger, flow: flow, wakeup: wakeup}
-}
-
-func (w *flowOnFailWorker) start(shutdownCtx, handlerCtx context.Context, wg *sync.WaitGroup) {
-	h := w.flow.onFailOpts
-
-	runClaimLoop(shutdownCtx, handlerCtx, wg, claimLoopConfig[flowOnFailClaim]{
-		concurrency:   h.concurrency,
-		pollClaims:    w.pollClaims,
-		handleClaim:   w.handle,
-		wakeup:        w.wakeup,
-		fallbackDelay: 500 * time.Millisecond,
-		logPollError: func(ctx context.Context, err error) {
-			w.logger.ErrorContext(ctx, "worker: cannot poll flow on-fail claims", "flow", w.flow.name, "error", err)
-		},
-	})
-}
-
-func (w *flowOnFailWorker) pollClaims(ctx context.Context) ([]flowOnFailClaim, error) {
-	h := w.flow.onFailOpts
-	q := `SELECT * FROM cb_claim_flow_on_fail($1, $2);`
-
-	rows, err := queryWithRetry(ctx, w.conn, q, w.flow.name, h.batchSize)
-	if err != nil {
-		return nil, err
-	}
-
-	return pgx.CollectRows(rows, scanCollectibleFlowOnFailClaim)
-}
-
-func (w *flowOnFailWorker) handle(ctx context.Context, claim flowOnFailClaim) {
-	h := w.flow.onFailOpts
-
-	failure := FlowFailure{
-		FlowName:              w.flow.name,
-		FlowRunID:             claim.ID,
-		FailedStepName:        claim.FailedStepName,
-		ErrorMessage:          claim.ErrorMessage,
-		Attempts:              claim.FailedStepAttempts,
-		OnFailAttempts:        claim.OnFailAttempts,
-		StartedAt:             claim.StartedAt,
-		FailedAt:              claim.FailedAt,
-		ConcurrencyKey:        claim.ConcurrencyKey,
-		FailedStepInput:       claim.FailedStepInput,
-		FailedStepSignalInput: claim.FailedStepSignalInput,
-		conn:                  w.conn,
-		outputCache:           &flowOutputCache{},
-	}
-
-	err := runWithTimeoutErr(ctx, h.timeout, func(fnCtx context.Context) error {
-		return w.flow.onFail(fnCtx, claim.Input, failure)
-	})
-
-	if err == nil {
-		completeFlowOnFail(ctx, w.conn, w.logger, w.flow.name, claim.ID)
-		return
-	}
-
-	exhausted := claim.OnFailAttempts > h.maxRetries
-	delay := nextRetryDelay(claim.OnFailAttempts-1, h.backoff, 250*time.Millisecond, 5*time.Second)
-	failFlowOnFail(ctx, w.conn, w.logger, w.flow.name, claim.ID, err.Error(), exhausted, delay.Milliseconds())
-}
-
-func scanCollectibleFlowOnFailClaim(row pgx.CollectableRow) (flowOnFailClaim, error) {
-	return scanFlowOnFailClaim(row)
-}
-
-func scanFlowOnFailClaim(row pgx.Row) (flowOnFailClaim, error) {
-	rec := flowOnFailClaim{}
-	var startedAt *time.Time
-	var failedAt *time.Time
-	var concurrencyKey *string
-	var failedStepName *string
-	var failedStepInput *json.RawMessage
-	var failedStepSignalInput *json.RawMessage
-	var failedStepAttempts *int
-
-	if err := row.Scan(
-		&rec.ID,
-		&rec.Input,
-		&rec.ErrorMessage,
-		&rec.OnFailAttempts,
-		&startedAt,
-		&failedAt,
-		&concurrencyKey,
-		&failedStepName,
-		&failedStepInput,
-		&failedStepSignalInput,
-		&failedStepAttempts,
-	); err != nil {
-		return rec, err
-	}
-
-	if startedAt != nil {
-		rec.StartedAt = *startedAt
-	}
-	if failedAt != nil {
-		rec.FailedAt = *failedAt
-	}
-	if concurrencyKey != nil {
-		rec.ConcurrencyKey = *concurrencyKey
-	}
-	if failedStepName != nil {
-		rec.FailedStepName = *failedStepName
-	}
-	if failedStepInput != nil {
-		rec.FailedStepInput = *failedStepInput
-	}
-	if failedStepSignalInput != nil {
-		rec.FailedStepSignalInput = *failedStepSignalInput
-	}
-	if failedStepAttempts != nil {
-		rec.FailedStepAttempts = *failedStepAttempts
-	}
-
-	return rec, nil
 }

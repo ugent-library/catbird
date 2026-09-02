@@ -1,1164 +1,474 @@
-[![Go Reference](https://pkg.go.dev/badge/github.com/ugent-library/catbird.svg)](https://pkg.go.dev/github.com/ugent-library/catbird)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Go Version](https://img.shields.io/badge/go-1.25+-blue.svg)](https://golang.org)
-[![Go Report Card](https://goreportcard.com/badge/github.com/ugent-library/catbird)](https://goreportcard.com/report/github.com/ugent-library/catbird)
-
-![CatBird](assets/banner.svg "CatBird banner")
-
 # Catbird
 
-A PostgreSQL-powered message queue and task execution engine. Catbird brings reliability and simplicity to background job processing by using your database as the single source of truth—no extra services to manage, just your database coordinating everything.
-
-## Why Catbird?
-
-- **Transactional by default**: enqueue messages in the same DB transaction as your app writes; rollback means no message.
-- **Exactly-once within a visibility window**: safe retries after crashes, no duplicate processing.
-- **Database as coordinator**: horizontal workers, PostgreSQL handles distribution and state.
-- **Workflows as DAGs**: dependencies, branching, and data passing between steps.
-- **Definition separate from implementation**: define and start tasks and flows in one place, implement them elsewhere.
-- **Persistence and auditability**: queues, runs, and results live in PostgreSQL.
-- **Resiliency baked in**: retries, backoff, optional circuit breakers.
-- **Operational UX**: web dashboard and tui for runs, queues, and workers.
-- **Optional real-time layer**: opt-in pub/sub with SSE support for pushing events to browsers.
-- **Durable notifications**: a per-identity inbox with a cursor and seen-tracking, so clients reliably catch up on missed notifications at their own pace.
-
 <p align="center">
-  <img src="assets/screenshots/dashboard-flows.png" alt="Flow Visualization" width="800" />
+	<img src="assets/banner.svg" alt="Catbird" width="984" />
 </p>
 
-## Quick Start
-```go
-client := catbird.New(conn)
-ctx := context.Background()
+Catbird is a PostgreSQL-backed stream for Go. Jobs, queues, and small workflows are built on the same immutable message substrate.
 
-// Queues
-err := client.CreateQueue(ctx, "my_queue")
-err = client.Send(ctx, "my_queue", map[string]any{"user_id": 123}, catbird.SendOpts{
-    ConcurrencyKey: "user-123",
-})
-messages, err := client.Read(ctx, "my_queue", 10, 30*time.Second)
-for _, msg := range messages {
-    err = client.Delete(ctx, "my_queue", msg.ID)
-}
+Published messages receive positions and form the stream. A job pairs a message with a claim, which gives workers claims, retries, signals, and dependencies. PostgreSQL is the only coordinator; plain SQL migrations define the schema; workers scale by starting more processes.
 
-// Continuous reader: loops ReadPoll, ack on nil, nack on error
-go client.Reader(ctx, "my_queue", 10, 30*time.Second,
-    func(ctx context.Context, msg catbird.Message) error {
-        return nil // ack (deletes message)
-    },
-)
+## Why this exists
 
-// Delayed send
-client.Send(ctx, "my_queue", map[string]any{"job": "cleanup"}, catbird.SendOpts{VisibleAt: time.Now().Add(30 * time.Minute)})
+Catbird is for the gap between "just run it in-process" and "operate a full distributed queue stack".
 
-// Tasks and flows
-task := catbird.NewTask("send_email").
-    WithDescription("Send a transactional email to a user").Do(func(ctx context.Context, input string) (string, error) {
-        return "sent", nil
-    })
+- Keep infrastructure simple: PostgreSQL is enough.
+- Keep behavior explicit: most operations are single SQL statements.
+- Start with a durable stream, then turn messages into work where needed.
+- Keep workflow logic in Go: enqueue, fan-out, join, signal, retry.
+- Keep browser updates close to data with the optional wire package.
 
-flow := catbird.NewFlow("double_add")
-flow.AddStep(catbird.NewStep("double").Do(func(ctx context.Context, input int) (int, error) {
-    return input * 2, nil
-}))
-flow.AddStep(catbird.NewStep("add").
-    DependsOn("double").Do(func(ctx context.Context, input int, doubled int) (int, error) {
-    return doubled + 1, nil
-}))
-
-worker := catbird.NewWorker(pool).
-    AddTask(task).
-    AddFlow(flow)
-
-// Ensure definitions exist before enqueueing runs; worker.Start below is asynchronous.
-err = client.CreateTask(ctx, task)
-err = client.CreateFlow(ctx, flow)
-go worker.Start(ctx)
-
-taskHandle, err := client.RunTask(ctx, "send_email", "hello")
-var taskOut string
-err = taskHandle.WaitForOutput(ctx, &taskOut)
-
-flowHandle, err := client.RunFlow(ctx, "double_add", 10)
-var flowOut int
-err = flowHandle.WaitForOutput(ctx, &flowOut)
-
-// Delayed execution
-client.RunTask(ctx, "process_user", userID, catbird.RunTaskOpts{VisibleAt: time.Now().Add(5 * time.Minute)})
-client.RunFlow(ctx, "order_processing", map[string]any{"order_id": 123}, catbird.RunFlowOpts{VisibleAt: time.Now().Add(30 * time.Second)})
-
-// Priority (higher = claimed first, default 0)
-client.RunTask(ctx, "send_email", email, catbird.RunTaskOpts{Priority: 10})
-
-// Definitions can also be created directly, for example from setup code.
-err = client.CreateTask(ctx, taskA)
-err = client.CreateTask(ctx, taskB)
-err = client.CreateFlow(ctx, flowA)
-err = client.CreateFlow(ctx, flowB)
-
-// Direct package-level usage (no Client), for example in a transaction:
-taskHandle, err = catbird.RunTask(ctx, tx, "send_email", "hello")
-```
-
-## Deduplication
-
-Catbird uses a `ConcurrencyKey` to prevent overlapping runs of tasks and flows, and overlapping messages in queues.
-
-```go
-// ConcurrencyKey: prevent overlap
-_, err := client.RunTask(ctx, "process_user", userID, catbird.RunTaskOpts{
-    ConcurrencyKey: fmt.Sprintf("user-%d", userID),
-})
-```
-
-### Behavior
-
-- **Deduplicates** `queued` and `started` runs: a new run with the same key is rejected while one is active
-- **After completion or failure**: the same key can be used again
-- **Return value on duplicate**: `RunTask()`/`RunFlow()` return a handle to the existing run ID
-- **Failure retries**: allows retries on failed runs
-- **No key = no deduplication**: if you don't provide a key, duplicates are allowed
-- **Queue messages**: Use `ConcurrencyKey` in `SendOpts` for message deduplication
-
-## Topic-Based Routing
-
-```go
-err := client.CreateQueue(ctx, "user_events")
-err = client.CreateQueue(ctx, "audit_log")
-
-err = client.Bind(ctx, "user_events", "events.user.created")
-err = client.Bind(ctx, "user_events", "events.*.updated")
-err = client.Bind(ctx, "audit_log", "events.#")
-
-_, err = client.Publish(ctx, "events.user.created", map[string]any{
-    "user_id": 123,
-    "email":   "user@example.com",
-})
-_, err = client.Unbind(ctx, "user_events", "events.*.updated")
-```
-
-Wildcard rules:
-- `*` matches a single token (e.g., `events.*.created` matches `events.user.created`)
-- `#` matches zero or more tokens at the end (e.g., `events.user.#` matches `events.user` and `events.user.created.v1`)
-- `#` must appear as `.#` at the end of the pattern, or as `#` by itself
-- Tokens are separated by `.` and can contain `a-z`, `A-Z`, `0-9`, `_`, `-`
-
-### Event-Triggered Runs
-
-Bind tasks or flows to topic patterns so that publishing a message automatically creates a run.
-
-```go
-// Bind a task to a topic pattern
-err = client.BindTask(ctx, "send_email", "events.email.*")
-
-// Bind a flow to a topic pattern
-err = client.BindFlow(ctx, "order_processing", "events.order.#")
-
-// Publishing now also triggers task/flow runs
-_, err = client.Publish(ctx, "events.email.welcome", map[string]any{
-    "user_id": 123,
-    "email":   "user@example.com",
-}, catbird.PublishOpts{
-    ConcurrencyKey: "user-123",
-})
-
-// Unbind when done
-_, err = client.UnbindTask(ctx, "send_email", "events.email.*")
-_, err = client.UnbindFlow(ctx, "order_processing", "events.order.#")
-```
-
-## Task Execution
-
-```go
-// Define task (scheduling is separate)
-task := catbird.NewTask("send_email").Do(func(ctx context.Context, input EmailRequest) (EmailResponse, error) {
-        return EmailResponse{SentAt: time.Now()}, nil
-    },
-        catbird.WithConcurrency(5),
-        catbird.WithMaxRetries(3),
-        catbird.WithFullJitterBackoff(500*time.Millisecond, 10*time.Second),
-        catbird.WithCircuitBreaker(5, 30*time.Second),
-    )
-
-// Define a task with a condition (skipped when condition is false)
-conditionalTask := catbird.NewTask("premium_processing").
-    WithCondition("input.is_premium"). // Skipped if is_premium = false
-    Do(func(ctx context.Context, input ProcessRequest) (string, error) {
-        return "processed", nil
-    })
-
-// Create worker (requires *pgxpool.Pool)
-worker := catbird.NewWorker(pool).
-    WithLogger(slog.Default()).
-    WithShutdownTimeout(10 * time.Second).
-    AddTask(task).
-    AddTask(conditionalTask)
-
-// Create definitions before enqueueing runs; worker.Start below is asynchronous.
-err := client.CreateTask(ctx, task)
-err = client.CreateTask(ctx, conditionalTask)
-go worker.Start(ctx)
-
-// Run the task
-handle, err := client.RunTask(ctx, "send_email", EmailRequest{
-    To:      "user@example.com",
-    Subject: "Hello",
-})
-
-// Get result
-var result EmailResponse
-err = handle.WaitForOutput(ctx, &result)
-```
-
-### OnFail Handlers
-
-On-fail handlers run after a task reaches a failed state (after its own retries).
-They execute with their own `HandlerOpt` retry and backoff settings, and receive the
-original input plus rich failure context.
-
-`OnFail` semantics (tasks and flows):
-- `OnFail` runs only after the main task/flow run reaches `failed` (after normal handler retries are exhausted).
-- `OnFail` has independent retry/backoff via its own `HandlerOpt` values.
-- A successful `OnFail` marks on-fail handling complete, but the original run remains `failed`.
-- If `OnFail` retries are exhausted, on-fail handling remains failed and no further retries are scheduled.
-
-```go
-task := catbird.NewTask("charge_payment").Do(func(ctx context.Context, input ChargeRequest) (ChargeResult, error) {
-        return ChargeResult{}, fmt.Errorf("gateway timeout")
-    }).
-    OnFail(func(ctx context.Context, input ChargeRequest, failure catbird.TaskFailure) error {
-        // Send alert, enqueue compensation, or record audit log.
-        return nil
-    },
-        catbird.WithMaxRetries(3),
-        catbird.WithFullJitterBackoff(200*time.Millisecond, 5*time.Second),
-    )
-```
-
-## Flow Execution
-
-A **flow** is a **directed acyclic graph (DAG)** of steps that execute when their dependencies are satisfied.
-
-### Summary
-
-- Steps with no dependencies start immediately; independent branches run in parallel.
-- Flow output is selected by output priority (configured with `OutputPriority(...)` or inferred from terminal steps).
-- Conditions can skip steps; downstream handlers must accept `Optional[T]` for any conditional dependency.
-- A step with a signal waits for both its dependencies and the signal input.
-- `WaitForOutput()` returns the selected flow output once the flow completes.
-
-### Examples: Workflows
-
-```go
-flow := catbird.NewFlow("order_processing")
-flow.AddStep(catbird.NewStep("validate").Do(func(ctx context.Context, order Order) (ValidationResult, error) {
-    if order.Amount <= 0 {
-        return ValidationResult{Valid: false, Reason: "Invalid amount"}, nil
-    }
-    return ValidationResult{Valid: true}, nil
-}))
-flow.AddStep(catbird.NewStep("charge").
-    DependsOn("validate").Do(func(ctx context.Context, order Order, validated ValidationResult) (ChargeResult, error) {
-    if !validated.Valid {
-        return ChargeResult{}, fmt.Errorf("cannot charge invalid order")
-    }
-    return ChargeResult{
-        TransactionID: "txn-" + order.ID,
-        Amount:        order.Amount,
-    }, nil
-}))
-flow.AddStep(catbird.NewStep("check_inventory").
-    DependsOn("validate").Do(func(ctx context.Context, order Order, validated ValidationResult) (InventoryCheck, error) {
-    return InventoryCheck{
-        InStock: true,
-        Qty:     order.Amount,
-    }, nil
-}))
-flow.AddStep(catbird.NewStep("ship").
-    DependsOn("charge", "check_inventory").Do(func(ctx context.Context, order Order, chargeResult ChargeResult, inventory InventoryCheck) (ShipmentResult, error) {
-    if !inventory.InStock {
-        return ShipmentResult{}, fmt.Errorf("out of stock")
-    }
-    return ShipmentResult{
-        TrackingNumber: "TRK-" + chargeResult.TransactionID,
-        EstimatedDays:  3,
-    }, nil
-}))
-
-// Create worker
-worker := catbird.NewWorker(pool).
-    AddFlow(flow)
-err := client.CreateFlow(ctx, flow)
-go worker.Start(ctx)
-```
-
-### Example: Multi-branch Output Ownership
-
-Flows can have multiple terminal steps.
-
-```go
-flow := catbird.NewFlow("approval_or_escalation")
-flow.OutputPriority("approve", "escalate")
-
-flow.AddStep(catbird.NewStep("validate").Do(func(ctx context.Context, req Request) (Validation, error) {
-    return Validation{Score: req.Score}, nil
-}))
-flow.AddStep(catbird.NewStep("approve").
-    DependsOn("validate").
-    WithCondition("validate.score gte 80").Do(func(ctx context.Context, req Request, v Validation) (Decision, error) {
-    return Decision{Status: "approved"}, nil
-}))
-flow.AddStep(catbird.NewStep("escalate").
-    DependsOn("validate").
-    WithCondition("validate.score lt 80").Do(func(ctx context.Context, req Request, v Validation) (Decision, error) {
-    return Decision{Status: "escalated"}, nil
-}))
-```
-
-If you omit `OutputPriority(...)`, Catbird uses terminal steps in definition order as the default priority.
-
-```go
-flow := catbird.NewFlow("default_terminal_priority")
-flow.AddStep(catbird.NewStep("a").Do(func(ctx context.Context, in int) (int, error) { return in, nil }))
-flow.AddStep(catbird.NewStep("left").DependsOn("a").Do(func(ctx context.Context, in int, a int) (int, error) { return a + 1, nil }))
-flow.AddStep(catbird.NewStep("right").DependsOn("a").Do(func(ctx context.Context, in int, a int) (int, error) { return a + 2, nil }))
-
-// Effective priority: left, then right.
-```
-
-### OnFail Handlers
-
-On-fail handlers run after a flow reaches a failed state (after its own retries).
-They execute with their own `HandlerOpt` retry and backoff settings, and receive the
-original input plus rich failure context.
-
-```go
-flow := catbird.NewFlow("order_processing")
-flow.AddStep(catbird.NewStep("charge").Do(func(ctx context.Context, order Order) (string, error) {
-    return "", fmt.Errorf("charge failed")
-}))
-flow.OnFail(func(ctx context.Context, order Order, failure catbird.FlowFailure) error {
-    var failedInput Order
-    if err := failure.FailedStepInputAs(&failedInput); err == nil {
-        // failedInput has the step input that caused the error
-    }
-
-    var chargeResult ChargeResult
-    if err := failure.OutputAs(ctx, "charge", &chargeResult); err == nil {
-        // access completed step output when available
-    }
-
-    return nil
-})
-```
-
-### Example: Signals & Human-in-the-Loop
-
-Signals enable workflows that wait for external input before proceeding, such as approval workflows or webhooks.
-
-```go
-flow := catbird.NewFlow("document_approval")
-flow.AddStep(catbird.NewStep("submit").Do(func(ctx context.Context, doc Document) (string, error) {
-    return doc.ID, nil
-}))
-flow.AddStep(catbird.NewStep("approve").
-    DependsOn("submit").
-    WithSignal().Do(func(ctx context.Context, doc Document, approval ApprovalInput, docID string) (ApprovalResult, error) {
-    if !approval.Approved {
-        return ApprovalResult{}, fmt.Errorf("approval denied by %s: %s", approval.ApproverID, approval.Notes)
-    }
-    return ApprovalResult{
-        Status:     "approved",
-        ApprovedBy: approval.ApproverID,
-        Timestamp:  time.Now().Format(time.RFC3339),
-    }, nil
-}))
-flow.AddStep(catbird.NewStep("publish").
-    DependsOn("approve").Do(func(ctx context.Context, doc Document, approval ApprovalResult) (PublishResult, error) {
-    return PublishResult{
-        PublishedAt: time.Now().Format(time.RFC3339),
-        URL:         "https://example.com/docs/" + approval.ApprovedBy,
-    }, nil
-}))
-```
-
-A step with both dependencies and a signal waits for **both** conditions: all dependencies must complete **and** the signal must be delivered before the step executes.
-
-### Example: Early Completion
-
-Use `CompleteEarly(ctx, output, reason)` inside a flow step handler when you already have the final business output and want to stop remaining branches.
-
-```go
-flow := catbird.NewFlow("fraud_check")
-flow.AddStep(catbird.NewStep("quick_guard").Do(func(ctx context.Context, in Order) (string, error) {
-    if in.IsKnownSafe {
-        return "", catbird.CompleteEarly(ctx, Decision{Approved: true}, "known-safe fast path")
-    }
-    return "continue", nil
-}))
-flow.AddStep(catbird.NewStep("slow_analysis").Do(func(ctx context.Context, in Order) (string, error) {
-    time.Sleep(2 * time.Second)
-    return "done", nil
-}))
-flow.AddStep(catbird.NewStep("final").
-    DependsOn("quick_guard", "slow_analysis").Do(func(ctx context.Context, in Order, guard string, analysis string) (Decision, error) {
-    return Decision{Approved: guard == "continue" && analysis == "done"}, nil
-}))
-```
-
-When early completion wins the race, the flow run becomes `completed` with the provided output, and in-flight sibling work is stopped cooperatively.
-
-### Map Steps
-
-Map steps fan out array processing into per-item SQL-coordinated work and aggregate results back in item order.
-
-- Define map steps with `AddStep(NewStep("name").MapFlowInput()...)` or `AddStep(NewStep("name").MapStepOutput("source")...)`
-- Use `MapFlowInput()` to map over flow input (flow input must be a JSON array)
-- Use `MapStepOutput("step_name")` to map over a dependency step output array
-- Each mapped item runs as its own task, so retries happen per item instead of rerunning the whole step.
-- To fold mapped item outputs without materializing a full `[]Out`, add an explicit reducer step with `AddStep(NewStep("name").ReduceStep("mapped_step").Do(fn))`.
-
-#### Map flow input
-
-```go
-flow := catbird.NewFlow("double_input")
-flow.AddStep(catbird.NewStep("double").
-    MapFlowInput().
-    Do(func(ctx context.Context, n int) (int, error) {
-    return n * 2, nil
-}))
-
-_ = client.CreateFlow(ctx, flow)
-handle, _ := client.RunFlow(ctx, "double_input", []int{1, 2, 3})
-var out []int
-_ = handle.WaitForOutput(ctx, &out)
-// out == []int{2, 4, 6}
-```
-
-#### Map dependency output
-
-```go
-flow := catbird.NewFlow("double_numbers")
-flow.AddStep(catbird.NewStep("numbers").Do(func(ctx context.Context, _ string) ([]int, error) {
-    return []int{1, 2, 3}, nil
-}))
-flow.AddStep(catbird.NewStep("double").
-    MapStepOutput("numbers").
-    Do(func(ctx context.Context, _ string, n int) (int, error) {
-    return n * 2, nil
-}))
-
-// Reduce mapped outputs with an explicit reducer step
-flow = catbird.NewFlow("double_numbers_reduced")
-flow.AddStep(catbird.NewStep("numbers").Do(func(ctx context.Context, _ string) ([]int, error) {
-    return []int{1, 2, 3}, nil
-}))
-flow.AddStep(catbird.NewStep("double").
-    MapStepOutput("numbers").
-    Do(func(ctx context.Context, _ string, n int) (int, error) {
-    return n * 2, nil
-}))
-flow.AddStep(catbird.NewStep("sum").
-    ReduceStep("double").
-    Do(func(ctx context.Context, acc int, out int) (int, error) {
-    return acc + out, nil
-}))
-```
-
-### Ignore Output
-
-Use `IgnoreOutput("step")` when a step must wait for a dependency but doesn't need its output. The dependency's output is never aggregated or transmitted — important for map steps with large fan-outs. The handler omits the parameter for that dependency.
-
-```go
-flow.AddStep(catbird.NewStep("finish").
-    DependsOn("expensive_map").
-    IgnoreOutput("expensive_map").
-    Do(func(ctx context.Context, in Input) (string, error) {
-    return "done", nil
-}))
-```
-
-### Generator Steps
-
-Generator steps act like normal flow steps with an extra trailing `yield` callback for streaming items; yielded items are processed by a per-item handler.
-
-- Define the step with `flow.AddStep(NewStep("name").Generate(...).Do(...))`
-- Optionally add `DependsOn(...)` and/or `WithSignal()` like a normal step
-- Provide a generator with signature `func(context.Context, In[, Signal][, Dep1, Dep2, ...], func(ItemType) error) error`
-- Provide an item handler with signature `func(context.Context, ItemType) (OutType, error)`
-- To fold yielded item outputs, add an explicit reducer step with `AddStep(NewStep(...).ReduceStep("generator_step").Do(fn))`
-- Generator steps do not support `MapFlowInput()` or `MapStepOutput()`
-
-```go
-flow := catbird.NewFlow("generate_double_sum")
-flow.AddStep(catbird.NewStep("seed").Do(func(ctx context.Context, in int) (int, error) {
-    return in, nil
-}))
-flow.AddStep(catbird.NewStep("generate").
-    DependsOn("seed").
-    Generate(func(ctx context.Context, in int, seed int, yield func(int) error) error {
-    for i := 0; i < seed; i++ {
-        if err := yield(i); err != nil {
-            return err
-        }
-    }
-    return nil
-}).
-    Do(func(ctx context.Context, item int) (int, error) {
-    return item * 2, nil
-}))
-flow.AddStep(catbird.NewStep("sum").
-    DependsOn("generate").Do(func(ctx context.Context, in int, generated []int) (int, error) {
-    total := 0
-    for _, v := range generated {
-        total += v
-    }
-    return total, nil
-}))
-
-_ = client.CreateFlow(ctx, flow)
-handle, _ := client.RunFlow(ctx, "generate_double_sum", 5)
-var out int
-_ = handle.WaitForOutput(ctx, &out)
-// out == 20
-```
-
-Use an explicit reducer step when you want bounded generator output instead of storing all item outputs as `[]Out`:
-
-```go
-flow := catbird.NewFlow("generate_double_sum_reduced")
-flow.AddStep(catbird.NewStep("generate").
-    Generate(func(ctx context.Context, input int, yield func(int) error) error {
-    for i := 0; i < input; i++ {
-        if err := yield(i); err != nil {
-            return err
-        }
-    }
-    return nil
-}).
-    Do(func(ctx context.Context, item int) (int, error) {
-    return item * 2, nil
-}))
-flow.AddStep(catbird.NewStep("sum").
-    ReduceStep("generate").
-    Do(func(ctx context.Context, acc int, out int) (int, error) {
-    return acc + out, nil
-}))
-
-_ = client.CreateFlow(ctx, flow)
-handle, _ := client.RunFlow(ctx, "generate_double_sum_reduced", 5)
-var out int
-_ = handle.WaitForOutput(ctx, &out)
-// out == 20
-```
-
-### Status Values
-
-| Status | Meaning | Used by |
-|--------|---------|---------|
-| `queued` | Runnable and never picked up by a worker | Task runs, flow step runs, map item runs |
-| `waiting_for_dependencies` | Not runnable yet because one or more dependencies are still incomplete | Flow step runs |
-| `waiting_for_signal` | Dependencies are resolved, but required signal input has not been delivered yet | Flow step runs |
-| `waiting_for_map_tasks` | Parent map/reducer step is waiting for spawned map item runs to finish | Flow step runs |
-| `started` | Picked up by a worker at least once (including retries) | Task runs, flow runs, flow step runs, map item runs |
-| `completed` | Finished successfully and output is available | Task runs, flow runs, flow step runs, map item runs |
-| `failed` | Finished with an error | Task runs, flow runs, flow step runs, map item runs |
-| `skipped` | Intentionally skipped (typically due to a condition evaluating false) | Task runs, flow step runs |
-| `canceling` | Cancellation requested; run is transitioning to canceled | Task runs, flow runs |
-| `canceled` | Run was canceled before completing normally | Task runs, flow runs |
-
-### Advanced: Step Communication at Runtime
-
-```go
-flow := catbird.NewFlow("parallel_watch_flow")
-flow.AddStep(catbird.NewStep("long_job").Do(func(ctx context.Context, in Order) (string, error) {
-    time.Sleep(500 * time.Millisecond)
-    return "job-finished", nil
-}))
-flow.AddStep(catbird.NewStep("watch_job").Do(func(ctx context.Context, in Order) (string, error) {
-    step, err := catbird.WaitForStep(ctx, "long_job", catbird.WaitOpts{PollInterval: 25 * time.Millisecond})
-    if err != nil {
-        return "", err
-    }
-    if !step.IsCompleted() {
-        return "", fmt.Errorf("long_job ended with status=%s", step.Status)
-    }
-    return "watcher-confirmed:" + step.Status, nil
-}))
-```
-
-This runs `long_job` and `watch_job` in parallel. `watch_job` blocks on `WaitForStep(...)` until `long_job` reaches a terminal state, then exits immediately.
-
-```go
-flow := catbird.NewFlow("loop_until_peer_done")
-flow.AddStep(catbird.NewStep("controller").Do(func(ctx context.Context, in string) (string, error) {
-    time.Sleep(2 * time.Second)
-    return "stop-now", nil
-}))
-flow.AddStep(catbird.NewStep("worker_loop").Do(func(ctx context.Context, in string) (string, error) {
-    for {
-        controller, err := catbird.GetStep(ctx, "controller")
-        if err != nil {
-            return "", err
-        }
-        if controller.IsDone() {
-            return "loop-stopped:" + controller.Status, nil
-        }
-
-        select {
-        case <-ctx.Done():
-            return "", ctx.Err()
-        case <-time.After(100 * time.Millisecond):
-        }
-    }
-}))
-```
-
-This pattern keeps `worker_loop` alive until `controller` reaches any terminal state, then exits cleanly.
-
-## Scheduling
-
-Tasks and flows can be scheduled with cron expressions using `CreateTaskSchedule` and `CreateFlowSchedule`. Schedules are stored in PostgreSQL and polled by workers — no external cron daemon needed.
-
-```go
-// Schedule a task
-client.CreateTaskSchedule(ctx, "send_email", "@hourly")
-
-// Schedule with static input
-client.CreateTaskSchedule(ctx, "send_report", "*/15 * * * *",
-    catbird.WithInput(EmailRequest{To: "ops@example.com", Subject: "Report"}),
-)
-
-// Schedule a flow
-client.CreateFlowSchedule(ctx, "order_processing", "0 2 * * *")
-
-// Skip all missed ticks on recovery (no catch-up runs)
-client.CreateTaskSchedule(ctx, "stats", "@hourly", catbird.WithSkipCatchUp())
-
-// Replay every missed tick on recovery
-client.CreateTaskSchedule(ctx, "billing", "0 * * * *", catbird.WithCatchUpAll())
-```
-
-### Cron Syntax
-
-Standard 5-field cron format: `minute hour day-of-month month day-of-week`
-
-| Field | Values | Wildcards |
-|-------|--------|-----------|
-| Minute | 0-59 | `*`, `*/N`, `N-M`, `N-M/S`, comma-separated |
-| Hour | 0-23 | same |
-| Day of month | 1-31 | same |
-| Month | 1-12 | same |
-| Day of week | 0-6 (0 = Sunday, 7 also accepted as Sunday) | same |
-
-When both day-of-month and day-of-week are restricted (not `*`), the date matches if **either** field matches (standard cron OR semantics).
-
-Shorthand descriptors: `@yearly` / `@annually`, `@monthly`, `@weekly`, `@daily` / `@midnight`, `@hourly`.
-
-All cron evaluation is in **UTC**.
-
-### Catch-Up Policies
-
-When a worker restarts after downtime, the catch-up policy controls how missed ticks are handled:
-
-| Policy | Option | On recovery (5 missed ticks) | Enqueues |
-|--------|--------|------------------------------|----------|
-| **skip** | `WithSkipCatchUp()` | Skip all missed ticks, jump to future | 0 runs |
-| **one** (default) | — | Enqueue one catch-up run (oldest), jump to future | 1 run |
-| **all** | `WithCatchUpAll()` | Replay every missed tick, one at a time | All runs |
-
-## Conditional Execution
-
-Both tasks and flow steps support conditional execution via `WithCondition` on the builder methods. If the condition evaluates to false (or a referenced field is missing), the task/step is marked `skipped` and its handler does not run.
-
-### Rules at a Glance
-
-- **Prefixes**: tasks use `input.*`; flow steps use `input.*`, `step_name.*`, or `signal.*`.
-- **Operators**: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `exists`, `contains`, plus `not <expr>`.
-- **Optional outputs**: if a step can be skipped, downstream handlers must accept `Optional[T]` for that dependency.
-- **Map steps**: define with `AddStep(NewStep("name")...)`, then use `MapFlowInput()` or `MapStepOutput("step_name")`; map source values must be arrays.
-- **No AND/OR**: only one expression per task/step; compute a derived field upstream if needed.
-
-### Tasks with Conditions
-
-Tasks can use conditions to skip execution based on input fields.
-
-```go
-type ProcessRequest struct {
-    UserID     int    `json:"user_id"`
-    IsPremium  bool   `json:"is_premium"`
-    Amount     int    `json:"amount"`
-    Environment string `json:"environment"`
-}
-
-// Only process premium users
-premiumTask := catbird.NewTask("premium_processing").
-    WithCondition("input.is_premium"). // Skipped if is_premium = false
-    Do(func(ctx context.Context, req ProcessRequest) (string, error) {
-        return fmt.Sprintf("Processed premium user %d", req.UserID), nil
-    })
-
-// Run task - may be skipped based on input
-_ = client.CreateTask(ctx, premiumTask)
-client.RunTask(ctx, "premium_processing", ProcessRequest{UserID: 123, IsPremium: false})
-// This task run will be skipped (is_premium = false)
-```
-
-### Flows with Conditions
-
-Flow steps can branch based on prior outputs. Use `Optional[T]` to handle skipped dependencies.
-
-```go
-flow := catbird.NewFlow("payment_processing")
-flow.OutputPriority("charge", "free_order")
-
-flow.AddStep(catbird.NewStep("validate").Do(func(ctx context.Context, order Order) (ValidationResult, error) {
-    return ValidationResult{Valid: order.Amount > 0}, nil
-}))
-flow.AddStep(catbird.NewStep("charge").
-    DependsOn("validate").
-    WithCondition("validate.valid").Do(func(ctx context.Context, order Order, validation ValidationResult) (FinalResult, error) {
-    return FinalResult{Status: "charged", TxnID: "txn-123"}, nil
-}))
-flow.AddStep(catbird.NewStep("free_order").
-    DependsOn("validate").
-    WithCondition("not validate.valid").Do(func(ctx context.Context, order Order, validation ValidationResult) (FinalResult, error) {
-    return FinalResult{Status: "free_order", TxnID: ""}, nil
-}))
-```
-
-## Resiliency
-
-Catbird includes multiple resiliency layers for runtime failures. Handler-level retries are configured with `HandlerOpt` values such as `WithMaxRetries(...)` and `WithFullJitterBackoff(...)`, and external calls can be protected with `WithCircuitBreaker(failureThreshold, openTimeout)` to avoid cascading outages. In worker database paths, PostgreSQL reads/writes are retried with bounded attempts and full-jitter backoff; retries stop immediately on context cancellation or deadline expiry.
-
-For reducer-step workflows, retries are two-phase: item handlers retry first per item, then reducer-step finalization retries at the reducer step.
-If retries are exhausted in either phase, the parent step fails and task/flow `OnFail` handlers run with the same terminal failure semantics as non-reduced steps.
-
-### Be aware of side effects
-
-Catbird deduplication (`ConcurrencyKey`) controls duplicate run creation, while handler retries can still re-attempt the same run after transient failures. For non-repeatable side effects (payments, email, webhooks), use idempotent write patterns or upstream idempotency keys so retry attempts remain safe.
-
-## Cancellation
-
-`Cancellation` semantics:
-- Cancellation is a distinct terminal outcome (`canceled`), separate from `failed` and `completed`.
-- Task cancellation moves `queued`/`started` runs directly to `canceled`; already-terminal task runs are unchanged.
-- Flow cancellation is two-phase: flow goes to `canceling`, queued child work is canceled, then flow becomes `canceled` after in-flight started work drains.
-- Cancellation requests are idempotent: repeated requests are successful no-ops.
-- A cancel request does not rewrite an already-terminal run.
-
-External cancellation:
-
-```go
-taskHandle, _ := client.RunTask(ctx, "send_email", "hello")
-_, _ = client.CancelTaskRun(ctx, "send_email", taskHandle.ID, catbird.CancelOpts{Reason: "operator requested stop"})
-
-flowHandle, _ := client.RunFlow(ctx, "order_processing", map[string]any{"order_id": 123})
-_, _ = client.CancelFlowRun(ctx, "order_processing", flowHandle.ID, catbird.CancelOpts{Reason: "customer canceled order"})
-```
-
-Internal cancellation from handlers:
-
-```go
-task := catbird.NewTask("validate_order").Do(func(ctx context.Context, input Order) (string, error) {
-        if input.Amount <= 0 {
-            if err := catbird.Cancel(ctx, catbird.CancelOpts{Reason: "invalid amount"}); err != nil {
-                return "", err
-            }
-            return "", nil
-        }
-        return "ok", nil
-    })
-
-flow := catbird.NewFlow("order_processing")
-flow.AddStep(catbird.NewStep("guard").Do(func(ctx context.Context, input Order) (string, error) {
-    if input.Amount <= 0 {
-        if err := catbird.Cancel(ctx, catbird.CancelOpts{Reason: "invalid amount"}); err != nil {
-            return "", err
-        }
-        return "", nil
-    }
-    return "proceed", nil
-}))
-```
-
-## Wire: Real-Time Notifications
-
-Wire is an optional real-time pub/sub layer — use it when you need to push events to browsers or react to notifications server-side. If you're only using queues, tasks, and flows, you can ignore Wire entirely.
-
-Wire provides topic-matched event dispatch with SSE support and presence tracking. Notifications are ephemeral (at-most-once, no storage).
-
-```go
-wire := catbird.NewWire(pool, secret)
-
-// Listen: server-side callbacks on topic patterns
-wire.Listen("order.*", func(ctx context.Context, topic, message string) {
-    log.Println(topic, message)
-})
-
-// Render: project events into a transport-neutral Fragment (acts as allowlist)
-wire.Render("task.*.completed", func(r *http.Request, topic, message string) (catbird.Fragment, error) {
-    return catbird.Fragment{Event: "task-done", Data: "<div>Task done</div>"}, nil
-})
-
-go wire.Start(ctx)
-
-// Notify: local dispatch + pg_notify for cross-node delivery
-wire.Notify(ctx, "order.created", `{"id": 123}`)
-
-// SSE: app controls token retrieval
-http.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
-    token := r.URL.Query().Get("token")
-    wire.ServeSSE(w, r, token)
-})
-```
-
-A `Render` definition is transport-neutral: `ServeSSE` wraps each `Fragment` as an SSE frame, and `ServePoll` concatenates fragments into an HTTP body backed by the [durable inbox](#durable-notifications) — define the projection once, pick the transport per surface. (`RenderSSE` is a deprecated alias for `Render`.)
-
-### Listen vs Render
-
-| Method | Runs on | Purpose |
-|--------|---------|---------|
-| `wire.Listen` | Every node | Server-side side effects (logging, webhooks) |
-| `wire.Render` | Node serving SSE/poll | Project events into a `Fragment` (e.g., JSON → HTML) |
-
-Topics without a renderer are handled per-transport: `ServeSSE` passes them through raw, `ServePoll` skips them. Multiple renderers matching the same topic each produce a fragment. Render handlers receive the client's `*http.Request` for access to user context (auth, language, etc).
-
-### Notify
-
-```go
-// Package-level: explicit Conn, works inside transactions (fires on commit)
-catbird.Notify(ctx, tx, "order.progress", `{"step": 1}`)
-
-// Client method: uses client's Conn
-client.Notify(ctx, "order.created", `{"id": 123}`)
-
-// Wire method: local dispatch + pg_notify for cross-node
-wire.Notify(ctx, "order.created", `{"id": 123}`)
-```
-
-### Fragment
-
-`Fragment` is the transport-neutral render output: a `Data` payload (e.g. an HTML fragment) plus SSE-only `Event`/`ID` hints. It implements `io.Writer`, so templates can write directly to it. `ServeSSE` frames it; `ServePoll` emits its `Data`. (`SSEEvent` is a deprecated alias for `Fragment`.)
-
-```go
-// Typed helper — unmarshals JSON, gives full Fragment control
-catbird.Render[TaskEvent](wire, "task.*", func(r *http.Request, topic string, data TaskEvent) (catbird.Fragment, error) {
-    f := catbird.Fragment{Event: "task-update", ID: topic}
-    err := views.TaskCompleted(r, data).Render(r.Context(), &f)
-    return f, err
-})
-```
-
-### Tokens & SSE
-
-SSE connections are authorized via encrypted tokens that specify which topics the client can subscribe to:
-
-```go
-token := wire.Token([]string{"order.*", "task.invoice.#"}, catbird.TokenOpts{
-    Identity: "user-123",
-    ValidFor: time.Hour,
-})
-```
-
-### Presence
-
-Track which identities are connected to a topic (across all nodes):
-
-```go
-identities, err := wire.Presence(ctx, "dashboard")
-```
-
-### Handler Access to Conn
-
-Handlers can access the database connection from context for transactional work:
-
-```go
-task := catbird.NewTask("process_order").Do(func(ctx context.Context, input Order) (Result, error) {
-    conn, _ := catbird.GetConn(ctx)
-    tx, _ := conn.Begin(ctx)
-    defer tx.Rollback(ctx)
-
-    catbird.Send(ctx, tx, "audit", map[string]any{"order_id": input.ID})
-    catbird.Notify(ctx, tx, "order.progress", `{"step": 1}`)  // fires on commit
-
-    tx.Commit(ctx)
-    return Result{}, nil
-})
-```
-
-## Durable Notifications
-
-A per-identity durable inbox. Where Wire is ephemeral push — miss the moment
-(navigating, offline, asleep) and the notification is gone — the inbox is a store the
-client catches up against on its own schedule. It is a separate primitive with **no
-dependency on Wire**: delete Wire and the inbox still does its whole job.
-
-The inbox is a mailbox keyed by `identity`. Each notification has a monotonic `id`
-(the cursor) and a `seen` marker, so "replay everything since I last looked" is just
-*read the unseen rows after my cursor, then ack the cursor*.
-
-```go
-// Append to an identity's inbox; returns the new id (the cursor value)
-id, err := catbird.NotifyDurable(ctx, conn, "user-123", "import.done", "Your import finished")
-
-// Read unseen, still-relevant notifications after the client's last cursor
-ns, err := catbird.UnseenNotifications(ctx, conn, "user-123", afterID, 50)
-for _, n := range ns {
-    fmt.Println(n.ID, n.Topic, n.Message)
-}
-
-// Ack the cursor: mark everything up to an id seen (returns rows marked)
-marked, err := catbird.MarkSeenUntil(ctx, conn, "user-123", ns[len(ns)-1].ID)
-```
-
-**Relevance window (`ExpiresAt`).** A notification is a *perishable pointer to a durable
-fact* — the underlying result lives permanently elsewhere (e.g. a task row); the
-notification is only the prompt to look. Set `ExpiresAt` to bound how long it is worth
-delivering: once it passes, the row drops out of `UnseenNotifications` and `cb_gc`
-deletes it. Leave it zero and the notification **waits until seen** (cleared by an
-explicit `MarkSeenUntil`/`MarkSeen` ack, not by a timer) — the right choice for
-"action required" items.
-
-```go
-// Perishable toast: gone after an hour whether seen or not
-catbird.NotifyDurable(ctx, conn, "user-123", "batch.done", "Batch finished",
-    catbird.NotifyDurableOpts{ExpiresAt: time.Now().Add(time.Hour)})
-
-// Collapse: a newer notification with the same CollapseKey marks prior unseen ones
-// seen, so only the latest stays live (FCM collapse-key semantics — keep newest,
-// the deliberate opposite of the queue's keep-oldest ConcurrencyKey)
-catbird.NotifyDurable(ctx, conn, "user-123", "import.progress", "100%",
-    catbird.NotifyDurableOpts{CollapseKey: "import-42"})
-```
-
-Reads return **unseen *and* still-relevant** rows — never "everything since the cursor"
-— so an identity offline for a day is not flooded with stale toasts. Retention folds
-into the core `cb_gc` sweep (see [Data Retention](#data-retention)).
-
-**Pairing with Wire (optional).** Durability (is it stored?) and transport (push vs
-poll) are independent. If you also run Wire, push a *content-free ping* and let the
-client re-pull from its cursor — the store stays the single source of truth and the
-cursor dedups, so a client that is both connected and polling never shows a
-notification twice:
-
-```go
-catbird.NotifyDurable(ctx, conn, userID, topic, msg, opts) // the real message, stored
-wire.Notify(ctx, "user."+userID, "")                       // empty ping → client re-pulls
-```
-
-`wire.ServePoll` is the read side: it renders an identity's unseen notifications
-(scoped to the token's topics) through the **same `Render` definitions** as `ServeSSE`
-and returns them as one HTTP body, with the next cursor in the `X-Wire-Cursor` header.
-It is a pure read — the client acks explicitly, so opening the same surface in several
-tabs is convergent, not destructive:
-
-```go
-http.HandleFunc("/inbox", func(w http.ResponseWriter, r *http.Request) {
-    wire.ServePoll(w, r, r.URL.Query().Get("token")) // ?after=<cursor> for catch-up
-})
-
-// Ack on an explicit gesture, never on read:
-catbird.MarkSeenUntil(ctx, conn, userID, cursor)        // "mark all read" (bounded watermark)
-catbird.MarkSeen(ctx, conn, userID, []int64{id1, id2})  // dismiss specific items (precise)
-```
-
-## Naming Rules
-
-- **Queue, task, flow, and step names**: Lowercase letters, digits, and underscores only (`a-z`, `0-9`, `_`). Max 58 characters. Step names must be unique within a flow. Reserved step names: `input`, `signal`.
-- **Topics/Patterns**: Letters (upper/lower), digits, dots, underscores, and hyphens (`a-z`, `A-Z`, `0-9`, `.`, `_`, `-`, plus wildcards `*`, `#`).
-
-## Query Helpers
-
-Use query builders when you want SQL + args directly (for `pgx.Batch` or custom execution):
-
-- `SendQuery(queue, body, opts)`
-- `PublishQuery(topic, body, opts)`
-- `RunTaskQuery(name, input, opts)`
-- `RunFlowQuery(name, input, opts)`
-
-```go
-// Queue into a batch
-var batch pgx.Batch
-q1, args1, err := catbird.SendQuery("my_queue", map[string]any{"user_id": 123})
-if err != nil {
-    return err
-}
-batch.Queue(q1, args1...)
-```
-
-## PostgreSQL API Reference
-
-Catbird is built on PostgreSQL functions, so you can use the API directly from any language or tool with PostgreSQL support (psql, Python, Node.js, Ruby, etc.).
-
-For the full SQL function reference and practical SQL examples (queues, tasks, workflows, and run monitoring), see the [SQL API reference](docs/sql-api.md).
-
-## Dashboard
-
-The dashboard provides a web UI for monitoring queues, tasks, flows, and workers. You can run it standalone with the `cb` CLI or embed it as an `http.Handler`.
+## Install
 
 ```bash
-go install github.com/ugent-library/catbird/cmd/cb@latest
-export CB_CONN="postgres://user:pass@localhost:5432/mydb?sslmode=disable"
-cb dashboard
+go get github.com/ugent-library/catbird
 ```
 
-The dashboard is a standard `http.Handler` and can be embedded in any Go web application:
+## Local PostgreSQL (for running examples)
+
+```bash
+docker compose up -d
+```
+
+Use this DSN in examples:
+
+```text
+postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+```
+
+## Quick start
+
+This program:
+
+1. connects to PostgreSQL,
+2. applies the Catbird schema,
+3. starts a runtime,
+4. enqueues one job,
+5. runs a typed handler.
 
 ```go
-import (
-    "log/slog"
-    "net/http"
+package main
 
-    "github.com/ugent-library/catbird"
-    "github.com/ugent-library/catbird/dashboard"
+import (
+	"context"
+	"log"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ugent-library/catbird"
+)
+
+type welcomeEmail struct {
+	UserID int64  `json:"user_id"`
+	Email  string `json:"email"`
+}
+
+var (
+	notifications = catbird.NewQueue("notifications", catbird.QueueOptions{
+		BatchSize:     20,
+		ClaimDuration: time.Minute,
+	})
+
+	sendWelcome = catbird.NewJobType("send-welcome-email", notifications, catbird.JobTypeOptions{
+		MaxAttempts: 5,
+	})
 )
 
 func main() {
-    client := catbird.New(conn)
-    dash := dashboard.New(dashboard.Config{
-        Client:     client,
-        Log:        slog.Default(), // Optional: provide custom logger
-        PathPrefix: "",              // Optional: mount at a subpath (e.g., "/admin")
-    })
-    http.ListenAndServe(":8080", dash.Handler())
+	ctx := context.Background()
+
+	pool, err := pgxpool.New(ctx, "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
+
+	if err := catbird.MigrateUp(ctx, pool); err != nil {
+		log.Fatal(err)
+	}
+
+	rt := catbird.New(pool, catbird.Options{})
+
+	rt.Handle(sendWelcome, catbird.JobHandler(func(ctx context.Context, payload welcomeEmail, job *catbird.Job) error {
+		log.Printf("send welcome email to user=%d email=%s", payload.UserID, payload.Email)
+		return nil
+	}))
+
+	go rt.Start(ctx)
+
+	workflowID, err := catbird.Enqueue(ctx, pool, sendWelcome, welcomeEmail{
+		UserID: 42,
+		Email:  "user@example.org",
+	}, catbird.EnqueueOptions{
+		DeduplicationKey: "welcome:42",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Printf("enqueued workflow id: %d", workflowID)
+
+	time.Sleep(2 * time.Second)
 }
 ```
 
-## Terminal UI
+## Workflow example: fan-out, join, and signal
 
-The terminal UI provides an interactive dashboard-like view in your terminal.
-
-```bash
-go install github.com/ugent-library/catbird/cmd/cb@latest
-export CB_CONN="postgres://user:pass@localhost:5432/mydb?sslmode=disable"
-cb ui
-```
-
-You can also start it from the root command using interactive mode:
-
-```bash
-cb -i
-```
-
-## Data Retention
-
-Set a retention period on a task or flow definition to have `cb_gc()` automatically
-delete terminal runs older than that duration. GC runs opportunistically from the
-worker heartbeat and can also be triggered manually via `client.GC(ctx)` or the
-standalone purge helpers below.
+This example starts one workflow, runs two jobs in parallel, waits for both, then waits for a human decision.
 
 ```go
-gcInfo, err := client.GC(ctx)
-if err != nil {
-    // handle error
-}
-
-_ = gcInfo.ExpiredQueuesDeleted
-_ = gcInfo.StaleWorkersDeleted
-_ = gcInfo.TaskRunsPurged
-_ = gcInfo.FlowRunsPurged
-_ = gcInfo.ExpiredNotificationsDeleted
-```
-
-Durable notifications past their `ExpiresAt` are deleted by the same `cb_gc()` sweep.
-Because GC runs from the worker heartbeat, a deployment that runs Wire but no worker
-must call `client.GC(ctx)` on its own schedule, or expired notifications accumulate.
-
-```go
-task := catbird.NewTask("send_email").
-    RetentionPeriod(7 * 24 * time.Hour). // NULL by default = no cleanup
-    Do(func(ctx context.Context, in EmailInput) (string, error) {
-        return "sent", nil
-    })
-
-flow := catbird.NewFlow("order_processing")
-flow.RetentionPeriod(90 * 24 * time.Hour)
-flow.AddStep(catbird.NewStep("step1").Do(func(ctx context.Context, in OrderInput) (string, error) {
-    return "done", nil
-}))
-```
-
-- **Task runs cleaned up**: `completed`, `failed`, `skipped`, `canceled` older than the retention period
-- **Flow runs cleaned up**: `completed`, `failed`, `canceled` older than the retention period; associated step runs and map tasks are removed automatically via cascade
-- **Non-terminal rows are never touched**: `queued`, `started`, `waiting_*`, `canceling` are left alone
-
-### Purge helpers
-
-For targeted or ad-hoc cleanup independent of the retention period:
-
-```go
-// Delete task runs older than 30 days
-taskPurged, err := client.PurgeTaskRuns(ctx, "send_email", 30*24*time.Hour)
-
-// Delete flow runs older than 90 days
-flowPurged, err := client.PurgeFlowRuns(ctx, "order_processing", 90*24*time.Hour)
-
-_ = taskPurged
-_ = flowPurged
-
-```
-
-### External archiving
-
-For SQL-based archiving patterns and example queries, see the
-`External archiving` section in the [SQL API reference](docs/sql-api.md).
-
-## Migrations
-
-### Standalone CLI
-
-When Catbird owns its own database (or you want to manage its schema outside your application's migration flow), the `cb` CLI applies the schema directly:
-
-```bash
-go install github.com/ugent-library/catbird/cmd/cb@latest
-export CB_CONN="postgres://user:pass@localhost:5432/mydb?sslmode=disable"
-
-cb migrate up              # apply all pending migrations
-cb migrate status          # list applied and pending migrations
-cb migrate down --to 1     # roll back down to a target version
-```
-
-### Embedding in your own migrations
-
-If your application already uses Goose migrations, you can register Catbird's schema migration as a normal app migration:
-
-Create a migration file such as `00003_add_catbird.go`:
-
-```go
-package migrations
+package main
 
 import (
-    "context"
-    "database/sql"
+	"context"
+	"encoding/json"
+	"errors"
+	"log"
+	"time"
 
-    "github.com/pressly/goose/v3"
-    "github.com/ugent-library/catbird"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ugent-library/catbird"
 )
 
-func init() {
-    goose.AddMigrationNoTxContext(addCatbirdUp, addCatbirdDown)
+type deposit struct {
+	ID int64 `json:"id"`
 }
 
-func addCatbirdUp(ctx context.Context, db *sql.DB) error {
-    return catbird.MigrateUpTo(ctx, db, 13)
+type decision struct {
+	Approved bool   `json:"approved"`
+	By       string `json:"by"`
 }
 
-func addCatbirdDown(ctx context.Context, db *sql.DB) error {
-    return catbird.MigrateDownTo(ctx, db, 0)
+type scanOutput struct {
+	Clean bool `json:"clean"`
+}
+
+var (
+	ingestQ  = catbird.NewQueue("ingest", catbird.QueueOptions{BatchSize: 8, ClaimDuration: 30 * time.Minute})
+	depositQ = catbird.NewQueue("deposit", catbird.QueueOptions{BatchSize: 50, ClaimDuration: time.Minute})
+
+	submitted = catbird.NewJobType("submitted", depositQ, catbird.JobTypeOptions{})
+	extract   = catbird.NewJobType("extract", ingestQ, catbird.JobTypeOptions{MaxAttempts: 3})
+	scan      = catbird.NewJobType("scan", ingestQ, catbird.JobTypeOptions{MaxAttempts: 3})
+	review    = catbird.NewJobType("review", depositQ, catbird.JobTypeOptions{Signal: true})
+	publish   = catbird.NewJobType("publish", depositQ, catbird.JobTypeOptions{MaxAttempts: 5})
+	archive   = catbird.NewJobType("archive", depositQ, catbird.JobTypeOptions{})
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
+
+	if err := catbird.MigrateUp(ctx, pool); err != nil {
+		log.Fatal(err)
+	}
+
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Handle(submitted, catbird.JobHandler(handleSubmitted))
+	rt.HandleFunc(extract, handleExtract)
+	rt.Handle(scan, catbird.JobHandler(handleScan))
+	rt.Handle(review, catbird.JobHandler(func(ctx context.Context, dep deposit, job *catbird.Job) error {
+		return handleReview(ctx, pool, dep, job)
+	}))
+	rt.HandleFunc(publish, handlePublish)
+	rt.HandleFunc(archive, handleArchive)
+	go rt.Start(ctx)
+
+	groupID, err := catbird.Enqueue(ctx, pool, submitted, deposit{ID: 42}, catbird.EnqueueOptions{
+		DeduplicationKey: "deposit:42",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := catbird.Signal(ctx, pool, groupID, review, decision{Approved: true, By: "ann"}); err != nil {
+		if !errors.Is(err, catbird.ErrNotFound) {
+			log.Fatal(err)
+		}
+	}
+
+	time.Sleep(2 * time.Second)
+}
+
+func handleSubmitted(ctx context.Context, dep deposit, job *catbird.Job) error {
+	job.Enqueue(extract, dep)
+	job.Enqueue(scan, dep)
+	job.EnqueueAfter(review, dep)
+	return nil
+}
+
+func handleScan(ctx context.Context, dep deposit, job *catbird.Job) error {
+	clean := dep.ID%2 == 0
+	return job.SetOutput(scanOutput{Clean: clean})
+}
+
+func handleReview(ctx context.Context, db catbird.Conn, dep deposit, job *catbird.Job) error {
+	var d decision
+	if err := json.Unmarshal(job.Signal, &d); err != nil {
+		return err
+	}
+
+	deps, err := job.DependencyOutputs(ctx, db)
+	if err != nil {
+		return err
+	}
+	var scanned scanOutput
+	if err := deps.Get(scan, &scanned); err != nil {
+		return err
+	}
+
+	switch {
+	case !scanned.Clean:
+		job.Enqueue(archive, dep)
+	case d.Approved:
+		job.Enqueue(publish, dep)
+	}
+	return nil
+}
+
+func handleExtract(ctx context.Context, job *catbird.Job) error { return nil }
+func handlePublish(ctx context.Context, job *catbird.Job) error { return nil }
+func handleArchive(ctx context.Context, job *catbird.Job) error { return nil }
+```
+
+## Transactional completion
+
+Use this pattern when your app writes data and must complete the job in the same transaction.
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ugent-library/catbird"
+)
+
+var (
+	queue = catbird.NewQueue("tx-example", catbird.QueueOptions{ClaimDuration: time.Minute})
+	task  = catbird.NewJobType("tx-task", queue, catbird.JobTypeOptions{})
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
+
+	if err := catbird.MigrateUp(ctx, pool); err != nil {
+		log.Fatal(err)
+	}
+
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(task, func(ctx context.Context, job *catbird.Job) error {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+
+		if _, err := tx.Exec(ctx, "SELECT 1"); err != nil {
+			return err
+		}
+
+		if err := job.SetOutput(map[string]any{"ok": true}); err != nil {
+			return err
+		}
+
+		if err := catbird.Complete(ctx, tx, job); err != nil {
+			return err
+		}
+
+		return tx.Commit(ctx)
+	})
+
+	go rt.Start(ctx)
+
+	if _, err := catbird.Enqueue(ctx, pool, task, map[string]any{"n": 1}, catbird.EnqueueOptions{}); err != nil {
+		log.Fatal(err)
+	}
+
+	time.Sleep(2 * time.Second)
 }
 ```
 
-Keep an explicit pinned version (for example `13`) in this migration file. Do not use `catbird.SchemaVersion`.
+## Stream usage
 
-## Documentation
+```go
+package main
 
-- **[Go API Documentation](https://pkg.go.dev/github.com/ugent-library/catbird)**
-- **[SQL API Reference](docs/sql-api.md)**: SQL function reference and practical SQL usage examples
-- **[Events Reference](docs/events.md)**
-- **[Testing Guide](docs/testing.md)**
-- **[Copilot Instructions](.github/copilot-instructions.md)**
+import (
+	"context"
+	"log"
+	"time"
 
-## Acknowledgments
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ugent-library/catbird"
+)
 
-SQL code is taken from or inspired by the excellent [pgmq](https://github.com/pgmq) and [pgflow](https://github.com/pgflow-dev/pgflow) projects.
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
+
+	if err := catbird.MigrateUp(ctx, pool); err != nil {
+		log.Fatal(err)
+	}
+
+	// Start assigner/listener loops so published messages receive stream positions.
+	go catbird.New(pool, catbird.Options{}).Start(ctx)
+
+	if _, err := catbird.Publish(ctx, pool, "record.42.updated", map[string]any{"id": 42}, "record:42:v1"); err != nil {
+		log.Fatal(err)
+	}
+
+	cursor := catbird.Cursor{Name: "indexer:records", Patterns: []string{"record.#"}}
+
+	for i := 0; i < 20; i++ {
+		msgs, err := cursor.Read(ctx, pool, 100)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if len(msgs) == 0 {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		for _, m := range msgs {
+			log.Printf("position=%d topic=%s payload=%s", m.Position, m.Topic, string(m.Payload))
+		}
+
+		if err := cursor.Ack(ctx, pool, msgs[len(msgs)-1].Position); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	log.Fatal("no stream messages became visible in time")
+}
+```
+
+## Browser delivery with wire
+
+The wire package turns stream messages into HTML fragments and serves them over polling.
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ugent-library/catbird"
+	"github.com/ugent-library/catbird/wire"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
+
+	if err := catbird.MigrateUp(ctx, pool); err != nil {
+		log.Fatal(err)
+	}
+
+	// Start a runtime so stream messages receive positions.
+	go catbird.New(pool, catbird.Options{}).Start(ctx)
+
+	rd := wire.NewRenderer()
+	rd.HandleFunc("record.work.{id}.#", func(r *http.Request, m wire.Match, f *wire.Fragment) error {
+		_, err := fmt.Fprintf(f, "<div id=\"record-%s\" hx-swap-oob=\"true\">%d updates</div>", m.Var("id"), len(m.Messages))
+		return err
+	})
+
+	w := wire.New(pool, rd, wire.Options{Secret: []byte("dev-secret")})
+
+	http.HandleFunc("/events", func(rw http.ResponseWriter, r *http.Request) {
+		token := w.Token("tray:1", "record.work.#")
+		w.ServePoll(rw, r, token)
+	})
+
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+```
+
+## API reference
+
+### Core types
+
+- Queue declaration: `NewQueue(name string, opts QueueOptions) *Queue`
+- Job type declaration: `NewJobType(name string, queue *Queue, opts JobTypeOptions) *JobType`
+- Runtime: `New(pool *pgxpool.Pool, opts Options) *Runtime`
+- Handler adapters: `HandlerFunc`, `JobHandler`
+- Claimed job: `Job`
+
+### Runtime methods
+
+- Register handlers: `(*Runtime).Handle`, `(*Runtime).HandleFunc`
+- Register stream trigger: `(*Runtime).Trigger`
+- Start loops: `(*Runtime).Start`
+
+### Job and workflow operations
+
+- Enqueue one job: `Enqueue`
+- Enqueue many jobs of one type: `EnqueueBatch`
+- Complete a claimed job: `Complete`
+- Deliver signal payload: `Signal`
+- Cancel live jobs in a workflow: `Cancel`
+- Read status: `Status`, `GroupStatus`, `Queues`
+- Collect old rows: `GC`
+
+### Stream operations
+
+- Publish one: `Publish`
+- Publish many: `PublishBatch`
+- Read with named cursor: `Cursor.Read`, `Cursor.Ack`
+- Read with caller-held position: `ReadAfter`
+- Stream bounds: `LastPosition`, `OldestPosition`
+
+### Migrations
+
+- Apply: `MigrateUp`
+- Roll back to version: `MigrateDownTo`
+- Read parsed migrations: `Migrations`
+- Embedded migration FS for external tools: `MigrationsFS`
+
+### wire package
+
+- Renderer setup: `wire.NewRenderer`, `(*Renderer).Handle`, `(*Renderer).HandleFunc`
+- Token flow: `(*Wire).Token`, `(*Wire).Verify`
+- Poll transport: `(*Wire).ServePoll`, `(*Wire).Serve`
+
+## Operational notes
+
+- PostgreSQL is the only coordinator.
+- Jobs are queued in `cb_claims`; stream messages are in `cb_messages`.
+- Stream readers use `position` order.
+- `Signal` targets workflow + job type, not a raw job id.
+- `EnqueueAfter` waits on jobs buffered by the same handler completion.
+
+## Running tests
+
+```bash
+docker compose up -d
+psql postgres://postgres:postgres@localhost:5432/postgres -c 'CREATE DATABASE cb_tst'
+go test ./...
+```

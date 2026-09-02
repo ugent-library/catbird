@@ -1,170 +1,2735 @@
-package catbird
+package catbird_test
 
 import (
 	"context"
-	"database/sql"
+	"encoding/json"
 	"errors"
-	"fmt"
-	"log/slog"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/ugent-library/catbird"
 )
 
-var testClient *Client
-var testPool *pgxpool.Pool
-var testOnce sync.Once
+const testDSN = "postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable"
 
+// TestMain holds an advisory lock for the life of the test binary. The wire
+// package's tests use the same database, and go test runs the two packages'
+// binaries at once — without the lock each drops the tables under the other
+// mid-test. Session lock 2 under catbird's namespace; the assigner's
+// transaction lock is 1.
 func TestMain(m *testing.M) {
-	code := m.Run()
-	if testPool != nil {
-		testPool.Close()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, testDSN)
+	if err != nil {
+		panic(err)
 	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtext('catbird'), 2)`); err != nil {
+		panic(err)
+	}
+	code := m.Run()
+	conn.Close(ctx)
 	os.Exit(code)
 }
 
-func startTestWorker(t *testing.T, worker *Worker) {
+// setupTestDB connects and recreates the schema through the runner, so tests
+// share no state and every down section is exercised on every test.
+func setupTestDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	worker.shutdownTimeout = 0
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, testDSN)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(pool.Close)
 
-	ctx, cancel := context.WithCancel(t.Context())
-	errCh := make(chan error, 1)
+	if err := catbird.MigrateDownTo(ctx, pool, 0); err != nil {
+		t.Fatalf("migrate down: %v", err)
+	}
+	if err := catbird.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("migrate up: %v", err)
+	}
+	return pool
+}
 
-	go func() {
-		errCh <- worker.Start(ctx)
-	}()
+func count(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(), sql, args...).Scan(&n); err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
+	return n
+}
 
-	// Wait briefly for Start to complete or error
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("worker.Start() failed: %v", err)
+// waitFor polls cond every 10 milliseconds until it holds, and fails with msg
+// when it has not held within timeout.
+func waitFor(t *testing.T, timeout time.Duration, msg string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal(msg)
 		}
-	case <-time.After(100 * time.Millisecond):
-		// Worker started successfully, continue
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestTortureThroughput(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const numProducers = 10
+	const msgsPerProducer = 1000
+	const totalMsgs = numProducers * msgsPerProducer
+
+	queue := catbird.NewQueue("torture_queue", catbird.QueueOptions{})
+	task := catbird.NewJobType("torture.task", queue, catbird.JobTypeOptions{})
+
+	start := time.Now()
+	var prodWg sync.WaitGroup
+	for i := 0; i < numProducers; i++ {
+		prodWg.Add(1)
+		go func(prodID int) {
+			defer prodWg.Done()
+			for j := 0; j < msgsPerProducer; j++ {
+				_, err := catbird.Enqueue(ctx, pool, task, map[string]int{"prod": prodID, "task": j}, catbird.EnqueueOptions{})
+				if err != nil {
+					t.Errorf("enqueue: %v", err)
+					return
+				}
+			}
+		}(i)
+	}
+	prodWg.Wait()
+	writeDur := time.Since(start)
+	t.Logf("wrote %d messages in %v (%.0f/s)", totalMsgs, writeDur, float64(totalMsgs)/writeDur.Seconds())
+
+	var processed int32
+	handle := func(ctx context.Context, job *catbird.Job) error {
+		// The transactional path: the handler's own writes and the completion
+		// of the job in one commit.
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx, "SELECT 1"); err != nil {
+			return err
+		}
+		if err := catbird.Complete(ctx, tx, job); err != nil {
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+		atomic.AddInt32(&processed, 1)
+		return nil
 	}
 
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-errCh:
-			if err != nil && !errors.Is(err, context.Canceled) {
-				t.Logf("worker shutdown error: %v", err)
-			}
-		case <-time.After(10 * time.Second):
-			t.Log("worker did not shutdown within timeout")
+	workStart := time.Now()
+	var workerWg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		rt := catbird.New(pool, catbird.Options{})
+		rt.HandleFunc(task, handle)
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			rt.Start(ctx)
+		}()
+	}
+
+	for atomic.LoadInt32(&processed) < totalMsgs {
+		if ctx.Err() != nil {
+			t.Fatalf("timed out: processed %d of %d", atomic.LoadInt32(&processed), totalMsgs)
 		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	workDur := time.Since(workStart)
+	t.Logf("processed %d messages in %v (%.0f/s)", totalMsgs, workDur, float64(totalMsgs)/workDur.Seconds())
+
+	// The counter moves inside the handler, before the commit; give the last commits a moment.
+	time.Sleep(time.Second)
+	cancel()
+	workerWg.Wait()
+
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims"); n != 0 {
+		t.Errorf("expected 0 claims left, got %d", n)
+	}
+}
+
+// One long job does not hold up the jobs beside it: the worker keeps BatchSize
+// jobs running and claims a new one whenever a slot frees. The two kinds share
+// one queue, so they also share its slots — one claim loop, two handlers.
+func TestLongJobDoesNotHoldUpTheQueue(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	mixed := catbird.NewQueue("mixed", catbird.QueueOptions{BatchSize: 4, PollInterval: 100 * time.Millisecond})
+	long := catbird.NewJobType("long", mixed, catbird.JobTypeOptions{})
+	short := catbird.NewJobType("short", mixed, catbird.JobTypeOptions{})
+
+	// The long job is enqueued first, so the worker claims it first.
+	if _, err := catbird.Enqueue(ctx, pool, long, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	const shortJobs = 20
+	batch := make([]catbird.BatchMessage, shortJobs)
+	for i := range batch {
+		batch[i] = catbird.BatchMessage{Topic: "short", Payload: i}
+	}
+	if _, err := catbird.EnqueueBatch(ctx, pool, short, batch, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	done := make(chan string, 32)
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(long, func(ctx context.Context, job *catbird.Job) error {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		done <- job.Type
+		return nil
+	})
+	rt.HandleFunc(short, func(ctx context.Context, job *catbird.Job) error {
+		done <- job.Type
+		return nil
+	})
+
+	workers, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(workers)
+
+	// Every short job finishes while the long one is still running.
+	for range shortJobs {
+		select {
+		case name := <-done:
+			if name != "short" {
+				t.Fatalf("finished %q before the long job was released", name)
+			}
+		case <-ctx.Done():
+			t.Fatalf("the short jobs waited for the long job: %d of %d done",
+				len(done), shortJobs)
+		}
+	}
+	// A job reports itself inside its handler, before its transaction commits,
+	// so wait for the claims to go: only the long job's may remain.
+	for count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'mixed'") > 1 {
+		if ctx.Err() != nil {
+			t.Fatal("short jobs finished but their claims stayed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	close(release)
+	select {
+	case name := <-done:
+		if name != "long" {
+			t.Fatalf("finished %q, want the long job", name)
+		}
+	case <-ctx.Done():
+		t.Fatal("the long job did not finish after release")
+	}
+}
+
+func TestExactlyOnceDeduplication(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	queue := catbird.NewQueue("deduplication_queue", catbird.QueueOptions{})
+	task := catbird.NewJobType("task", queue, catbird.JobTypeOptions{})
+	opts := catbird.EnqueueOptions{DeduplicationKey: "deterministic-hash-12345"}
+
+	id, err := catbird.Enqueue(ctx, pool, task, nil, opts)
+	if err != nil || id == 0 {
+		t.Fatalf("first enqueue: id=%d err=%v", id, err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			id, err := catbird.Enqueue(ctx, pool, task, nil, opts)
+			if err != nil {
+				t.Errorf("duplicate enqueue: %v", err)
+			}
+			if id != 0 {
+				t.Errorf("duplicate enqueue returned id %d, want 0", id)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'deduplication_queue'"); n != 1 {
+		t.Fatalf("expected 1 claim, got %d", n)
+	}
+}
+
+// A handler's follow-on work is written by the statement that ends it: the jobs
+// it asked for with Enqueue run next, the one it asked for with EnqueueAfter
+// runs when those finished, and all of them join the workflow of the job that
+// asked. Nothing outside catbird counts anything.
+func TestHandlerFansOutAndJoins(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("flow", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	root := catbird.NewJobType("root", queue, catbird.JobTypeOptions{})
+	branch := catbird.NewJobType("branch", queue, catbird.JobTypeOptions{})
+	join := catbird.NewJobType("join", queue, catbird.JobTypeOptions{})
+
+	joined := make(chan *catbird.Job, 4)
+	branchesDone := make(chan int, 8)
+
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(root, func(ctx context.Context, job *catbird.Job) error {
+		job.Enqueue(branch, 1)
+		job.Enqueue(branch, 2)
+		job.Enqueue(branch, 3)
+		job.EnqueueAfter(join, "after all three")
+		return nil
+	})
+	rt.HandleFunc(branch, func(ctx context.Context, job *catbird.Job) error {
+		var n int
+		if err := json.Unmarshal(job.Payload, &n); err != nil {
+			return err
+		}
+		branchesDone <- n
+		return job.SetOutput(n * 10)
+	})
+	rt.HandleFunc(join, func(ctx context.Context, job *catbird.Job) error {
+		joined <- job
+		return nil
+	})
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	groupID, err := catbird.Enqueue(ctx, pool, root, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for range 3 {
+		select {
+		case <-branchesDone:
+		case <-ctx.Done():
+			t.Fatal("the branches did not all run")
+		}
+	}
+
+	var joinJob *catbird.Job
+	select {
+	case joinJob = <-joined:
+	case <-ctx.Done():
+		t.Fatal("the joining job never ran")
+	}
+	if len(branchesDone) != 0 {
+		t.Error("the joining job ran before every branch finished")
+	}
+	if joinJob.GroupID != groupID {
+		t.Errorf("the joining job is in group %d, want the workflow's %d", joinJob.GroupID, groupID)
+	}
+
+	// The branches' results are addressed by what produced them: the workflow
+	// and the job type. Their ids did not exist when the handler asked for them.
+	gs, err := catbird.GroupStatus(ctx, pool, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []int
+	for _, o := range gs.Outputs.GetAll(branch) {
+		var n int
+		if err := o.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, n)
+	}
+	if len(got) != 3 || got[0] != 10 || got[1] != 20 || got[2] != 30 {
+		t.Fatalf("branch outputs %v, want [10 20 30] in the order they were asked for", got)
+	}
+	// One type with three results is not a single-result read.
+	var one int
+	if err := gs.Outputs.Get(branch, &one); !errors.Is(err, catbird.ErrAmbiguous) {
+		t.Errorf("single-result read of a fan-out: %v, want ErrAmbiguous", err)
+	}
+
+	waitFor(t, 5*time.Second, "the workflow left claims behind", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims") == 0
 	})
 }
 
-// requireSlowTests skips tests unless CB_SLOW_TESTS is enabled.
-// Set CB_SLOW_TESTS=1 (or true/yes) to run long-running stress/concurrency tests.
-func requireSlowTests(t *testing.T) {
-	t.Helper()
+// A joining job reads the outputs of the jobs it waited for, by the ids the
+// completion that created it wrote on its claim: in the order they were
+// enqueued, without the jobs that recorded nothing, and the same on every
+// attempt. The read by job type is the wider one — it takes every job of that
+// type in the workflow, a round this job never waited for included.
+func TestDependencyOutputs(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
 
-	v := strings.TrimSpace(strings.ToLower(os.Getenv("CB_SLOW_TESTS")))
-	if v == "1" || v == "true" || v == "yes" {
-		return
+	queue := catbird.NewQueue("dependencies", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	root := catbird.NewJobType("dep_root", queue, catbird.JobTypeOptions{})
+	branch := catbird.NewJobType("dep_branch", queue, catbird.JobTypeOptions{})
+	join := catbird.NewJobType("dep_join", queue, catbird.JobTypeOptions{MinBackoff: 50 * time.Millisecond})
+	rejoin := catbird.NewJobType("dep_rejoin", queue, catbird.JobTypeOptions{})
+
+	rootRound := make(chan catbird.Outputs, 1)
+	firstAttempt := make(chan catbird.Outputs, 1)
+	retriedAttempt := make(chan catbird.Outputs, 1)
+	secondRound := make(chan catbird.Outputs, 1)
+
+	read := func(job *catbird.Job, to chan<- catbird.Outputs) error {
+		outputs, err := job.DependencyOutputs(ctx, pool)
+		if err != nil {
+			return err
+		}
+		to <- outputs
+		return nil
 	}
 
-	t.Skip("slow test skipped; set CB_SLOW_TESTS=1 to include")
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(root, func(ctx context.Context, job *catbird.Job) error {
+		if err := read(job, rootRound); err != nil {
+			return err
+		}
+		job.Enqueue(branch, 3)
+		job.Enqueue(branch, 1)
+		job.Enqueue(branch, 2) // this one records no result
+		job.EnqueueAfter(join, nil)
+		return nil
+	})
+	rt.HandleFunc(branch, func(ctx context.Context, job *catbird.Job) error {
+		var n int
+		if err := json.Unmarshal(job.Payload, &n); err != nil {
+			return err
+		}
+		if n == 2 {
+			return nil
+		}
+		return job.SetOutput(n * 10)
+	})
+	rt.HandleFunc(join, func(ctx context.Context, job *catbird.Job) error {
+		if job.Attempts == 1 {
+			if err := read(job, firstAttempt); err != nil {
+				return err
+			}
+			return errors.New("the first attempt fails after reading its dependencies")
+		}
+		if err := read(job, retriedAttempt); err != nil {
+			return err
+		}
+		// A second round of a type the first round already ran.
+		job.Enqueue(branch, 4)
+		job.EnqueueAfter(rejoin, nil)
+		return nil
+	})
+	rt.HandleFunc(rejoin, func(ctx context.Context, job *catbird.Job) error {
+		return read(job, secondRound)
+	})
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	groupID, err := catbird.Enqueue(ctx, pool, root, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	show := func(outputs catbird.Outputs) string {
+		parts := make([]string, len(outputs))
+		for i, o := range outputs {
+			parts[i] = string(o.Value)
+		}
+		return strings.Join(parts, " ")
+	}
+	take := func(from <-chan catbird.Outputs, what string) string {
+		t.Helper()
+		select {
+		case outputs := <-from:
+			return show(outputs)
+		case <-ctx.Done():
+			t.Fatalf("%s never ran", what)
+			return ""
+		}
+	}
+
+	if got := take(rootRound, "the job that started the workflow"); got != "" {
+		t.Errorf("a job that waited for nothing read %q, want no results", got)
+	}
+	// One element per branch that recorded a result, in the order they were
+	// enqueued — which is neither the order of their ids nor of their results.
+	// The branch that recorded nothing has no element.
+	if got := take(firstAttempt, "the joining job"); got != "30 10" {
+		t.Errorf("the joining job read %q, want \"30 10\"", got)
+	}
+	// The retry reads the same: the ids are on the claim, and claiming a job
+	// again rewrites the row without touching them.
+	if got := take(retriedAttempt, "the joining job's retry"); got != "30 10" {
+		t.Errorf("the retried attempt read %q, want \"30 10\": what the first attempt read", got)
+	}
+	// The second round waited for one job and reads that one, not the three the
+	// first round produced.
+	if got := take(secondRound, "the second joining job"); got != "40" {
+		t.Errorf("the second joining job read %q, want \"40\"", got)
+	}
+
+	waitFor(t, 5*time.Second, "the workflow left claims behind", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims") == 0
+	})
+
+	// What the read by job type takes: every branch of the workflow, both rounds.
+	gs, err := catbird.GroupStatus(ctx, pool, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := show(gs.Outputs.GetAll(branch)); got != "30 10 40" {
+		t.Errorf("the read by job type took %q, want \"30 10 40\": every round of it", got)
+	}
 }
 
-// Hardcoded test database connection
-// See docker-compose.yml and scripts/test.sh for setup
-const testDSN = "postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable"
+// A handler that fails records nothing: its retry starts with an empty buffer,
+// so the jobs it asked for are created once, by the attempt that completed.
+func TestAFailedAttemptAsksForNothing(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
 
-// verifyMigrationsApplied checks if key functions exist after migration
-func verifyMigrationsApplied(ctx context.Context, db *sql.DB) error {
-	// Check for functions that should exist at different schema versions
-	requiredFunctions := map[int][]string{
-		2:  {"cb_create_queue", "cb_send", "cb_read"},
-		10: {"cb_create_task", "cb_run_task", "cb_create_flow", "cb_gc", "_cb_parse_condition", "_cb_evaluate_condition"},
-		12: {"cb_next_cron_tick"},
-		13: {"cb_create_task_schedule", "cb_create_flow_schedule", "cb_advance_task_schedule", "cb_advance_flow_schedule", "cb_execute_due_task_schedules", "cb_execute_due_flow_schedules"},
-		16: {"cb_notify"},
-		3:  {"cb_notify_durable", "cb_mark_seen_until", "cb_mark_seen"},
+	queue := catbird.NewQueue("buffer", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	next := catbird.NewJobType("next", queue, catbird.JobTypeOptions{})
+	flaky := catbird.NewJobType("flaky", queue, catbird.JobTypeOptions{MinBackoff: 50 * time.Millisecond})
+
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(flaky, func(ctx context.Context, job *catbird.Job) error {
+		job.Enqueue(next, job.Attempts)
+		if job.Attempts == 1 {
+			return errors.New("the first attempt fails after asking for more work")
+		}
+		return nil
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	if _, err := catbird.Enqueue(ctx, pool, flaky, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "the flaky job never completed", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE job_type = 'flaky'") == 0
+	})
+	time.Sleep(200 * time.Millisecond)
+
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE job_type = 'next'"); n != 1 {
+		t.Fatalf("%d jobs asked for, want 1: the failed attempt's buffer was written", n)
+	}
+	var attempt int
+	if err := pool.QueryRow(ctx, `
+		SELECT (payload #>> '{}')::int FROM cb_messages m
+		JOIN cb_claims c ON c.message_id = m.id WHERE c.job_type = 'next'
+	`).Scan(&attempt); err != nil {
+		t.Fatal(err)
+	}
+	if attempt != 2 {
+		t.Errorf("the job was asked for by attempt %d, want the one that completed, 2", attempt)
+	}
+}
+
+// A job type declared with Signal waits for a payload. It is not claimable
+// until one arrives, its handler is always given one, and a second delivery
+// finds nothing waiting.
+func TestSignalGatesAJob(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("gates", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	gate := catbird.NewJobType("gate", queue, catbird.JobTypeOptions{Signal: true})
+	plain := catbird.NewJobType("plain", queue, catbird.JobTypeOptions{})
+
+	id, err := catbird.Enqueue(ctx, pool, gate, "waiting for a person", catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE awaits_signal AND visible_at = 'infinity'"); n != 1 {
+		t.Fatal("the gated job is claimable before its signal arrived")
 	}
 
-	for version, functions := range requiredFunctions {
-		if version > SchemaVersion {
+	ran := make(chan *catbird.Job, 2)
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(gate, func(ctx context.Context, job *catbird.Job) error {
+		ran <- job
+		return nil
+	})
+	rt.HandleFunc(plain, func(ctx context.Context, job *catbird.Job) error { return nil })
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	time.Sleep(200 * time.Millisecond)
+	if len(ran) != 0 {
+		t.Fatal("the gated job ran with no signal")
+	}
+
+	// A type that waits for nothing has no gate to open.
+	plainID, err := catbird.Enqueue(ctx, pool, plain, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catbird.Signal(ctx, pool, plainID, plain, nil); !errors.Is(err, catbird.ErrNotFound) {
+		t.Errorf("signal to a type that waits for none: %v, want ErrNotFound", err)
+	}
+
+	if err := catbird.Signal(ctx, pool, id, gate, map[string]bool{"ok": true}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case job := <-ran:
+		var decision struct {
+			OK bool `json:"ok"`
+		}
+		if err := json.Unmarshal(job.Signal, &decision); err != nil || !decision.OK {
+			t.Fatalf("signal payload %s (%v)", job.Signal, err)
+		}
+	case <-ctx.Done():
+		t.Fatal("the gated job did not run after its signal")
+	}
+
+	if err := catbird.Signal(ctx, pool, id, gate, nil); !errors.Is(err, catbird.ErrNotFound) {
+		t.Errorf("second signal: %v, want ErrNotFound", err)
+	}
+}
+
+// A gate a handler asked for is addressed by the workflow and the job type,
+// because its id does not exist until that handler's completion runs.
+func TestSignalAddressesAGateInsideAWorkflow(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("wf_gates", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	start := catbird.NewJobType("start", queue, catbird.JobTypeOptions{})
+	approve := catbird.NewJobType("approve", queue, catbird.JobTypeOptions{Signal: true})
+
+	ran := make(chan *catbird.Job, 2)
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(start, func(ctx context.Context, job *catbird.Job) error {
+		job.EnqueueAfter(approve, "decide on me")
+		return nil
+	})
+	rt.HandleFunc(approve, func(ctx context.Context, job *catbird.Job) error {
+		ran <- job
+		return nil
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	groupID, err := catbird.Enqueue(ctx, pool, start, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "the gate was never created", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE job_type = 'approve' AND group_id = $1", groupID) == 1
+	})
+
+	if err := catbird.Signal(ctx, pool, groupID, approve, "yes"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case job := <-ran:
+		var answer string
+		if err := json.Unmarshal(job.Signal, &answer); err != nil || answer != "yes" {
+			t.Fatalf("signal payload %s (%v)", job.Signal, err)
+		}
+	case <-ctx.Done():
+		t.Fatal("the gate did not open")
+	}
+}
+
+// A process claims only the job types registered on it. A job of a type it does
+// not know is left where it is, for a process that does.
+func TestAProcessClaimsOnlyWhatItHandles(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("shared", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	known := catbird.NewJobType("known", queue, catbird.JobTypeOptions{})
+	unknown := catbird.NewJobType("unknown", queue, catbird.JobTypeOptions{})
+
+	unknownID, err := catbird.Enqueue(ctx, pool, unknown, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catbird.Enqueue(ctx, pool, known, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	ran := make(chan string, 4)
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(known, func(ctx context.Context, job *catbird.Job) error { // and not unknown
+		ran <- job.Type
+		return nil
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	select {
+	case <-ran:
+	case <-ctx.Done():
+		t.Fatal("the registered type never ran")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE message_id = $1 AND attempts = 0", unknownID); n != 1 {
+		t.Error("a process claimed a job type it has no handler for")
+	}
+}
+
+// A handler that outlives its claim loses its work; the attempt that holds the
+// claim commits.
+func TestOnlyTheClaimHolderCommits(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := pool.Exec(ctx, "CREATE TABLE IF NOT EXISTS claim_test (attempt INT)"); err != nil {
+		t.Fatal(err)
+	}
+	pool.Exec(ctx, "TRUNCATE claim_test")
+
+	queue := catbird.NewQueue("claim_queue", catbird.QueueOptions{
+		ClaimDuration: 200 * time.Millisecond, PollInterval: 50 * time.Millisecond,
+	})
+	slow := catbird.NewJobType("slow", queue, catbird.JobTypeOptions{})
+
+	if _, err := catbird.Enqueue(ctx, pool, slow, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int32
+	handle := func(ctx context.Context, job *catbird.Job) error {
+		atomic.AddInt32(&calls, 1)
+		if job.Attempts == 1 {
+			time.Sleep(800 * time.Millisecond) // past the claim
+		}
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx, "INSERT INTO claim_test (attempt) VALUES ($1)", job.Attempts); err != nil {
+			return err
+		}
+		if err := catbird.Complete(ctx, tx, job); err != nil {
+			return err // the late attempt gets ErrClaimLost and its insert is rolled back
+		}
+		return tx.Commit(ctx)
+	}
+
+	// Two processes on the same queue, which is what puts the second attempt in
+	// another worker's hands while the first is still running.
+	for range 2 {
+		rt := catbird.New(pool, catbird.Options{})
+		rt.HandleFunc(slow, handle)
+		go rt.Start(ctx)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for count(t, pool, "SELECT count(*) FROM cb_claims") != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("claim was not completed")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(time.Second) // let the late first attempt finish and be discarded
+
+	if n := atomic.LoadInt32(&calls); n != 2 {
+		t.Errorf("expected 2 handler calls, got %d", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM claim_test"); n != 1 {
+		t.Errorf("expected exactly one committed attempt, got %d", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM claim_test WHERE attempt = 2"); n != 1 {
+		t.Errorf("expected attempt 2 to be the one committed")
+	}
+}
+
+func TestTriggerBridgesPayloadUnchanged(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := catbird.Publish(ctx, pool, "image.uploaded", map[string]string{"url": "https://example.com/a.png"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catbird.Publish(ctx, pool, "image_x", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	queue := catbird.NewQueue("image_processing", catbird.QueueOptions{PollInterval: 50 * time.Millisecond})
+	process := catbird.NewJobType("process", queue, catbird.JobTypeOptions{})
+
+	got := make(chan catbird.Job, 16)
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	rt.Trigger("img", []string{"image.#"}, process, catbird.TriggerOptions{PollInterval: 50 * time.Millisecond})
+	rt.HandleFunc(process, func(ctx context.Context, job *catbird.Job) error {
+		got <- *job
+		return nil
+	})
+	go rt.Start(ctx)
+
+	select {
+	case m := <-got:
+		var p struct {
+			URL string `json:"url"`
+		}
+		if err := json.Unmarshal(m.Payload, &p); err != nil || p.URL != "https://example.com/a.png" {
+			t.Fatalf("payload arrived as %s (%v)", m.Payload, err)
+		}
+		// The stream message's topic rides along as data; the job type is what
+		// chose the handler.
+		if m.Topic != "image.uploaded" {
+			t.Fatalf("topic %q", m.Topic)
+		}
+		if m.Type != "process" {
+			t.Fatalf("job type %q", m.Type)
+		}
+	case <-ctx.Done():
+		t.Fatal("trigger did not bridge the message")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims"); n != 0 {
+		t.Errorf("expected only the matching message bridged and completed, %d claims left", n)
+	}
+	if n := count(t, pool, "SELECT last_position FROM cb_cursors WHERE name = 'trigger:img'"); n != 1 {
+		t.Errorf("cursor at %d, want 1", n)
+	}
+}
+
+func TestGCKeepsLiveClaims(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	queue := catbird.NewQueue("gc_queue", catbird.QueueOptions{})
+	later := catbird.NewJobType("later", queue, catbird.JobTypeOptions{})
+	doomed := catbird.NewJobType("doomed", queue, catbird.JobTypeOptions{})
+
+	if _, err := catbird.Enqueue(ctx, pool, later, nil, catbird.EnqueueOptions{Delay: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	doomedID, err := catbird.Enqueue(ctx, pool, doomed, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catbird.Publish(ctx, pool, "event", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := catbird.Cancel(ctx, pool, doomedID); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE died_at IS NULL AND dependencies = 0 AND visible_at <= now()"); n != 0 {
+		t.Fatalf("canceled job still claimable")
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	if err := catbird.GC(ctx, pool, 10*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims"); n != 1 {
+		t.Errorf("expected the delayed claim to survive GC, got %d claims", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_messages"); n != 1 {
+		t.Errorf("expected only the delayed job's message to survive, got %d", n)
+	}
+}
+
+// A gated job waits on visible_at = 'infinity'. Cancel resets it to when the
+// job died; without that GC's age test never passes and the claim and its
+// message are immortal.
+func TestGCCollectsACanceledGatedJob(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	queue := catbird.NewQueue("gc_gated_queue", catbird.QueueOptions{})
+	gated := catbird.NewJobType("gc_gated", queue, catbird.JobTypeOptions{Signal: true})
+
+	id, err := catbird.Enqueue(ctx, pool, gated, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catbird.Cancel(ctx, pool, id); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	if err := catbird.GC(ctx, pool, 10*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims"); n != 0 {
+		t.Errorf("expected the canceled gated claim to be collected, got %d claims", n)
+	}
+	if _, err := catbird.Status(ctx, pool, id); !errors.Is(err, catbird.ErrNotFound) {
+		t.Errorf("expected ErrNotFound after GC, got %v", err)
+	}
+}
+
+// A message published in a transaction that commits late is read after the
+// messages that committed before it — never skipped.
+func TestStreamLateCommitIsNotSkipped(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	go rt.Start(ctx)
+	cursor := catbird.Cursor{Name: "late", Patterns: []string{"ev"}}
+
+	// Message 1 is inserted first but its transaction stays open.
+	slow, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catbird.Publish(ctx, slow, "ev", "first inserted, last committed", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Messages 2 and 3 commit right away.
+	for _, p := range []string{"second", "third"} {
+		if _, err := catbird.Publish(ctx, pool, "ev", p, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	read := func(want []string) {
+		t.Helper()
+		var got []string
+		deadline := time.Now().Add(2 * time.Second)
+		for len(got) < len(want) && time.Now().Before(deadline) {
+			msgs, err := cursor.Read(ctx, pool, 50)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, m := range msgs {
+				var s string
+				json.Unmarshal(m.Payload, &s)
+				got = append(got, s)
+				if err := cursor.Ack(ctx, pool, m.Position); err != nil {
+					t.Fatal(err)
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("read %v, want %v", got, want)
+		}
+	}
+
+	read([]string{"second", "third"}) // the open transaction's message is not there yet
+	if err := slow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	read([]string{"first inserted, last committed"}) // and it shows up once it commits
+}
+
+func TestOutputAndStreamNotify(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("out_queue", catbird.QueueOptions{PollInterval: 50 * time.Millisecond})
+	sum := catbird.NewJobType("sum", queue, catbird.JobTypeOptions{})
+
+	id, err := catbird.Enqueue(ctx, pool, sum, []int{1, 2, 3}, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result int
+	gs, err := catbird.GroupStatus(ctx, pool, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gs.Outputs.Get(sum, &result); !errors.Is(err, catbird.ErrNotFound) {
+		t.Fatalf("output before completion: %v", err)
+	}
+
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	rt.HandleFunc(sum, func(ctx context.Context, job *catbird.Job) error {
+		var in []int
+		json.Unmarshal(job.Payload, &in)
+		total := 0
+		for _, n := range in {
+			total += n
+		}
+		return job.SetOutput(total) // the worker writes it with the completion
+	})
+	go rt.Start(ctx)
+
+	for {
+		gs, err := catbird.GroupStatus(ctx, pool, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := gs.Outputs.Get(sum, &result); err == nil {
+			if result != 6 {
+				t.Fatalf("output %d, want 6", result)
+			}
 			break
 		}
+		if ctx.Err() != nil {
+			t.Fatal("no output")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
-		for _, fname := range functions {
-			var exists bool
-			err := db.QueryRowContext(ctx,
-				"SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = $1)",
-				fname).Scan(&exists)
-			if err != nil {
-				return fmt.Errorf("error checking function %s: %w", fname, err)
+	// The assigner announces new positions on channel cb_stream.
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, "LISTEN cb_stream"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catbird.Publish(ctx, pool, "ev", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	n, err := conn.Conn().WaitForNotification(ctx)
+	if err != nil {
+		t.Fatalf("no notification: %v", err)
+	}
+	if n.Payload != "1" {
+		t.Fatalf("notified position %q, want 1", n.Payload)
+	}
+}
+
+// A result is written by the completion and by nothing else. An attempt that
+// records one and then fails leaves nothing behind, so a reader never sees the
+// result of work that did not finish, and the attempt that completes the job is
+// the one whose result is readable.
+func TestFailedAttemptWritesNoOutput(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const backoff = time.Second
+	queue := catbird.NewQueue("output_retries", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	flaky := catbird.NewJobType("flaky", queue, catbird.JobTypeOptions{MinBackoff: backoff})
+
+	id, err := catbird.Enqueue(ctx, pool, flaky, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(flaky, func(ctx context.Context, job *catbird.Job) error {
+		if err := job.SetOutput(job.Attempts); err != nil {
+			return err
+		}
+		if job.Attempts == 1 {
+			return errors.New("the first attempt fails after recording its result")
+		}
+		return nil
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	// The retry row is the first moment the failed attempt is over: it is
+	// written after the handler returned, and the wait holds it there.
+	waitFor(t, 5*time.Second, "the failed attempt scheduled no retry", func() bool {
+		return count(t, pool, `
+			SELECT count(*) FROM cb_claims
+			WHERE queue = 'output_retries' AND died_at IS NULL AND attempts = 1
+			  AND visible_at > now()
+		`) == 1
+	})
+	gs, err := catbird.GroupStatus(ctx, pool, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw json.RawMessage
+	if err := gs.Outputs.Get(flaky, &raw); !errors.Is(err, catbird.ErrNotFound) {
+		t.Fatalf("the failed attempt left a result behind: %v", err)
+	}
+
+	waitFor(t, 5*time.Second, "the job was never completed", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'output_retries'") == 0
+	})
+	gs, err = catbird.GroupStatus(ctx, pool, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var attempt int
+	if err := gs.Outputs.Get(flaky, &attempt); err != nil {
+		t.Fatal(err)
+	}
+	if attempt != 2 {
+		t.Fatalf("output %d, want 2: the result of the attempt that completed the job", attempt)
+	}
+}
+
+// PublishBatch writes one row per message in a single statement, skips the keys
+// that are already taken, and the batch is read in position order like any
+// other published message.
+func TestPublishBatchSkipsTakenKeys(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := catbird.Publish(ctx, pool, "record.work.1", "first", "taken"); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := catbird.PublishBatch(ctx, pool, []catbird.BatchMessage{
+		{Topic: "record.work.2", Payload: "second"},
+		{Topic: "record.work.3", Payload: "skipped", DeduplicationKey: "taken"}, // published above
+		{Topic: "record.work.4", Payload: "third", DeduplicationKey: "once"},
+		{Topic: "record.work.5", Payload: "skipped", DeduplicationKey: "once"}, // repeats a key from this batch
+		{Topic: "other", Payload: "not on this topic"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("wrote %d messages, want 3", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_messages"); n != 4 {
+		t.Errorf("%d messages in the table, want 4 with the one published before the batch", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims"); n != 0 {
+		t.Errorf("published messages got %d claims, want none", n)
+	}
+
+	// An empty batch is a no-op.
+	if n, err := catbird.PublishBatch(ctx, pool, nil); err != nil || n != 0 {
+		t.Fatalf("empty batch wrote %d (%v)", n, err)
+	}
+
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	go rt.Start(ctx)
+	cursor := catbird.Cursor{Name: "batch", Patterns: []string{"record.work.#"}}
+
+	var got []string
+	deadline := time.Now().Add(2 * time.Second)
+	for len(got) < 3 && time.Now().Before(deadline) {
+		msgs, err := cursor.Read(ctx, pool, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range msgs {
+			var s string
+			json.Unmarshal(m.Payload, &s)
+			got = append(got, s)
+			if err := cursor.Ack(ctx, pool, m.Position); err != nil {
+				t.Fatal(err)
 			}
-			if !exists {
-				return fmt.Errorf("migration failed: function %s does not exist (schema v%d)", fname, version)
-			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if want := "first,second,third"; strings.Join(got, ",") != want {
+		t.Fatalf("read %v, want %v", got, want)
+	}
+}
+
+// One tick of the assigner assigns a whole backlog, not one statement's worth.
+// A batch larger than the statement's limit used to wait a tick per 5000
+// messages, so the last of these would only be readable four ticks after its
+// commit.
+func TestAssignerDrainsABacklogInOneTick(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const messages = 12000 // more than two statements' worth
+	batch := make([]catbird.BatchMessage, messages)
+	for i := range batch {
+		batch[i] = catbird.BatchMessage{Topic: "backlog", Payload: i}
+	}
+	if n, err := catbird.PublishBatch(ctx, pool, batch); err != nil || n != messages {
+		t.Fatalf("published %d messages (%v), want %d", n, err, messages)
+	}
+
+	// The tick is long enough that a second one cannot rescue an assigner that
+	// stops after its first statement: the first fires at 2s, the deadline is
+	// half a second before the second.
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 2 * time.Second})
+	go rt.Start(ctx)
+
+	assigned := 0
+	deadline := time.Now().Add(3500 * time.Millisecond)
+	for time.Now().Before(deadline) && assigned < messages {
+		assigned = count(t, pool, "SELECT count(*) FROM cb_messages WHERE position IS NOT NULL")
+		time.Sleep(50 * time.Millisecond)
+	}
+	if assigned != messages {
+		t.Fatalf("%d messages have a position after one tick, want %d", assigned, messages)
+	}
+}
+
+// EnqueueBatch creates one job per message that survives deduplication, and
+// wakes the queue once for the whole batch — never once per job, and not at all
+// while the jobs cannot be claimed yet.
+func TestEnqueueBatchWakesTheQueueOnce(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("images", catbird.QueueOptions{})
+	resize := catbird.NewJobType("resize", queue, catbird.JobTypeOptions{})
+
+	// This job's key is taken before the listener starts, so its notification
+	// is not delivered here.
+	if _, err := catbird.Enqueue(ctx, pool, resize, nil, catbird.EnqueueOptions{DeduplicationKey: "taken"}); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, "LISTEN cb_queue_images"); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := catbird.EnqueueBatch(ctx, pool, resize, []catbird.BatchMessage{
+		{Topic: "resize", Payload: 1, DeduplicationKey: "taken"}, // enqueued above
+		{Topic: "resize", Payload: 2, DeduplicationKey: "once"},
+		{Topic: "resize", Payload: 3, DeduplicationKey: "once"}, // repeats a key from this batch
+		{Topic: "resize", Payload: 4},
+	}, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("created %d jobs, want 2", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'images'"); n != 3 {
+		t.Errorf("%d claims, want 3 with the job enqueued before the batch", n)
+	}
+
+	// A delayed batch can be claimed by nobody yet, so it sends nothing.
+	if n, err := catbird.EnqueueBatch(ctx, pool, resize, []catbird.BatchMessage{
+		{Topic: "resize", Payload: 5},
+		{Topic: "resize", Payload: 6},
+	}, catbird.EnqueueOptions{Delay: time.Hour}); err != nil || n != 2 {
+		t.Fatalf("delayed batch created %d jobs (%v)", n, err)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE visible_at > now() + interval '30 minutes'"); n != 2 {
+		t.Errorf("%d delayed claims, want 2", n)
+	}
+
+	// The ready batch wakes the queue; the delayed batch, in its own
+	// transaction, must not.
+	first, stop := context.WithTimeout(ctx, time.Second)
+	defer stop()
+	if _, err := conn.Conn().WaitForNotification(first); err != nil {
+		t.Fatalf("the batch did not wake the queue: %v", err)
+	}
+	second, stop := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer stop()
+	if _, err := conn.Conn().WaitForNotification(second); err == nil {
+		t.Error("the delayed batch woke the queue")
+	}
+}
+
+// A trigger enqueues its whole batch in one statement, and a redone batch still
+// produces one job per message.
+func TestTriggerBatchIsEnqueuedOnce(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	msgs := make([]catbird.BatchMessage, 20)
+	for i := range msgs {
+		msgs[i] = catbird.BatchMessage{Topic: "record.work", Payload: i}
+	}
+	if n, err := catbird.PublishBatch(ctx, pool, msgs); err != nil || n != 20 {
+		t.Fatalf("published %d messages (%v)", n, err)
+	}
+
+	queue := catbird.NewQueue("index_queue", catbird.QueueOptions{})
+	index := catbird.NewJobType("index", queue, catbird.JobTypeOptions{})
+
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	rt.Trigger("indexer", []string{"record.#"}, index, catbird.TriggerOptions{PollInterval: 50 * time.Millisecond})
+	go rt.Start(ctx)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'index_queue'") < 20 {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d jobs arrived", count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'index_queue'"))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond) // let the trigger run again on its cursor
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'index_queue'"); n != 20 {
+		t.Errorf("%d jobs for 20 messages", n)
+	}
+}
+
+// CreatedAt is the message row's insert time, filled in both on a stream read
+// and on a claimed job. The window is read from the database, so the test does
+// not depend on the test process and the server agreeing on the clock.
+func TestCreatedAtIsSetOnStreamAndJobMessages(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	dbNow := func() time.Time {
+		t.Helper()
+		var now time.Time
+		if err := pool.QueryRow(ctx, "SELECT now()").Scan(&now); err != nil {
+			t.Fatal(err)
+		}
+		return now
+	}
+	start := dbNow()
+
+	queue := catbird.NewQueue("age_queue", catbird.QueueOptions{PollInterval: 50 * time.Millisecond})
+	age := catbird.NewJobType("age", queue, catbird.JobTypeOptions{})
+
+	if _, err := catbird.Publish(ctx, pool, "age", "published", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catbird.Enqueue(ctx, pool, age, "enqueued", catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	jobCreatedAt := make(chan time.Time, 1)
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	rt.HandleFunc(age, func(ctx context.Context, job *catbird.Job) error {
+		jobCreatedAt <- job.CreatedAt
+		return nil
+	})
+	cursor := catbird.Cursor{Name: "age", Patterns: []string{"age"}}
+	go rt.Start(ctx)
+
+	var streamCreatedAt time.Time
+	for streamCreatedAt.IsZero() {
+		msgs, err := cursor.Read(ctx, pool, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(msgs) > 0 {
+			streamCreatedAt = msgs[0].CreatedAt
+		} else if ctx.Err() != nil {
+			t.Fatal("message never got a position")
+		} else {
+			time.Sleep(20 * time.Millisecond)
 		}
 	}
 
-	return nil
+	var jobCreated time.Time
+	select {
+	case <-ctx.Done():
+		t.Fatal("job never ran")
+	case jobCreated = <-jobCreatedAt:
+	}
+	end := dbNow()
+
+	for name, got := range map[string]time.Time{"stream": streamCreatedAt, "job": jobCreated} {
+		if got.Before(start) || got.After(end) {
+			t.Fatalf("%s message CreatedAt %v, want between %v and %v", name, got, start, end)
+		}
+	}
 }
 
-func getTestClient(tb testing.TB) *Client {
-	tb.Helper()
+// Shutdown does not spend an attempt. A job stopped in the middle of its
+// handler is handed back: the attempt is returned and the job is claimable
+// again at once, so a rolling deploy costs neither retries nor claim time.
+func TestShutdownReturnsTheJob(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	testOnce.Do(func() {
-		ctx := context.Background()
-		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	queue := catbird.NewQueue("deploys", catbird.QueueOptions{BatchSize: 1, PollInterval: 100 * time.Millisecond})
+	slow := catbird.NewJobType("slow", queue, catbird.JobTypeOptions{})
 
-		logger.Info("test harness", "dsn", testDSN)
+	if _, err := catbird.Enqueue(ctx, pool, slow, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
 
-		// Open SQL DB for migrations
-		db, err := sql.Open("pgx", testDSN)
-		if err != nil {
-			tb.Fatalf("error opening database: %v", err)
-		}
-		defer db.Close()
-
-		// Verify connection
-		if err := db.Ping(); err != nil {
-			tb.Fatalf("error connecting to database: %v\nMake sure Docker is running: docker compose up -d", err)
-		}
-		logger.Info("connected to test database")
-
-		// Migrate down to clean state (skip if no tables exist)
-		logger.Info("starting migration", "step", "down")
-		if err := MigrateDownTo(ctx, db, 0); err != nil {
-			// Ignore errors on first run when no tables exist
-			logger.Warn("migration down encountered error (may be normal on first run)", "error", err)
-		}
-		logger.Info("migration complete", "step", "down")
-
-		// Migrate up to current schema
-		logger.Info("starting migration", "step", "up", "target_version", SchemaVersion)
-		if err := MigrateUpTo(ctx, db, SchemaVersion); err != nil {
-			tb.Fatalf("migration up failed: %v", err)
-		}
-		logger.Info("migration complete", "step", "up", "version", SchemaVersion)
-
-		// Verify migrations were applied
-		if err := verifyMigrationsApplied(ctx, db); err != nil {
-			tb.Fatalf("migration verification failed: %v", err)
-		}
-		logger.Info("migration verification passed")
-
-		// Create connection pool
-		pool, err := pgxpool.New(ctx, testDSN)
-		if err != nil {
-			tb.Fatalf("error creating connection pool: %v", err)
-		}
-		testPool = pool
-		testClient = New(pool)
-		logger.Info("test client initialized")
+	started := make(chan struct{})
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(slow, func(ctx context.Context, job *catbird.Job) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
 	})
 
-	return testClient
+	workers, stop := context.WithCancel(ctx)
+	stopped := make(chan struct{})
+	go func() {
+		rt.Start(workers)
+		close(stopped)
+	}()
+
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("the job never started")
+	}
+	stop()
+	select {
+	case <-stopped:
+	case <-ctx.Done():
+		t.Fatal("the runtime did not stop")
+	}
+
+	var attempts int
+	var claimable bool
+	err := pool.QueryRow(ctx, `
+		SELECT attempts, visible_at <= now() FROM cb_claims WHERE queue = 'deploys'
+	`).Scan(&attempts, &claimable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 {
+		t.Errorf("attempts = %d, want 0: shutdown spent an attempt on a job that did not fail", attempts)
+	}
+	if !claimable {
+		t.Error("the job is not claimable again: shutdown left the claim deadline in place")
+	}
+}
+
+// A handler that runs past the queue's HandlerTimeout has its context
+// cancelled, and the attempt is counted as a failure like any other: the
+// retry waits MinBackoff and the attempt is not given back. What decides that
+// is the worker's own context, which the timeout does not touch. A timeout
+// that cancelled it would look like a shutdown, and a handler that always
+// times out would be given its attempt back and claimed again at once,
+// forever.
+func TestTimeoutCountsTheAttemptAsFailed(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const backoff = 500 * time.Millisecond
+	// The claim is far enough from the backoff to tell the two apart below.
+	queue := catbird.NewQueue("timeouts", catbird.QueueOptions{
+		ClaimDuration:  5 * time.Second,
+		HandlerTimeout: 100 * time.Millisecond,
+		PollInterval:   25 * time.Millisecond,
+	})
+	hangs := catbird.NewJobType("hangs", queue, catbird.JobTypeOptions{MinBackoff: backoff})
+
+	if _, err := catbird.Enqueue(ctx, pool, hangs, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int32
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(hangs, func(ctx context.Context, job *catbird.Job) error {
+		atomic.AddInt32(&calls, 1)
+		<-ctx.Done() // the queue's HandlerTimeout, with the runtime still running
+		return ctx.Err()
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	stopped := make(chan struct{})
+	go func() {
+		rt.Start(runCtx)
+		close(stopped)
+	}()
+	// The handler hangs until its attempt times out, so the runtime is stopped
+	// and waited for before the pool closes.
+	t.Cleanup(func() {
+		stop()
+		<-stopped
+	})
+
+	// The wait is read in the database's clock, like the backoff test below: the
+	// retry is an interval added to the server's now(). It is a band and not
+	// "some time from now" because a running job also has visible_at in the
+	// future: the claim set it a ClaimDuration ahead. The first retry of a
+	// failed attempt is MinBackoff exactly, a give-back leaves visible_at at
+	// now() below the band, and a running attempt leaves it a ClaimDuration
+	// ahead, above it.
+	waitFor(t, 5*time.Second, "no retry a backoff away: the timed-out attempt was not counted as a failure", func() bool {
+		return count(t, pool, `
+			SELECT count(*) FROM cb_claims
+			WHERE queue = 'timeouts' AND died_at IS NULL AND attempts = 1
+			  AND visible_at > now() + $1::interval AND visible_at < now() + $2::interval
+		`, backoff/2, backoff*2) == 1
+	})
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Errorf("the handler ran %d times, want 1: the timed-out attempt was given back instead of counted", n)
+	}
+}
+
+// A queue that sets only HandlerTimeout gets a claim that covers it: the
+// default ClaimDuration is HandlerTimeout plus the completion's few seconds,
+// so a queue of short jobs recovers a crashed worker's jobs quickly instead of
+// holding them for the five-minute fallback.
+func TestClaimDurationDefaultsFromHandlerTimeout(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("covered", catbird.QueueOptions{
+		HandlerTimeout: 3 * time.Second,
+		PollInterval:   50 * time.Millisecond,
+	})
+	short := catbird.NewJobType("short", queue, catbird.JobTypeOptions{})
+
+	if _, err := catbird.Enqueue(ctx, pool, short, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(short, func(ctx context.Context, job *catbird.Job) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	stopped := make(chan struct{})
+	go func() {
+		rt.Start(runCtx)
+		close(stopped)
+	}()
+	t.Cleanup(func() {
+		stop()
+		<-stopped
+	})
+
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("the job never started")
+	}
+	// The claim set visible_at 8 seconds ahead: HandlerTimeout plus the
+	// completion's five. Read moments after the handler started, anything close
+	// to that tells this default from the five-minute fallback (about 300) and
+	// from a claim of HandlerTimeout alone (about 3).
+	var claimedFor float64
+	err := pool.QueryRow(ctx, `
+		SELECT extract(epoch FROM visible_at - now()) FROM cb_claims WHERE queue = 'covered'
+	`).Scan(&claimedFor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimedFor < 5 || claimedFor > 8 {
+		t.Errorf("claimed for %.1fs, want about 8s: ClaimDuration did not default to HandlerTimeout plus the completion margin", claimedFor)
+	}
+}
+
+// A queue whose HandlerTimeout exceeds its ClaimDuration renews the claims of
+// its running jobs, so a handler may run for several ClaimDurations without
+// another worker taking the job.
+func TestRenewalKeepsALongJobClaimed(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("renews", catbird.QueueOptions{
+		ClaimDuration:  300 * time.Millisecond,
+		HandlerTimeout: 5 * time.Second,
+		PollInterval:   50 * time.Millisecond,
+	})
+	long := catbird.NewJobType("long", queue, catbird.JobTypeOptions{})
+
+	if _, err := catbird.Enqueue(ctx, pool, long, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int32
+	handle := func(ctx context.Context, job *catbird.Job) error {
+		atomic.AddInt32(&calls, 1)
+		time.Sleep(900 * time.Millisecond) // three ClaimDurations
+		return nil
+	}
+	// Two processes, so a claim that lapsed would put the job in the other
+	// worker's hands.
+	for range 2 {
+		rt := catbird.New(pool, catbird.Options{})
+		rt.HandleFunc(long, handle)
+		go rt.Start(ctx)
+	}
+
+	waitFor(t, 5*time.Second, "the job was not completed", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims") == 0
+	})
+	time.Sleep(500 * time.Millisecond) // room for a wrongly claimed second attempt to surface
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Errorf("the handler ran %d times, want 1: the claim was not renewed", n)
+	}
+}
+
+// Renewal follows the handler's context: a handler that hangs past
+// HandlerTimeout is renewed no further, so its job is claimed again about a
+// ClaimDuration later even though the hung goroutine never returns its slot,
+// and whatever the hung attempt writes afterwards matches no row: attempts
+// has moved on.
+func TestRenewalStopsAtTimeout(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("renews_hang", catbird.QueueOptions{
+		ClaimDuration:  300 * time.Millisecond,
+		HandlerTimeout: 600 * time.Millisecond,
+		PollInterval:   50 * time.Millisecond,
+	})
+	hangs := catbird.NewJobType("hangs", queue, catbird.JobTypeOptions{})
+
+	if _, err := catbird.Enqueue(ctx, pool, hangs, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int32
+	handle := func(ctx context.Context, job *catbird.Job) error {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			time.Sleep(1500 * time.Millisecond) // ignores its context well past HandlerTimeout
+		}
+		return nil
+	}
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(hangs, handle)
+	runCtx, stop := context.WithCancel(ctx)
+	stopped := make(chan struct{})
+	go func() {
+		rt.Start(runCtx)
+		close(stopped)
+	}()
+	// The hung attempt outlives the assertions, so the runtime is stopped and
+	// waited for before the pool closes.
+	t.Cleanup(func() {
+		stop()
+		<-stopped
+	})
+
+	waitFor(t, 5*time.Second, "the hung attempt kept its claim: the job was never claimed again", func() bool {
+		return atomic.LoadInt32(&calls) == 2
+	})
+	waitFor(t, 5*time.Second, "the second attempt did not complete", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims") == 0
+	})
+}
+
+// On a renewing queue a renewal that matches no row cancels the handler:
+// Cancel marks the claim dead, the next renewal misses it, and the running
+// handler's context ends with ErrClaimLost as its cause — so a cancelled
+// job stops holding its slot within about half a ClaimDuration instead of
+// running to HandlerTimeout.
+func TestCancelStopsARenewingHandler(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("renews_cancel", catbird.QueueOptions{
+		ClaimDuration:  300 * time.Millisecond,
+		HandlerTimeout: 10 * time.Second,
+		PollInterval:   50 * time.Millisecond,
+	})
+	waits := catbird.NewJobType("waits", queue, catbird.JobTypeOptions{})
+
+	id, err := catbird.Enqueue(ctx, pool, waits, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var runs int32
+	started := make(chan struct{})
+	causes := make(chan error, 1)
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(waits, func(ctx context.Context, job *catbird.Job) error {
+		if atomic.AddInt32(&runs, 1) == 1 {
+			close(started)
+		}
+		<-ctx.Done()
+		causes <- context.Cause(ctx)
+		return ctx.Err()
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	stopped := make(chan struct{})
+	go func() {
+		rt.Start(runCtx)
+		close(stopped)
+	}()
+	t.Cleanup(func() {
+		stop()
+		<-stopped
+	})
+
+	<-started
+	if err := catbird.Cancel(ctx, pool, id); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case cause := <-causes:
+		if !errors.Is(cause, catbird.ErrClaimLost) {
+			t.Errorf("handler cancelled with cause %v, want ErrClaimLost", cause)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Cancel did not reach the running handler")
+	}
+	// The attempt is discarded rather than counted as a failure: the dead claim
+	// keeps its one spent attempt and no error text.
+	waitFor(t, 2*time.Second, "the discarded attempt wrote on the dead claim", func() bool {
+		return count(t, pool, `
+			SELECT count(*) FROM cb_claims
+			WHERE message_id = $1 AND died_at IS NOT NULL AND attempts = 1 AND last_error IS NULL
+		`, id) == 1
+	})
+}
+
+// A handler that completes the job and then returns an error is not retried:
+// the completion committed, and the retry matches on attempts, so it finds no
+// claim to correct.
+func TestCompletedJobIsNotRetriedAfterAnError(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("late_error", catbird.QueueOptions{PollInterval: 50 * time.Millisecond})
+	done := catbird.NewJobType("done", queue, catbird.JobTypeOptions{MinBackoff: 50 * time.Millisecond})
+
+	if _, err := catbird.Enqueue(ctx, pool, done, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int32
+	ran := make(chan struct{}, 4)
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(done, func(ctx context.Context, job *catbird.Job) error {
+		atomic.AddInt32(&calls, 1)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		if err := catbird.Complete(ctx, tx, job); err != nil {
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+		ran <- struct{}{}
+		return errors.New("the work is done, the handler is unhappy")
+	})
+
+	runCtx, stop := context.WithTimeout(ctx, 2*time.Second)
+	defer stop()
+	go rt.Start(runCtx)
+
+	select {
+	case <-ran:
+	case <-runCtx.Done():
+		t.Fatal("the job did not run")
+	}
+	<-runCtx.Done()
+
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'late_error'"); n != 0 {
+		t.Errorf("%d claims left: the error undid a completion", n)
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Errorf("the handler ran %d times, want 1: the completed job was retried", n)
+	}
+}
+
+// A handler that returns an error spends the attempt and keeps the job: the
+// claim stays where it is and its next attempt is held back by MinBackoff.
+// Without the wait, a queue whose downstream is down retries every failing job
+// as fast as it can claim it.
+func TestHandlerErrorSchedulesARetryAfterBackoff(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const backoff = 500 * time.Millisecond
+	queue := catbird.NewQueue("retries", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	flaky := catbird.NewJobType("flaky", queue, catbird.JobTypeOptions{MinBackoff: backoff})
+
+	if _, err := catbird.Enqueue(ctx, pool, flaky, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int32
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(flaky, func(ctx context.Context, job *catbird.Job) error {
+		atomic.AddInt32(&calls, 1)
+		if job.Attempts == 1 {
+			return errors.New("the first attempt fails")
+		}
+		return nil
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	// How far off the retry is has to be read in the database's clock: the wait
+	// is an interval added to the server's now(), and the claim that picks the
+	// job up again compares against the same now().
+	waitFor(t, 5*time.Second, "the failed attempt scheduled no retry a backoff away", func() bool {
+		return count(t, pool, `
+			SELECT count(*) FROM cb_claims
+			WHERE queue = 'retries' AND died_at IS NULL AND attempts = 1
+			  AND visible_at > now() + $1::interval
+		`, backoff/2) == 1
+	})
+	waitFor(t, 5*time.Second, "the failed job was never retried", func() bool {
+		return atomic.LoadInt32(&calls) == 2
+	})
+	waitFor(t, 5*time.Second, "the second attempt did not complete the job", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'retries'") == 0
+	})
+}
+
+// MaxBackoff is where the doubling stops. Without a ceiling the wait grows past
+// any use it has: doubling from five milliseconds, the seventeenth wait alone
+// reaches five minutes, so the retries of a five-minute outage would go on for
+// an hour after it ended. It is also what spends this job's eighteen attempts
+// inside the wait below, which a wait that kept doubling could not.
+func TestMaxBackoffCapsTheGrowingWait(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("capped", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	flaky := catbird.NewJobType("flaky", queue, catbird.JobTypeOptions{
+		MaxAttempts: 18,
+		MinBackoff:  5 * time.Millisecond,
+		MaxBackoff:  50 * time.Millisecond,
+	})
+
+	if _, err := catbird.Enqueue(ctx, pool, flaky, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(flaky, func(ctx context.Context, job *catbird.Job) error {
+		return errors.New("every attempt fails")
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	waitFor(t, 10*time.Second, "the job did not spend its attempts: the wait grew past MaxBackoff", func() bool {
+		return count(t, pool, `
+			SELECT count(*) FROM cb_claims
+			WHERE queue = 'capped' AND died_at IS NOT NULL AND attempts = 18
+		`) == 1
+	})
+}
+
+// The last attempt ends the job: the claim is marked dead, no worker claims it
+// again, and OnDead runs once with the attempt that failed. MaxAttempts,
+// MinBackoff and OnDead come from the job type, so the two types sharing this queue are
+// retried on their own terms.
+func TestMaxAttemptsMarksTheJobDeadAndRunsOnDead(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	dead := make(chan *catbird.Job, 4)
+	queue := catbird.NewQueue("dead_end", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	doomed := catbird.NewJobType("doomed", queue, catbird.JobTypeOptions{
+		MaxAttempts: 3,
+		MinBackoff:  20 * time.Millisecond,
+		OnDead: catbird.HandlerFunc(func(ctx context.Context, job *catbird.Job) error {
+			dead <- job
+			return nil
+		}),
+	})
+	patient := catbird.NewJobType("patient", queue, catbird.JobTypeOptions{
+		MaxAttempts: 10, MinBackoff: 20 * time.Millisecond,
+	})
+
+	id, err := catbird.Enqueue(ctx, pool, doomed, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catbird.Enqueue(ctx, pool, patient, nil, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls, patientCalls int32
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(doomed, func(ctx context.Context, job *catbird.Job) error {
+		atomic.AddInt32(&calls, 1)
+		return errors.New("this handler never succeeds")
+	})
+	rt.HandleFunc(patient, func(ctx context.Context, job *catbird.Job) error {
+		atomic.AddInt32(&patientCalls, 1)
+		return errors.New("this one is allowed more tries")
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	var job *catbird.Job
+	select {
+	case job = <-dead:
+	case <-ctx.Done():
+		t.Fatal("OnDead never ran")
+	}
+	if job.ID != id {
+		t.Errorf("OnDead got job %d, want %d", job.ID, id)
+	}
+	if job.Attempts != 3 {
+		t.Errorf("OnDead got attempt %d, want the last one, 3", job.Attempts)
+	}
+
+	// MinBackoff and poll interval are both far shorter than this wait, so a claim
+	// that still matched the dead row would have run the handler again by now.
+	time.Sleep(300 * time.Millisecond)
+	if n := atomic.LoadInt32(&calls); n != 3 {
+		t.Errorf("the handler ran %d times, want MaxAttempts, 3", n)
+	}
+	if n := len(dead); n != 0 {
+		t.Errorf("OnDead ran %d more times, want once", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE message_id = $1 AND died_at IS NOT NULL AND attempts = 3", id); n != 1 {
+		t.Error("the dead job's claim is not marked dead at its last attempt")
+	}
+	if n := atomic.LoadInt32(&patientCalls); n <= 3 {
+		t.Errorf("the other type on this queue ran %d times, want more than 3: it has its own MaxAttempts", n)
+	}
+}
+
+// A job that dies stops the rest of its workflow: every job of the group that
+// has not run is marked dead and no worker claims it. A job outside the group
+// is left alone.
+func TestADeadJobCancelsItsWorkflow(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	cascade := catbird.NewQueue("cascade", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	root := catbird.NewJobType("root", cascade, catbird.JobTypeOptions{})
+	failing := catbird.NewJobType("failing", cascade, catbird.JobTypeOptions{MaxAttempts: 1})
+	// Never registered here, so what reaches it is the cascade and nothing else.
+	sibling := catbird.NewJobType("sibling", cascade, catbird.JobTypeOptions{})
+
+	bystander, err := catbird.Enqueue(ctx, pool, sibling, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(root, func(ctx context.Context, job *catbird.Job) error {
+		job.Enqueue(failing, nil)
+		job.Enqueue(sibling, nil)
+		return nil
+	})
+	rt.HandleFunc(failing, func(ctx context.Context, job *catbird.Job) error {
+		return errors.New("the first step fails")
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	groupID, err := catbird.Enqueue(ctx, pool, root, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 10*time.Second, "the sibling of the dead job was never canceled", func() bool {
+		return count(t, pool, `
+			SELECT count(*) FROM cb_claims
+			WHERE group_id = $1 AND job_type = 'sibling' AND died_at IS NOT NULL
+		`, groupID) == 1
+	})
+	if n := count(t, pool, `
+		SELECT count(*) FROM cb_claims
+		WHERE message_id = $1 AND died_at IS NULL AND dependencies = 0 AND visible_at <= now()
+	`, bystander); n != 1 {
+		t.Error("the cascade took a job outside the workflow")
+	}
+}
+
+// Cancel stops the jobs of a workflow that have not started; the one already
+// running finishes and completes. A cancel that also undid a running job would
+// leave its writes half done with no claim left to retry them.
+func TestCancelStopsWaitingJobsAndLetsARunningOneFinish(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("cancels", catbird.QueueOptions{BatchSize: 1, PollInterval: 25 * time.Millisecond})
+	root := catbird.NewJobType("root", queue, catbird.JobTypeOptions{})
+	running := catbird.NewJobType("running", queue, catbird.JobTypeOptions{})
+	// Registered nowhere, so nothing but Cancel reaches it.
+	waiting := catbird.NewJobType("waiting", queue, catbird.JobTypeOptions{})
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(root, func(ctx context.Context, job *catbird.Job) error {
+		job.Enqueue(running, nil)
+		job.Enqueue(waiting, nil)
+		return nil
+	})
+	rt.HandleFunc(running, func(ctx context.Context, job *catbird.Job) error {
+		close(started)
+		<-release
+		return nil
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	groupID, err := catbird.Enqueue(ctx, pool, root, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("the running job never started")
+	}
+	if err := catbird.Cancel(ctx, pool, groupID); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE group_id = $1 AND job_type = 'waiting' AND died_at IS NOT NULL", groupID); n != 1 {
+		t.Error("the waiting job was not canceled")
+	}
+	close(release)
+
+	waitFor(t, 5*time.Second, "the running job's claim is still there: Cancel stopped a job that had already started", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE group_id = $1 AND job_type = 'running'", groupID) == 0
+	})
+
+	time.Sleep(300 * time.Millisecond)
+	if n := count(t, pool, `
+		SELECT count(*) FROM cb_claims
+		WHERE group_id = $1 AND job_type = 'waiting' AND died_at IS NOT NULL AND attempts = 0
+	`, groupID); n != 1 {
+		t.Error("the canceled job was claimed after all: its claim is not the untouched row Cancel left")
+	}
+}
+
+// waitForPositions blocks until the assigner has given out n positions.
+func waitForPositions(t *testing.T, ctx context.Context, pool *pgxpool.Pool, n int64) {
+	t.Helper()
+	for {
+		last, err := catbird.LastPosition(ctx, pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if last >= n {
+			return
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("only %d of %d messages got a position", last, n)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The three pattern forms: a topic on its own matches exactly, a prefix with
+// ".#" matches the prefix and everything under it, and "#" matches the stream.
+// "orders" is in the stream because a subtree has to stop at the separator.
+func TestReadPatternForms(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for _, topic := range []string{"order", "order.paid", "order.paid.refund", "orders", "other"} {
+		if _, err := catbird.Publish(ctx, pool, topic, topic, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	go rt.Start(ctx)
+	waitForPositions(t, ctx, pool, 5)
+
+	for _, tt := range []struct {
+		patterns []string
+		want     string
+	}{
+		{[]string{"order"}, "order"},
+		{[]string{"order.#"}, "order,order.paid,order.paid.refund"},
+		{[]string{"order.paid.#"}, "order.paid,order.paid.refund"},
+		{[]string{"orders", "other"}, "orders,other"},
+		{[]string{"#"}, "order,order.paid,order.paid.refund,orders,other"},
+		{[]string{"order.nothing.#"}, ""},
+	} {
+		msgs, err := catbird.ReadAfter(ctx, pool, tt.patterns, 0, 50)
+		if err != nil {
+			t.Fatalf("%v: %v", tt.patterns, err)
+		}
+		var topics []string
+		for _, m := range msgs {
+			topics = append(topics, m.Topic)
+		}
+		if got := strings.Join(topics, ","); got != tt.want {
+			t.Errorf("%v read %q, want %q", tt.patterns, got, tt.want)
+		}
+	}
+}
+
+// A pattern that is not one of the three forms is refused, so a caller who
+// expects a wildcard is told instead of quietly reading nothing.
+func TestReadRejectsPatterns(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	for _, patterns := range [][]string{
+		nil,
+		{},
+		{""},
+		{"*"},
+		{"order.*"},
+		{"order.#.paid"},
+		{"ord#er"},
+		{"#", "order.*"},
+	} {
+		if _, err := catbird.ReadAfter(ctx, pool, patterns, 0, 50); !errors.Is(err, catbird.ErrBadPattern) {
+			t.Errorf("%v was accepted (%v)", patterns, err)
+		}
+	}
+}
+
+// A reader that was away longer than GC keeps messages gets the rows that are
+// left with nothing in them to say the rest is gone. OldestPosition is what
+// tells it: past the position the reader held, messages were removed.
+func TestStreamWindow(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for _, payload := range []string{"first", "second", "third"} {
+		if _, err := catbird.Publish(ctx, pool, "ev", payload, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	go rt.Start(ctx)
+	waitForPositions(t, ctx, pool, 3)
+
+	if oldest, err := catbird.OldestPosition(ctx, pool); err != nil || oldest != 1 {
+		t.Fatalf("oldest position %d (%v), want 1", oldest, err)
+	}
+
+	// What GC does to a reader that stopped at position 0.
+	if _, err := pool.Exec(ctx, `DELETE FROM cb_messages WHERE position <= 2`); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := catbird.ReadAfter(ctx, pool, []string{"ev"}, 0, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].Position != 3 {
+		t.Fatalf("read %d messages, want the one that survived", len(msgs))
+	}
+	oldest, err := catbird.OldestPosition(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldest <= 0+1 {
+		t.Errorf("oldest position %d does not report the gap after position 0", oldest)
+	}
+}
+
+// The LISTEN connection is hijacked out of the pool, so the pool keeps its full
+// width while a process listens. A one-connection pool is the sharpest form of
+// it: the listener takes the only connection, and everything else — here the
+// assigner — still has to be able to work.
+func TestListenDoesNotSpendAPoolConnection(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cfg, err := pgxpool.ParseConfig(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxConns = 1
+	narrow, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer narrow.Close()
+
+	rt := catbird.New(narrow, catbird.Options{})
+	done := make(chan struct{})
+	go func() { defer close(done); rt.Start(ctx) }()
+
+	if _, err := catbird.Publish(ctx, pool, "ev.one", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	waitForPositions(t, ctx, pool, 1)
+
+	if stat := narrow.Stat(); stat.AcquiredConns() != 0 {
+		t.Errorf("%d pool connections still held by the listener, want 0", stat.AcquiredConns())
+	}
+	cancel()
+	<-done
+}
+
+// The one LISTEN connection comes back after the server drops it, and a job
+// enqueued afterwards still wakes its worker. The poll interval here is a
+// minute, so a worker that runs the job did not fall back to polling for it.
+func TestListenReconnectsAfterTheConnectionDrops(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("reconnect", catbird.QueueOptions{PollInterval: time.Minute})
+	after := catbird.NewJobType("after.reconnect", queue, catbird.JobTypeOptions{})
+
+	ran := make(chan int64, 4)
+	rt := catbird.New(pool, catbird.Options{ReconnectAfter: 100 * time.Millisecond})
+	rt.HandleFunc(after, func(ctx context.Context, job *catbird.Job) error {
+		ran <- job.ID
+		return nil
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	// The runtime's is the only connection that runs a LISTEN, so its backend
+	// is the one whose last statement was one.
+	listener := func() int {
+		return count(t, pool, `
+			SELECT coalesce(max(pid), 0) FROM pg_stat_activity
+			WHERE datname = current_database() AND query LIKE 'LISTEN %'
+		`)
+	}
+	var dropped int
+	waitFor(t, 10*time.Second, "the runtime never listened", func() bool {
+		dropped = listener()
+		return dropped != 0
+	})
+	if _, err := pool.Exec(ctx, "SELECT pg_terminate_backend($1)", dropped); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "the listen connection did not come back", func() bool {
+		pid := listener()
+		return pid != 0 && pid != dropped
+	})
+	// A reconnect wakes every loop once, so the worker has already been nudged,
+	// found nothing and gone back to waiting. What wakes it below is the
+	// enqueue's own notification.
+	time.Sleep(200 * time.Millisecond)
+
+	id, err := catbird.Enqueue(ctx, pool, after, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-ran:
+		if got != id {
+			t.Errorf("ran job %d, want %d", got, id)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the job did not run: no notification arrived after the reconnect")
+	}
+}
+
+// Every state Status reports comes from columns that were already there. The
+// ones below need no worker: a job's row says it is queued, scheduled or waiting
+// before anything has claimed it.
+func TestStatusReportsWhatAJobIsDoing(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("states", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	plain := catbird.NewJobType("plain", queue, catbird.JobTypeOptions{})
+	gate := catbird.NewJobType("gate", queue, catbird.JobTypeOptions{Signal: true})
+	// Nothing handles this type, so the jobs a handler fans out to it stay where
+	// they are and the job enqueued after them keeps waiting.
+	stuck := catbird.NewJobType("stuck", catbird.NewQueue("nobody", catbird.QueueOptions{}), catbird.JobTypeOptions{})
+	joins := catbird.NewJobType("joins", queue, catbird.JobTypeOptions{})
+
+	state := func(id int64) catbird.State {
+		t.Helper()
+		js, err := catbird.Status(ctx, pool, id)
+		if err != nil {
+			t.Fatalf("status of %d: %v", id, err)
+		}
+		return js.State
+	}
+
+	queued, err := catbird.Enqueue(ctx, pool, plain, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduled, err := catbird.Enqueue(ctx, pool, plain, nil, catbird.EnqueueOptions{Delay: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gated, err := catbird.Enqueue(ctx, pool, gate, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canceled, err := catbird.Enqueue(ctx, pool, plain, nil, catbird.EnqueueOptions{Delay: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catbird.Cancel(ctx, pool, canceled); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range []struct {
+		id   int64
+		want catbird.State
+	}{
+		{queued, catbird.StateQueued},
+		{scheduled, catbird.StateScheduled},
+		{gated, catbird.StateWaitingForSignal},
+		{canceled, catbird.StateDead},
+	} {
+		if got := state(c.id); got != c.want {
+			t.Errorf("job %d: %v, want %v", c.id, got, c.want)
+		}
+	}
+
+	// A signal turns the wait into a job that is ready to run.
+	if err := catbird.Signal(ctx, pool, gated, gate, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := state(gated); got != catbird.StateQueued {
+		t.Errorf("signaled job: %v, want %v", got, catbird.StateQueued)
+	}
+
+	// A published message is not a job, and neither is an id nothing was written
+	// under.
+	published, err := catbird.Publish(ctx, pool, "not.a.job", nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catbird.Status(ctx, pool, published); !errors.Is(err, catbird.ErrNotFound) {
+		t.Errorf("status of a published message: %v, want ErrNotFound", err)
+	}
+	if _, err := catbird.Status(ctx, pool, published+10000); !errors.Is(err, catbird.ErrNotFound) {
+		t.Errorf("status of no such id: %v, want ErrNotFound", err)
+	}
+
+	// A completed job is a message whose claim is gone.
+	var fansOut int64
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(plain, func(ctx context.Context, job *catbird.Job) error { return nil })
+	rt.HandleFunc(joins, func(ctx context.Context, job *catbird.Job) error { return nil })
+	rt.HandleFunc(gate, func(ctx context.Context, job *catbird.Job) error {
+		job.Enqueue(stuck, nil)
+		job.Enqueue(stuck, nil)
+		job.EnqueueAfter(joins, nil)
+		return nil
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	waitFor(t, 5*time.Second, "the queued job never completed", func() bool {
+		js, err := catbird.Status(ctx, pool, queued)
+		return err == nil && js.State == catbird.StateCompleted
+	})
+
+	// The job the handler enqueued after two others waits for them, and they are
+	// on a queue nobody runs, so it keeps waiting.
+	waitFor(t, 5*time.Second, "the joining job never came to wait for its dependencies", func() bool {
+		return pool.QueryRow(ctx, `
+			SELECT message_id FROM cb_claims WHERE job_type = 'joins'
+		`).Scan(&fansOut) == nil
+	})
+	if got := state(fansOut); got != catbird.StateWaitingForJobs {
+		t.Errorf("joining job: %v, want %v", got, catbird.StateWaitingForJobs)
+	}
+}
+
+// Running and waiting to retry are the same row but for the error text: a live
+// claim with visible_at in the future and an attempt spent. The claim clears the
+// text, so what is there belongs to the attempt that is waiting and never to the
+// one running.
+func TestStatusTellsARunningJobFromOneWaitingToRetry(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("running", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	flaky := catbird.NewJobType("flaky", queue, catbird.JobTypeOptions{MinBackoff: time.Hour})
+
+	id, err := catbird.Enqueue(ctx, pool, flaky, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	started := make(chan struct{}, 2)
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(flaky, func(ctx context.Context, job *catbird.Job) error {
+		started <- struct{}{}
+		<-release
+		return errors.New("the service is down")
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("the job never ran")
+	}
+	js, err := catbird.Status(ctx, pool, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if js.State != catbird.StateRunning || js.Attempts != 1 || js.LastError != "" {
+		t.Errorf("while the handler runs: %v, attempt %d, error %q; want running, attempt 1, no error",
+			js.State, js.Attempts, js.LastError)
+	}
+
+	// The retry is an hour out, so the job stays where the failure left it.
+	close(release)
+	waitFor(t, 5*time.Second, "the failed attempt did not leave the job waiting to retry", func() bool {
+		js, err = catbird.Status(ctx, pool, id)
+		return err == nil && js.State == catbird.StateWaitingToRetry
+	})
+	if js.Attempts != 1 || js.LastError != "the service is down" {
+		t.Errorf("after the failure: attempt %d, error %q; want attempt 1, the handler's error", js.Attempts, js.LastError)
+	}
+}
+
+func TestGroupStatusReportsWhatAWorkflowIsDoing(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("grouped", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	start := catbird.NewJobType("start", queue, catbird.JobTypeOptions{})
+	gate := catbird.NewJobType("gate", queue, catbird.JobTypeOptions{Signal: true})
+	// Nothing handles this type, so the job the handler fans out to it stays
+	// where it is and the job enqueued after it keeps waiting.
+	stuck := catbird.NewJobType("stuck", catbird.NewQueue("nobody", catbird.QueueOptions{}), catbird.JobTypeOptions{})
+	joins := catbird.NewJobType("joins", queue, catbird.JobTypeOptions{})
+	plain := catbird.NewJobType("plain", queue, catbird.JobTypeOptions{})
+
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(plain, func(ctx context.Context, job *catbird.Job) error { return nil })
+	rt.HandleFunc(start, func(ctx context.Context, job *catbird.Job) error {
+		job.Enqueue(stuck, nil)
+		job.Enqueue(gate, nil)
+		job.EnqueueAfter(joins, nil)
+		return nil
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	// A completed standalone job is a workflow of one with nothing left in it.
+	alone, err := catbird.Enqueue(ctx, pool, plain, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "the standalone job never read as completed", func() bool {
+		gs, err := catbird.GroupStatus(ctx, pool, alone)
+		return err == nil && gs.State == catbird.StateCompleted
+	})
+
+	groupID, err := catbird.Enqueue(ctx, pool, start, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fan-out settles into three waiting jobs: one on a queue nobody runs,
+	// one waiting for a signal, and one waiting for both of them. The workflow
+	// is running while jobs remain, whatever they wait for.
+	waitFor(t, 5*time.Second, "the fan-out never settled", func() bool {
+		return count(t, pool, `
+			SELECT count(*) FROM cb_claims WHERE group_id = $1 AND died_at IS NULL
+		`, groupID) == 3
+	})
+	gs, err := catbird.GroupStatus(ctx, pool, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gs.State != catbird.StateRunning || gs.DeadJobID != 0 || len(gs.Outputs) != 0 {
+		t.Errorf("waiting workflow: %v, dead job %d, %d outputs; want running, none, none",
+			gs.State, gs.DeadJobID, len(gs.Outputs))
+	}
+
+	// A published message is not a workflow, and neither is an id nothing was
+	// written under.
+	published, err := catbird.Publish(ctx, pool, "not.a.job", nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catbird.GroupStatus(ctx, pool, published); !errors.Is(err, catbird.ErrNotFound) {
+		t.Errorf("group status of a published message: %v, want ErrNotFound", err)
+	}
+	if _, err := catbird.GroupStatus(ctx, pool, published+10000); !errors.Is(err, catbird.ErrNotFound) {
+		t.Errorf("group status of no such id: %v, want ErrNotFound", err)
+	}
+
+	// Cancel marks the waiting jobs dead, and dead jobs are seen, not gone.
+	if err := catbird.Cancel(ctx, pool, groupID); err != nil {
+		t.Fatal(err)
+	}
+	gs, err = catbird.GroupStatus(ctx, pool, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gs.State != catbird.StateDead || gs.DeadJobID == 0 {
+		t.Errorf("canceled workflow: %v, dead job %d; want dead and an id", gs.State, gs.DeadJobID)
+	}
+
+	// GC deletes the dead claims and then the messages, so the canceled
+	// workflow reads as not found, the lifetime StatusCompleted has.
+	if err := catbird.GC(ctx, pool, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catbird.GroupStatus(ctx, pool, groupID); !errors.Is(err, catbird.ErrNotFound) {
+		t.Errorf("group status after GC: %v, want ErrNotFound", err)
+	}
+}
+
+// The dead job GroupStatus names is the one whose failure is recorded, never
+// one the cancel took with it. The sibling here is enqueued first and so has
+// the smaller id: a pick by smallest id would name it and point Status at a
+// claim with no error.
+func TestGroupStatusNamesTheJobThatFailed(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("culprit", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	root := catbird.NewJobType("root", queue, catbird.JobTypeOptions{})
+	failing := catbird.NewJobType("failing", queue, catbird.JobTypeOptions{MaxAttempts: 1})
+	// Never registered, so it dies by the cancel and not by running.
+	sibling := catbird.NewJobType("sibling", queue, catbird.JobTypeOptions{})
+
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(root, func(ctx context.Context, job *catbird.Job) error {
+		job.Enqueue(sibling, nil)
+		job.Enqueue(failing, nil)
+		return nil
+	})
+	rt.HandleFunc(failing, func(ctx context.Context, job *catbird.Job) error {
+		return errors.New("this step fails")
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	groupID, err := catbird.Enqueue(ctx, pool, root, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var failedID int64
+	waitFor(t, 10*time.Second, "the failing job never died", func() bool {
+		return pool.QueryRow(ctx, `
+			SELECT message_id FROM cb_claims
+			WHERE group_id = $1 AND job_type = 'failing' AND died_at IS NOT NULL
+		`, groupID).Scan(&failedID) == nil
+	})
+	// The cancel takes the sibling with it, and the workflow names the job that
+	// failed, not the earlier-created job the cancel killed.
+	waitFor(t, 10*time.Second, "the sibling was never canceled", func() bool {
+		return count(t, pool, `
+			SELECT count(*) FROM cb_claims WHERE group_id = $1 AND died_at IS NOT NULL
+		`, groupID) == 2
+	})
+	gs, err := catbird.GroupStatus(ctx, pool, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gs.State != catbird.StateDead || gs.DeadJobID != failedID {
+		t.Errorf("dead workflow: %v, dead job %d; want dead and the failed job %d", gs.State, gs.DeadJobID, failedID)
+	}
+
+	js, err := catbird.Status(ctx, pool, failedID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if js.Attempts != 1 || js.LastError != "this step fails" {
+		t.Errorf("the failed job: attempt %d, error %q; want attempt 1, the handler's error", js.Attempts, js.LastError)
+	}
+}
+
+func TestQueuesReportsWhatEveryQueueIsDoing(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	first := catbird.NewQueue("first", catbird.QueueOptions{})
+	second := catbird.NewQueue("second", catbird.QueueOptions{})
+	plain := catbird.NewJobType("counted", first, catbird.JobTypeOptions{})
+	gate := catbird.NewJobType("gated", first, catbird.JobTypeOptions{Signal: true})
+	other := catbird.NewJobType("other", second, catbird.JobTypeOptions{})
+
+	// With no claims there are no queues to report.
+	statuses, err := catbird.Queues(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 0 {
+		t.Fatalf("queues of an empty database: %v, want none", statuses)
+	}
+
+	enqueue := func(t2 *catbird.JobType, opts catbird.EnqueueOptions) int64 {
+		t.Helper()
+		id, err := catbird.Enqueue(ctx, pool, t2, nil, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	// One job of every state on the first queue. Running, waiting to retry and
+	// waiting for jobs are written directly, as the claim, the failure and the
+	// completion write them: an attempt spent with visible_at ahead is a held
+	// claim, the error text is what tells a backoff from it, and a positive
+	// dependencies count is a job waiting for others.
+	queued := enqueue(plain, catbird.EnqueueOptions{})
+	enqueue(plain, catbird.EnqueueOptions{Delay: time.Hour})
+	enqueue(gate, catbird.EnqueueOptions{})
+	dead := enqueue(plain, catbird.EnqueueOptions{Delay: time.Hour})
+	if err := catbird.Cancel(ctx, pool, dead); err != nil {
+		t.Fatal(err)
+	}
+	running := enqueue(plain, catbird.EnqueueOptions{})
+	retrying := enqueue(plain, catbird.EnqueueOptions{})
+	waiting := enqueue(plain, catbird.EnqueueOptions{})
+	for _, sql := range []struct {
+		text string
+		id   int64
+	}{
+		// The oldest queued job has been claimable for five minutes.
+		{`UPDATE cb_claims SET visible_at = now() - interval '5 minutes' WHERE message_id = $1`, queued},
+		{`UPDATE cb_claims SET visible_at = now() + interval '1 hour', attempts = 1 WHERE message_id = $1`, running},
+		{`UPDATE cb_claims SET visible_at = now() + interval '1 hour', attempts = 1, last_error = 'failed' WHERE message_id = $1`, retrying},
+		{`UPDATE cb_claims SET dependencies = 1 WHERE message_id = $1`, waiting},
+	} {
+		if _, err := pool.Exec(ctx, sql.text, sql.id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	enqueue(other, catbird.EnqueueOptions{})
+
+	statuses, err = catbird.Queues(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 2 || statuses[0].Queue != "first" || statuses[1].Queue != "second" {
+		t.Fatalf("queues: %v, want first and second in name order", statuses)
+	}
+	got := statuses[0]
+	want := catbird.QueueInfo{
+		Queue: "first", Queued: 1, Scheduled: 1, Running: 1, WaitingToRetry: 1,
+		WaitingForSignal: 1, WaitingForJobs: 1, Dead: 1,
+	}
+	if got.LongestQueued < 5*time.Minute || got.LongestQueued > 6*time.Minute {
+		t.Errorf("longest queued %v, want about five minutes", got.LongestQueued)
+	}
+	got.LongestQueued = 0
+	if got != want {
+		t.Errorf("first queue: %+v, want %+v", got, want)
+	}
+	got = statuses[1]
+	if got.LongestQueued < 0 || got.LongestQueued > time.Minute {
+		t.Errorf("second queue's longest queued %v, want just now", got.LongestQueued)
+	}
+	got.LongestQueued = 0
+	if (got != catbird.QueueInfo{Queue: "second", Queued: 1}) {
+		t.Errorf("second queue: %+v, want one queued job and nothing else", got)
+	}
+}
+
+// The text is cut to what the column holds, and a job that dies keeps it: a dead
+// claim is not deleted, so the error of the attempt that ended the job is the one
+// thing left to say why.
+func TestADeadJobKeepsItsLastError(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("dying", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	doomed := catbird.NewJobType("doomed", queue, catbird.JobTypeOptions{
+		MaxAttempts: 2,
+		MinBackoff:  10 * time.Millisecond,
+	})
+
+	id, err := catbird.Enqueue(ctx, pool, doomed, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	long := strings.Repeat("a wrapped error chain, ", 40) // 920 characters
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(doomed, func(ctx context.Context, job *catbird.Job) error {
+		return errors.New(long)
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	var js catbird.JobStatus
+	waitFor(t, 5*time.Second, "the job never died", func() bool {
+		js, err = catbird.Status(ctx, pool, id)
+		return err == nil && js.State == catbird.StateDead
+	})
+	if js.Attempts != 2 {
+		t.Errorf("dead after %d attempts, want 2", js.Attempts)
+	}
+	if len(js.LastError) != 256 || js.LastError != long[:256] {
+		t.Errorf("error text is %d characters, want the first 256 of what the handler returned", len(js.LastError))
+	}
+}
+
+// JobHandler decodes the payload before the handler runs: the function takes
+// it as a parameter of its own, so its shape is checked by the compiler
+// instead of read off an Unmarshal call at the top of the handler. A payload
+// that does not unmarshal never reaches the function and fails the attempt
+// like any other handler error.
+func TestJobHandlerDecodesThePayload(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	type report struct {
+		Year   int    `json:"year"`
+		Format string `json:"format"`
+	}
+
+	queue := catbird.NewQueue("typed", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	build := catbird.NewJobType("typed.build", queue, catbird.JobTypeOptions{MaxAttempts: 1})
+
+	got := make(chan report, 2)
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Handle(build, catbird.JobHandler(func(ctx context.Context, payload report, job *catbird.Job) error {
+		got <- payload
+		return nil
+	}))
+	go rt.Start(ctx)
+
+	if _, err := catbird.Enqueue(ctx, pool, build, report{Year: 2026, Format: "pdf"}, catbird.EnqueueOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case p := <-got:
+		if p.Year != 2026 || p.Format != "pdf" {
+			t.Errorf("payload arrived as %+v", p)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the typed handler never ran")
+	}
+
+	id, err := catbird.Enqueue(ctx, pool, build, "not a report", catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "the job with the bad payload never failed", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE message_id = $1 AND died_at IS NOT NULL", id) == 1
+	})
+	if len(got) != 0 {
+		t.Error("the handler ran on a payload that does not unmarshal")
+	}
 }

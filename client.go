@@ -2,317 +2,997 @@ package catbird
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// Client is a facade for interacting with Catbird
-type Client struct {
-	Conn Conn
+// ErrNotFound is returned when the addressed job or result does not exist, or
+// the job is not waiting for what was delivered to it.
+var ErrNotFound = errors.New("catbird: not found")
+
+// ErrAmbiguous is returned by Outputs.Get when several jobs of the type asked
+// for recorded outputs. Read them with GetAll.
+var ErrAmbiguous = errors.New("catbird: several results")
+
+// ErrClaimLost is returned by Complete when the job's claim expired and
+// another worker took it. The work of the late attempt is not the queue's any
+// more: roll its transaction back.
+var ErrClaimLost = errors.New("catbird: claim lost before completion")
+
+// ErrBadPattern is returned by the stream reads when a pattern is not a topic,
+// a prefix followed by ".#", or "#".
+var ErrBadPattern = errors.New("catbird: invalid topic pattern")
+
+// State is what a job or a whole workflow is doing. No column holds it: the
+// statements in Status and GroupStatus derive it. A job takes any of the eight
+// states; a workflow takes StateRunning, StateDead or StateCompleted, where
+// running means jobs remain — queued, waiting or retrying included.
+type State int
+
+const (
+	StateQueued           State = iota // ready, waiting for a worker to take it
+	StateScheduled                     // never claimed, the start time is still ahead
+	StateRunning                       // a worker holds the claim; for a workflow: jobs remain
+	StateWaitingToRetry                // an attempt failed, the retry is scheduled
+	StateWaitingForSignal              // waiting for Signal to deliver a payload
+	StateWaitingForJobs                // waiting for the jobs it was enqueued after
+	StateDead                          // failed permanently, or Cancel stopped it
+	StateCompleted                     // the message is here and its claim is gone
+)
+
+// stateNames are the words the statements return, in constant order. The
+// statements name the states so another client reads them out of the SQL.
+var stateNames = [...]string{
+	"queued", "scheduled", "running", "waiting to retry",
+	"waiting for signal", "waiting for jobs", "dead", "completed",
 }
 
-// New creates a new Client with the given database connection.
+// String returns the word the statements return, so a log line and a database
+// read of the same job agree.
+func (s State) String() string {
+	if s < 0 || int(s) >= len(stateNames) {
+		return fmt.Sprintf("State(%d)", int(s))
+	}
+	return stateNames[s]
+}
+
+// Message is a published message, as a consumer reads it.
+type Message struct {
+	ID        int64
+	Position  int64 // place in the stream, in commit order
+	Topic     string
+	Payload   json.RawMessage
+	CreatedAt time.Time // insert time, not commit time: it does not follow position order
+}
+
+// Job is one claimed unit of work, as a handler is given it. A job has no
+// position; it is not part of the stream.
+type Job struct {
+	ID   int64
+	Type string // the job type's name
+	// The workflow this job belongs to, and the value Signal, Cancel and the
+	// result reads take. A job that stands alone is its own group.
+	GroupID   int64
+	Topic     string
+	Payload   json.RawMessage
+	Signal    json.RawMessage // the payload delivered by Signal; nil unless the type declared one
+	Attempts  int             // 1 on the first run
+	CreatedAt time.Time       // insert time of the job's message
+
+	dependencyIDs []int64         // the jobs this one waited for, read by DependencyOutputs
+	completed     bool            // Complete's delete succeeded, so the worker does not repeat it
+	output        json.RawMessage // what SetOutput recorded, written by the completion
+	newJobs       []newJob        // what Enqueue and EnqueueAfter recorded, written by the completion
+	payloadErr    error           // a payload that could not be marshaled, returned by the completion
+}
+
+// newJob is one job a handler asked for, in the shape the completion writes.
+type newJob struct {
+	jobType string
+	queue   string
+	payload []byte
+	// Whether this job depends on the others: a dependent job runs when every
+	// job of the same buffer that is not dependent has completed.
+	dependent bool
+	signal    bool
+}
+
+// SetOutput records the job's result. Nothing is written here: the completion
+// writes the result in the statement that deletes the claim, so a result cannot
+// outlive an attempt that never finished. Call it and then either complete the
+// job or return nil and let the worker complete it. A second call replaces the
+// first.
 //
-// The connection can be a *pgxpool.Pool, *pgx.Conn, or pgx.Tx.
-func New(conn Conn) *Client {
-	return &Client{Conn: conn}
+// The value is marshaled here rather than in the completion: a value that
+// cannot be marshaled fails the attempt that produced it, instead of failing
+// every attempt once its work is already done.
+func (j *Job) SetOutput(v any) error {
+	body, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	j.output = body
+	return nil
 }
 
-// CreateQueue creates a queue with the given name and optional options.
-func (c *Client) CreateQueue(ctx context.Context, queueName string, opts ...QueueOpts) error {
-	return CreateQueue(ctx, c.Conn, queueName, opts...)
+// Enqueue records a job to run when this one completes. Nothing is written
+// here: the completion writes it in the statement that deletes the claim, so
+// the work this job asked for and the end of this job are one commit, and a
+// handler that fails or crashes halfway records nothing and retries with an
+// empty buffer.
+//
+// The new job joins this job's workflow, so Signal, Cancel and the result reads
+// address it by the same group id. A marshal failure is kept and returned by
+// the completion, which fails the attempt.
+func (j *Job) Enqueue(t *JobType, payload any) {
+	j.record(t, payload, false)
 }
 
-// GetQueue retrieves queue metadata by name.
-func (c *Client) GetQueue(ctx context.Context, queueName string) (*QueueInfo, error) {
-	return GetQueue(ctx, c.Conn, queueName)
+// EnqueueAfter records a job to run after the jobs this handler recorded with
+// Enqueue — all of them, and nothing wider: not the rest of the workflow, and
+// not what another handler is adding at the same time. The count comes from the
+// buffer, so nothing outside catbird holds it and it cannot be wrong.
+//
+// Recorded with no Enqueue beside it, the job waits for nothing and runs at
+// once.
+func (j *Job) EnqueueAfter(t *JobType, payload any) {
+	j.record(t, payload, true)
 }
 
-// ListQueues returns all queues
-func (c *Client) ListQueues(ctx context.Context) ([]*QueueInfo, error) {
-	return ListQueues(ctx, c.Conn)
+func (j *Job) record(t *JobType, payload any, dependent bool) {
+	body, err := json.Marshal(payload)
+	if err != nil && j.payloadErr == nil {
+		j.payloadErr = fmt.Errorf("catbird: job type %s: %w", t.name, err)
+	}
+	j.newJobs = append(j.newJobs, newJob{
+		jobType:   t.name,
+		queue:     t.queue.name,
+		payload:   body,
+		dependent: dependent,
+		signal:    t.opts.Signal,
+	})
 }
 
-// DeleteQueue deletes a queue and all its messages.
-// Returns true if the queue existed.
-func (c *Client) DeleteQueue(ctx context.Context, queueName string) (bool, error) {
-	return DeleteQueue(ctx, c.Conn, queueName)
+// DependencyOutputs returns the outputs of the jobs this one waited for: the
+// jobs the completion that created it recorded with Enqueue, in the order they
+// were enqueued. A job that recorded no output has no element. Nil for a job
+// that waited for nothing.
+//
+// This is the read a joining job makes. It waited for one buffer's jobs and
+// this returns those, where GroupStatus carries every output in the whole
+// workflow — every round of it, and the jobs another handler added. The ids
+// come from the claim, so the read probes cb_outputs by primary key.
+func (j *Job) DependencyOutputs(ctx context.Context, db Conn) (Outputs, error) {
+	if len(j.dependencyIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := db.Query(ctx, `
+		SELECT result.message_id, result.job_type, result.output
+		FROM unnest($1::bigint[]) WITH ORDINALITY AS dependency (job_id, place)
+		JOIN cb_outputs result ON result.message_id = dependency.job_id
+		ORDER BY dependency.place
+	`, j.dependencyIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var outputs Outputs
+	for rows.Next() {
+		var o Output
+		if err := rows.Scan(&o.JobID, &o.JobType, &o.Value); err != nil {
+			return nil, err
+		}
+		outputs = append(outputs, o)
+	}
+	return outputs, rows.Err()
 }
 
-// Send enqueues a message to the specified queue.
-func (c *Client) Send(ctx context.Context, queueName string, body any, opts ...SendOpts) error {
-	return Send(ctx, c.Conn, queueName, body, opts...)
+// Conn is the part of pgx.Tx and *pgxpool.Pool this package uses: a pool, a
+// connection, or a transaction.
+type Conn interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-// SendMany enqueues multiple messages to the specified queue.
-func (c *Client) SendMany(ctx context.Context, queueName string, bodies []any, opts ...SendManyOpts) error {
-	return SendMany(ctx, c.Conn, queueName, bodies, opts...)
+// EnqueueOptions are the optional parts of Enqueue.
+type EnqueueOptions struct {
+	DeduplicationKey string        // when set, a second Enqueue with the same key does nothing
+	Delay            time.Duration // earliest start, measured from now
+	Topic            string        // what the job is about; the job type's name when empty
 }
 
-// Bind subscribes a queue to a topic pattern.
-// Pattern supports exact topics and wildcards: * (single token), # (multi-token tail).
-// Examples: "foo.bar", "foo.*.bar", "foo.bar.#"
-func (c *Client) Bind(ctx context.Context, queueName string, pattern string) error {
-	return Bind(ctx, c.Conn, queueName, pattern)
+// Publish appends a message to the stream: consumers see it, no worker runs it.
+// Returns the message id, or 0 when deduplicationKey already exists.
+func Publish(ctx context.Context, db Conn, topic string, payload any, deduplicationKey string) (int64, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, err
+	}
+	var id int64
+	err = db.QueryRow(ctx, `
+		INSERT INTO cb_messages (topic, payload, stream, deduplication_key)
+		VALUES ($1, $2, true, $3)
+		ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
+		RETURNING id
+	`, topic, body, nullString(deduplicationKey)).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	return id, err
 }
 
-// Unbind unsubscribes a queue from a topic pattern.
-func (c *Client) Unbind(ctx context.Context, queueName string, pattern string) (bool, error) {
-	return Unbind(ctx, c.Conn, queueName, pattern)
+// BatchMessage is one message for PublishBatch and EnqueueBatch.
+type BatchMessage struct {
+	Topic            string
+	Payload          any    // marshalled to JSON; a json.RawMessage is written as it is
+	DeduplicationKey string // when set, a second message with the same key is not written
 }
 
-// Publish sends a message to all queues subscribed to the specified topic.
-func (c *Client) Publish(ctx context.Context, topic string, body any, opts ...PublishOpts) (int, error) {
-	return Publish(ctx, c.Conn, topic, body, opts...)
+// PublishBatch appends messages to the stream in one statement, so a
+// transaction that changed ten thousand records announces them in one round
+// trip. Returns how many were written: a message whose DeduplicationKey
+// already exists, or that repeats a key from its own batch, is skipped and not
+// counted.
+//
+// The messages travel as three arrays that are unnested into rows, so the
+// number of messages is not limited by the number of statement parameters. Like
+// Publish it sends no notification: the assigner announces the messages when it
+// gives them their positions.
+func PublishBatch(ctx context.Context, db Conn, msgs []BatchMessage) (int, error) {
+	if len(msgs) == 0 {
+		return 0, nil
+	}
+	topics, payloads, deduplicationKeys, err := batchArrays(msgs)
+	if err != nil {
+		return 0, err
+	}
+	tag, err := db.Exec(ctx, `
+		INSERT INTO cb_messages (topic, payload, stream, deduplication_key)
+		SELECT topic, payload, true, deduplication_key
+		FROM unnest($1::text[], $2::jsonb[], $3::text[]) AS message (topic, payload, deduplication_key)
+		ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
+	`, topics, payloads, deduplicationKeys)
+	return int(tag.RowsAffected()), err
 }
 
-// PublishMany sends multiple messages to all queues subscribed to the specified topic.
-func (c *Client) PublishMany(ctx context.Context, topic string, bodies []any, opts ...PublishManyOpts) (int, error) {
-	return PublishMany(ctx, c.Conn, topic, bodies, opts...)
+// Cursor is a named position in the stream together with what is read from it:
+// the patterns and the position belong to each other, because a position only
+// says how far a reader has come through the messages its own patterns select.
+// Two readers sharing a name with different patterns skip each other's
+// messages — the one reading less acks past what the other has not seen — so
+// build a cursor in one place and let both calls use it.
+type Cursor struct {
+	Name     string
+	Patterns []string
 }
 
-// Read reads up to quantity messages from the queue, hiding them from other
-// readers for the specified duration.
-func (c *Client) Read(ctx context.Context, queueName string, quantity int, hideFor time.Duration) ([]Message, error) {
-	return Read(ctx, c.Conn, queueName, quantity, hideFor)
+// Read returns the next messages after the cursor, in position order. A cursor
+// that has never been acked starts at position 0. Reading writes nothing and
+// moves nothing; Ack is what moves the cursor.
+//
+// The messages Enqueue writes get no position and are never returned:
+// enqueuing a job does not publish it.
+func (c Cursor) Read(ctx context.Context, db Conn, limit int) ([]Message, error) {
+	startSQL := "COALESCE((SELECT last_position FROM cb_cursors WHERE name = $1), 0)"
+	return readMessages(ctx, db, startSQL, c.Name, c.Patterns, limit)
 }
 
-// ReadPoll reads messages from a queue with polling support.
-// It polls repeatedly at the specified interval until messages are available
-// or the pollFor timeout is reached.
-func (c *Client) ReadPoll(ctx context.Context, queueName string, quantity int, hideFor time.Duration, opts ...ReadPollOpts) ([]Message, error) {
-	return ReadPoll(ctx, c.Conn, queueName, quantity, hideFor, opts...)
+// Ack moves the cursor to position. The cursor never moves backwards, so a
+// batch acked out of order cannot undo the progress of a later one.
+func (c Cursor) Ack(ctx context.Context, db Conn, position int64) error {
+	_, err := db.Exec(ctx, `
+		INSERT INTO cb_cursors (name, last_position) VALUES ($1, $2)
+		ON CONFLICT (name) DO UPDATE SET last_position = GREATEST(cb_cursors.last_position, EXCLUDED.last_position)
+	`, c.Name, position)
+	return err
 }
 
-// Hide hides a single message from being read for the specified duration.
-// Returns true if the message existed.
-func (c *Client) Hide(ctx context.Context, queueName string, id int64, hideFor time.Duration) (bool, error) {
-	return Hide(ctx, c.Conn, queueName, id, hideFor)
+// ReadAfter returns the next messages after position, in position order, for a
+// caller that holds its own position instead of a cursor: a poll endpoint, or
+// a connection that pushes messages to a browser.
+//
+// A caller that has been away longer than GC keeps messages resumes past
+// deleted ones with no sign of it here. OldestPosition is what tells it: when
+// that is ahead of the position it held, something was removed and the caller
+// refetches its state instead of trusting the rows.
+func ReadAfter(ctx context.Context, db Conn, patterns []string, after int64, limit int) ([]Message, error) {
+	return readMessages(ctx, db, "$1", after, patterns, limit)
 }
 
-// HideMany hides multiple messages from being read for the specified duration.
-func (c *Client) HideMany(ctx context.Context, queueName string, ids []int64, hideFor time.Duration) ([]int64, error) {
-	return HideMany(ctx, c.Conn, queueName, ids, hideFor)
+// LastPosition is the end of the stream: the highest position assigned so far,
+// or 0 on an empty stream. A page embeds it when it renders, so a reader that
+// connects afterwards starts there and misses nothing in between.
+func LastPosition(ctx context.Context, db Conn) (int64, error) {
+	var position int64
+	err := db.QueryRow(ctx, `SELECT COALESCE(max(position), 0) FROM cb_messages`).Scan(&position)
+	return position, err
 }
 
-// Delete deletes a single message from the queue.
-// Returns true if the message existed.
-func (c *Client) Delete(ctx context.Context, queueName string, id int64) (bool, error) {
-	return Delete(ctx, c.Conn, queueName, id)
+// OldestPosition is the lowest position GC has not removed, or 0 on an empty
+// stream. A reader compares it with the position it holds: when it is higher,
+// the messages in between are gone.
+func OldestPosition(ctx context.Context, db Conn) (int64, error) {
+	var position int64
+	err := db.QueryRow(ctx, `SELECT COALESCE(min(position), 0) FROM cb_messages`).Scan(&position)
+	return position, err
 }
 
-// DeleteMany deletes multiple messages from the queue.
-func (c *Client) DeleteMany(ctx context.Context, queueName string, ids []int64) ([]int64, error) {
-	return DeleteMany(ctx, c.Conn, queueName, ids)
+// readMessages runs one stream read. startSQL is the SQL for the position to
+// read after, holding $1, and limit is $2; the patterns take the parameters
+// from $3.
+func readMessages(ctx context.Context, db Conn, startSQL string, startArg any, patterns []string, limit int) ([]Message, error) {
+	matchSQL, args, err := compilePatterns(patterns, 3)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := db.Query(ctx, `
+		SELECT id, position, topic, payload, created_at
+		FROM cb_messages
+		WHERE position > `+startSQL+` AND `+matchSQL+`
+		ORDER BY position ASC
+		LIMIT $2
+	`, append([]any{startArg, limit}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []Message
+	for rows.Next() {
+		var m Message
+		if err := rows.Scan(&m.ID, &m.Position, &m.Topic, &m.Payload, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, rows.Err()
 }
 
-// CreateTask creates a task definition.
-func (c *Client) CreateTask(ctx context.Context, task *Task) error {
-	return CreateTask(ctx, c.Conn, task)
+// compilePatterns turns patterns into one boolean expression and the arguments
+// it reads, numbered from next. Three forms: a topic on its own matches that
+// topic exactly; a prefix followed by ".#" matches the prefix and every topic
+// under it, so "order.#" covers "order", "order.paid" and
+// "order.paid.refund"; "#" matches everything.
+//
+// Each pattern becomes its own comparison rather than one array test. A list
+// compared with = ANY or LIKE ANY cannot be read as index arms, so it walks the
+// position index and filters: 188 buffer hits against 72 for three subtrees
+// read from the start of a 300k-message stream.
+//
+// There is no "*". A wildcard inside a topic is not a prefix range, so it can
+// use no index at any position; a pattern that holds one is refused instead of
+// quietly running as the slowest read in the system.
+func compilePatterns(patterns []string, next int) (string, []any, error) {
+	if len(patterns) == 0 {
+		return "", nil, ErrBadPattern
+	}
+	var comparisonsSQL []string
+	var args []any
+	everything := false
+	for _, pattern := range patterns {
+		switch {
+		case pattern == "#":
+			everything = true
+		case strings.HasSuffix(pattern, ".#"):
+			prefix := strings.TrimSuffix(pattern, ".#")
+			if err := checkTopic(prefix); err != nil {
+				return "", nil, err
+			}
+			comparisonsSQL = append(comparisonsSQL, fmt.Sprintf("(topic = $%d OR topic LIKE $%d)", next, next+1))
+			args = append(args, prefix, subtreeLikePattern(prefix))
+			next += 2
+		default:
+			if err := checkTopic(pattern); err != nil {
+				return "", nil, err
+			}
+			comparisonsSQL = append(comparisonsSQL, fmt.Sprintf("topic = $%d", next))
+			args = append(args, pattern)
+			next++
+		}
+	}
+	// "#" is checked last so that a bad pattern beside it is still refused.
+	if everything {
+		return "true", nil, nil
+	}
+	return "(" + strings.Join(comparisonsSQL, " OR ") + ")", args, nil
 }
 
-// GetTask retrieves task metadata by name.
-func (c *Client) GetTask(ctx context.Context, taskName string) (*TaskInfo, error) {
-	return GetTask(ctx, c.Conn, taskName)
+func checkTopic(topic string) error {
+	if topic == "" || strings.ContainsAny(topic, "#*") {
+		return ErrBadPattern
+	}
+	return nil
 }
 
-// ListTasks returns all tasks
-func (c *Client) ListTasks(ctx context.Context) ([]*TaskInfo, error) {
-	return ListTasks(ctx, c.Conn)
+// subtreeLikePattern builds the SQL LIKE pattern matching every topic under
+// prefix — not prefix itself, which is the equality arm beside it. LIKE's own
+// wildcard characters in the prefix are escaped so they match literally:
+// "image_x" is not a topic under "image".
+func subtreeLikePattern(prefix string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix) + ".%"
 }
 
-// RunTask enqueues a task execution and returns a handle for monitoring
-// progress and retrieving output.
-func (c *Client) RunTask(ctx context.Context, taskName string, input any, opts ...RunTaskOpts) (*TaskHandle, error) {
-	return RunTask(ctx, c.Conn, taskName, input, opts...)
+// Enqueue appends a message and a claim for it, and wakes the queue's workers
+// unless the job cannot run yet. Returns the job's id, which is also the id of
+// the workflow it starts — what Signal, Cancel and the result reads address —
+// or 0 when opts.DeduplicationKey already exists.
+//
+// One statement does all three. The wake CTE calls pg_notify only for a job
+// that is claimable now, so a delayed job and a job waiting for a signal do not
+// wake workers that can do nothing with them; the final LEFT JOIN references it
+// so that it runs, since an unreferenced SELECT CTE is never executed. The
+// notification is delivered when the caller's transaction commits, together
+// with the row.
+func Enqueue(ctx context.Context, db Conn, t *JobType, payload any, opts EnqueueOptions) (int64, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, err
+	}
+	topic := opts.Topic
+	if topic == "" {
+		topic = t.name
+	}
+	var id int64
+	err = db.QueryRow(ctx, `
+		WITH message AS (
+			INSERT INTO cb_messages (topic, payload, deduplication_key)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
+			RETURNING id
+		),
+		claim AS (
+			INSERT INTO cb_claims (message_id, queue, job_type, visible_at, awaits_signal)
+			SELECT id, $4, $5,
+			       CASE WHEN $6 THEN 'infinity'::timestamptz ELSE now() + $7::interval END, $6
+			FROM message
+			RETURNING message_id, visible_at
+		),
+		wake AS (
+			SELECT pg_notify('cb_queue_' || $4, '') FROM claim WHERE visible_at <= now()
+		)
+		SELECT message_id FROM claim LEFT JOIN wake ON true
+	`, topic, body, nullString(opts.DeduplicationKey), t.queue.name, t.name, t.opts.Signal, opts.Delay).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	return id, err
 }
 
-// CancelTaskRun cancels a task run.
-func (c *Client) CancelTaskRun(ctx context.Context, taskName string, runID int64, opts ...CancelOpts) (bool, error) {
-	return CancelTaskRun(ctx, c.Conn, taskName, runID, opts...)
+// EnqueueBatch appends messages and their claims for one job type in one
+// statement and wakes the queue's workers. Returns how many jobs it created: a
+// message whose DeduplicationKey is already taken, or that repeats a key from
+// its own batch, gets neither a message nor a claim and is not counted.
+//
+// This is the volume path — what a trigger uses. Every job in the batch takes
+// the same options, and none of them starts a workflow or waits for anything: a
+// job type declared with Signal cannot be enqueued this way, because a batch has
+// no ids for a caller to signal.
+//
+// The claims come from the messages that were written, so a deduplicated
+// message produces no job. The wake CTE reads the claims through LIMIT 1, which
+// does two things: the join at the end sees one wake row, so it cannot multiply
+// the count, and pg_notify runs once instead of once per job. It saves the calls
+// rather than the wake-ups — Postgres delivers identical notifications from one
+// transaction once whatever we do. Reading the claim CTE through a LIMIT does
+// not cut the insert short; a data-modifying CTE always runs in full.
+func EnqueueBatch(ctx context.Context, db Conn, t *JobType, msgs []BatchMessage, opts EnqueueOptions) (int, error) {
+	if len(msgs) == 0 {
+		return 0, nil
+	}
+	if t.opts.Signal {
+		return 0, fmt.Errorf("catbird: job type %s waits for a signal and cannot be enqueued in a batch", t.name)
+	}
+	topics, payloads, deduplicationKeys, err := batchArrays(msgs)
+	if err != nil {
+		return 0, err
+	}
+	var created int
+	err = db.QueryRow(ctx, `
+		WITH input AS (
+			SELECT * FROM unnest($1::text[], $2::jsonb[], $3::text[]) AS message (topic, payload, deduplication_key)
+		),
+		message AS (
+			INSERT INTO cb_messages (topic, payload, deduplication_key)
+			SELECT topic, payload, deduplication_key FROM input
+			ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
+			RETURNING id
+		),
+		claim AS (
+			INSERT INTO cb_claims (message_id, queue, job_type, visible_at)
+			SELECT id, $4, $5, now() + $6::interval FROM message
+			RETURNING message_id
+		),
+		wake AS (
+			SELECT pg_notify('cb_queue_' || $4, '') FROM (SELECT 1 FROM claim LIMIT 1) one WHERE $7
+		)
+		SELECT count(*) FROM claim LEFT JOIN wake ON true
+	`, topics, payloads, deduplicationKeys, t.queue.name, t.name, opts.Delay, opts.Delay <= 0).Scan(&created)
+	return created, err
 }
 
-// GetTaskRun retrieves a specific task run result by ID.
-func (c *Client) GetTaskRun(ctx context.Context, taskName string, taskRunID int64) (*TaskRunInfo, error) {
-	return GetTaskRun(ctx, c.Conn, taskName, taskRunID)
+// enqueuePeriodic writes one tick of a scheduled job type: the job whose
+// deduplication key names the minute, unless that key is taken or a live job
+// of the type exists. Two guards in one statement. The key,
+// periodic:<type>:<minute> with the minute in UTC as YYYY-MM-DDTHH:MMZ,
+// collapses every process ticking in the same minute into one job; the format
+// is fixed because every process must produce the same key. The NOT EXISTS
+// makes a tick during a live run write nothing at all — no message row, no
+// key — so a run that outlives its schedule swallows the ticks it covers and
+// no backlog of stale ticks can form.
+//
+// The guard counts every live job of the type, not only ticks, so a manual
+// Enqueue of the type holds it too — "run it now" composes — but is not
+// itself guarded: two manual enqueues can overlap. It repeats the ready
+// index's dependencies = 0 so the probe stays on that index instead of
+// scanning the heap; the cost is that a job of the type created inside a
+// workflow is not counted while it still waits for other jobs.
+func enqueuePeriodic(ctx context.Context, db Conn, t *JobType, minute time.Time) error {
+	key := "periodic:" + t.name + ":" + minute.UTC().Format("2006-01-02T15:04") + "Z"
+	_, err := db.Exec(ctx, `
+		WITH message AS (
+			INSERT INTO cb_messages (topic, deduplication_key)
+			SELECT $1, $2
+			WHERE NOT EXISTS (
+				SELECT 1 FROM cb_claims
+				WHERE queue = $3 AND job_type = $1 AND died_at IS NULL AND dependencies = 0
+			)
+			ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
+			RETURNING id
+		),
+		claim AS (
+			INSERT INTO cb_claims (message_id, queue, job_type, visible_at)
+			SELECT id, $3, $1, now()
+			FROM message
+			RETURNING message_id
+		),
+		wake AS (
+			SELECT pg_notify('cb_queue_' || $3, '') FROM claim
+		)
+		SELECT message_id FROM claim LEFT JOIN wake ON true
+	`, t.name, key, t.queue.name)
+	return err
 }
 
-// ListTaskRuns returns recent task runs for the specified task.
-func (c *Client) ListTaskRuns(ctx context.Context, taskName string) ([]*TaskRunInfo, error) {
-	return ListTaskRuns(ctx, c.Conn, taskName)
+// Complete finishes a job: it deletes the claim, writes the result the handler
+// recorded with SetOutput, counts down the jobs waiting for this one, and
+// creates the jobs the handler recorded with Enqueue and EnqueueAfter. A worker
+// does this itself when the handler returns nil, so a handler only calls it to
+// put the completion in the same transaction as its own writes, which is what
+// makes the job's work and the job's end one commit. The delete matches on
+// attempts: if the claim expired and another worker took the job, attempts moved
+// on, nothing is deleted, and this returns ErrClaimLost — the caller rolls
+// back and the work of the late attempt is discarded.
+//
+// It is one statement, so a job costs one round trip to finish however much it
+// asked for. Everything in it hangs off the claim the delete returned, so an
+// attempt that lost its claim writes no result, counts nothing down and creates no
+// jobs.
+//
+// The new jobs get their ids from the sequence inside the statement, which is
+// what lets one statement point the jobs that are not dependent at the ones
+// that are: a job recorded with EnqueueAfter takes the count of the others as
+// its dependencies and their ids in dependency_job_ids, and each of the others
+// carries its id in dependent_job_ids. The count and the list come out of the
+// same rows, so they cannot disagree.
+// The CTE that hands out the ids is MATERIALIZED because nextval is volatile and
+// an inlined CTE would be evaluated once per reference, giving a message and its
+// claim different ids.
+//
+// A successful call marks job, so the worker does not run the completion a
+// second time. The mark records that the statement succeeded, not that the
+// caller's transaction committed: a handler that completes the job, rolls the
+// transaction back, and then returns nil leaves a claim nothing deletes until
+// the claim expires and the job runs again.
+func Complete(ctx context.Context, db Conn, job *Job) error {
+	if job.payloadErr != nil {
+		return job.payloadErr
+	}
+	types, queues, payloads, dependents, signals := newJobArrays(job.newJobs)
+	var completed, woken int
+	err := db.QueryRow(ctx, `
+		WITH claim AS (
+		    DELETE FROM cb_claims WHERE message_id = $1 AND attempts = $2
+		    RETURNING message_id, job_type, coalesce(group_id, message_id) AS group_id, dependent_job_ids
+		),
+		output AS (
+		    INSERT INTO cb_outputs (message_id, group_id, job_type, output)
+		    SELECT message_id, group_id, job_type, $3::jsonb FROM claim WHERE $3::jsonb IS NOT NULL
+		),
+		dependent_job AS (
+		    UPDATE cb_claims SET dependencies = dependencies - 1
+		    WHERE message_id IN (SELECT unnest(dependent_job_ids) FROM claim)
+		      AND died_at IS NULL AND dependencies > 0
+		    RETURNING queue, dependencies, visible_at
+		),
+		new_job AS MATERIALIZED (
+		    SELECT nextval('cb_messages_id_seq') AS id, n.*
+		    FROM unnest($4::text[], $5::text[], $6::jsonb[], $7::boolean[], $8::boolean[])
+		         AS n (job_type, queue, payload, dependent, signal)
+		),
+		new_message AS (
+		    INSERT INTO cb_messages (id, topic, payload)
+		    SELECT n.id, n.job_type, n.payload FROM new_job n, claim
+		),
+		new_claim AS (
+		    INSERT INTO cb_claims (message_id, queue, job_type, group_id, visible_at,
+		                           dependencies, dependency_job_ids, dependent_job_ids, awaits_signal)
+		    SELECT n.id, n.queue, n.job_type, c.group_id,
+		           CASE WHEN n.signal THEN 'infinity'::timestamptz ELSE now() END,
+		           CASE WHEN n.dependent THEN (SELECT count(*) FROM new_job WHERE NOT dependent) ELSE 0 END::smallint,
+		           CASE WHEN n.dependent THEN (SELECT array_agg(id ORDER BY id) FROM new_job WHERE NOT dependent) END,
+		           CASE WHEN n.dependent THEN NULL ELSE (SELECT array_agg(id ORDER BY id) FROM new_job WHERE dependent) END,
+		           n.signal
+		    FROM new_job n, claim c
+		    RETURNING queue, dependencies, visible_at
+		),
+		woken AS (
+		    SELECT DISTINCT queue FROM (
+		        SELECT queue, dependencies, visible_at FROM dependent_job
+		        UNION ALL
+		        SELECT queue, dependencies, visible_at FROM new_claim
+		    ) ready
+		    WHERE dependencies = 0 AND visible_at <= now()
+		),
+		wake AS (
+		    SELECT pg_notify('cb_queue_' || queue, '') FROM woken
+		)
+		SELECT (SELECT count(*) FROM claim), (SELECT count(*) FROM wake)
+	`, job.ID, job.Attempts, job.output, types, queues, payloads, dependents, signals).Scan(&completed, &woken)
+	if err != nil {
+		return err
+	}
+	if completed == 0 {
+		return ErrClaimLost
+	}
+	job.completed = true
+	return nil
 }
 
-// CreateFlow creates a flow definition.
-func (c *Client) CreateFlow(ctx context.Context, flow *Flow) error {
-	return CreateFlow(ctx, c.Conn, flow)
+// Signal delivers the payload a job of this type is waiting for in the given
+// workflow, and makes it claimable. groupID is what Enqueue returned for the
+// job that started the workflow, which is also the id of a job that stands
+// alone. Returns ErrNotFound when nothing is waiting: no such workflow, no live
+// job of that type in it, or the signal was already delivered.
+//
+// The job is addressed by what it is rather than by its id, because a job a
+// handler asked for has no id until that handler's completion runs and no
+// caller can hold one. Every live job of the type in the workflow is given the
+// payload; declaring one gate per type in a workflow is what keeps that to one.
+func Signal(ctx context.Context, db Conn, groupID int64, t *JobType, payload any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	var delivered, woken int
+	err = db.QueryRow(ctx, `
+		WITH gated AS (
+			UPDATE cb_claims SET signal = $3, visible_at = now()
+			WHERE (group_id = $1 OR message_id = $1) AND job_type = $2
+			  AND died_at IS NULL AND awaits_signal AND signal IS NULL
+			RETURNING queue, dependencies
+		),
+		wake AS (
+			SELECT pg_notify('cb_queue_' || queue, '') FROM gated WHERE dependencies = 0
+		)
+		SELECT (SELECT count(*) FROM gated), (SELECT count(*) FROM wake)
+	`, groupID, t.name, body).Scan(&delivered, &woken)
+	if err != nil {
+		return err
+	}
+	if delivered == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
-// GetFlow retrieves flow metadata by name.
-func (c *Client) GetFlow(ctx context.Context, flowName string) (*FlowInfo, error) {
-	return GetFlow(ctx, c.Conn, flowName)
+// Cancel marks every live job of the workflow dead, the job that started it
+// included. A job that is already running finishes; cancel only stops jobs from
+// starting.
+func Cancel(ctx context.Context, db Conn, groupID int64) error {
+	_, err := db.Exec(ctx, `
+		UPDATE cb_claims SET died_at = now()
+		WHERE (group_id = $1 OR message_id = $1) AND died_at IS NULL
+	`, groupID)
+	return err
 }
 
-// ListFlows returns all flows
-func (c *Client) ListFlows(ctx context.Context) ([]*FlowInfo, error) {
-	return ListFlows(ctx, c.Conn)
+// Output is one recorded result: which job recorded it, that job's type, and
+// the value SetOutput was given. The JSON tags are the names GroupStatus's
+// statement builds, so its rows decode straight into the type.
+type Output struct {
+	JobID   int64           `json:"job_id"`
+	JobType string          `json:"job_type"`
+	Value   json.RawMessage `json:"value"`
 }
 
-// RunFlow enqueues a flow execution and returns a handle for monitoring.
-func (c *Client) RunFlow(ctx context.Context, flowName string, input any, opts ...RunFlowOpts) (*FlowHandle, error) {
-	return RunFlow(ctx, c.Conn, flowName, input, opts...)
+// Scan unmarshals the value into dest. A dest of *json.RawMessage takes the
+// JSON untouched.
+func (o Output) Scan(dest any) error {
+	return json.Unmarshal(o.Value, dest)
 }
 
-// CancelFlowRun cancels a flow run.
-func (c *Client) CancelFlowRun(ctx context.Context, flowName string, runID int64, opts ...CancelOpts) (bool, error) {
-	return CancelFlowRun(ctx, c.Conn, flowName, runID, opts...)
+// Outputs holds recorded results in the order the jobs that recorded them were
+// created. A job that recorded nothing has no element.
+type Outputs []Output
+
+// Get unmarshals into dest the one output recorded by a job of this type.
+// ErrNotFound when no job of the type recorded one, ErrAmbiguous when several
+// did — a fan-out, which GetAll reads.
+func (os Outputs) Get(t *JobType, dest any) error {
+	all := os.GetAll(t)
+	switch len(all) {
+	case 0:
+		return ErrNotFound
+	case 1:
+		return all[0].Scan(dest)
+	default:
+		return ErrAmbiguous
+	}
 }
 
-// GetFlowRun retrieves a specific flow run result by ID.
-func (c *Client) GetFlowRun(ctx context.Context, flowName string, flowRunID int64) (*FlowRunInfo, error) {
-	return GetFlowRun(ctx, c.Conn, flowName, flowRunID)
+// GetAll returns the outputs recorded by jobs of this type, order kept.
+func (os Outputs) GetAll(t *JobType) Outputs {
+	var all Outputs
+	for _, o := range os {
+		if o.JobType == t.name {
+			all = append(all, o)
+		}
+	}
+	return all
 }
 
-// ListFlowRuns returns recent flow runs for the specified flow.
-func (c *Client) ListFlowRuns(ctx context.Context, flowName string) ([]*FlowRunInfo, error) {
-	return ListFlowRuns(ctx, c.Conn, flowName)
+// JobStatus is what Status reports of one job: its state, the attempts it has
+// spent, and what its last failed attempt returned.
+//
+// LastError is empty while an attempt runs, because the claim clears it. That
+// is what separates StateRunning from StateWaitingToRetry.
+type JobStatus struct {
+	State     State
+	Attempts  int
+	LastError string
 }
 
-// GetFlowRunSteps retrieves all step runs for a specific flow run.
-func (c *Client) GetFlowRunSteps(ctx context.Context, flowName string, flowRunID int64) ([]*StepRunInfo, error) {
-	return GetFlowRunSteps(ctx, c.Conn, flowName, flowRunID)
+// stateCaseSQL is the body of the CASE that derives what a live claim is doing,
+// over a row aliased claim. It is one constant because Status and Queues both
+// run it, and a copy that drifted — a test reordered, a comparison changed —
+// would let the two reads sort the same job into different states with nothing
+// failing. The words are stateNames; Status alone puts the completed test
+// above these, which is the absence of a claim.
+const stateCaseSQL = `
+		           WHEN claim.died_at IS NOT NULL THEN 'dead'
+		           WHEN claim.awaits_signal AND claim.signal IS NULL THEN 'waiting for signal'
+		           WHEN claim.dependencies > 0 THEN 'waiting for jobs'
+		           WHEN claim.visible_at <= now() THEN 'queued'
+		           WHEN claim.attempts = 0 THEN 'scheduled'
+		           WHEN claim.last_error IS NOT NULL THEN 'waiting to retry'
+		           ELSE 'running'`
+
+// Status reports what one job is doing. Two primary-key probes; no column
+// holds a state.
+//
+// StateCompleted means the message is here and its claim is gone, so it lasts
+// only as long as the message: after GC the job returns ErrNotFound, as does a
+// published message's id.
+func Status(ctx context.Context, db Conn, id int64) (JobStatus, error) {
+	var status JobStatus
+	var name string
+	var text *string
+	err := db.QueryRow(ctx, `
+		SELECT CASE
+		           WHEN claim.message_id IS NULL THEN 'completed'`+stateCaseSQL+`
+		       END,
+		       coalesce(claim.attempts, 0), claim.last_error
+		FROM cb_messages message
+		LEFT JOIN cb_claims claim ON claim.message_id = message.id
+		WHERE message.id = $1 AND NOT message.stream
+	`, id).Scan(&name, &status.Attempts, &text)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return JobStatus{}, ErrNotFound
+	}
+	if err != nil {
+		return JobStatus{}, err
+	}
+	if text != nil {
+		status.LastError = *text
+	}
+	for i, n := range stateNames {
+		if n == name {
+			status.State = State(i)
+			return status, nil
+		}
+	}
+	return JobStatus{}, fmt.Errorf("catbird: unknown job state %q", name)
 }
 
-// SignalFlow delivers a signal to a waiting step in a flow run.
-// The step must have been defined with a signal variant (e.g., NewStepWithSignal).
-// Returns an error if the signal was already delivered or the step doesn't require a signal.
-func (c *Client) SignalFlow(ctx context.Context, flowName string, flowRunID int64, stepName string, input any) error {
-	return SignalFlow(ctx, c.Conn, flowName, flowRunID, stepName, input)
+// JobGroupStatus is what GroupStatus reports of a whole workflow: its state,
+// which job to ask when it is dead, and every output its jobs recorded so far,
+// in the order the jobs that recorded them were created.
+//
+// DeadJobID is 0 unless the state is StateDead. It is the job whose failure is
+// recorded when there is one — a job that dies cancels the rest of its
+// workflow, and the jobs the cancel took carry no error to read — so Status on
+// it has the attempts and the error.
+type JobGroupStatus struct {
+	State     State
+	DeadJobID int64
+	Outputs   Outputs
 }
 
-// PurgeTaskRuns deletes terminal task runs older than the given duration.
-// See PurgeTaskRuns for details.
-func (c *Client) PurgeTaskRuns(ctx context.Context, taskName string, olderThan time.Duration) (int, error) {
-	return PurgeTaskRuns(ctx, c.Conn, taskName, olderThan)
+// GroupStatus reports what a workflow is doing: StateRunning while jobs
+// remain, StateDead once any job died, StateCompleted when every job
+// completed. The outputs ride the same statement, so polling and reading the
+// result is one call.
+//
+// This is the read for the caller that holds only the id Enqueue returned:
+// handlers decide the fan-out as they run, so that caller cannot name the
+// workflow's jobs, and a job that died runs nothing and publishes nothing —
+// only its claim shows it. Like StateCompleted, the completed answer lasts as
+// long as the starting job's message: after GC the workflow returns
+// ErrNotFound.
+func GroupStatus(ctx context.Context, db Conn, groupID int64) (JobGroupStatus, error) {
+	var name *string
+	var status JobGroupStatus
+	var outputs []byte
+	err := db.QueryRow(ctx, `
+		WITH claim AS (
+		    SELECT message_id, died_at, last_error
+		    FROM cb_claims WHERE group_id = $1 OR message_id = $1
+		)
+		SELECT CASE
+		           WHEN EXISTS (SELECT 1 FROM claim WHERE died_at IS NOT NULL) THEN 'dead'
+		           WHEN EXISTS (SELECT 1 FROM claim) THEN 'running'
+		           WHEN EXISTS (SELECT 1 FROM cb_messages WHERE id = $1 AND NOT stream) THEN 'completed'
+		       END,
+		       -- The job whose failure is recorded sorts before the jobs Cancel
+		       -- took with it, which carry no error.
+		       coalesce((SELECT message_id FROM claim WHERE died_at IS NOT NULL
+		                 ORDER BY last_error IS NULL, died_at, message_id LIMIT 1), 0),
+		       (SELECT coalesce(jsonb_agg(jsonb_build_object(
+		                   'job_id', result.message_id,
+		                   'job_type', result.job_type,
+		                   'value', result.output) ORDER BY result.message_id), '[]')
+		        FROM cb_outputs result WHERE result.group_id = $1)
+	`, groupID).Scan(&name, &status.DeadJobID, &outputs)
+	if err != nil {
+		return JobGroupStatus{}, err
+	}
+	if name == nil {
+		return JobGroupStatus{}, ErrNotFound
+	}
+	if err := json.Unmarshal(outputs, &status.Outputs); err != nil {
+		return JobGroupStatus{}, err
+	}
+	for i, n := range stateNames {
+		if n == *name {
+			status.State = State(i)
+			return status, nil
+		}
+	}
+	return JobGroupStatus{}, fmt.Errorf("catbird: unknown workflow state %q", *name)
 }
 
-// PurgeFlowRuns deletes terminal flow runs older than the given duration.
-// See PurgeFlowRuns for details.
-func (c *Client) PurgeFlowRuns(ctx context.Context, flowName string, olderThan time.Duration) (int, error) {
-	return PurgeFlowRuns(ctx, c.Conn, flowName, olderThan)
+// QueueInfo is what Queues reports of one queue: how many of its jobs are in
+// each state, and the longest any queued job has been waiting for a worker.
+// The wait runs from visible_at, so a retry counts from when its backoff ran
+// out, not from when the job was created: it measures workers falling behind,
+// which is what a depth number alone cannot show.
+type QueueInfo struct {
+	Queue            string
+	Queued           int
+	Scheduled        int
+	Running          int
+	WaitingToRetry   int
+	WaitingForSignal int
+	WaitingForJobs   int
+	Dead             int // dead jobs GC has not collected yet
+	LongestQueued    time.Duration
 }
 
-// ClearTaskRuns deletes all runs for the given task regardless of status.
-// See ClearTaskRuns for details.
-func (c *Client) ClearTaskRuns(ctx context.Context, taskName string) (int, error) {
-	return ClearTaskRuns(ctx, c.Conn, taskName)
+// Queues reports what every queue is doing: one QueueInfo per queue that has
+// claims, in name order. Completed jobs have no claim, so a drained queue does
+// not appear; a caller exporting a fixed set of queues merges in the ones it
+// declared. It walks every claim row — a table this design keeps small — so it
+// is a read to poll on an interval, not a hot-path statement.
+func Queues(ctx context.Context, db Conn) ([]QueueInfo, error) {
+	rows, err := db.Query(ctx, `
+		SELECT queue,
+		       count(*) FILTER (WHERE state = 'queued'),
+		       count(*) FILTER (WHERE state = 'scheduled'),
+		       count(*) FILTER (WHERE state = 'running'),
+		       count(*) FILTER (WHERE state = 'waiting to retry'),
+		       count(*) FILTER (WHERE state = 'waiting for signal'),
+		       count(*) FILTER (WHERE state = 'waiting for jobs'),
+		       count(*) FILTER (WHERE state = 'dead'),
+		       coalesce(extract(epoch FROM now() - min(visible_at) FILTER (WHERE state = 'queued')), 0)::float8
+		FROM (
+		    SELECT claim.queue, claim.visible_at,
+		           CASE`+stateCaseSQL+`
+		           END AS state
+		    FROM cb_claims claim
+		) claim
+		GROUP BY queue
+		ORDER BY queue
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var queues []QueueInfo
+	for rows.Next() {
+		var q QueueInfo
+		var age float64
+		if err := rows.Scan(&q.Queue, &q.Queued, &q.Scheduled, &q.Running,
+			&q.WaitingToRetry, &q.WaitingForSignal, &q.WaitingForJobs, &q.Dead, &age); err != nil {
+			return nil, err
+		}
+		q.LongestQueued = time.Duration(age * float64(time.Second))
+		queues = append(queues, q)
+	}
+	return queues, rows.Err()
 }
 
-// ClearFlowRuns deletes all runs for the given flow regardless of status.
-// See ClearFlowRuns for details.
-func (c *Client) ClearFlowRuns(ctx context.Context, flowName string) (int, error) {
-	return ClearFlowRuns(ctx, c.Conn, flowName)
+// GC deletes claims dead longer than retention and messages older than
+// retention. A message that still has a claim is kept, however old it is.
+// Results go with their message.
+func GC(ctx context.Context, db Conn, retention time.Duration) error {
+	_, err := db.Exec(ctx, `
+		DELETE FROM cb_claims
+		WHERE died_at < now() - $1::interval
+	`, retention)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(ctx, `
+		DELETE FROM cb_messages m
+		WHERE created_at < now() - $1::interval
+		  AND NOT EXISTS (SELECT 1 FROM cb_claims c WHERE c.message_id = m.id)
+	`, retention)
+	return err
 }
 
-// BindTask subscribes a task to a topic pattern.
-// When a message is published to a matching topic, a task run is created
-// with the message body as input.
-func (c *Client) BindTask(ctx context.Context, taskName string, pattern string) error {
-	return BindTask(ctx, c.Conn, taskName, pattern)
+// batchArrays turns messages into the three parallel arrays the batch
+// statements unnest, so the number of messages is not limited by the number of
+// statement parameters.
+func batchArrays(msgs []BatchMessage) (topics []string, payloads [][]byte, deduplicationKeys []*string, err error) {
+	topics = make([]string, len(msgs))
+	payloads = make([][]byte, len(msgs))
+	deduplicationKeys = make([]*string, len(msgs))
+	for i, msg := range msgs {
+		body, err := json.Marshal(msg.Payload)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		topics[i], payloads[i], deduplicationKeys[i] = msg.Topic, body, nullString(msg.DeduplicationKey)
+	}
+	return topics, payloads, deduplicationKeys, nil
 }
 
-// UnbindTask removes a task trigger binding.
-func (c *Client) UnbindTask(ctx context.Context, taskName string, pattern string) (bool, error) {
-	return UnbindTask(ctx, c.Conn, taskName, pattern)
+// newJobArrays turns a handler's buffer into the five parallel arrays the
+// completion unnests.
+func newJobArrays(jobs []newJob) (types, queues []string, payloads [][]byte, dependents, signals []bool) {
+	types = make([]string, len(jobs))
+	queues = make([]string, len(jobs))
+	payloads = make([][]byte, len(jobs))
+	dependents = make([]bool, len(jobs))
+	signals = make([]bool, len(jobs))
+	for i, n := range jobs {
+		types[i], queues[i], payloads[i] = n.jobType, n.queue, n.payload
+		dependents[i], signals[i] = n.dependent, n.signal
+	}
+	return types, queues, payloads, dependents, signals
 }
 
-// BindFlow subscribes a flow to a topic pattern.
-// When a message is published to a matching topic, a flow run is created
-// with the message body as input.
-func (c *Client) BindFlow(ctx context.Context, flowName string, pattern string) error {
-	return BindFlow(ctx, c.Conn, flowName, pattern)
-}
-
-// UnbindFlow removes a flow trigger binding.
-func (c *Client) UnbindFlow(ctx context.Context, flowName string, pattern string) (bool, error) {
-	return UnbindFlow(ctx, c.Conn, flowName, pattern)
-}
-
-// Notify sends an ephemeral notification via pg NOTIFY.
-func (c *Client) Notify(ctx context.Context, topic, message string, opts ...NotifyOpts) error {
-	return Notify(ctx, c.Conn, topic, message, opts...)
-}
-
-// NotifyDurable appends a durable notification to identity's inbox and returns its id.
-func (c *Client) NotifyDurable(ctx context.Context, identity, topic, message string, opts ...NotifyDurableOpts) (int64, error) {
-	return NotifyDurable(ctx, c.Conn, identity, topic, message, opts...)
-}
-
-// UnseenNotifications returns an identity's unseen and still-relevant notifications
-// with id greater than afterID, ordered by id, limited to limit rows.
-func (c *Client) UnseenNotifications(ctx context.Context, identity string, afterID int64, limit int) ([]Notification, error) {
-	return UnseenNotifications(ctx, c.Conn, identity, afterID, limit)
-}
-
-// MarkSeenUntil acks the cursor as a bounded watermark: marks all of identity's
-// unseen notifications with id less than or equal to id as seen, and returns the
-// number of rows marked. Whole-inbox scope only — see the package-level MarkSeenUntil.
-func (c *Client) MarkSeenUntil(ctx context.Context, identity string, id int64) (int64, error) {
-	return MarkSeenUntil(ctx, c.Conn, identity, id)
-}
-
-// MarkSeen acks precisely: marks the identity's unseen notifications whose id is in
-// ids as seen, and returns the number of rows marked. Use for subset-scoped acks.
-func (c *Client) MarkSeen(ctx context.Context, identity string, ids []int64) (int64, error) {
-	return MarkSeen(ctx, c.Conn, identity, ids)
-}
-
-// Reader continuously reads messages from a queue and processes them.
-// Blocks until ctx is cancelled.
-func (c *Client) Reader(ctx context.Context, queueName string, quantity int, hideFor time.Duration, handler ReaderHandler, opts ...ReadPollOpts) error {
-	return Reader(ctx, c.Conn, queueName, quantity, hideFor, handler, opts...)
-}
-
-// GC runs garbage collection and returns a summary report.
-func (c *Client) GC(ctx context.Context) (*GCInfo, error) {
-	return GC(ctx, c.Conn)
-}
-
-// ListWorkers returns all registered workers.
-func (c *Client) ListWorkers(ctx context.Context) ([]*WorkerInfo, error) {
-	return ListWorkers(ctx, c.Conn)
-}
-
-// CreateTaskSchedule creates a cron-based schedule for a task.
-// cronSpec should be in 5-field format (min hour day month dow) or descriptors like @hourly, @daily.
-// opts are optional ScheduleOpt values configuring the schedule.
-func (c *Client) CreateTaskSchedule(ctx context.Context, taskName, cronSpec string, opts ...ScheduleOpt) error {
-	return CreateTaskSchedule(ctx, c.Conn, taskName, cronSpec, opts...)
-}
-
-// CreateFlowSchedule creates a cron-based schedule for a flow.
-// cronSpec should be in 5-field format (min hour day month dow) or descriptors like @hourly, @daily.
-// opts are optional ScheduleOpt values configuring the schedule.
-func (c *Client) CreateFlowSchedule(ctx context.Context, flowName, cronSpec string, opts ...ScheduleOpt) error {
-	return CreateFlowSchedule(ctx, c.Conn, flowName, cronSpec, opts...)
-}
-
-// DeleteTaskSchedule removes the cron schedule for a task.
-// It reports whether a schedule existed; deleting a missing schedule is a no-op.
-func (c *Client) DeleteTaskSchedule(ctx context.Context, taskName string) (bool, error) {
-	return DeleteTaskSchedule(ctx, c.Conn, taskName)
-}
-
-// DeleteFlowSchedule removes the cron schedule for a flow.
-// It reports whether a schedule existed; deleting a missing schedule is a no-op.
-func (c *Client) DeleteFlowSchedule(ctx context.Context, flowName string) (bool, error) {
-	return DeleteFlowSchedule(ctx, c.Conn, flowName)
-}
-
-// ListTaskSchedules returns all task schedules ordered by next_run_at.
-func (c *Client) ListTaskSchedules(ctx context.Context) ([]*TaskScheduleInfo, error) {
-	return ListTaskSchedules(ctx, c.Conn)
-}
-
-// ListFlowSchedules returns all flow schedules ordered by next_run_at.
-func (c *Client) ListFlowSchedules(ctx context.Context) ([]*FlowScheduleInfo, error) {
-	return ListFlowSchedules(ctx, c.Conn)
+func nullString(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
