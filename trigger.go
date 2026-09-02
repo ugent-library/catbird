@@ -105,7 +105,7 @@ func (t *trigger) start(ctx context.Context) {
 // trigger writes no rows. The wake reads the claims through LIMIT 1 and the
 // final SELECT references it so that it runs, both as in EnqueueBatch.
 func (t *trigger) enqueueNextBatch(ctx context.Context) (int, error) {
-	match, args, err := compilePatterns(t.cursor.Patterns, 6)
+	matchSQL, args, err := compilePatterns(t.cursor.Patterns, 6)
 	if err != nil {
 		return 0, err
 	}
@@ -115,7 +115,7 @@ func (t *trigger) enqueueNextBatch(ctx context.Context) (int, error) {
 			SELECT id, position, topic, payload
 			FROM cb_messages
 			WHERE position > COALESCE((SELECT last_position FROM cb_cursors WHERE name = $1), 0)
-			  AND `+match+`
+			  AND `+matchSQL+`
 			ORDER BY position ASC
 			LIMIT $2
 		),

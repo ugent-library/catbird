@@ -281,8 +281,8 @@ type Cursor struct {
 // The messages Enqueue writes get no position and are never returned:
 // enqueuing a job does not publish it.
 func (c Cursor) Read(ctx context.Context, db Conn, limit int) ([]Message, error) {
-	start := "COALESCE((SELECT last_position FROM cb_cursors WHERE name = $1), 0)"
-	return readMessages(ctx, db, start, c.Name, c.Patterns, limit)
+	startSQL := "COALESCE((SELECT last_position FROM cb_cursors WHERE name = $1), 0)"
+	return readMessages(ctx, db, startSQL, c.Name, c.Patterns, limit)
 }
 
 // Ack moves the cursor to position. The cursor never moves backwards, so a
@@ -325,17 +325,18 @@ func OldestPosition(ctx context.Context, db Conn) (int64, error) {
 	return position, err
 }
 
-// readMessages runs one stream read. start is the SQL for the position to read
-// after, holding $1, and limit is $2; the patterns take the parameters from $3.
-func readMessages(ctx context.Context, db Conn, start string, startArg any, patterns []string, limit int) ([]Message, error) {
-	match, args, err := compilePatterns(patterns, 3)
+// readMessages runs one stream read. startSQL is the SQL for the position to
+// read after, holding $1, and limit is $2; the patterns take the parameters
+// from $3.
+func readMessages(ctx context.Context, db Conn, startSQL string, startArg any, patterns []string, limit int) ([]Message, error) {
+	matchSQL, args, err := compilePatterns(patterns, 3)
 	if err != nil {
 		return nil, err
 	}
 	rows, err := db.Query(ctx, `
 		SELECT id, position, topic, payload, created_at
 		FROM cb_messages
-		WHERE position > `+start+` AND `+match+`
+		WHERE position > `+startSQL+` AND `+matchSQL+`
 		ORDER BY position ASC
 		LIMIT $2
 	`, append([]any{startArg, limit}, args...)...)
@@ -373,7 +374,7 @@ func compilePatterns(patterns []string, next int) (string, []any, error) {
 	if len(patterns) == 0 {
 		return "", nil, ErrBadPattern
 	}
-	var arms []string
+	var comparisonsSQL []string
 	var args []any
 	everything := false
 	for _, pattern := range patterns {
@@ -385,14 +386,14 @@ func compilePatterns(patterns []string, next int) (string, []any, error) {
 			if err := checkTopic(prefix); err != nil {
 				return "", nil, err
 			}
-			arms = append(arms, fmt.Sprintf("(topic = $%d OR topic LIKE $%d)", next, next+1))
+			comparisonsSQL = append(comparisonsSQL, fmt.Sprintf("(topic = $%d OR topic LIKE $%d)", next, next+1))
 			args = append(args, prefix, subtreeLikePattern(prefix))
 			next += 2
 		default:
 			if err := checkTopic(pattern); err != nil {
 				return "", nil, err
 			}
-			arms = append(arms, fmt.Sprintf("topic = $%d", next))
+			comparisonsSQL = append(comparisonsSQL, fmt.Sprintf("topic = $%d", next))
 			args = append(args, pattern)
 			next++
 		}
@@ -401,7 +402,7 @@ func compilePatterns(patterns []string, next int) (string, []any, error) {
 	if everything {
 		return "true", nil, nil
 	}
-	return "(" + strings.Join(arms, " OR ") + ")", args, nil
+	return "(" + strings.Join(comparisonsSQL, " OR ") + ")", args, nil
 }
 
 func checkTopic(topic string) error {

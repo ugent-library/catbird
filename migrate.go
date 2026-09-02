@@ -100,7 +100,7 @@ type TxBeginner interface {
 // cb_migrations records which migrations ran. The runner creates it on first
 // use, so no migration has to; it is written once per schema change and read
 // by nothing on a hot path.
-const createMigrationsTable = `
+const createMigrationsTableSQL = `
     CREATE TABLE IF NOT EXISTS cb_migrations (
         version BIGINT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -162,7 +162,7 @@ func migrateStep(ctx context.Context, db TxBeginner, sql, record string, args ..
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('catbird'), 3)`); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, createMigrationsTable); err != nil {
+	if _, err := tx.Exec(ctx, createMigrationsTableSQL); err != nil {
 		return err
 	}
 	tag, err := tx.Exec(ctx, record, args...)
