@@ -110,10 +110,14 @@ func handleReview(ctx context.Context, depositID int, job *catbird.Job) error {
 		return err
 	}
 
-	// The scan's result, read by what produced it: a job a handler asked for
-	// has no id anyone can hold, so the workflow and the job type address it.
+	// The scan's result, read from the jobs this one waited for and addressed
+	// by the job type: a job a handler asked for has no id anyone can hold.
+	deps, err := job.DependencyOutputs(ctx, pool)
+	if err != nil {
+		return err
+	}
 	var scanned scanResult
-	if err := catbird.Output(ctx, pool, job.GroupID, scan, &scanned); err != nil {
+	if err := deps.Get(scan, &scanned); err != nil {
 		return err
 	}
 

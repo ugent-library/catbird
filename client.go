@@ -16,8 +16,8 @@ import (
 // the job is not waiting for what was delivered to it.
 var ErrNotFound = errors.New("catbird: not found")
 
-// ErrAmbiguous is returned by Output when a workflow holds several results of
-// the job type asked for. Read them with Outputs.
+// ErrAmbiguous is returned by Outputs.Get when several jobs of the type asked
+// for recorded outputs. Read them with GetAll.
 var ErrAmbiguous = errors.New("catbird: several results")
 
 // ErrLeaseExpired is returned by Complete when the job's lease ran out and
@@ -29,34 +29,37 @@ var ErrLeaseExpired = errors.New("catbird: lease expired before completion")
 // a prefix followed by ".#", or "#".
 var ErrBadPattern = errors.New("catbird: invalid topic pattern")
 
-// JobStatus is what a job is doing. No column holds it; Status derives it.
-type JobStatus int
+// State is what a job or a whole workflow is doing. No column holds it: the
+// statements in Status and GroupStatus derive it. A job takes any of the eight
+// states; a workflow takes StateRunning, StateDead or StateCompleted, where
+// running means jobs remain — queued, waiting or retrying included.
+type State int
 
 const (
-	StatusQueued           JobStatus = iota // ready, waiting for a worker to take it
-	StatusScheduled                         // never claimed, the start time is still ahead
-	StatusRunning                           // a worker holds the lease
-	StatusWaitingToRetry                    // an attempt failed, the retry is scheduled
-	StatusWaitingForSignal                  // waiting for Signal to deliver a payload
-	StatusWaitingForJobs                    // waiting for the jobs it was enqueued after
-	StatusDead                              // failed permanently, or Cancel stopped it
-	StatusCompleted                         // the message is here and its claim is gone
+	StateQueued           State = iota // ready, waiting for a worker to take it
+	StateScheduled                     // never claimed, the start time is still ahead
+	StateRunning                       // a worker holds the lease; for a workflow: jobs remain
+	StateWaitingToRetry                // an attempt failed, the retry is scheduled
+	StateWaitingForSignal              // waiting for Signal to deliver a payload
+	StateWaitingForJobs                // waiting for the jobs it was enqueued after
+	StateDead                          // failed permanently, or Cancel stopped it
+	StateCompleted                     // the message is here and its claim is gone
 )
 
-// statusNames are the words the statement in Status returns, in constant order.
-// The statement names the states so another client reads them out of the SQL.
-var statusNames = [...]string{
+// stateNames are the words the statements return, in constant order. The
+// statements name the states so another client reads them out of the SQL.
+var stateNames = [...]string{
 	"queued", "scheduled", "running", "waiting to retry",
 	"waiting for signal", "waiting for jobs", "dead", "completed",
 }
 
-// String returns the word the statement returns, so a log line and a database
+// String returns the word the statements return, so a log line and a database
 // read of the same job agree.
-func (s JobStatus) String() string {
-	if s < 0 || int(s) >= len(statusNames) {
-		return fmt.Sprintf("JobStatus(%d)", int(s))
+func (s State) String() string {
+	if s < 0 || int(s) >= len(stateNames) {
+		return fmt.Sprintf("State(%d)", int(s))
 	}
-	return statusNames[s]
+	return stateNames[s]
 }
 
 // Message is a published message, as a consumer reads it.
@@ -156,23 +159,23 @@ func (j *Job) record(t *JobType, payload any, dependent bool) {
 	})
 }
 
-// DependencyOutputs returns the results of the jobs this one waited for: the
-// jobs the completion that created it recorded with Enqueue, one element per
-// job, in the order they were enqueued, nil where a job recorded no result. Nil
-// for a job that waited for nothing.
+// DependencyOutputs returns the outputs of the jobs this one waited for: the
+// jobs the completion that created it recorded with Enqueue, in the order they
+// were enqueued. A job that recorded no output has no element. Nil for a job
+// that waited for nothing.
 //
 // This is the read a joining job makes. It waited for one buffer's jobs and
-// this returns those, where Outputs returns every job of a type in the whole
-// workflow — every round of it, and the jobs another handler added. The ids come
-// from the claim, so the read probes cb_outputs by primary key.
-func (j *Job) DependencyOutputs(ctx context.Context, db Conn) ([]json.RawMessage, error) {
+// this returns those, where GroupStatus carries every output in the whole
+// workflow — every round of it, and the jobs another handler added. The ids
+// come from the claim, so the read probes cb_outputs by primary key.
+func (j *Job) DependencyOutputs(ctx context.Context, db Conn) (Outputs, error) {
 	if len(j.dependencyIDs) == 0 {
 		return nil, nil
 	}
 	rows, err := db.Query(ctx, `
-		SELECT result.output
+		SELECT result.message_id, result.job_type, result.output
 		FROM unnest($1::bigint[]) WITH ORDINALITY AS dependency (job_id, place)
-		LEFT JOIN cb_outputs result ON result.message_id = dependency.job_id
+		JOIN cb_outputs result ON result.message_id = dependency.job_id
 		ORDER BY dependency.place
 	`, j.dependencyIDs)
 	if err != nil {
@@ -180,15 +183,15 @@ func (j *Job) DependencyOutputs(ctx context.Context, db Conn) ([]json.RawMessage
 	}
 	defer rows.Close()
 
-	bodies := make([]json.RawMessage, 0, len(j.dependencyIDs))
+	var outputs Outputs
 	for rows.Next() {
-		var body json.RawMessage
-		if err := rows.Scan(&body); err != nil {
+		var o Output
+		if err := rows.Scan(&o.JobID, &o.JobType, &o.Value); err != nil {
 			return nil, err
 		}
-		bodies = append(bodies, body)
+		outputs = append(outputs, o)
 	}
-	return bodies, rows.Err()
+	return outputs, rows.Err()
 }
 
 // Conn is the part of pgx.Tx and *pgxpool.Pool this package uses: a pool, a
@@ -700,19 +703,73 @@ func Cancel(ctx context.Context, db Conn, groupID int64) error {
 	return err
 }
 
-// Status reports what one job is doing, the attempts it has spent, and what its
-// last failed attempt returned. Two primary-key probes; no column holds a state.
+// Output is one recorded result: which job recorded it, that job's type, and
+// the value SetOutput was given. The JSON tags are the names GroupStatus's
+// statement builds, so its rows decode straight into the type.
+type Output struct {
+	JobID   int64           `json:"job_id"`
+	JobType string          `json:"job_type"`
+	Value   json.RawMessage `json:"value"`
+}
+
+// Scan unmarshals the value into dest. A dest of *json.RawMessage takes the
+// JSON untouched.
+func (o Output) Scan(dest any) error {
+	return json.Unmarshal(o.Value, dest)
+}
+
+// Outputs holds recorded results in the order the jobs that recorded them were
+// created. A job that recorded nothing has no element.
+type Outputs []Output
+
+// Get unmarshals into dest the one output recorded by a job of this type.
+// ErrNotFound when no job of the type recorded one, ErrAmbiguous when several
+// did — a fan-out, which GetAll reads.
+func (os Outputs) Get(t *JobType, dest any) error {
+	all := os.GetAll(t)
+	switch len(all) {
+	case 0:
+		return ErrNotFound
+	case 1:
+		return all[0].Scan(dest)
+	default:
+		return ErrAmbiguous
+	}
+}
+
+// GetAll returns the outputs recorded by jobs of this type, order kept.
+func (os Outputs) GetAll(t *JobType) Outputs {
+	var all Outputs
+	for _, o := range os {
+		if o.JobType == t.name {
+			all = append(all, o)
+		}
+	}
+	return all
+}
+
+// JobStatus is what Status reports of one job: its state, the attempts it has
+// spent, and what its last failed attempt returned.
 //
-// lastError is empty while an attempt runs, because the claim clears it. That is
-// what separates StatusRunning from StatusWaitingToRetry.
+// LastError is empty while an attempt runs, because the claim clears it. That
+// is what separates StateRunning from StateWaitingToRetry.
+type JobStatus struct {
+	State     State
+	Attempts  int
+	LastError string
+}
+
+// Status reports what one job is doing. Two primary-key probes; no column
+// holds a state.
 //
-// StatusCompleted means the message is here and its claim is gone, so it lasts
+// StateCompleted means the message is here and its claim is gone, so it lasts
 // only as long as the message: after GC the job returns ErrNotFound, as does a
 // published message's id.
-func Status(ctx context.Context, db Conn, id int64) (status JobStatus, attempts int, lastError string, err error) {
+func Status(ctx context.Context, db Conn, id int64) (JobStatus, error) {
+	var status JobStatus
 	var name string
 	var text *string
-	err = db.QueryRow(ctx, `
+	err := db.QueryRow(ctx, `
 		SELECT CASE
 		           WHEN claim.message_id IS NULL THEN 'completed'
 		           WHEN claim.died_at IS NOT NULL THEN 'dead'
@@ -727,22 +784,90 @@ func Status(ctx context.Context, db Conn, id int64) (status JobStatus, attempts 
 		FROM cb_messages message
 		LEFT JOIN cb_claims claim ON claim.message_id = message.id
 		WHERE message.id = $1 AND NOT message.stream
-	`, id).Scan(&name, &attempts, &text)
+	`, id).Scan(&name, &status.Attempts, &text)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, 0, "", ErrNotFound
+		return JobStatus{}, ErrNotFound
 	}
 	if err != nil {
-		return 0, 0, "", err
+		return JobStatus{}, err
 	}
 	if text != nil {
-		lastError = *text
+		status.LastError = *text
 	}
-	for i, n := range statusNames {
+	for i, n := range stateNames {
 		if n == name {
-			return JobStatus(i), attempts, lastError, nil
+			status.State = State(i)
+			return status, nil
 		}
 	}
-	return 0, 0, "", fmt.Errorf("catbird: unknown job status %q", name)
+	return JobStatus{}, fmt.Errorf("catbird: unknown job state %q", name)
+}
+
+// JobGroupStatus is what GroupStatus reports of a whole workflow: its state,
+// which job to ask when it is dead, and every output its jobs recorded so far,
+// in the order the jobs that recorded them were created.
+//
+// DeadJobID is 0 unless the state is StateDead. It is the job whose failure is
+// recorded when there is one — a job that dies cancels the rest of its
+// workflow, and the jobs the cancel took carry no error to read — so Status on
+// it has the attempts and the error.
+type JobGroupStatus struct {
+	State     State
+	DeadJobID int64
+	Outputs   Outputs
+}
+
+// GroupStatus reports what a workflow is doing: StateRunning while jobs
+// remain, StateDead once any job died, StateCompleted when every job
+// completed. The outputs ride the same statement, so polling and reading the
+// result is one call.
+//
+// This is the read for the caller that holds only the id Enqueue returned:
+// handlers decide the fan-out as they run, so that caller cannot name the
+// workflow's jobs, and a job that died runs nothing and publishes nothing —
+// only its claim shows it. Like StateCompleted, the completed answer lasts as
+// long as the starting job's message: after GC the workflow returns
+// ErrNotFound.
+func GroupStatus(ctx context.Context, db Conn, groupID int64) (JobGroupStatus, error) {
+	var name *string
+	var status JobGroupStatus
+	var outputs []byte
+	err := db.QueryRow(ctx, `
+		WITH claim AS (
+		    SELECT message_id, died_at, last_error
+		    FROM cb_claims WHERE group_id = $1 OR message_id = $1
+		)
+		SELECT CASE
+		           WHEN EXISTS (SELECT 1 FROM claim WHERE died_at IS NOT NULL) THEN 'dead'
+		           WHEN EXISTS (SELECT 1 FROM claim) THEN 'running'
+		           WHEN EXISTS (SELECT 1 FROM cb_messages WHERE id = $1 AND NOT stream) THEN 'completed'
+		       END,
+		       -- The job whose failure is recorded sorts before the jobs Cancel
+		       -- took with it, which carry no error.
+		       coalesce((SELECT message_id FROM claim WHERE died_at IS NOT NULL
+		                 ORDER BY last_error IS NULL, died_at, message_id LIMIT 1), 0),
+		       (SELECT coalesce(jsonb_agg(jsonb_build_object(
+		                   'job_id', result.message_id,
+		                   'job_type', result.job_type,
+		                   'value', result.output) ORDER BY result.message_id), '[]')
+		        FROM cb_outputs result WHERE result.group_id = $1)
+	`, groupID).Scan(&name, &status.DeadJobID, &outputs)
+	if err != nil {
+		return JobGroupStatus{}, err
+	}
+	if name == nil {
+		return JobGroupStatus{}, ErrNotFound
+	}
+	if err := json.Unmarshal(outputs, &status.Outputs); err != nil {
+		return JobGroupStatus{}, err
+	}
+	for i, n := range stateNames {
+		if n == *name {
+			status.State = State(i)
+			return status, nil
+		}
+	}
+	return JobGroupStatus{}, fmt.Errorf("catbird: unknown workflow state %q", *name)
 }
 
 // GC deletes claims dead longer than retention and messages older than
@@ -762,52 +887,6 @@ func GC(ctx context.Context, db Conn, retention time.Duration) error {
 		  AND NOT EXISTS (SELECT 1 FROM cb_claims c WHERE c.message_id = m.id)
 	`, retention)
 	return err
-}
-
-// Output unmarshals into dest the result recorded by the workflow's job of this
-// type. It takes a destination rather than returning the JSON because the caller
-// that reads a result is the one that wrote it and knows its type; a caller that
-// wants the JSON untouched passes a *json.RawMessage.
-//
-// Returns ErrNotFound when no job of the type recorded one, and ErrAmbiguous
-// when several did — a fan-out, which Outputs reads.
-func Output(ctx context.Context, db Conn, groupID int64, t *JobType, dest any) error {
-	bodies, err := Outputs(ctx, db, groupID, t)
-	if err != nil {
-		return err
-	}
-	switch len(bodies) {
-	case 0:
-		return ErrNotFound
-	case 1:
-		return json.Unmarshal(bodies[0], dest)
-	default:
-		return ErrAmbiguous
-	}
-}
-
-// Outputs returns the results recorded by the workflow's jobs of this type, in
-// the order the jobs were created — the fan-out read. Any count, zero included.
-func Outputs(ctx context.Context, db Conn, groupID int64, t *JobType) ([]json.RawMessage, error) {
-	rows, err := db.Query(ctx, `
-		SELECT output FROM cb_outputs
-		WHERE group_id = $1 AND job_type = $2
-		ORDER BY message_id
-	`, groupID, t.name)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var bodies []json.RawMessage
-	for rows.Next() {
-		var body json.RawMessage
-		if err := rows.Scan(&body); err != nil {
-			return nil, err
-		}
-		bodies = append(bodies, body)
-	}
-	return bodies, rows.Err()
 }
 
 // batchArrays turns messages into the three parallel arrays the batch

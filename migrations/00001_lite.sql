@@ -105,12 +105,14 @@ CREATE TABLE cb_claims (
 -- occasionally, or can be down for a while, gets a queue of its own: the queue
 -- leads this index, so its backlog sits in a range no other claim scans.
 CREATE INDEX cb_claims_ready_idx ON cb_claims (queue, visible_at) WHERE died_at IS NULL AND dependencies = 0;
--- What Cancel and Signal probe. A worker cancels the group of every job that
--- dies in one, so without this a downstream outage runs one full scan of
--- cb_claims per dead job: 834 buffers and 4.9 ms at 100k live claims, against 6
--- buffers here. Jobs outside a workflow stay out of a structure that can never
--- match them: 112 kB against 2128 kB with 1% of jobs grouped.
-CREATE INDEX cb_claims_group_idx ON cb_claims (group_id) WHERE died_at IS NULL AND group_id IS NOT NULL;
+-- What Cancel, Signal and GroupStatus probe. A worker cancels the group of
+-- every job that dies in one, so without this a downstream outage runs one
+-- full scan of cb_claims per dead job: 834 buffers and 4.9 ms at 100k live
+-- claims, against 6 buffers here. Jobs outside a workflow stay out of a
+-- structure that can never match them: 112 kB against 2128 kB with 1% of jobs
+-- grouped. Dead jobs stay in it so GroupStatus can count them; they are few,
+-- and they leave with GC.
+CREATE INDEX cb_claims_group_idx ON cb_claims (group_id) WHERE group_id IS NOT NULL;
 
 -- Optional result of a job. The handler records it with SetOutput and the
 -- completion writes it here, so a result cannot outlive an attempt that never

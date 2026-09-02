@@ -344,14 +344,14 @@ func TestHandlerFansOutAndJoins(t *testing.T) {
 
 	// The branches' results are addressed by what produced them: the workflow
 	// and the job type. Their ids did not exist when the handler asked for them.
-	bodies, err := catbird.Outputs(ctx, pool, groupID, branch)
+	gs, err := catbird.GroupStatus(ctx, pool, groupID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var got []int
-	for _, body := range bodies {
+	for _, o := range gs.Outputs.GetAll(branch) {
 		var n int
-		if err := json.Unmarshal(body, &n); err != nil {
+		if err := o.Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		got = append(got, n)
@@ -361,7 +361,7 @@ func TestHandlerFansOutAndJoins(t *testing.T) {
 	}
 	// One type with three results is not a single-result read.
 	var one int
-	if err := catbird.Output(ctx, pool, groupID, branch, &one); !errors.Is(err, catbird.ErrAmbiguous) {
+	if err := gs.Outputs.Get(branch, &one); !errors.Is(err, catbird.ErrAmbiguous) {
 		t.Errorf("single-result read of a fan-out: %v, want ErrAmbiguous", err)
 	}
 
@@ -370,11 +370,11 @@ func TestHandlerFansOutAndJoins(t *testing.T) {
 	})
 }
 
-// A joining job reads the results of the jobs it waited for, by the ids the
-// completion that created it wrote on its claim: one element per job, in the
-// order they were enqueued, nil where a job recorded nothing, and the same on
-// every attempt. The read by job type is the wider one — it takes every job of
-// that type in the workflow, a round this job never waited for included.
+// A joining job reads the outputs of the jobs it waited for, by the ids the
+// completion that created it wrote on its claim: in the order they were
+// enqueued, without the jobs that recorded nothing, and the same on every
+// attempt. The read by job type is the wider one — it takes every job of that
+// type in the workflow, a round this job never waited for included.
 func TestDependencyOutputs(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -386,17 +386,17 @@ func TestDependencyOutputs(t *testing.T) {
 	join := catbird.NewJobType("dep_join", queue, catbird.JobTypeOptions{MinBackoff: 50 * time.Millisecond})
 	rejoin := catbird.NewJobType("dep_rejoin", queue, catbird.JobTypeOptions{})
 
-	rootRound := make(chan []json.RawMessage, 1)
-	firstAttempt := make(chan []json.RawMessage, 1)
-	retriedAttempt := make(chan []json.RawMessage, 1)
-	secondRound := make(chan []json.RawMessage, 1)
+	rootRound := make(chan catbird.Outputs, 1)
+	firstAttempt := make(chan catbird.Outputs, 1)
+	retriedAttempt := make(chan catbird.Outputs, 1)
+	secondRound := make(chan catbird.Outputs, 1)
 
-	read := func(job *catbird.Job, to chan<- []json.RawMessage) error {
-		bodies, err := job.DependencyOutputs(ctx, pool)
+	read := func(job *catbird.Job, to chan<- catbird.Outputs) error {
+		outputs, err := job.DependencyOutputs(ctx, pool)
 		if err != nil {
 			return err
 		}
-		to <- bodies
+		to <- outputs
 		return nil
 	}
 
@@ -449,21 +449,18 @@ func TestDependencyOutputs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	show := func(bodies []json.RawMessage) string {
-		parts := make([]string, len(bodies))
-		for i, body := range bodies {
-			parts[i] = "nil"
-			if body != nil {
-				parts[i] = string(body)
-			}
+	show := func(outputs catbird.Outputs) string {
+		parts := make([]string, len(outputs))
+		for i, o := range outputs {
+			parts[i] = string(o.Value)
 		}
 		return strings.Join(parts, " ")
 	}
-	take := func(from <-chan []json.RawMessage, what string) string {
+	take := func(from <-chan catbird.Outputs, what string) string {
 		t.Helper()
 		select {
-		case bodies := <-from:
-			return show(bodies)
+		case outputs := <-from:
+			return show(outputs)
 		case <-ctx.Done():
 			t.Fatalf("%s never ran", what)
 			return ""
@@ -473,16 +470,16 @@ func TestDependencyOutputs(t *testing.T) {
 	if got := take(rootRound, "the job that started the workflow"); got != "" {
 		t.Errorf("a job that waited for nothing read %q, want no results", got)
 	}
-	// One element per branch, in the order they were enqueued — which is neither
-	// the order of their ids nor of their results — and the branch that recorded
-	// nothing keeps its place.
-	if got := take(firstAttempt, "the joining job"); got != "30 10 nil" {
-		t.Errorf("the joining job read %q, want \"30 10 nil\"", got)
+	// One element per branch that recorded a result, in the order they were
+	// enqueued — which is neither the order of their ids nor of their results.
+	// The branch that recorded nothing has no element.
+	if got := take(firstAttempt, "the joining job"); got != "30 10" {
+		t.Errorf("the joining job read %q, want \"30 10\"", got)
 	}
 	// The retry reads the same: the ids are on the claim, and claiming a job
 	// again rewrites the row without touching them.
-	if got := take(retriedAttempt, "the joining job's retry"); got != "30 10 nil" {
-		t.Errorf("the retried attempt read %q, want \"30 10 nil\": what the first attempt read", got)
+	if got := take(retriedAttempt, "the joining job's retry"); got != "30 10" {
+		t.Errorf("the retried attempt read %q, want \"30 10\": what the first attempt read", got)
 	}
 	// The second round waited for one job and reads that one, not the three the
 	// first round produced.
@@ -495,11 +492,11 @@ func TestDependencyOutputs(t *testing.T) {
 	})
 
 	// What the read by job type takes: every branch of the workflow, both rounds.
-	bodies, err := catbird.Outputs(ctx, pool, groupID, branch)
+	gs, err := catbird.GroupStatus(ctx, pool, groupID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := show(bodies); got != "30 10 40" {
+	if got := show(gs.Outputs.GetAll(branch)); got != "30 10 40" {
 		t.Errorf("the read by job type took %q, want \"30 10 40\": every round of it", got)
 	}
 }
@@ -883,7 +880,7 @@ func TestGCCollectsACanceledGatedJob(t *testing.T) {
 	if n := count(t, pool, "SELECT count(*) FROM cb_claims"); n != 0 {
 		t.Errorf("expected the canceled gated claim to be collected, got %d claims", n)
 	}
-	if _, _, _, err := catbird.Status(ctx, pool, id); !errors.Is(err, catbird.ErrNotFound) {
+	if _, err := catbird.Status(ctx, pool, id); !errors.Is(err, catbird.ErrNotFound) {
 		t.Errorf("expected ErrNotFound after GC, got %v", err)
 	}
 }
@@ -958,7 +955,11 @@ func TestOutputAndStreamNotify(t *testing.T) {
 		t.Fatal(err)
 	}
 	var result int
-	if err := catbird.Output(ctx, pool, id, sum, &result); !errors.Is(err, catbird.ErrNotFound) {
+	gs, err := catbird.GroupStatus(ctx, pool, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gs.Outputs.Get(sum, &result); !errors.Is(err, catbird.ErrNotFound) {
 		t.Fatalf("output before completion: %v", err)
 	}
 
@@ -975,7 +976,11 @@ func TestOutputAndStreamNotify(t *testing.T) {
 	go rt.Start(ctx)
 
 	for {
-		if err := catbird.Output(ctx, pool, id, sum, &result); err == nil {
+		gs, err := catbird.GroupStatus(ctx, pool, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := gs.Outputs.Get(sum, &result); err == nil {
 			if result != 6 {
 				t.Fatalf("output %d, want 6", result)
 			}
@@ -1049,16 +1054,24 @@ func TestFailedAttemptWritesNoOutput(t *testing.T) {
 			  AND visible_at > now()
 		`) == 1
 	})
+	gs, err := catbird.GroupStatus(ctx, pool, id)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var raw json.RawMessage
-	if err := catbird.Output(ctx, pool, id, flaky, &raw); !errors.Is(err, catbird.ErrNotFound) {
+	if err := gs.Outputs.Get(flaky, &raw); !errors.Is(err, catbird.ErrNotFound) {
 		t.Fatalf("the failed attempt left a result behind: %v", err)
 	}
 
 	waitFor(t, 5*time.Second, "the job was never completed", func() bool {
 		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'output_retries'") == 0
 	})
+	gs, err = catbird.GroupStatus(ctx, pool, id)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var attempt int
-	if err := catbird.Output(ctx, pool, id, flaky, &attempt); err != nil {
+	if err := gs.Outputs.Get(flaky, &attempt); err != nil {
 		t.Fatal(err)
 	}
 	if attempt != 2 {
@@ -2175,13 +2188,13 @@ func TestStatusReportsWhatAJobIsDoing(t *testing.T) {
 	stuck := catbird.NewJobType("stuck", catbird.NewQueue("nobody", catbird.QueueOptions{}), catbird.JobTypeOptions{})
 	joins := catbird.NewJobType("joins", queue, catbird.JobTypeOptions{})
 
-	status := func(id int64) catbird.JobStatus {
+	state := func(id int64) catbird.State {
 		t.Helper()
-		s, _, _, err := catbird.Status(ctx, pool, id)
+		js, err := catbird.Status(ctx, pool, id)
 		if err != nil {
 			t.Fatalf("status of %d: %v", id, err)
 		}
-		return s
+		return js.State
 	}
 
 	queued, err := catbird.Enqueue(ctx, pool, plain, nil, catbird.EnqueueOptions{})
@@ -2206,14 +2219,14 @@ func TestStatusReportsWhatAJobIsDoing(t *testing.T) {
 
 	for _, c := range []struct {
 		id   int64
-		want catbird.JobStatus
+		want catbird.State
 	}{
-		{queued, catbird.StatusQueued},
-		{scheduled, catbird.StatusScheduled},
-		{gated, catbird.StatusWaitingForSignal},
-		{canceled, catbird.StatusDead},
+		{queued, catbird.StateQueued},
+		{scheduled, catbird.StateScheduled},
+		{gated, catbird.StateWaitingForSignal},
+		{canceled, catbird.StateDead},
 	} {
-		if got := status(c.id); got != c.want {
+		if got := state(c.id); got != c.want {
 			t.Errorf("job %d: %v, want %v", c.id, got, c.want)
 		}
 	}
@@ -2222,8 +2235,8 @@ func TestStatusReportsWhatAJobIsDoing(t *testing.T) {
 	if err := catbird.Signal(ctx, pool, gated, gate, nil); err != nil {
 		t.Fatal(err)
 	}
-	if got := status(gated); got != catbird.StatusQueued {
-		t.Errorf("signaled job: %v, want %v", got, catbird.StatusQueued)
+	if got := state(gated); got != catbird.StateQueued {
+		t.Errorf("signaled job: %v, want %v", got, catbird.StateQueued)
 	}
 
 	// A published message is not a job, and neither is an id nothing was written
@@ -2232,10 +2245,10 @@ func TestStatusReportsWhatAJobIsDoing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := catbird.Status(ctx, pool, published); !errors.Is(err, catbird.ErrNotFound) {
+	if _, err := catbird.Status(ctx, pool, published); !errors.Is(err, catbird.ErrNotFound) {
 		t.Errorf("status of a published message: %v, want ErrNotFound", err)
 	}
-	if _, _, _, err := catbird.Status(ctx, pool, published+10000); !errors.Is(err, catbird.ErrNotFound) {
+	if _, err := catbird.Status(ctx, pool, published+10000); !errors.Is(err, catbird.ErrNotFound) {
 		t.Errorf("status of no such id: %v, want ErrNotFound", err)
 	}
 
@@ -2255,8 +2268,8 @@ func TestStatusReportsWhatAJobIsDoing(t *testing.T) {
 	go rt.Start(runCtx)
 
 	waitFor(t, 5*time.Second, "the queued job never completed", func() bool {
-		s, _, _, err := catbird.Status(ctx, pool, queued)
-		return err == nil && s == catbird.StatusCompleted
+		js, err := catbird.Status(ctx, pool, queued)
+		return err == nil && js.State == catbird.StateCompleted
 	})
 
 	// The job the handler enqueued after two others waits for them, and they are
@@ -2266,8 +2279,8 @@ func TestStatusReportsWhatAJobIsDoing(t *testing.T) {
 			SELECT message_id FROM cb_claims WHERE job_type = 'joins'
 		`).Scan(&fansOut) == nil
 	})
-	if got := status(fansOut); got != catbird.StatusWaitingForJobs {
-		t.Errorf("joining job: %v, want %v", got, catbird.StatusWaitingForJobs)
+	if got := state(fansOut); got != catbird.StateWaitingForJobs {
+		t.Errorf("joining job: %v, want %v", got, catbird.StateWaitingForJobs)
 	}
 }
 
@@ -2305,23 +2318,179 @@ func TestStatusTellsARunningJobFromOneWaitingToRetry(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("the job never ran")
 	}
-	status, attempts, lastError, err := catbird.Status(ctx, pool, id)
+	js, err := catbird.Status(ctx, pool, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status != catbird.StatusRunning || attempts != 1 || lastError != "" {
+	if js.State != catbird.StateRunning || js.Attempts != 1 || js.LastError != "" {
 		t.Errorf("while the handler runs: %v, attempt %d, error %q; want running, attempt 1, no error",
-			status, attempts, lastError)
+			js.State, js.Attempts, js.LastError)
 	}
 
 	// The retry is an hour out, so the job stays where the failure left it.
 	close(release)
 	waitFor(t, 5*time.Second, "the failed attempt did not leave the job waiting to retry", func() bool {
-		status, attempts, lastError, err = catbird.Status(ctx, pool, id)
-		return err == nil && status == catbird.StatusWaitingToRetry
+		js, err = catbird.Status(ctx, pool, id)
+		return err == nil && js.State == catbird.StateWaitingToRetry
 	})
-	if attempts != 1 || lastError != "the service is down" {
-		t.Errorf("after the failure: attempt %d, error %q; want attempt 1, the handler's error", attempts, lastError)
+	if js.Attempts != 1 || js.LastError != "the service is down" {
+		t.Errorf("after the failure: attempt %d, error %q; want attempt 1, the handler's error", js.Attempts, js.LastError)
+	}
+}
+
+func TestGroupStatusReportsWhatAWorkflowIsDoing(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("grouped", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	start := catbird.NewJobType("start", queue, catbird.JobTypeOptions{})
+	gate := catbird.NewJobType("gate", queue, catbird.JobTypeOptions{Signal: true})
+	// Nothing handles this type, so the job the handler fans out to it stays
+	// where it is and the job enqueued after it keeps waiting.
+	stuck := catbird.NewJobType("stuck", catbird.NewQueue("nobody", catbird.QueueOptions{}), catbird.JobTypeOptions{})
+	joins := catbird.NewJobType("joins", queue, catbird.JobTypeOptions{})
+	plain := catbird.NewJobType("plain", queue, catbird.JobTypeOptions{})
+
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(plain, func(ctx context.Context, job *catbird.Job) error { return nil })
+	rt.HandleFunc(start, func(ctx context.Context, job *catbird.Job) error {
+		job.Enqueue(stuck, nil)
+		job.Enqueue(gate, nil)
+		job.EnqueueAfter(joins, nil)
+		return nil
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	// A completed standalone job is a workflow of one with nothing left in it.
+	alone, err := catbird.Enqueue(ctx, pool, plain, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "the standalone job never read as completed", func() bool {
+		gs, err := catbird.GroupStatus(ctx, pool, alone)
+		return err == nil && gs.State == catbird.StateCompleted
+	})
+
+	groupID, err := catbird.Enqueue(ctx, pool, start, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fan-out settles into three waiting jobs: one on a queue nobody runs,
+	// one waiting for a signal, and one waiting for both of them. The workflow
+	// is running while jobs remain, whatever they wait for.
+	waitFor(t, 5*time.Second, "the fan-out never settled", func() bool {
+		return count(t, pool, `
+			SELECT count(*) FROM cb_claims WHERE group_id = $1 AND died_at IS NULL
+		`, groupID) == 3
+	})
+	gs, err := catbird.GroupStatus(ctx, pool, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gs.State != catbird.StateRunning || gs.DeadJobID != 0 || len(gs.Outputs) != 0 {
+		t.Errorf("waiting workflow: %v, dead job %d, %d outputs; want running, none, none",
+			gs.State, gs.DeadJobID, len(gs.Outputs))
+	}
+
+	// A published message is not a workflow, and neither is an id nothing was
+	// written under.
+	published, err := catbird.Publish(ctx, pool, "not.a.job", nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catbird.GroupStatus(ctx, pool, published); !errors.Is(err, catbird.ErrNotFound) {
+		t.Errorf("group status of a published message: %v, want ErrNotFound", err)
+	}
+	if _, err := catbird.GroupStatus(ctx, pool, published+10000); !errors.Is(err, catbird.ErrNotFound) {
+		t.Errorf("group status of no such id: %v, want ErrNotFound", err)
+	}
+
+	// Cancel marks the waiting jobs dead, and dead jobs are seen, not gone.
+	if err := catbird.Cancel(ctx, pool, groupID); err != nil {
+		t.Fatal(err)
+	}
+	gs, err = catbird.GroupStatus(ctx, pool, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gs.State != catbird.StateDead || gs.DeadJobID == 0 {
+		t.Errorf("canceled workflow: %v, dead job %d; want dead and an id", gs.State, gs.DeadJobID)
+	}
+
+	// GC deletes the dead claims and then the messages, so the canceled
+	// workflow reads as not found, the lifetime StatusCompleted has.
+	if err := catbird.GC(ctx, pool, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catbird.GroupStatus(ctx, pool, groupID); !errors.Is(err, catbird.ErrNotFound) {
+		t.Errorf("group status after GC: %v, want ErrNotFound", err)
+	}
+}
+
+// The dead job GroupStatus names is the one whose failure is recorded, never
+// one the cancel took with it. The sibling here is enqueued first and so has
+// the smaller id: a pick by smallest id would name it and point Status at a
+// claim with no error.
+func TestGroupStatusNamesTheJobThatFailed(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("culprit", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	root := catbird.NewJobType("root", queue, catbird.JobTypeOptions{})
+	failing := catbird.NewJobType("failing", queue, catbird.JobTypeOptions{MaxAttempts: 1})
+	// Never registered, so it dies by the cancel and not by running.
+	sibling := catbird.NewJobType("sibling", queue, catbird.JobTypeOptions{})
+
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(root, func(ctx context.Context, job *catbird.Job) error {
+		job.Enqueue(sibling, nil)
+		job.Enqueue(failing, nil)
+		return nil
+	})
+	rt.HandleFunc(failing, func(ctx context.Context, job *catbird.Job) error {
+		return errors.New("this step fails")
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	groupID, err := catbird.Enqueue(ctx, pool, root, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var failedID int64
+	waitFor(t, 10*time.Second, "the failing job never died", func() bool {
+		return pool.QueryRow(ctx, `
+			SELECT message_id FROM cb_claims
+			WHERE group_id = $1 AND job_type = 'failing' AND died_at IS NOT NULL
+		`, groupID).Scan(&failedID) == nil
+	})
+	// The cancel takes the sibling with it, and the workflow names the job that
+	// failed, not the earlier-created job the cancel killed.
+	waitFor(t, 10*time.Second, "the sibling was never canceled", func() bool {
+		return count(t, pool, `
+			SELECT count(*) FROM cb_claims WHERE group_id = $1 AND died_at IS NOT NULL
+		`, groupID) == 2
+	})
+	gs, err := catbird.GroupStatus(ctx, pool, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gs.State != catbird.StateDead || gs.DeadJobID != failedID {
+		t.Errorf("dead workflow: %v, dead job %d; want dead and the failed job %d", gs.State, gs.DeadJobID, failedID)
+	}
+
+	js, err := catbird.Status(ctx, pool, failedID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if js.Attempts != 1 || js.LastError != "this step fails" {
+		t.Errorf("the failed job: attempt %d, error %q; want attempt 1, the handler's error", js.Attempts, js.LastError)
 	}
 }
 
@@ -2353,18 +2522,16 @@ func TestADeadJobKeepsItsLastError(t *testing.T) {
 	defer stop()
 	go rt.Start(runCtx)
 
-	var status catbird.JobStatus
-	var attempts int
-	var lastError string
+	var js catbird.JobStatus
 	waitFor(t, 5*time.Second, "the job never died", func() bool {
-		status, attempts, lastError, err = catbird.Status(ctx, pool, id)
-		return err == nil && status == catbird.StatusDead
+		js, err = catbird.Status(ctx, pool, id)
+		return err == nil && js.State == catbird.StateDead
 	})
-	if attempts != 2 {
-		t.Errorf("dead after %d attempts, want 2", attempts)
+	if js.Attempts != 2 {
+		t.Errorf("dead after %d attempts, want 2", js.Attempts)
 	}
-	if len(lastError) != 256 || lastError != long[:256] {
-		t.Errorf("error text is %d characters, want the first 256 of what the handler returned", len(lastError))
+	if len(js.LastError) != 256 || js.LastError != long[:256] {
+		t.Errorf("error text is %d characters, want the first 256 of what the handler returned", len(js.LastError))
 	}
 }
 

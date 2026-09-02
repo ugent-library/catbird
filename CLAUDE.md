@@ -64,15 +64,17 @@ Seven files and one migration in the root package, and one package under it:
   registration.
 - `client.go` — every statement a caller runs, as package functions:
   `Publish`, `PublishBatch`, `Enqueue`, `EnqueueBatch`, `Complete`, `Signal`,
-  `Cancel`, `Status`, `GC`, `Output`, `Outputs`, and the stream reads
+  `Cancel`, `Status`, `GroupStatus`, `GC`, and the stream reads
   `ReadAfter`, `LastPosition` and `OldestPosition`. Each takes a `Conn` — a pool, a
   connection, or a transaction — and holds no state; what a process runs lives
-  on the `Runtime`. It also holds the three values a caller handles: `Message`,
+  on the `Runtime`. It also holds the values a caller handles: `Message`,
   a published message as a reader gets it; `Job`, one claimed unit of work as a
   handler is given it, which carries `SetOutput`, `Enqueue`, `EnqueueAfter` and
-  `DependencyOutputs` as methods; and `Cursor`, a name and the patterns read
+  `DependencyOutputs` as methods; `Cursor`, a name and the patterns read
   under it, which carries `Read` and `Ack` as methods and holds no connection
-  either.
+  either; the status objects `JobStatus` and `JobGroupStatus`, which share the
+  one `State` enum; and `Outputs`, recorded results as rows that unmarshal into
+  the caller's types with `Scan`, `Get` and `GetAll`.
 - `runtime.go` — `New`, `Handle`, `HandleFunc`, `Start`, and the two loops every process runs
   whether or not anything is registered: the position assigner and the one
   `LISTEN` connection that wakes the rest. One `Runtime` per process owns the
@@ -181,7 +183,7 @@ client exists.
   retry rewrites. A column added in the middle by role rather than by width
   costs padding.
 - The failure writes `last_error` and the claim clears it, which is the only
-  thing that tells `StatusRunning` from `StatusWaitingToRetry`: both are a live
+  thing that tells `StateRunning` from `StateWaitingToRetry`: both are a live
   claim with `visible_at` in the future and an attempt spent. The write carries
   the `attempts` lease token like the retry it rides on, so a late attempt
   records no error text either, and the 256-character cut keeps a claim row out
@@ -238,7 +240,7 @@ the kind of job it is, declared once and used by both the enqueue and the
 worker; a message is a row of `cb_messages`, and a published message is what a
 consumer reads. The word job belongs where a claim does, and the type carries it
 rather than the name: the handler type is `Handler` and takes a `*Job`, and the
-completion is `Complete`. `Signal`, `Cancel`, `Output` and `Outputs` address a
+completion is `Complete`. `Signal`, `Cancel` and `GroupStatus` address a
 workflow, so their parameter is `groupID`, while the column it matches stays
 `group_id`.
 
