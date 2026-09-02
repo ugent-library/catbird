@@ -5,9 +5,8 @@ Guidance for Claude Code (claude.ai/code) working in this repository.
 ## What is Catbird Lite?
 
 A PostgreSQL-backed job queue, stream, and small workflow engine. Four tables
-plus a migrations record, plain SQL, no PL/pgSQL, no extensions, one dependency
-(pgx). Postgres is the only coordinator; workers scale by starting more
-processes.
+plus a migrations record, plain SQL, no PL/pgSQL, no extensions. Postgres is
+the only coordinator; workers scale by starting more processes.
 
 `DESIGN.md` is the specification and the first thing to read. It describes what
 is built and, under "Planned additions", what is not — do not treat anything in
