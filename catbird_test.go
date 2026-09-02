@@ -2494,6 +2494,94 @@ func TestGroupStatusNamesTheJobThatFailed(t *testing.T) {
 	}
 }
 
+func TestQueuesReportsWhatEveryQueueIsDoing(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	first := catbird.NewQueue("first", catbird.QueueOptions{})
+	second := catbird.NewQueue("second", catbird.QueueOptions{})
+	plain := catbird.NewJobType("counted", first, catbird.JobTypeOptions{})
+	gate := catbird.NewJobType("gated", first, catbird.JobTypeOptions{Signal: true})
+	other := catbird.NewJobType("other", second, catbird.JobTypeOptions{})
+
+	// With no claims there are no queues to report.
+	statuses, err := catbird.Queues(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 0 {
+		t.Fatalf("queues of an empty database: %v, want none", statuses)
+	}
+
+	enqueue := func(t2 *catbird.JobType, opts catbird.EnqueueOptions) int64 {
+		t.Helper()
+		id, err := catbird.Enqueue(ctx, pool, t2, nil, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	// One job of every state on the first queue. Running, waiting to retry and
+	// waiting for jobs are written directly, as the claim, the failure and the
+	// completion write them: an attempt spent with visible_at ahead is a lease,
+	// the error text is what tells a backoff from it, and a positive
+	// dependencies count is a job waiting for others.
+	queued := enqueue(plain, catbird.EnqueueOptions{})
+	enqueue(plain, catbird.EnqueueOptions{Delay: time.Hour})
+	enqueue(gate, catbird.EnqueueOptions{})
+	dead := enqueue(plain, catbird.EnqueueOptions{Delay: time.Hour})
+	if err := catbird.Cancel(ctx, pool, dead); err != nil {
+		t.Fatal(err)
+	}
+	running := enqueue(plain, catbird.EnqueueOptions{})
+	retrying := enqueue(plain, catbird.EnqueueOptions{})
+	waiting := enqueue(plain, catbird.EnqueueOptions{})
+	for _, sql := range []struct {
+		text string
+		id   int64
+	}{
+		// The oldest queued job has been claimable for five minutes.
+		{`UPDATE cb_claims SET visible_at = now() - interval '5 minutes' WHERE message_id = $1`, queued},
+		{`UPDATE cb_claims SET visible_at = now() + interval '1 hour', attempts = 1 WHERE message_id = $1`, running},
+		{`UPDATE cb_claims SET visible_at = now() + interval '1 hour', attempts = 1, last_error = 'failed' WHERE message_id = $1`, retrying},
+		{`UPDATE cb_claims SET dependencies = 1 WHERE message_id = $1`, waiting},
+	} {
+		if _, err := pool.Exec(ctx, sql.text, sql.id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	enqueue(other, catbird.EnqueueOptions{})
+
+	statuses, err = catbird.Queues(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 2 || statuses[0].Queue != "first" || statuses[1].Queue != "second" {
+		t.Fatalf("queues: %v, want first and second in name order", statuses)
+	}
+	got := statuses[0]
+	want := catbird.QueueInfo{
+		Queue: "first", Queued: 1, Scheduled: 1, Running: 1, WaitingToRetry: 1,
+		WaitingForSignal: 1, WaitingForJobs: 1, Dead: 1,
+	}
+	if got.LongestQueued < 5*time.Minute || got.LongestQueued > 6*time.Minute {
+		t.Errorf("longest queued %v, want about five minutes", got.LongestQueued)
+	}
+	got.LongestQueued = 0
+	if got != want {
+		t.Errorf("first queue: %+v, want %+v", got, want)
+	}
+	got = statuses[1]
+	if got.LongestQueued < 0 || got.LongestQueued > time.Minute {
+		t.Errorf("second queue's longest queued %v, want just now", got.LongestQueued)
+	}
+	got.LongestQueued = 0
+	if (got != catbird.QueueInfo{Queue: "second", Queued: 1}) {
+		t.Errorf("second queue: %+v, want one queued job and nothing else", got)
+	}
+}
+
 // The text is cut to what the column holds, and a job that dies keeps it: a dead
 // claim is not deleted, so the error of the attempt that ended the job is the one
 // thing left to say why.

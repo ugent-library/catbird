@@ -64,7 +64,7 @@ Seven files and one migration in the root package, and one package under it:
   registration.
 - `client.go` — every statement a caller runs, as package functions:
   `Publish`, `PublishBatch`, `Enqueue`, `EnqueueBatch`, `Complete`, `Signal`,
-  `Cancel`, `Status`, `GroupStatus`, `GC`, and the stream reads
+  `Cancel`, `Status`, `GroupStatus`, `Queues`, `GC`, and the stream reads
   `ReadAfter`, `LastPosition` and `OldestPosition`. Each takes a `Conn` — a pool, a
   connection, or a transaction — and holds no state; what a process runs lives
   on the `Runtime`. It also holds the values a caller handles: `Message`,
@@ -73,7 +73,7 @@ Seven files and one migration in the root package, and one package under it:
   `DependencyOutputs` as methods; `Cursor`, a name and the patterns read
   under it, which carries `Read` and `Ack` as methods and holds no connection
   either; the status objects `JobStatus` and `JobGroupStatus`, which share the
-  one `State` enum; and `Outputs`, recorded results as rows that unmarshal into
+  one `State` enum, and `QueueInfo`, the per-queue counts `Queues` returns; and `Outputs`, recorded results as rows that unmarshal into
   the caller's types with `Scan`, `Get` and `GetAll`.
 - `runtime.go` — `New`, `Handle`, `HandleFunc`, `Start`, and the two loops every process runs
   whether or not anything is registered: the position assigner and the one

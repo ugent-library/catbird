@@ -759,6 +759,21 @@ type JobStatus struct {
 	LastError string
 }
 
+// stateCaseSQL is the body of the CASE that derives what a live claim is doing,
+// over a row aliased claim. It is one constant because Status and Queues both
+// run it, and a copy that drifted — a test reordered, a comparison changed —
+// would let the two reads sort the same job into different states with nothing
+// failing. The words are stateNames; Status alone puts the completed test
+// above these, which is the absence of a claim.
+const stateCaseSQL = `
+		           WHEN claim.died_at IS NOT NULL THEN 'dead'
+		           WHEN claim.awaits_signal AND claim.signal IS NULL THEN 'waiting for signal'
+		           WHEN claim.dependencies > 0 THEN 'waiting for jobs'
+		           WHEN claim.visible_at <= now() THEN 'queued'
+		           WHEN claim.attempts = 0 THEN 'scheduled'
+		           WHEN claim.last_error IS NOT NULL THEN 'waiting to retry'
+		           ELSE 'running'`
+
 // Status reports what one job is doing. Two primary-key probes; no column
 // holds a state.
 //
@@ -771,14 +786,7 @@ func Status(ctx context.Context, db Conn, id int64) (JobStatus, error) {
 	var text *string
 	err := db.QueryRow(ctx, `
 		SELECT CASE
-		           WHEN claim.message_id IS NULL THEN 'completed'
-		           WHEN claim.died_at IS NOT NULL THEN 'dead'
-		           WHEN claim.awaits_signal AND claim.signal IS NULL THEN 'waiting for signal'
-		           WHEN claim.dependencies > 0 THEN 'waiting for jobs'
-		           WHEN claim.visible_at <= now() THEN 'queued'
-		           WHEN claim.attempts = 0 THEN 'scheduled'
-		           WHEN claim.last_error IS NOT NULL THEN 'waiting to retry'
-		           ELSE 'running'
+		           WHEN claim.message_id IS NULL THEN 'completed'`+stateCaseSQL+`
 		       END,
 		       coalesce(claim.attempts, 0), claim.last_error
 		FROM cb_messages message
@@ -868,6 +876,66 @@ func GroupStatus(ctx context.Context, db Conn, groupID int64) (JobGroupStatus, e
 		}
 	}
 	return JobGroupStatus{}, fmt.Errorf("catbird: unknown workflow state %q", *name)
+}
+
+// QueueInfo is what Queues reports of one queue: how many of its jobs are in
+// each state, and the longest any queued job has been waiting for a worker.
+// The wait runs from visible_at, so a retry counts from when its backoff ran
+// out, not from when the job was created: it measures workers falling behind,
+// which is what a depth number alone cannot show.
+type QueueInfo struct {
+	Queue            string
+	Queued           int
+	Scheduled        int
+	Running          int
+	WaitingToRetry   int
+	WaitingForSignal int
+	WaitingForJobs   int
+	Dead             int // dead jobs GC has not collected yet
+	LongestQueued    time.Duration
+}
+
+// Queues reports what every queue is doing: one QueueInfo per queue that has
+// claims, in name order. Completed jobs have no claim, so a drained queue does
+// not appear; a caller exporting a fixed set of queues merges in the ones it
+// declared. It walks every claim row — a table this design keeps small — so it
+// is a read to poll on an interval, not a hot-path statement.
+func Queues(ctx context.Context, db Conn) ([]QueueInfo, error) {
+	rows, err := db.Query(ctx, `
+		SELECT queue,
+		       count(*) FILTER (WHERE state = 'queued'),
+		       count(*) FILTER (WHERE state = 'scheduled'),
+		       count(*) FILTER (WHERE state = 'running'),
+		       count(*) FILTER (WHERE state = 'waiting to retry'),
+		       count(*) FILTER (WHERE state = 'waiting for signal'),
+		       count(*) FILTER (WHERE state = 'waiting for jobs'),
+		       count(*) FILTER (WHERE state = 'dead'),
+		       coalesce(extract(epoch FROM now() - min(visible_at) FILTER (WHERE state = 'queued')), 0)::float8
+		FROM (
+		    SELECT claim.queue, claim.visible_at,
+		           CASE`+stateCaseSQL+`
+		           END AS state
+		    FROM cb_claims claim
+		) claim
+		GROUP BY queue
+		ORDER BY queue
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var queues []QueueInfo
+	for rows.Next() {
+		var q QueueInfo
+		var age float64
+		if err := rows.Scan(&q.Queue, &q.Queued, &q.Scheduled, &q.Running,
+			&q.WaitingToRetry, &q.WaitingForSignal, &q.WaitingForJobs, &q.Dead, &age); err != nil {
+			return nil, err
+		}
+		q.LongestQueued = time.Duration(age * float64(time.Second))
+		queues = append(queues, q)
+	}
+	return queues, rows.Err()
 }
 
 // GC deletes claims dead longer than retention and messages older than
