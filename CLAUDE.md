@@ -8,9 +8,9 @@ A PostgreSQL-backed job queue, stream, and small workflow engine. Four tables
 plus a migrations record, plain SQL, no PL/pgSQL, no extensions. Postgres is
 the only coordinator; workers scale by starting more processes.
 
-`DESIGN.md` is the specification and the first thing to read. It describes what
-is built and, under "Planned additions", what is not — do not treat anything in
-that section as existing code.
+Start with `docs/architecture.md` for the system design, `docs/usage.md` for
+application guidance, and `docs/decisions.md` for deliberate boundaries. The
+code and its package comments are the exact API contract.
 
 ## The earlier design
 
@@ -101,7 +101,8 @@ Seven files and one migration in the root package, and one package under it:
   dependency; goose reads them as they stand (its comparison is
   case-insensitive).
 - `wire/` — the browser layer, a package of its own so the core keeps no
-  `net/http`; DESIGN.md's "Wire" section is its spec. `renderer.go` holds
+  `net/http`; `docs/architecture.md` and `docs/usage.md` describe its boundary.
+  `renderer.go` holds
   `Renderer`, a process-global mux from topic patterns to handlers: the
   pattern grammar is the stream's plus `{name}`, which matches one segment in
   Go and never reaches SQL, and dispatch runs each rule once per distinct
@@ -119,7 +120,7 @@ Seven files and one migration in the root package, and one package under it:
   the client cannot cancel — sent is seen — and an empty poll acks nothing,
   so idle pages write no rows. The form without a cursor, where the page
   holds the position and polls with `?after=`, and SSE are deferred until a
-  page needs them; DESIGN.md's "Wire" section carries both rulings.
+  page needs them; `docs/decisions.md` records those rulings.
 
 ## Architecture
 

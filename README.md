@@ -4,9 +4,9 @@
 	<img src="assets/banner.svg" alt="Catbird" width="984" />
 </p>
 
-Catbird is a PostgreSQL-backed job queue, stream, and small workflow engine for Go.
+Catbird is a PostgreSQL-backed stream for Go. Jobs, queues, and small workflows are built on the same immutable message substrate.
 
-It is built for teams that want strong delivery guarantees without adding a separate queue server. You keep PostgreSQL as the only coordinator, use plain SQL schema migrations, and scale workers by starting more processes.
+Published messages receive positions and form the stream. A job pairs a message with a claim, which gives workers leases, retries, signals, and dependencies. PostgreSQL is the only coordinator; plain SQL migrations define the schema; workers scale by starting more processes.
 
 ## Why this exists
 
@@ -14,6 +14,7 @@ Catbird is for the gap between "just run it in-process" and "operate a full dist
 
 - Keep infrastructure simple: PostgreSQL is enough.
 - Keep behavior explicit: most operations are single SQL statements.
+- Start with a durable stream, then turn messages into work where needed.
 - Keep workflow logic in Go: enqueue, fan-out, join, signal, retry.
 - Keep browser updates close to data with the optional wire package.
 
