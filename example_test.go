@@ -39,7 +39,7 @@ var pool *pgxpool.Pool
 func Example_workflow() {
 	ctx := context.Background()
 
-	// The 00001_lite.sql schema must be applied first. The pool carries the
+	// The 00001_schema.sql schema must be applied first. The pool carries the
 	// library's own statements — about eight — plus one connection for every
 	// handler that holds a transaction, which is what BatchSize is set against.
 	pool, _ = pgxpool.New(ctx, "postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable&pool_max_conns=32")
