@@ -12,9 +12,14 @@ Start with `docs/architecture.md` for the system design, `docs/usage.md` for
 application guidance, and `docs/decisions.md` for deliberate boundaries. The
 code and its package comments are the exact API contract.
 
-## The earlier design
+## The earlier versions
 
-Catbird was rewritten. The previous version — `streams/`, `jobs/`, `wire/`,
+Catbird was rewritten. The released versions before the rewrite — the v0.2.x
+series and everything under it — live on the `v0.2` branch, which is where
+their bugfix releases are made and tagged. The new series on `main` starts at
+v0.3.0.
+
+An unreleased intermediate rewrite — `streams/`, `jobs/`, `wire/`,
 `notify/`, the PL/pgSQL SQL API, the dashboard, the TUI, the `cmd/cb` CLI, and
 about six thousand lines of plan and decision-log documents — lives on the
 `streams` branch and is reachable from there:
@@ -97,7 +102,7 @@ Seven files and one migration in the root package, and one package under it:
   `cb_migrations` row; concurrency is an advisory lock (key 3 under
   `hashtext('catbird')`) plus the insert guard. The parser is `strings.Cut`
   on the two markers, which works only while the schema has no PL/pgSQL.
-- `migrations/00001_lite.sql` — the whole schema. Goose markers, no goose
+- `migrations/00001_schema.sql` — the whole schema. Goose markers, no goose
   dependency; goose reads them as they stand (its comparison is
   case-insensitive).
 - `wire/` — the browser layer, a package of its own so the core keeps no
