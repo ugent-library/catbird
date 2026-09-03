@@ -85,7 +85,7 @@ func (t *trigger) start(ctx context.Context) {
 
 // enqueueNextBatch reads the next stream messages matching the trigger's
 // patterns and enqueues a job for each, all in one statement: the read after
-// the cursor, the job messages and their claims, the cursor moved to the last
+// the cursor, the job messages and their job rows, the cursor moved to the last
 // position read, and one wake for the target queue. Each job's deduplication
 // key is trigger:<name>: followed by the source message's id, so a second
 // process running the same trigger reads the same batch but creates no second
@@ -102,7 +102,7 @@ func (t *trigger) start(ctx context.Context) {
 // caller whose rows are not already in cb_messages.
 //
 // The cursor insert is guarded, so an empty batch acks nothing and an idle
-// trigger writes no rows. The wake reads the claims through LIMIT 1 and the
+// trigger writes no rows. The wake reads the job rows through LIMIT 1 and the
 // final SELECT references it so that it runs, both as in EnqueueBatch.
 func (t *trigger) enqueueNextBatch(ctx context.Context) (int, error) {
 	matchSQL, args, err := compilePatterns(t.cursor.Patterns, 6)
@@ -125,8 +125,8 @@ func (t *trigger) enqueueNextBatch(ctx context.Context) (int, error) {
 			ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
 			RETURNING id
 		),
-		claim AS (
-			INSERT INTO cb_claims (message_id, queue, job_type, visible_at)
+		job AS (
+			INSERT INTO cb_jobs (message_id, queue, job_type, claimable_at)
 			SELECT id, $4, $5, now() FROM message
 			RETURNING message_id
 		),
@@ -136,7 +136,7 @@ func (t *trigger) enqueueNextBatch(ctx context.Context) (int, error) {
 			ON CONFLICT (name) DO UPDATE SET last_position = GREATEST(cb_cursors.last_position, EXCLUDED.last_position)
 		),
 		wake AS (
-			SELECT pg_notify('cb_queue_' || $4, '') FROM (SELECT 1 FROM claim LIMIT 1) one
+			SELECT pg_notify('cb_queue_' || $4, '') FROM (SELECT 1 FROM job LIMIT 1) one
 		)
 		SELECT count(*) FROM source LEFT JOIN wake ON true
 	`, append([]any{t.cursor.Name, t.opts.BatchSize, "trigger:" + t.name + ":",

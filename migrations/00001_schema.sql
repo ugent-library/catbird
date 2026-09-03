@@ -38,35 +38,37 @@ CREATE INDEX cb_messages_unassigned_idx ON cb_messages (id) WHERE stream AND pos
 CREATE TABLE cb_cursors (
     name TEXT PRIMARY KEY,
     last_position BIGINT NOT NULL,
-    -- Until when a Consume loop holds the cursor. While it is in the future one
-    -- process reads and acks under the cursor and the others wait, so a batch
-    -- runs in one process at a time; when it passes, another process takes the
-    -- cursor over. The ack matches on the value the claim returned, so a
-    -- process whose claim ran out during its handler moves nothing and releases
-    -- nothing. '-infinity' is free: a cursor that is only ever read and acked
-    -- directly, as wire's are, is never claimed.
-    claimed_until TIMESTAMPTZ NOT NULL DEFAULT '-infinity'
+    -- When another process may claim the cursor. A Consume loop's claim sets it
+    -- ClaimDuration ahead, so while it is in the future one process reads and
+    -- acks under the cursor and the others wait, and a batch runs in one process
+    -- at a time; when it passes, another process takes the cursor over. The ack
+    -- matches on the value the claim returned, so a process whose claim ran out
+    -- during its handler moves nothing and releases nothing. '-infinity' means
+    -- claimable now: a cursor that is only ever read and acked directly, as
+    -- wire's are, stays there.
+    claimable_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity'
 ) WITH (fillfactor = 90);
 
 -- One row per job that still has to run. Deleted when the job completes.
--- visible_at is both the earliest start time and the claim deadline: a claimed
--- job has visible_at in the future; when it passes, any worker may claim it again.
+-- claimable_at is when a worker may next take the job: the start time of a
+-- delayed job, the end of a retry's backoff, and on a claimed job the claim
+-- deadline, past which any worker may claim it again.
 --
 -- Columns run widest first so the fixed-width ones pack without padding: 74
 -- bytes a row instead of 78. Grouping them by role costs those 4 bytes on every
 -- claim and retry, so the comments carry the grouping.
-CREATE TABLE cb_claims (
+CREATE TABLE cb_jobs (
     message_id BIGINT PRIMARY KEY REFERENCES cb_messages (id) ON DELETE CASCADE,
     -- The workflow this job belongs to: the id of the job that started it.
     -- NULL for a job that started one or stands alone, so the volume of
-    -- single-shot jobs stays out of cb_claims_group_idx below and pays nothing
+    -- single-shot jobs stays out of cb_jobs_group_idx below and pays nothing
     -- for it on every claim and retry. A job's own group is
     -- coalesce(group_id, message_id).
     group_id BIGINT,
-    visible_at TIMESTAMPTZ NOT NULL,
+    claimable_at TIMESTAMPTZ NOT NULL,
     -- When the job died: it failed permanently or Cancel stopped it, and no
     -- worker claims it again. NULL while the job lives. GC's age test runs from
-    -- it; reusing visible_at for that would never collect a canceled gated job,
+    -- it; reusing claimable_at for that would never collect a canceled gated job,
     -- which sits on 'infinity'. Not a state machine: what a job is doing is
     -- stored nowhere, Status derives it from the columns here.
     died_at TIMESTAMPTZ,
@@ -76,8 +78,8 @@ CREATE TABLE cb_claims (
     -- How many jobs this one is still waiting for; it runs when this reaches 0.
     dependencies SMALLINT NOT NULL DEFAULT 0,
     -- This job waits for a signal; the payload arrives in signal below. It sits
-    -- on visible_at = 'infinity', so the wait is a delay and needs no place in
-    -- the ready index. Signal writes the payload and sets visible_at to now().
+    -- on claimable_at = 'infinity', so the wait is a delay and needs no place in
+    -- the ready index. Signal writes the payload and sets claimable_at to now().
     awaits_signal BOOLEAN NOT NULL DEFAULT false,
     queue TEXT NOT NULL, -- the claim key: which workers may take this job
     job_type TEXT NOT NULL, -- which handler runs it
@@ -91,11 +93,11 @@ CREATE TABLE cb_claims (
     -- catbird holds a count and no count can disagree with its list.
     dependent_job_ids BIGINT[],
     -- The signal payload, once one arrived. It lives here and not in a table of
-    -- its own because it is created, read and deleted with the claim.
+    -- its own because it is created, read and deleted with the job row.
     signal JSONB,
     -- What the last failed attempt returned, cut to 256 characters. The claim
     -- clears it, so text means the job is waiting to retry and no text means an
-    -- attempt is running; both are otherwise a live claim with visible_at in the
+    -- attempt is running; both are otherwise a live job with claimable_at in the
     -- future. Not a run history: the next failure overwrites it and completion
     -- deletes the row. A job that never failed pays nothing, and 256 characters
     -- put the tuple at 336 bytes against 74 empty. Past about 1.9 kB every
@@ -114,32 +116,32 @@ CREATE TABLE cb_claims (
 -- against 102 and 0.03 ms with none. A job type whose consumer runs
 -- occasionally, or can be down for a while, gets a queue of its own: the queue
 -- leads this index, so its backlog sits in a range no other claim scans.
-CREATE INDEX cb_claims_ready_idx ON cb_claims (queue, visible_at) WHERE died_at IS NULL AND dependencies = 0;
+CREATE INDEX cb_jobs_ready_idx ON cb_jobs (queue, claimable_at) WHERE died_at IS NULL AND dependencies = 0;
 -- What Cancel, Signal and GroupStatus probe. A worker cancels the group of
 -- every job that dies in one, so without this a downstream outage runs one
--- full scan of cb_claims per dead job: 834 buffers and 4.9 ms at 100k live
--- claims, against 6 buffers here. Jobs outside a workflow stay out of a
+-- full scan of cb_jobs per dead job: 834 buffers and 4.9 ms at 100k live
+-- jobs, against 6 buffers here. Jobs outside a workflow stay out of a
 -- structure that can never match them: 112 kB against 2128 kB with 1% of jobs
 -- grouped. Dead jobs stay in it so GroupStatus can count them; they are few,
 -- and they leave with GC.
-CREATE INDEX cb_claims_group_idx ON cb_claims (group_id) WHERE group_id IS NOT NULL;
+CREATE INDEX cb_jobs_group_idx ON cb_jobs (group_id) WHERE group_id IS NOT NULL;
 
 -- Optional result of a job. The handler records it with SetOutput and the
 -- completion writes it here, so a result cannot outlive an attempt that never
--- finished. group_id and job_type are copied from the claim, which is deleted
+-- finished. group_id and job_type are copied from the job row, which is deleted
 -- by the same statement: a later job of the same workflow reads an earlier
 -- one's result by what it was, not by an id it cannot know.
-CREATE TABLE cb_outputs (
+CREATE TABLE cb_job_outputs (
     message_id BIGINT PRIMARY KEY REFERENCES cb_messages (id) ON DELETE CASCADE,
     group_id BIGINT NOT NULL,
     job_type TEXT NOT NULL,
     output JSONB
 );
-CREATE INDEX cb_outputs_group_idx ON cb_outputs (group_id, job_type);
+CREATE INDEX cb_job_outputs_group_idx ON cb_job_outputs (group_id, job_type);
 
 -- +goose down
-DROP TABLE cb_outputs;
-DROP TABLE cb_claims;
+DROP TABLE cb_job_outputs;
+DROP TABLE cb_jobs;
 DROP TABLE cb_cursors;
 DROP TABLE cb_messages;
 DROP SEQUENCE cb_position_seq;

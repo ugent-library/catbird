@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # Index Bloat Benchmark for Catbird - Bottom-Up Index Deletion Test
-# Tests whether Postgres 14+ BUID handles visible_at index churn at medium load
+# Tests whether Postgres 14+ BUID handles claimable_at index churn at medium load
 # Run against: postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable
 
 set -e
 
 DB_URL="postgres://postgres:postgres@localhost:5432/cb_tst?sslmode=disable"
-TABLE_NAME="cb_claims_test"
-INDEX_NAME="idx_claims_queue_visible"
+TABLE_NAME="cb_jobs_test"
+INDEX_NAME="idx_jobs_queue_claimable"
 
 # We want enough rows and churn to force Postgres to allocate new B-Tree pages
 # if it is unable to recycle dead tuples internally.
@@ -38,24 +38,24 @@ trap cleanup EXIT
 log_info "Setting up test table and index..."
 
 psql "$DB_URL" << 'SQL' >/dev/null
-DROP TABLE IF EXISTS cb_claims_test CASCADE;
+DROP TABLE IF EXISTS cb_jobs_test CASCADE;
 
-CREATE TABLE cb_claims_test (
+CREATE TABLE cb_jobs_test (
     id BIGSERIAL PRIMARY KEY,
     queue TEXT NOT NULL,
-    visible_at TIMESTAMP NOT NULL,
+    claimable_at TIMESTAMP NOT NULL,
     status SMALLINT NOT NULL DEFAULT 0,
     payload JSONB DEFAULT '{}'::jsonb
 );
 
 -- The Catbird Lite target index
-CREATE INDEX idx_claims_queue_visible ON cb_claims_test (queue, visible_at) WHERE status = 0;
+CREATE INDEX idx_jobs_queue_claimable ON cb_jobs_test (queue, claimable_at) WHERE status = 0;
 SQL
 
 # === DATA LOAD PHASE ===
 log_info "Inserting $INITIAL_ROWS initial rows..."
 psql "$DB_URL" << SQL >/dev/null
-INSERT INTO cb_claims_test (queue, visible_at, status, payload)
+INSERT INTO cb_jobs_test (queue, claimable_at, status, payload)
 SELECT
     'default',
     NOW() + (random() * interval '60 seconds'),
@@ -77,17 +77,17 @@ printf "%-12d %-15s %-15s\n" "$iter" "$start_idx_size" "$(measure_table_size)"
 for iter in $(seq 1 $CHURN_ITERATIONS); do
     # 1. Claim rows (status 0 -> 1)
     psql "$DB_URL" -q << SQL
-    UPDATE cb_claims_test
-    SET status = 1, visible_at = NOW() + interval '5 minutes'
+    UPDATE cb_jobs_test
+    SET status = 1, claimable_at = NOW() + interval '5 minutes'
     WHERE id IN (
-        SELECT id FROM cb_claims_test WHERE status = 0 LIMIT $UPDATES_PER_ITERATION
+        SELECT id FROM cb_jobs_test WHERE status = 0 LIMIT $UPDATES_PER_ITERATION
     );
 SQL
 
-    # 2. Fail and backoff (status 1 -> 0, advance visible_at)
+    # 2. Fail and backoff (status 1 -> 0, advance claimable_at)
     psql "$DB_URL" -q << SQL
-    UPDATE cb_claims_test
-    SET status = 0, visible_at = NOW() + (random() * interval '30 seconds')
+    UPDATE cb_jobs_test
+    SET status = 0, claimable_at = NOW() + (random() * interval '30 seconds')
     WHERE status = 1;
 SQL
 

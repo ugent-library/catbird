@@ -136,14 +136,14 @@ func (c *consumer) start(ctx context.Context) {
 // and a claim left standing would keep every process off the cursor for the
 // rest of ClaimDuration.
 func (c *consumer) handleNextBatch(ctx context.Context) (int, error) {
-	position, claimedUntil, claimed, err := c.claim(ctx)
+	position, claimableAt, claimed, err := c.claim(ctx)
 	if err != nil || !claimed {
 		return 0, err
 	}
 	msgs, err := ReadAfter(ctx, c.runtime.pool, c.cursor.Patterns, position, c.opts.BatchSize)
 	if err == nil && len(msgs) > 0 {
 		var lost bool
-		claimedUntil, lost, err = c.runHandler(ctx, msgs, claimedUntil)
+		claimableAt, lost, err = c.runHandler(ctx, msgs, claimableAt)
 		if lost {
 			c.runtime.opts.Logger.Warn("catbird: cursor claim lost during the handler, work discarded",
 				"consumer", c.name, "messages", len(msgs), "err", err)
@@ -156,7 +156,7 @@ func (c *consumer) handleNextBatch(ctx context.Context) (int, error) {
 
 	after, cancel := context.WithTimeout(context.WithoutCancel(ctx), afterHandlerTimeout)
 	defer cancel()
-	switch ackErr := c.ack(after, position, claimedUntil); {
+	switch ackErr := c.ack(after, position, claimableAt); {
 	case errors.Is(ackErr, ErrClaimLost):
 		c.runtime.opts.Logger.Warn("catbird: cursor claim lost before the ack, the batch runs again in another process",
 			"consumer", c.name, "messages", len(msgs))
@@ -180,7 +180,7 @@ func (c *consumer) handleNextBatch(ctx context.Context) (int, error) {
 // renewal, which cancels through it with ErrClaimLost when the claim is not
 // this process's any more, so the batch is discarded rather than acked on a
 // cursor another process holds.
-func (c *consumer) runHandler(ctx context.Context, msgs []Message, claimedUntil time.Time) (time.Time, bool, error) {
+func (c *consumer) runHandler(ctx context.Context, msgs []Message, claimableAt time.Time) (time.Time, bool, error) {
 	lost, cancelLost := context.WithCancelCause(ctx)
 	defer cancelLost(nil)
 	handlerCtx, cancelHandler := context.WithTimeout(lost, c.opts.HandlerTimeout)
@@ -188,14 +188,14 @@ func (c *consumer) runHandler(ctx context.Context, msgs []Message, claimedUntil 
 
 	renewed := make(chan time.Time, 1)
 	if c.opts.HandlerTimeout > c.opts.ClaimDuration {
-		go func() { renewed <- c.renewClaim(ctx, handlerCtx, claimedUntil, cancelLost) }()
+		go func() { renewed <- c.renewClaim(ctx, handlerCtx, claimableAt, cancelLost) }()
 	} else {
-		renewed <- claimedUntil
+		renewed <- claimableAt
 	}
 	err := c.handle(handlerCtx, msgs)
 	cancelHandler() // ends the renewal, which then reports the deadline it last set
-	claimedUntil = <-renewed
-	return claimedUntil, errors.Is(context.Cause(handlerCtx), ErrClaimLost), err
+	claimableAt = <-renewed
+	return claimableAt, errors.Is(context.Cause(handlerCtx), ErrClaimLost), err
 }
 
 // renewClaim moves the claim's deadline a full ClaimDuration out every half
@@ -212,26 +212,26 @@ func (c *consumer) runHandler(ctx context.Context, msgs []Message, claimedUntil 
 // means the claim is not this process's any more — it lapsed and another
 // process took the cursor — so the handler is cancelled with ErrClaimLost to
 // stop work nothing will ack.
-func (c *consumer) renewClaim(ctx, handlerCtx context.Context, claimedUntil time.Time, cancel context.CancelCauseFunc) time.Time {
+func (c *consumer) renewClaim(ctx, handlerCtx context.Context, claimableAt time.Time, cancel context.CancelCauseFunc) time.Time {
 	tick := time.NewTicker(c.opts.ClaimDuration / 2)
 	defer tick.Stop()
 	for {
 		select {
 		case <-handlerCtx.Done():
-			return claimedUntil
+			return claimableAt
 		case <-tick.C:
 		}
 		var renewed time.Time
 		err := c.runtime.pool.QueryRow(ctx, `
 			UPDATE cb_cursors
-			SET claimed_until = now() + $2::interval
-			WHERE name = $1 AND claimed_until = $3
-			RETURNING claimed_until
-		`, c.cursor.Name, c.opts.ClaimDuration, claimedUntil).Scan(&renewed)
+			SET claimable_at = now() + $2::interval
+			WHERE name = $1 AND claimable_at = $3
+			RETURNING claimable_at
+		`, c.cursor.Name, c.opts.ClaimDuration, claimableAt).Scan(&renewed)
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
 			cancel(ErrClaimLost)
-			return claimedUntil
+			return claimableAt
 		case err != nil:
 			// Nothing is cancelled on an error: the claim may still be this
 			// process's, and the next tick renews it a full ClaimDuration deep.
@@ -239,7 +239,7 @@ func (c *consumer) renewClaim(ctx, handlerCtx context.Context, claimedUntil time
 				c.runtime.opts.Logger.Error("catbird: renewing the cursor claim failed", "consumer", c.name, "err", err)
 			}
 		default:
-			claimedUntil = renewed
+			claimableAt = renewed
 		}
 	}
 }
@@ -247,26 +247,26 @@ func (c *consumer) renewClaim(ctx, handlerCtx context.Context, claimedUntil time
 // claim takes the cursor for ClaimDuration and returns the position to read
 // after and the deadline the claim set, or false when another process holds
 // the cursor. One statement covers the three cases: it creates the row on a
-// cursor's first claim, takes an existing row whose claimed_until has passed,
+// cursor's first claim, takes an existing row whose claimable_at has passed,
 // and writes nothing when it has not — ON CONFLICT DO UPDATE with a WHERE
 // updates no row when the condition fails, and RETURNING returns only rows
 // written. A bare UPDATE would take nothing on a cursor that has never been
 // acked, and every process would read that as another one holding it.
-func (c *consumer) claim(ctx context.Context) (position int64, claimedUntil time.Time, claimed bool, err error) {
+func (c *consumer) claim(ctx context.Context) (position int64, claimableAt time.Time, claimed bool, err error) {
 	err = c.runtime.pool.QueryRow(ctx, `
-		INSERT INTO cb_cursors (name, last_position, claimed_until)
+		INSERT INTO cb_cursors (name, last_position, claimable_at)
 		VALUES ($1, 0, now() + $2::interval)
-		ON CONFLICT (name) DO UPDATE SET claimed_until = now() + $2::interval
-		WHERE cb_cursors.claimed_until <= now()
-		RETURNING last_position, claimed_until
-	`, c.cursor.Name, c.opts.ClaimDuration).Scan(&position, &claimedUntil)
+		ON CONFLICT (name) DO UPDATE SET claimable_at = now() + $2::interval
+		WHERE cb_cursors.claimable_at <= now()
+		RETURNING last_position, claimable_at
+	`, c.cursor.Name, c.opts.ClaimDuration).Scan(&position, &claimableAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, time.Time{}, false, nil
 	}
 	if err != nil {
 		return 0, time.Time{}, false, err
 	}
-	return position, claimedUntil, true, nil
+	return position, claimableAt, true, nil
 }
 
 // ack moves the cursor to position and releases the claim. It matches on the
@@ -276,12 +276,12 @@ func (c *consumer) claim(ctx context.Context) (position int64, claimedUntil time
 // match, a late ack would release the other process's claim while its batch is
 // still running, and a third process would start the next batch beside it.
 // GREATEST keeps the cursor from moving backwards, as Cursor.Ack does.
-func (c *consumer) ack(ctx context.Context, position int64, claimedUntil time.Time) error {
+func (c *consumer) ack(ctx context.Context, position int64, claimableAt time.Time) error {
 	tag, err := c.runtime.pool.Exec(ctx, `
 		UPDATE cb_cursors
-		SET last_position = GREATEST(last_position, $2), claimed_until = '-infinity'
-		WHERE name = $1 AND claimed_until = $3
-	`, c.cursor.Name, position, claimedUntil)
+		SET last_position = GREATEST(last_position, $2), claimable_at = '-infinity'
+		WHERE name = $1 AND claimable_at = $3
+	`, c.cursor.Name, position, claimableAt)
 	if err != nil {
 		return err
 	}

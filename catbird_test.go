@@ -158,7 +158,7 @@ func TestTortureThroughput(t *testing.T) {
 	cancel()
 	workerWg.Wait()
 
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims"); n != 0 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs"); n != 0 {
 		t.Errorf("expected 0 claims left, got %d", n)
 	}
 }
@@ -223,7 +223,7 @@ func TestLongJobDoesNotHoldUpTheQueue(t *testing.T) {
 	}
 	// A job reports itself inside its handler, before its transaction commits,
 	// so wait for the claims to go: only the long job's may remain.
-	for count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'mixed'") > 1 {
+	for count(t, pool, "SELECT count(*) FROM cb_jobs WHERE queue = 'mixed'") > 1 {
 		if ctx.Err() != nil {
 			t.Fatal("short jobs finished but their claims stayed")
 		}
@@ -269,7 +269,7 @@ func TestExactlyOnceDeduplication(t *testing.T) {
 	}
 	wg.Wait()
 
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'deduplication_queue'"); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs WHERE queue = 'deduplication_queue'"); n != 1 {
 		t.Fatalf("expected 1 claim, got %d", n)
 	}
 }
@@ -366,7 +366,7 @@ func TestHandlerFansOutAndJoins(t *testing.T) {
 	}
 
 	waitFor(t, 5*time.Second, "the workflow left claims behind", func() bool {
-		return count(t, pool, "SELECT count(*) FROM cb_claims") == 0
+		return count(t, pool, "SELECT count(*) FROM cb_jobs") == 0
 	})
 }
 
@@ -488,7 +488,7 @@ func TestDependencyOutputs(t *testing.T) {
 	}
 
 	waitFor(t, 5*time.Second, "the workflow left claims behind", func() bool {
-		return count(t, pool, "SELECT count(*) FROM cb_claims") == 0
+		return count(t, pool, "SELECT count(*) FROM cb_jobs") == 0
 	})
 
 	// What the read by job type takes: every branch of the workflow, both rounds.
@@ -528,17 +528,17 @@ func TestAFailedAttemptAsksForNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 10*time.Second, "the flaky job never completed", func() bool {
-		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE job_type = 'flaky'") == 0
+		return count(t, pool, "SELECT count(*) FROM cb_jobs WHERE job_type = 'flaky'") == 0
 	})
 	time.Sleep(200 * time.Millisecond)
 
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE job_type = 'next'"); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs WHERE job_type = 'next'"); n != 1 {
 		t.Fatalf("%d jobs asked for, want 1: the failed attempt's buffer was written", n)
 	}
 	var attempt int
 	if err := pool.QueryRow(ctx, `
 		SELECT (payload #>> '{}')::int FROM cb_messages m
-		JOIN cb_claims c ON c.message_id = m.id WHERE c.job_type = 'next'
+		JOIN cb_jobs c ON c.message_id = m.id WHERE c.job_type = 'next'
 	`).Scan(&attempt); err != nil {
 		t.Fatal(err)
 	}
@@ -563,7 +563,7 @@ func TestSignalGatesAJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE awaits_signal AND visible_at = 'infinity'"); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs WHERE awaits_signal AND claimable_at = 'infinity'"); n != 1 {
 		t.Fatal("the gated job is claimable before its signal arrived")
 	}
 
@@ -642,7 +642,7 @@ func TestSignalAddressesAGateInsideAWorkflow(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, "the gate was never created", func() bool {
-		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE job_type = 'approve' AND group_id = $1", groupID) == 1
+		return count(t, pool, "SELECT count(*) FROM cb_jobs WHERE job_type = 'approve' AND group_id = $1", groupID) == 1
 	})
 
 	if err := catbird.Signal(ctx, pool, groupID, approve, "yes"); err != nil {
@@ -694,7 +694,7 @@ func TestAProcessClaimsOnlyWhatItHandles(t *testing.T) {
 		t.Fatal("the registered type never ran")
 	}
 	time.Sleep(300 * time.Millisecond)
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE message_id = $1 AND attempts = 0", unknownID); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs WHERE message_id = $1 AND attempts = 0", unknownID); n != 1 {
 		t.Error("a process claimed a job type it has no handler for")
 	}
 }
@@ -749,7 +749,7 @@ func TestOnlyTheClaimHolderCommits(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
-	for count(t, pool, "SELECT count(*) FROM cb_claims") != 0 {
+	for count(t, pool, "SELECT count(*) FROM cb_jobs") != 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("claim was not completed")
 		}
@@ -812,7 +812,7 @@ func TestTriggerBridgesPayloadUnchanged(t *testing.T) {
 		t.Fatal("trigger did not bridge the message")
 	}
 	time.Sleep(300 * time.Millisecond)
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims"); n != 0 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs"); n != 0 {
 		t.Errorf("expected only the matching message bridged and completed, %d claims left", n)
 	}
 	if n := count(t, pool, "SELECT last_position FROM cb_cursors WHERE name = 'trigger:img'"); n != 1 {
@@ -840,7 +840,7 @@ func TestGCKeepsLiveClaims(t *testing.T) {
 	if err := catbird.Cancel(ctx, pool, doomedID); err != nil {
 		t.Fatal(err)
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE died_at IS NULL AND dependencies = 0 AND visible_at <= now()"); n != 0 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs WHERE died_at IS NULL AND dependencies = 0 AND claimable_at <= now()"); n != 0 {
 		t.Fatalf("canceled job still claimable")
 	}
 
@@ -848,7 +848,7 @@ func TestGCKeepsLiveClaims(t *testing.T) {
 	if err := catbird.GC(ctx, pool, 10*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims"); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs"); n != 1 {
 		t.Errorf("expected the delayed claim to survive GC, got %d claims", n)
 	}
 	if n := count(t, pool, "SELECT count(*) FROM cb_messages"); n != 1 {
@@ -856,7 +856,7 @@ func TestGCKeepsLiveClaims(t *testing.T) {
 	}
 }
 
-// A gated job waits on visible_at = 'infinity'. Cancel resets it to when the
+// A gated job waits on claimable_at = 'infinity'. Cancel resets it to when the
 // job died; without that GC's age test never passes and the claim and its
 // message are immortal.
 func TestGCCollectsACanceledGatedJob(t *testing.T) {
@@ -877,7 +877,7 @@ func TestGCCollectsACanceledGatedJob(t *testing.T) {
 	if err := catbird.GC(ctx, pool, 10*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims"); n != 0 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs"); n != 0 {
 		t.Errorf("expected the canceled gated claim to be collected, got %d claims", n)
 	}
 	if _, err := catbird.Status(ctx, pool, id); !errors.Is(err, catbird.ErrNotFound) {
@@ -1049,9 +1049,9 @@ func TestFailedAttemptWritesNoOutput(t *testing.T) {
 	// written after the handler returned, and the wait holds it there.
 	waitFor(t, 5*time.Second, "the failed attempt scheduled no retry", func() bool {
 		return count(t, pool, `
-			SELECT count(*) FROM cb_claims
+			SELECT count(*) FROM cb_jobs
 			WHERE queue = 'output_retries' AND died_at IS NULL AND attempts = 1
-			  AND visible_at > now()
+			  AND claimable_at > now()
 		`) == 1
 	})
 	gs, err := catbird.GroupStatus(ctx, pool, id)
@@ -1064,7 +1064,7 @@ func TestFailedAttemptWritesNoOutput(t *testing.T) {
 	}
 
 	waitFor(t, 5*time.Second, "the job was never completed", func() bool {
-		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'output_retries'") == 0
+		return count(t, pool, "SELECT count(*) FROM cb_jobs WHERE queue = 'output_retries'") == 0
 	})
 	gs, err = catbird.GroupStatus(ctx, pool, id)
 	if err != nil {
@@ -1107,7 +1107,7 @@ func TestPublishBatchSkipsTakenKeys(t *testing.T) {
 	if n := count(t, pool, "SELECT count(*) FROM cb_messages"); n != 4 {
 		t.Errorf("%d messages in the table, want 4 with the one published before the batch", n)
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims"); n != 0 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs"); n != 0 {
 		t.Errorf("published messages got %d claims, want none", n)
 	}
 
@@ -1215,7 +1215,7 @@ func TestEnqueueBatchWakesTheQueueOnce(t *testing.T) {
 	if n != 2 {
 		t.Errorf("created %d jobs, want 2", n)
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'images'"); n != 3 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs WHERE queue = 'images'"); n != 3 {
 		t.Errorf("%d claims, want 3 with the job enqueued before the batch", n)
 	}
 
@@ -1226,7 +1226,7 @@ func TestEnqueueBatchWakesTheQueueOnce(t *testing.T) {
 	}, catbird.EnqueueOptions{Delay: time.Hour}); err != nil || n != 2 {
 		t.Fatalf("delayed batch created %d jobs (%v)", n, err)
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE visible_at > now() + interval '30 minutes'"); n != 2 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs WHERE claimable_at > now() + interval '30 minutes'"); n != 2 {
 		t.Errorf("%d delayed claims, want 2", n)
 	}
 
@@ -1267,14 +1267,14 @@ func TestTriggerBatchIsEnqueuedOnce(t *testing.T) {
 	go rt.Start(ctx)
 
 	deadline := time.Now().Add(3 * time.Second)
-	for count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'index_queue'") < 20 {
+	for count(t, pool, "SELECT count(*) FROM cb_jobs WHERE queue = 'index_queue'") < 20 {
 		if time.Now().After(deadline) {
-			t.Fatalf("only %d jobs arrived", count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'index_queue'"))
+			t.Fatalf("only %d jobs arrived", count(t, pool, "SELECT count(*) FROM cb_jobs WHERE queue = 'index_queue'"))
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	time.Sleep(300 * time.Millisecond) // let the trigger run again on its cursor
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'index_queue'"); n != 20 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs WHERE queue = 'index_queue'"); n != 20 {
 		t.Errorf("%d jobs for 20 messages", n)
 	}
 }
@@ -1391,7 +1391,7 @@ func TestShutdownReturnsTheJob(t *testing.T) {
 	var attempts int
 	var claimable bool
 	err := pool.QueryRow(ctx, `
-		SELECT attempts, visible_at <= now() FROM cb_claims WHERE queue = 'deploys'
+		SELECT attempts, claimable_at <= now() FROM cb_jobs WHERE queue = 'deploys'
 	`).Scan(&attempts, &claimable)
 	if err != nil {
 		t.Fatal(err)
@@ -1451,16 +1451,16 @@ func TestTimeoutCountsTheAttemptAsFailed(t *testing.T) {
 
 	// The wait is read in the database's clock, like the backoff test below: the
 	// retry is an interval added to the server's now(). It is a band and not
-	// "some time from now" because a running job also has visible_at in the
+	// "some time from now" because a running job also has claimable_at in the
 	// future: the claim set it a ClaimDuration ahead. The first retry of a
-	// failed attempt is MinBackoff exactly, a give-back leaves visible_at at
+	// failed attempt is MinBackoff exactly, a give-back leaves claimable_at at
 	// now() below the band, and a running attempt leaves it a ClaimDuration
 	// ahead, above it.
 	waitFor(t, 5*time.Second, "no retry a backoff away: the timed-out attempt was not counted as a failure", func() bool {
 		return count(t, pool, `
-			SELECT count(*) FROM cb_claims
+			SELECT count(*) FROM cb_jobs
 			WHERE queue = 'timeouts' AND died_at IS NULL AND attempts = 1
-			  AND visible_at > now() + $1::interval AND visible_at < now() + $2::interval
+			  AND claimable_at > now() + $1::interval AND claimable_at < now() + $2::interval
 		`, backoff/2, backoff*2) == 1
 	})
 	if n := atomic.LoadInt32(&calls); n != 1 {
@@ -1510,13 +1510,13 @@ func TestClaimDurationDefaultsFromHandlerTimeout(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("the job never started")
 	}
-	// The claim set visible_at 8 seconds ahead: HandlerTimeout plus the
+	// The claim set claimable_at 8 seconds ahead: HandlerTimeout plus the
 	// completion's five. Read moments after the handler started, anything close
 	// to that tells this default from the five-minute fallback (about 300) and
 	// from a claim of HandlerTimeout alone (about 3).
 	var claimedFor float64
 	err := pool.QueryRow(ctx, `
-		SELECT extract(epoch FROM visible_at - now()) FROM cb_claims WHERE queue = 'covered'
+		SELECT extract(epoch FROM claimable_at - now()) FROM cb_jobs WHERE queue = 'covered'
 	`).Scan(&claimedFor)
 	if err != nil {
 		t.Fatal(err)
@@ -1560,7 +1560,7 @@ func TestRenewalKeepsALongJobClaimed(t *testing.T) {
 	}
 
 	waitFor(t, 5*time.Second, "the job was not completed", func() bool {
-		return count(t, pool, "SELECT count(*) FROM cb_claims") == 0
+		return count(t, pool, "SELECT count(*) FROM cb_jobs") == 0
 	})
 	time.Sleep(500 * time.Millisecond) // room for a wrongly claimed second attempt to surface
 	if n := atomic.LoadInt32(&calls); n != 1 {
@@ -1615,7 +1615,7 @@ func TestRenewalStopsAtTimeout(t *testing.T) {
 		return atomic.LoadInt32(&calls) == 2
 	})
 	waitFor(t, 5*time.Second, "the second attempt did not complete", func() bool {
-		return count(t, pool, "SELECT count(*) FROM cb_claims") == 0
+		return count(t, pool, "SELECT count(*) FROM cb_jobs") == 0
 	})
 }
 
@@ -1680,7 +1680,7 @@ func TestCancelStopsARenewingHandler(t *testing.T) {
 	// keeps its one spent attempt and no error text.
 	waitFor(t, 2*time.Second, "the discarded attempt wrote on the dead claim", func() bool {
 		return count(t, pool, `
-			SELECT count(*) FROM cb_claims
+			SELECT count(*) FROM cb_jobs
 			WHERE message_id = $1 AND died_at IS NOT NULL AND attempts = 1 AND last_error IS NULL
 		`, id) == 1
 	})
@@ -1732,7 +1732,7 @@ func TestCompletedJobIsNotRetriedAfterAnError(t *testing.T) {
 	}
 	<-runCtx.Done()
 
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'late_error'"); n != 0 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs WHERE queue = 'late_error'"); n != 0 {
 		t.Errorf("%d claims left: the error undid a completion", n)
 	}
 	if n := atomic.LoadInt32(&calls); n != 1 {
@@ -1775,16 +1775,16 @@ func TestHandlerErrorSchedulesARetryAfterBackoff(t *testing.T) {
 	// job up again compares against the same now().
 	waitFor(t, 5*time.Second, "the failed attempt scheduled no retry a backoff away", func() bool {
 		return count(t, pool, `
-			SELECT count(*) FROM cb_claims
+			SELECT count(*) FROM cb_jobs
 			WHERE queue = 'retries' AND died_at IS NULL AND attempts = 1
-			  AND visible_at > now() + $1::interval
+			  AND claimable_at > now() + $1::interval
 		`, backoff/2) == 1
 	})
 	waitFor(t, 5*time.Second, "the failed job was never retried", func() bool {
 		return atomic.LoadInt32(&calls) == 2
 	})
 	waitFor(t, 5*time.Second, "the second attempt did not complete the job", func() bool {
-		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE queue = 'retries'") == 0
+		return count(t, pool, "SELECT count(*) FROM cb_jobs WHERE queue = 'retries'") == 0
 	})
 }
 
@@ -1819,7 +1819,7 @@ func TestMaxBackoffCapsTheGrowingWait(t *testing.T) {
 
 	waitFor(t, 10*time.Second, "the job did not spend its attempts: the wait grew past MaxBackoff", func() bool {
 		return count(t, pool, `
-			SELECT count(*) FROM cb_claims
+			SELECT count(*) FROM cb_jobs
 			WHERE queue = 'capped' AND died_at IS NOT NULL AND attempts = 18
 		`) == 1
 	})
@@ -1892,7 +1892,7 @@ func TestMaxAttemptsMarksTheJobDeadAndRunsOnDead(t *testing.T) {
 	if n := len(dead); n != 0 {
 		t.Errorf("OnDead ran %d more times, want once", n)
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE message_id = $1 AND died_at IS NOT NULL AND attempts = 3", id); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs WHERE message_id = $1 AND died_at IS NOT NULL AND attempts = 3", id); n != 1 {
 		t.Error("the dead job's claim is not marked dead at its last attempt")
 	}
 	if n := atomic.LoadInt32(&patientCalls); n <= 3 {
@@ -1939,13 +1939,13 @@ func TestADeadJobCancelsItsWorkflow(t *testing.T) {
 
 	waitFor(t, 10*time.Second, "the sibling of the dead job was never canceled", func() bool {
 		return count(t, pool, `
-			SELECT count(*) FROM cb_claims
+			SELECT count(*) FROM cb_jobs
 			WHERE group_id = $1 AND job_type = 'sibling' AND died_at IS NOT NULL
 		`, groupID) == 1
 	})
 	if n := count(t, pool, `
-		SELECT count(*) FROM cb_claims
-		WHERE message_id = $1 AND died_at IS NULL AND dependencies = 0 AND visible_at <= now()
+		SELECT count(*) FROM cb_jobs
+		WHERE message_id = $1 AND died_at IS NULL AND dependencies = 0 AND claimable_at <= now()
 	`, bystander); n != 1 {
 		t.Error("the cascade took a job outside the workflow")
 	}
@@ -1995,18 +1995,18 @@ func TestCancelStopsWaitingJobsAndLetsARunningOneFinish(t *testing.T) {
 	if err := catbird.Cancel(ctx, pool, groupID); err != nil {
 		t.Fatal(err)
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE group_id = $1 AND job_type = 'waiting' AND died_at IS NOT NULL", groupID); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs WHERE group_id = $1 AND job_type = 'waiting' AND died_at IS NOT NULL", groupID); n != 1 {
 		t.Error("the waiting job was not canceled")
 	}
 	close(release)
 
 	waitFor(t, 5*time.Second, "the running job's claim is still there: Cancel stopped a job that had already started", func() bool {
-		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE group_id = $1 AND job_type = 'running'", groupID) == 0
+		return count(t, pool, "SELECT count(*) FROM cb_jobs WHERE group_id = $1 AND job_type = 'running'", groupID) == 0
 	})
 
 	time.Sleep(300 * time.Millisecond)
 	if n := count(t, pool, `
-		SELECT count(*) FROM cb_claims
+		SELECT count(*) FROM cb_jobs
 		WHERE group_id = $1 AND job_type = 'waiting' AND died_at IS NOT NULL AND attempts = 0
 	`, groupID); n != 1 {
 		t.Error("the canceled job was claimed after all: its claim is not the untouched row Cancel left")
@@ -2337,7 +2337,7 @@ func TestStatusReportsWhatAJobIsDoing(t *testing.T) {
 	// on a queue nobody runs, so it keeps waiting.
 	waitFor(t, 5*time.Second, "the joining job never came to wait for its dependencies", func() bool {
 		return pool.QueryRow(ctx, `
-			SELECT message_id FROM cb_claims WHERE job_type = 'joins'
+			SELECT message_id FROM cb_jobs WHERE job_type = 'joins'
 		`).Scan(&fansOut) == nil
 	})
 	if got := state(fansOut); got != catbird.StateWaitingForJobs {
@@ -2346,7 +2346,7 @@ func TestStatusReportsWhatAJobIsDoing(t *testing.T) {
 }
 
 // Running and waiting to retry are the same row but for the error text: a live
-// claim with visible_at in the future and an attempt spent. The claim clears the
+// claim with claimable_at in the future and an attempt spent. The claim clears the
 // text, so what is there belongs to the attempt that is waiting and never to the
 // one running.
 func TestStatusTellsARunningJobFromOneWaitingToRetry(t *testing.T) {
@@ -2444,7 +2444,7 @@ func TestGroupStatusReportsWhatAWorkflowIsDoing(t *testing.T) {
 	// is running while jobs remain, whatever they wait for.
 	waitFor(t, 5*time.Second, "the fan-out never settled", func() bool {
 		return count(t, pool, `
-			SELECT count(*) FROM cb_claims WHERE group_id = $1 AND died_at IS NULL
+			SELECT count(*) FROM cb_jobs WHERE group_id = $1 AND died_at IS NULL
 		`, groupID) == 3
 	})
 	gs, err := catbird.GroupStatus(ctx, pool, groupID)
@@ -2527,7 +2527,7 @@ func TestGroupStatusNamesTheJobThatFailed(t *testing.T) {
 	var failedID int64
 	waitFor(t, 10*time.Second, "the failing job never died", func() bool {
 		return pool.QueryRow(ctx, `
-			SELECT message_id FROM cb_claims
+			SELECT message_id FROM cb_jobs
 			WHERE group_id = $1 AND job_type = 'failing' AND died_at IS NOT NULL
 		`, groupID).Scan(&failedID) == nil
 	})
@@ -2535,7 +2535,7 @@ func TestGroupStatusNamesTheJobThatFailed(t *testing.T) {
 	// failed, not the earlier-created job the cancel killed.
 	waitFor(t, 10*time.Second, "the sibling was never canceled", func() bool {
 		return count(t, pool, `
-			SELECT count(*) FROM cb_claims WHERE group_id = $1 AND died_at IS NOT NULL
+			SELECT count(*) FROM cb_jobs WHERE group_id = $1 AND died_at IS NOT NULL
 		`, groupID) == 2
 	})
 	gs, err := catbird.GroupStatus(ctx, pool, groupID)
@@ -2585,7 +2585,7 @@ func TestQueuesReportsWhatEveryQueueIsDoing(t *testing.T) {
 	}
 	// One job of every state on the first queue. Running, waiting to retry and
 	// waiting for jobs are written directly, as the claim, the failure and the
-	// completion write them: an attempt spent with visible_at ahead is a held
+	// completion write them: an attempt spent with claimable_at ahead is a held
 	// claim, the error text is what tells a backoff from it, and a positive
 	// dependencies count is a job waiting for others.
 	queued := enqueue(plain, catbird.EnqueueOptions{})
@@ -2603,10 +2603,10 @@ func TestQueuesReportsWhatEveryQueueIsDoing(t *testing.T) {
 		id   int64
 	}{
 		// The oldest queued job has been claimable for five minutes.
-		{`UPDATE cb_claims SET visible_at = now() - interval '5 minutes' WHERE message_id = $1`, queued},
-		{`UPDATE cb_claims SET visible_at = now() + interval '1 hour', attempts = 1 WHERE message_id = $1`, running},
-		{`UPDATE cb_claims SET visible_at = now() + interval '1 hour', attempts = 1, last_error = 'failed' WHERE message_id = $1`, retrying},
-		{`UPDATE cb_claims SET dependencies = 1 WHERE message_id = $1`, waiting},
+		{`UPDATE cb_jobs SET claimable_at = now() - interval '5 minutes' WHERE message_id = $1`, queued},
+		{`UPDATE cb_jobs SET claimable_at = now() + interval '1 hour', attempts = 1 WHERE message_id = $1`, running},
+		{`UPDATE cb_jobs SET claimable_at = now() + interval '1 hour', attempts = 1, last_error = 'failed' WHERE message_id = $1`, retrying},
+		{`UPDATE cb_jobs SET dependencies = 1 WHERE message_id = $1`, waiting},
 	} {
 		if _, err := pool.Exec(ctx, sql.text, sql.id); err != nil {
 			t.Fatal(err)
@@ -2727,7 +2727,7 @@ func TestJobHandlerDecodesThePayload(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 10*time.Second, "the job with the bad payload never failed", func() bool {
-		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE message_id = $1 AND died_at IS NOT NULL", id) == 1
+		return count(t, pool, "SELECT count(*) FROM cb_jobs WHERE message_id = $1 AND died_at IS NOT NULL", id) == 1
 	})
 	if len(got) != 0 {
 		t.Error("the handler ran on a payload that does not unmarshal")

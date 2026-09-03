@@ -83,7 +83,7 @@ Triggers preserve the source topic and payload and create one job per matching s
 
 Poll `Queues` for queue depth, state counts, dead jobs, and the age of the oldest claimable job. Use application metrics around handlers for throughput and failure rates; Catbird deliberately stores no run history.
 
-Run `GC` on an application schedule. It removes dead claims after the requested retention period, then removes old messages whose jobs have completed. It does not run automatically.
+Run `GC` on an application schedule. It removes dead jobs after the requested retention period, then removes old messages whose jobs have completed. It does not run automatically.
 
 ## Use wire behind application authentication
 

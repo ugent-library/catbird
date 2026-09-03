@@ -141,7 +141,7 @@ func NewQueue(name string, opts QueueOptions) *Queue {
 	return &Queue{name: name, opts: opts.withDefaults()}
 }
 
-// Name is the queue's name, as it is stored on a claim.
+// Name is the queue's name, as it is stored on a job row.
 func (q *Queue) Name() string { return q.name }
 
 // JobTypeOptions are the optional parts of NewJobType. Zero values take the
@@ -206,7 +206,7 @@ func (o JobTypeOptions) withDefaults() JobTypeOptions {
 }
 
 // JobType is a kind of job: its name, the queue it runs on, and how a run of it
-// is retried. Everything on it is either stamped on the claim or decided about a
+// is retried. Everything on it is either written on the job row or decided about a
 // run; the function that runs it is not here, because a process that only
 // enqueues has no use for it. Both the enqueue and the worker take the value, so
 // what a caller creates and what a handler is given cannot disagree — a type
@@ -249,7 +249,7 @@ func NewJobType(name string, queue *Queue, opts JobTypeOptions) *JobType {
 	return t
 }
 
-// Name is the job type's name, as it is stored on a claim and on a result.
+// Name is the job type's name, as it is stored on a job row and on a result.
 func (t *JobType) Name() string { return t.name }
 
 // Queue is the queue this type's jobs are claimed from.

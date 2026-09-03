@@ -6,7 +6,7 @@
 
 Catbird is a PostgreSQL-backed stream for Go. Jobs, queues, and small workflows are built on the same immutable message substrate.
 
-Published messages receive positions and form the stream. A job pairs a message with a claim, which gives workers claims, retries, signals, and dependencies. PostgreSQL is the only coordinator; plain SQL migrations define the schema; workers scale by starting more processes.
+Published messages receive positions and form the stream. A job pairs a message with a row in `cb_jobs`, which gives it claims, retries, signals, and dependencies. PostgreSQL is the only coordinator; plain SQL migrations define the schema; workers scale by starting more processes.
 
 ## Why this exists
 
@@ -448,7 +448,7 @@ func main() {
 ## Operational notes
 
 - PostgreSQL is the only coordinator.
-- Jobs are queued in `cb_claims`; stream messages are in `cb_messages`.
+- Jobs are queued in `cb_jobs`; stream messages are in `cb_messages`.
 - Stream readers use `position` order.
 - `Signal` targets workflow + job type, not a raw job id.
 - `EnqueueAfter` waits on jobs buffered by the same handler completion.

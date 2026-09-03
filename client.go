@@ -43,7 +43,7 @@ const (
 	StateWaitingForSignal              // waiting for Signal to deliver a payload
 	StateWaitingForJobs                // waiting for the jobs it was enqueued after
 	StateDead                          // failed permanently, or Cancel stopped it
-	StateCompleted                     // the message is here and its claim is gone
+	StateCompleted                     // the message is here and its job row is gone
 )
 
 // stateNames are the words the statements return, in constant order. The
@@ -104,7 +104,7 @@ type newJob struct {
 }
 
 // SetOutput records the job's result. Nothing is written here: the completion
-// writes the result in the statement that deletes the claim, so a result cannot
+// writes the result in the statement that deletes the job row, so a result cannot
 // outlive an attempt that never finished. Call it and then either complete the
 // job or return nil and let the worker complete it. A second call replaces the
 // first.
@@ -122,7 +122,7 @@ func (j *Job) SetOutput(v any) error {
 }
 
 // Enqueue records a job to run when this one completes. Nothing is written
-// here: the completion writes it in the statement that deletes the claim, so
+// here: the completion writes it in the statement that deletes the job row, so
 // the work this job asked for and the end of this job are one commit, and a
 // handler that fails or crashes halfway records nothing and retries with an
 // empty buffer.
@@ -167,7 +167,7 @@ func (j *Job) record(t *JobType, payload any, dependent bool) {
 // This is the read a joining job makes. It waited for one buffer's jobs and
 // this returns those, where GroupStatus carries every output in the whole
 // workflow — every round of it, and the jobs another handler added. The ids
-// come from the claim, so the read probes cb_outputs by primary key.
+// come from the job row, so the read probes cb_job_outputs by primary key.
 func (j *Job) DependencyOutputs(ctx context.Context, db Conn) (Outputs, error) {
 	if len(j.dependencyIDs) == 0 {
 		return nil, nil
@@ -175,7 +175,7 @@ func (j *Job) DependencyOutputs(ctx context.Context, db Conn) (Outputs, error) {
 	rows, err := db.Query(ctx, `
 		SELECT result.message_id, result.job_type, result.output
 		FROM unnest($1::bigint[]) WITH ORDINALITY AS dependency (job_id, place)
-		JOIN cb_outputs result ON result.message_id = dependency.job_id
+		JOIN cb_job_outputs result ON result.message_id = dependency.job_id
 		ORDER BY dependency.place
 	`, j.dependencyIDs)
 	if err != nil {
@@ -423,7 +423,7 @@ func subtreeLikePattern(prefix string) string {
 	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix) + ".%"
 }
 
-// Enqueue appends a message and a claim for it, and wakes the queue's workers
+// Enqueue appends a message and a job row for it, and wakes the queue's workers
 // unless the job cannot run yet. Returns the job's id, which is also the id of
 // the workflow it starts — what Signal, Cancel and the result reads address —
 // or 0 when opts.DeduplicationKey already exists.
@@ -451,17 +451,17 @@ func Enqueue(ctx context.Context, db Conn, t *JobType, payload any, opts Enqueue
 			ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
 			RETURNING id
 		),
-		claim AS (
-			INSERT INTO cb_claims (message_id, queue, job_type, visible_at, awaits_signal)
+		job AS (
+			INSERT INTO cb_jobs (message_id, queue, job_type, claimable_at, awaits_signal)
 			SELECT id, $4, $5,
 			       CASE WHEN $6 THEN 'infinity'::timestamptz ELSE now() + $7::interval END, $6
 			FROM message
-			RETURNING message_id, visible_at
+			RETURNING message_id, claimable_at
 		),
 		wake AS (
-			SELECT pg_notify('cb_queue_' || $4, '') FROM claim WHERE visible_at <= now()
+			SELECT pg_notify('cb_queue_' || $4, '') FROM job WHERE claimable_at <= now()
 		)
-		SELECT message_id FROM claim LEFT JOIN wake ON true
+		SELECT message_id FROM job LEFT JOIN wake ON true
 	`, topic, body, nullString(opts.DeduplicationKey), t.queue.name, t.name, t.opts.Signal, opts.Delay).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil
@@ -469,22 +469,22 @@ func Enqueue(ctx context.Context, db Conn, t *JobType, payload any, opts Enqueue
 	return id, err
 }
 
-// EnqueueBatch appends messages and their claims for one job type in one
+// EnqueueBatch appends messages and their job rows for one job type in one
 // statement and wakes the queue's workers. Returns how many jobs it created: a
 // message whose DeduplicationKey is already taken, or that repeats a key from
-// its own batch, gets neither a message nor a claim and is not counted.
+// its own batch, gets neither a message nor a job row and is not counted.
 //
 // This is the volume path — what a trigger uses. Every job in the batch takes
 // the same options, and none of them starts a workflow or waits for anything: a
 // job type declared with Signal cannot be enqueued this way, because a batch has
 // no ids for a caller to signal.
 //
-// The claims come from the messages that were written, so a deduplicated
-// message produces no job. The wake CTE reads the claims through LIMIT 1, which
+// The job rows come from the messages that were written, so a deduplicated
+// message produces no job. The wake CTE reads the job rows through LIMIT 1, which
 // does two things: the join at the end sees one wake row, so it cannot multiply
 // the count, and pg_notify runs once instead of once per job. It saves the calls
 // rather than the wake-ups — Postgres delivers identical notifications from one
-// transaction once whatever we do. Reading the claim CTE through a LIMIT does
+// transaction once whatever we do. Reading the job CTE through a LIMIT does
 // not cut the insert short; a data-modifying CTE always runs in full.
 func EnqueueBatch(ctx context.Context, db Conn, t *JobType, msgs []BatchMessage, opts EnqueueOptions) (int, error) {
 	if len(msgs) == 0 {
@@ -508,15 +508,15 @@ func EnqueueBatch(ctx context.Context, db Conn, t *JobType, msgs []BatchMessage,
 			ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
 			RETURNING id
 		),
-		claim AS (
-			INSERT INTO cb_claims (message_id, queue, job_type, visible_at)
+		job AS (
+			INSERT INTO cb_jobs (message_id, queue, job_type, claimable_at)
 			SELECT id, $4, $5, now() + $6::interval FROM message
 			RETURNING message_id
 		),
 		wake AS (
-			SELECT pg_notify('cb_queue_' || $4, '') FROM (SELECT 1 FROM claim LIMIT 1) one WHERE $7
+			SELECT pg_notify('cb_queue_' || $4, '') FROM (SELECT 1 FROM job LIMIT 1) one WHERE $7
 		)
-		SELECT count(*) FROM claim LEFT JOIN wake ON true
+		SELECT count(*) FROM job LEFT JOIN wake ON true
 	`, topics, payloads, deduplicationKeys, t.queue.name, t.name, opts.Delay, opts.Delay <= 0).Scan(&created)
 	return created, err
 }
@@ -544,27 +544,27 @@ func enqueuePeriodic(ctx context.Context, db Conn, t *JobType, minute time.Time)
 			INSERT INTO cb_messages (topic, deduplication_key)
 			SELECT $1, $2
 			WHERE NOT EXISTS (
-				SELECT 1 FROM cb_claims
+				SELECT 1 FROM cb_jobs
 				WHERE queue = $3 AND job_type = $1 AND died_at IS NULL AND dependencies = 0
 			)
 			ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
 			RETURNING id
 		),
-		claim AS (
-			INSERT INTO cb_claims (message_id, queue, job_type, visible_at)
+		job AS (
+			INSERT INTO cb_jobs (message_id, queue, job_type, claimable_at)
 			SELECT id, $3, $1, now()
 			FROM message
 			RETURNING message_id
 		),
 		wake AS (
-			SELECT pg_notify('cb_queue_' || $3, '') FROM claim
+			SELECT pg_notify('cb_queue_' || $3, '') FROM job
 		)
-		SELECT message_id FROM claim LEFT JOIN wake ON true
+		SELECT message_id FROM job LEFT JOIN wake ON true
 	`, t.name, key, t.queue.name)
 	return err
 }
 
-// Complete finishes a job: it deletes the claim, writes the result the handler
+// Complete finishes a job: it deletes the job row, writes the result the handler
 // recorded with SetOutput, counts down the jobs waiting for this one, and
 // creates the jobs the handler recorded with Enqueue and EnqueueAfter. A worker
 // does this itself when the handler returns nil, so a handler only calls it to
@@ -575,7 +575,7 @@ func enqueuePeriodic(ctx context.Context, db Conn, t *JobType, minute time.Time)
 // back and the work of the late attempt is discarded.
 //
 // It is one statement, so a job costs one round trip to finish however much it
-// asked for. Everything in it hangs off the claim the delete returned, so an
+// asked for. Everything in it hangs off the row the delete returned, so an
 // attempt that lost its claim writes no result, counts nothing down and creates no
 // jobs.
 //
@@ -587,12 +587,12 @@ func enqueuePeriodic(ctx context.Context, db Conn, t *JobType, minute time.Time)
 // same rows, so they cannot disagree.
 // The CTE that hands out the ids is MATERIALIZED because nextval is volatile and
 // an inlined CTE would be evaluated once per reference, giving a message and its
-// claim different ids.
+// job row different ids.
 //
 // A successful call marks job, so the worker does not run the completion a
 // second time. The mark records that the statement succeeded, not that the
 // caller's transaction committed: a handler that completes the job, rolls the
-// transaction back, and then returns nil leaves a claim nothing deletes until
+// transaction back, and then returns nil leaves a job row nothing deletes until
 // the claim expires and the job runs again.
 func Complete(ctx context.Context, db Conn, job *Job) error {
 	if job.payloadErr != nil {
@@ -601,19 +601,19 @@ func Complete(ctx context.Context, db Conn, job *Job) error {
 	types, queues, payloads, dependents, signals := newJobArrays(job.newJobs)
 	var completed, woken int
 	err := db.QueryRow(ctx, `
-		WITH claim AS (
-		    DELETE FROM cb_claims WHERE message_id = $1 AND attempts = $2
+		WITH completed AS (
+		    DELETE FROM cb_jobs WHERE message_id = $1 AND attempts = $2
 		    RETURNING message_id, job_type, coalesce(group_id, message_id) AS group_id, dependent_job_ids
 		),
 		output AS (
-		    INSERT INTO cb_outputs (message_id, group_id, job_type, output)
-		    SELECT message_id, group_id, job_type, $3::jsonb FROM claim WHERE $3::jsonb IS NOT NULL
+		    INSERT INTO cb_job_outputs (message_id, group_id, job_type, output)
+		    SELECT message_id, group_id, job_type, $3::jsonb FROM completed WHERE $3::jsonb IS NOT NULL
 		),
 		dependent_job AS (
-		    UPDATE cb_claims SET dependencies = dependencies - 1
-		    WHERE message_id IN (SELECT unnest(dependent_job_ids) FROM claim)
+		    UPDATE cb_jobs SET dependencies = dependencies - 1
+		    WHERE message_id IN (SELECT unnest(dependent_job_ids) FROM completed)
 		      AND died_at IS NULL AND dependencies > 0
-		    RETURNING queue, dependencies, visible_at
+		    RETURNING queue, dependencies, claimable_at
 		),
 		new_job AS MATERIALIZED (
 		    SELECT nextval('cb_messages_id_seq') AS id, n.*
@@ -622,10 +622,10 @@ func Complete(ctx context.Context, db Conn, job *Job) error {
 		),
 		new_message AS (
 		    INSERT INTO cb_messages (id, topic, payload)
-		    SELECT n.id, n.job_type, n.payload FROM new_job n, claim
+		    SELECT n.id, n.job_type, n.payload FROM new_job n, completed
 		),
-		new_claim AS (
-		    INSERT INTO cb_claims (message_id, queue, job_type, group_id, visible_at,
+		new_job_row AS (
+		    INSERT INTO cb_jobs (message_id, queue, job_type, group_id, claimable_at,
 		                           dependencies, dependency_job_ids, dependent_job_ids, awaits_signal)
 		    SELECT n.id, n.queue, n.job_type, c.group_id,
 		           CASE WHEN n.signal THEN 'infinity'::timestamptz ELSE now() END,
@@ -633,21 +633,21 @@ func Complete(ctx context.Context, db Conn, job *Job) error {
 		           CASE WHEN n.dependent THEN (SELECT array_agg(id ORDER BY id) FROM new_job WHERE NOT dependent) END,
 		           CASE WHEN n.dependent THEN NULL ELSE (SELECT array_agg(id ORDER BY id) FROM new_job WHERE dependent) END,
 		           n.signal
-		    FROM new_job n, claim c
-		    RETURNING queue, dependencies, visible_at
+		    FROM new_job n, completed c
+		    RETURNING queue, dependencies, claimable_at
 		),
 		woken AS (
 		    SELECT DISTINCT queue FROM (
-		        SELECT queue, dependencies, visible_at FROM dependent_job
+		        SELECT queue, dependencies, claimable_at FROM dependent_job
 		        UNION ALL
-		        SELECT queue, dependencies, visible_at FROM new_claim
+		        SELECT queue, dependencies, claimable_at FROM new_job_row
 		    ) ready
-		    WHERE dependencies = 0 AND visible_at <= now()
+		    WHERE dependencies = 0 AND claimable_at <= now()
 		),
 		wake AS (
 		    SELECT pg_notify('cb_queue_' || queue, '') FROM woken
 		)
-		SELECT (SELECT count(*) FROM claim), (SELECT count(*) FROM wake)
+		SELECT (SELECT count(*) FROM completed), (SELECT count(*) FROM wake)
 	`, job.ID, job.Attempts, job.output, types, queues, payloads, dependents, signals).Scan(&completed, &woken)
 	if err != nil {
 		return err
@@ -677,7 +677,7 @@ func Signal(ctx context.Context, db Conn, groupID int64, t *JobType, payload any
 	var delivered, woken int
 	err = db.QueryRow(ctx, `
 		WITH gated AS (
-			UPDATE cb_claims SET signal = $3, visible_at = now()
+			UPDATE cb_jobs SET signal = $3, claimable_at = now()
 			WHERE (group_id = $1 OR message_id = $1) AND job_type = $2
 			  AND died_at IS NULL AND awaits_signal AND signal IS NULL
 			RETURNING queue, dependencies
@@ -701,7 +701,7 @@ func Signal(ctx context.Context, db Conn, groupID int64, t *JobType, payload any
 // starting.
 func Cancel(ctx context.Context, db Conn, groupID int64) error {
 	_, err := db.Exec(ctx, `
-		UPDATE cb_claims SET died_at = now()
+		UPDATE cb_jobs SET died_at = now()
 		WHERE (group_id = $1 OR message_id = $1) AND died_at IS NULL
 	`, groupID)
 	return err
@@ -763,25 +763,25 @@ type JobStatus struct {
 	LastError string
 }
 
-// stateCaseSQL is the body of the CASE that derives what a live claim is doing,
-// over a row aliased claim. It is one constant because Status and Queues both
+// stateCaseSQL is the body of the CASE that derives what a live job is doing,
+// over a cb_jobs row aliased job. It is one constant because Status and Queues both
 // run it, and a copy that drifted — a test reordered, a comparison changed —
 // would let the two reads sort the same job into different states with nothing
 // failing. The words are stateNames; Status alone puts the completed test
-// above these, which is the absence of a claim.
+// above these, which is the absence of a row.
 const stateCaseSQL = `
-		           WHEN claim.died_at IS NOT NULL THEN 'dead'
-		           WHEN claim.awaits_signal AND claim.signal IS NULL THEN 'waiting for signal'
-		           WHEN claim.dependencies > 0 THEN 'waiting for jobs'
-		           WHEN claim.visible_at <= now() THEN 'queued'
-		           WHEN claim.attempts = 0 THEN 'scheduled'
-		           WHEN claim.last_error IS NOT NULL THEN 'waiting to retry'
+		           WHEN job.died_at IS NOT NULL THEN 'dead'
+		           WHEN job.awaits_signal AND job.signal IS NULL THEN 'waiting for signal'
+		           WHEN job.dependencies > 0 THEN 'waiting for jobs'
+		           WHEN job.claimable_at <= now() THEN 'queued'
+		           WHEN job.attempts = 0 THEN 'scheduled'
+		           WHEN job.last_error IS NOT NULL THEN 'waiting to retry'
 		           ELSE 'running'`
 
 // Status reports what one job is doing. Two primary-key probes; no column
 // holds a state.
 //
-// StateCompleted means the message is here and its claim is gone, so it lasts
+// StateCompleted means the message is here and its job row is gone, so it lasts
 // only as long as the message: after GC the job returns ErrNotFound, as does a
 // published message's id.
 func Status(ctx context.Context, db Conn, id int64) (JobStatus, error) {
@@ -790,11 +790,11 @@ func Status(ctx context.Context, db Conn, id int64) (JobStatus, error) {
 	var text *string
 	err := db.QueryRow(ctx, `
 		SELECT CASE
-		           WHEN claim.message_id IS NULL THEN 'completed'`+stateCaseSQL+`
+		           WHEN job.message_id IS NULL THEN 'completed'`+stateCaseSQL+`
 		       END,
-		       coalesce(claim.attempts, 0), claim.last_error
+		       coalesce(job.attempts, 0), job.last_error
 		FROM cb_messages message
-		LEFT JOIN cb_claims claim ON claim.message_id = message.id
+		LEFT JOIN cb_jobs job ON job.message_id = message.id
 		WHERE message.id = $1 AND NOT message.stream
 	`, id).Scan(&name, &status.Attempts, &text)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -837,7 +837,7 @@ type JobGroupStatus struct {
 // This is the read for the caller that holds only the id Enqueue returned:
 // handlers decide the fan-out as they run, so that caller cannot name the
 // workflow's jobs, and a job that died runs nothing and publishes nothing —
-// only its claim shows it. Like StateCompleted, the completed answer lasts as
+// only its row shows it. Like StateCompleted, the completed answer lasts as
 // long as the starting job's message: after GC the workflow returns
 // ErrNotFound.
 func GroupStatus(ctx context.Context, db Conn, groupID int64) (JobGroupStatus, error) {
@@ -845,24 +845,24 @@ func GroupStatus(ctx context.Context, db Conn, groupID int64) (JobGroupStatus, e
 	var status JobGroupStatus
 	var outputs []byte
 	err := db.QueryRow(ctx, `
-		WITH claim AS (
+		WITH job AS (
 		    SELECT message_id, died_at, last_error
-		    FROM cb_claims WHERE group_id = $1 OR message_id = $1
+		    FROM cb_jobs WHERE group_id = $1 OR message_id = $1
 		)
 		SELECT CASE
-		           WHEN EXISTS (SELECT 1 FROM claim WHERE died_at IS NOT NULL) THEN 'dead'
-		           WHEN EXISTS (SELECT 1 FROM claim) THEN 'running'
+		           WHEN EXISTS (SELECT 1 FROM job WHERE died_at IS NOT NULL) THEN 'dead'
+		           WHEN EXISTS (SELECT 1 FROM job) THEN 'running'
 		           WHEN EXISTS (SELECT 1 FROM cb_messages WHERE id = $1 AND NOT stream) THEN 'completed'
 		       END,
 		       -- The job whose failure is recorded sorts before the jobs Cancel
 		       -- took with it, which carry no error.
-		       coalesce((SELECT message_id FROM claim WHERE died_at IS NOT NULL
+		       coalesce((SELECT message_id FROM job WHERE died_at IS NOT NULL
 		                 ORDER BY last_error IS NULL, died_at, message_id LIMIT 1), 0),
 		       (SELECT coalesce(jsonb_agg(jsonb_build_object(
 		                   'job_id', result.message_id,
 		                   'job_type', result.job_type,
 		                   'value', result.output) ORDER BY result.message_id), '[]')
-		        FROM cb_outputs result WHERE result.group_id = $1)
+		        FROM cb_job_outputs result WHERE result.group_id = $1)
 	`, groupID).Scan(&name, &status.DeadJobID, &outputs)
 	if err != nil {
 		return JobGroupStatus{}, err
@@ -884,7 +884,7 @@ func GroupStatus(ctx context.Context, db Conn, groupID int64) (JobGroupStatus, e
 
 // QueueInfo is what Queues reports of one queue: how many of its jobs are in
 // each state, and the longest any queued job has been waiting for a worker.
-// The wait runs from visible_at, so a retry counts from when its backoff ran
+// The wait runs from claimable_at, so a retry counts from when its backoff ran
 // out, not from when the job was created: it measures workers falling behind,
 // which is what a depth number alone cannot show.
 type QueueInfo struct {
@@ -900,9 +900,9 @@ type QueueInfo struct {
 }
 
 // Queues reports what every queue is doing: one QueueInfo per queue that has
-// claims, in name order. Completed jobs have no claim, so a drained queue does
+// live jobs, in name order. Completed jobs have no row, so a drained queue does
 // not appear; a caller exporting a fixed set of queues merges in the ones it
-// declared. It walks every claim row — a table this design keeps small — so it
+// declared. It walks every job row — a table this design keeps small — so it
 // is a read to poll on an interval, not a hot-path statement.
 func Queues(ctx context.Context, db Conn) ([]QueueInfo, error) {
 	rows, err := db.Query(ctx, `
@@ -914,13 +914,13 @@ func Queues(ctx context.Context, db Conn) ([]QueueInfo, error) {
 		       count(*) FILTER (WHERE state = 'waiting for signal'),
 		       count(*) FILTER (WHERE state = 'waiting for jobs'),
 		       count(*) FILTER (WHERE state = 'dead'),
-		       coalesce(extract(epoch FROM now() - min(visible_at) FILTER (WHERE state = 'queued')), 0)::float8
+		       coalesce(extract(epoch FROM now() - min(claimable_at) FILTER (WHERE state = 'queued')), 0)::float8
 		FROM (
-		    SELECT claim.queue, claim.visible_at,
+		    SELECT job.queue, job.claimable_at,
 		           CASE`+stateCaseSQL+`
 		           END AS state
-		    FROM cb_claims claim
-		) claim
+		    FROM cb_jobs job
+		) job
 		GROUP BY queue
 		ORDER BY queue
 	`)
@@ -942,12 +942,12 @@ func Queues(ctx context.Context, db Conn) ([]QueueInfo, error) {
 	return queues, rows.Err()
 }
 
-// GC deletes claims dead longer than retention and messages older than
-// retention. A message that still has a claim is kept, however old it is.
+// GC deletes jobs dead longer than retention and messages older than
+// retention. A message whose job row is still here is kept, however old it is.
 // Results go with their message.
 func GC(ctx context.Context, db Conn, retention time.Duration) error {
 	_, err := db.Exec(ctx, `
-		DELETE FROM cb_claims
+		DELETE FROM cb_jobs
 		WHERE died_at < now() - $1::interval
 	`, retention)
 	if err != nil {
@@ -956,7 +956,7 @@ func GC(ctx context.Context, db Conn, retention time.Duration) error {
 	_, err = db.Exec(ctx, `
 		DELETE FROM cb_messages m
 		WHERE created_at < now() - $1::interval
-		  AND NOT EXISTS (SELECT 1 FROM cb_claims c WHERE c.message_id = m.id)
+		  AND NOT EXISTS (SELECT 1 FROM cb_jobs job WHERE job.message_id = m.id)
 	`, retention)
 	return err
 }

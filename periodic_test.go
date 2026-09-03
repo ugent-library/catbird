@@ -60,7 +60,7 @@ func TestPeriodicSkipsWhileAJobLives(t *testing.T) {
 	if n := ran.Load(); n != 0 {
 		t.Fatalf("a job ran %d times while the manual job lives", n)
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_claims WHERE job_type = 'periodic.report'"); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs WHERE job_type = 'periodic.report'"); n != 1 {
 		t.Fatalf("%d claims, want only the manual job's", n)
 	}
 	if n := count(t, pool, "SELECT count(*) FROM cb_messages WHERE deduplication_key LIKE 'periodic:%'"); n != 0 {
@@ -94,7 +94,7 @@ func TestPeriodicOneJobAcrossProcesses(t *testing.T) {
 	}
 
 	waitFor(t, 10*time.Second, "no tick produced a job", func() bool {
-		return count(t, pool, "SELECT count(*) FROM cb_claims WHERE job_type = 'periodic.report'") == 1
+		return count(t, pool, "SELECT count(*) FROM cb_jobs WHERE job_type = 'periodic.report'") == 1
 	})
 	time.Sleep(time.Second)
 	if n := count(t, pool, "SELECT count(*) FROM cb_messages WHERE deduplication_key LIKE 'periodic:%'"); n != 1 {

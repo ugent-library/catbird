@@ -72,7 +72,7 @@ func TestConsumeHandlesEachMessageOnceInOrder(t *testing.T) {
 	if batches != 3 {
 		t.Errorf("%d handler calls for %d messages in batches of 50", batches, total)
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_cursors WHERE name = 'consumer:indexer' AND last_position = $1 AND claimed_until = '-infinity'", positions[total-1]); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_cursors WHERE name = 'consumer:indexer' AND last_position = $1 AND claimable_at = '-infinity'", positions[total-1]); n != 1 {
 		t.Errorf("the cursor is not at the last position and released")
 	}
 }
@@ -218,7 +218,7 @@ func TestConsumeRenewsTheClaimWhileTheHandlerRuns(t *testing.T) {
 	if strings.Contains(logs.String(), "claim lost") {
 		t.Errorf("a claim was lost:\n%s", logs.String())
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_cursors WHERE name = 'consumer:indexer' AND last_position = (SELECT max(position) FROM cb_messages) AND claimed_until = '-infinity'"); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_cursors WHERE name = 'consumer:indexer' AND last_position = (SELECT max(position) FROM cb_messages) AND claimable_at = '-infinity'"); n != 1 {
 		t.Errorf("the cursor is not past the batch and released")
 	}
 }
@@ -263,7 +263,7 @@ func TestConsumeCancelsTheHandlerWhenTheClaimIsLost(t *testing.T) {
 		t.Fatal("the handler never started")
 	}
 	// Take the cursor away under the running handler, as a takeover would.
-	if _, err := pool.Exec(ctx, "UPDATE cb_cursors SET claimed_until = '-infinity' WHERE name = 'consumer:indexer'"); err != nil {
+	if _, err := pool.Exec(ctx, "UPDATE cb_cursors SET claimable_at = '-infinity' WHERE name = 'consumer:indexer'"); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, "the batch was not handled again", func() bool {
@@ -281,7 +281,7 @@ func TestConsumeCancelsTheHandlerWhenTheClaimIsLost(t *testing.T) {
 	if !strings.Contains(logs.String(), "claim lost during the handler") {
 		t.Errorf("the lost claim was not logged:\n%s", logs.String())
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_cursors WHERE name = 'consumer:indexer' AND last_position = (SELECT max(position) FROM cb_messages) AND claimed_until = '-infinity'"); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_cursors WHERE name = 'consumer:indexer' AND last_position = (SELECT max(position) FROM cb_messages) AND claimable_at = '-infinity'"); n != 1 {
 		t.Errorf("the cursor is not past the batch and released")
 	}
 }
@@ -343,7 +343,7 @@ func TestConsumeTakesOverAnExpiredClaim(t *testing.T) {
 	if !slices.Equal(handled["slow"], handled["fast"]) {
 		t.Errorf("the two processes handled different batches: %v and %v", handled["slow"], handled["fast"])
 	}
-	if n := count(t, pool, "SELECT count(*) FROM cb_cursors WHERE name = 'consumer:indexer' AND last_position = $1 AND claimed_until = '-infinity'", handled["fast"][0]); n != 1 {
+	if n := count(t, pool, "SELECT count(*) FROM cb_cursors WHERE name = 'consumer:indexer' AND last_position = $1 AND claimable_at = '-infinity'", handled["fast"][0]); n != 1 {
 		t.Errorf("the cursor is not past the batch and released")
 	}
 }

@@ -200,7 +200,7 @@ func (w *worker) run(ctx context.Context, job *Job) {
 }
 
 // interrupted hands a job back after shutdown stopped it: the attempt is given
-// back and the job is visible again at once, because nothing about it failed.
+// back and the job is claimable again at once, because nothing about it failed.
 // Without this, three rolling deploys spend three attempts and 15 minutes of
 // claim time on a job that never ran wrong. The update matches on attempts:
 // if the claim had expired and another worker took the job, attempts has
@@ -212,7 +212,7 @@ func (w *worker) run(ctx context.Context, job *Job) {
 // logged and the attempt is still given back.
 func (w *worker) interrupted(ctx context.Context, job *Job, cause error) {
 	_, err := w.runtime.pool.Exec(ctx, `
-		UPDATE cb_claims SET attempts = attempts - 1, visible_at = now()
+		UPDATE cb_jobs SET attempts = attempts - 1, claimable_at = now()
 		WHERE message_id = $1 AND attempts = $2 AND died_at IS NULL
 	`, job.ID, job.Attempts)
 	if err != nil {
@@ -244,8 +244,8 @@ func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) 
 
 	if job.Attempts < t.opts.MaxAttempts {
 		tag, err := w.runtime.pool.Exec(ctx, `
-			UPDATE cb_claims
-			SET visible_at = now() + $3::interval
+			UPDATE cb_jobs
+			SET claimable_at = now() + $3::interval
 			    + (least($3::interval * 2 ^ least(attempts - 1, 20), $4::interval) - $3::interval) * random(),
 			    last_error = left($5, 256)
 			WHERE message_id = $1 AND attempts = $2 AND died_at IS NULL
@@ -262,7 +262,7 @@ func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) 
 	}
 
 	tag, err := w.runtime.pool.Exec(ctx, `
-		UPDATE cb_claims SET died_at = now(), last_error = left($3, 256)
+		UPDATE cb_jobs SET died_at = now(), last_error = left($3, 256)
 		WHERE message_id = $1 AND attempts = $2
 	`, job.ID, job.Attempts, cause.Error())
 	if err != nil {
@@ -285,7 +285,7 @@ func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) 
 	}
 }
 
-// claimBatch claims up to limit ready jobs by moving visible_at a
+// claimBatch claims up to limit ready jobs by moving claimable_at a
 // ClaimDuration ahead, and returns them with their payloads and delivered
 // signals. The job_type
 // filter is what keeps a process from taking work it has no handler for: a job
@@ -300,13 +300,13 @@ func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) 
 func (w *worker) claimBatch(ctx context.Context, limit int) ([]*Job, error) {
 	rows, err := w.runtime.pool.Query(ctx, `
 		WITH claimed AS (
-			UPDATE cb_claims
-			SET visible_at = now() + $2::interval, attempts = attempts + 1, last_error = NULL
+			UPDATE cb_jobs
+			SET claimable_at = now() + $2::interval, attempts = attempts + 1, last_error = NULL
 			WHERE message_id IN (
-				SELECT message_id FROM cb_claims
-				WHERE queue = $1 AND died_at IS NULL AND dependencies = 0 AND visible_at <= now()
+				SELECT message_id FROM cb_jobs
+				WHERE queue = $1 AND died_at IS NULL AND dependencies = 0 AND claimable_at <= now()
 				  AND job_type = ANY($4)
-				ORDER BY visible_at ASC LIMIT $3
+				ORDER BY claimable_at ASC LIMIT $3
 				FOR UPDATE SKIP LOCKED
 			)
 			RETURNING message_id, job_type, attempts, coalesce(group_id, message_id) AS group_id,
@@ -376,7 +376,7 @@ func (w *worker) running() []*inFlightJob {
 
 // renewClaims keeps the claims of running handlers from expiring, on a queue
 // whose HandlerTimeout lets an attempt outlive its ClaimDuration. Every half
-// ClaimDuration it moves visible_at a full ClaimDuration out for every job
+// ClaimDuration it moves claimable_at a full ClaimDuration out for every job
 // whose handler context is still live, all in one statement, so one missed
 // tick — a network error, a slow statement — loses nothing. Renewal follows
 // the handler's context rather than the handler: past HandlerTimeout the
@@ -411,12 +411,12 @@ func (w *worker) renewClaims(ctx context.Context) {
 		}
 		renewed := map[int64]bool{}
 		rows, err := w.runtime.pool.Query(ctx, `
-			UPDATE cb_claims claim
-			SET visible_at = now() + $3::interval
+			UPDATE cb_jobs job
+			SET claimable_at = now() + $3::interval
 			FROM unnest($1::bigint[], $2::int[]) AS running (message_id, attempts)
-			WHERE claim.message_id = running.message_id AND claim.attempts = running.attempts
-			  AND claim.died_at IS NULL
-			RETURNING claim.message_id
+			WHERE job.message_id = running.message_id AND job.attempts = running.attempts
+			  AND job.died_at IS NULL
+			RETURNING job.message_id
 		`, ids, attempts, w.queue.opts.ClaimDuration)
 		if err == nil {
 			for rows.Next() {

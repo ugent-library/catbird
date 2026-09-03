@@ -50,7 +50,7 @@ their binaries at once, so each `TestMain` holds advisory lock
 `(hashtext('catbird'), 2)` for the binary's life and the two suites take
 turns.
 
-`bench_hot.sh` measures index bloat on `cb_claims` under sustained update churn.
+`bench_hot.sh` measures index bloat on `cb_jobs` under sustained update churn.
 It talks to the same database directly and needs no Go build.
 
 ## Layout
@@ -63,7 +63,7 @@ Eight files and one migration in the root package, and one package under it:
   its name, its queue, and how a run of it is retried (`Signal`, `Schedule`,
   `MaxAttempts`, `MinBackoff`, `MaxBackoff`, `OnDead`). Both are plain Go values; nothing about
   them is written to the database, and only their names reach a row. The
-  handler is not on either — everything on a job type is stamped on a claim or
+  handler is not on either — everything on a job type is written on a job row or
   decided about a run, and a handler is neither, so it is given at
   registration.
 - `client.go` — every statement a caller runs, as package functions:
@@ -135,11 +135,11 @@ Eight files and one migration in the root package, and one package under it:
 ## Architecture
 
 **Tables.** `cb_messages` holds every job's payload and every published message,
-one row, written once. `cb_claims` holds one narrow row per job that still has
+one row, written once. `cb_jobs` holds one narrow row per job that still has
 to run, rewritten on every claim and retry, deleted on completion; it carries
 the queue, the job type, the workflow, what the job waits for, the signal
 payload once one arrives, when it died if no worker will claim it again, and
-what the last failed attempt returned. `cb_cursors` and `cb_outputs` are one row each per
+what the last failed attempt returned. `cb_cursors` and `cb_job_outputs` are one row each per
 stream consumer and per job result. `cb_migrations` is one row per schema
 change that ran, created by the runner rather than by a migration, and touches
 no hot path.
@@ -158,7 +158,7 @@ client exists.
 
 **Invariants that edits must not break:**
 
-- A job's completion is `DELETE FROM cb_claims WHERE message_id = $1 AND attempts = $2`.
+- A job's completion is `DELETE FROM cb_jobs WHERE message_id = $1 AND attempts = $2`.
   The delete matches on `attempts`, so two workers may run the same job and
   only the attempt that still holds the claim deletes it. A handler is given no connection: it runs
   `Complete` in its own transaction to end the job in the same commit as its
@@ -178,31 +178,31 @@ client exists.
   the jobs it waited for and not every job of their type in the workflow. The
   CTE that hands them out is `MATERIALIZED` because `nextval` is volatile and an
   inlined CTE would give a message and its claim different ids.
-- A job waiting for a signal has `visible_at = 'infinity'`, so waiting is a
+- A job waiting for a signal has `claimable_at = 'infinity'`, so waiting is a
   delay and needs no place in the ready index. `Signal` writes the payload and
-  sets `visible_at` to `now()`.
-- What a job is doing is not stored. `cb_claims.died_at` is one timestamp —
+  sets `claimable_at` to `now()`.
+- What a job is doing is not stored. `cb_jobs.died_at` is one timestamp —
   when the job died, never to be claimed again, and what `GC`'s age test runs
   from; NULL while it lives — and `Status` derives the eight states a caller
-  sees from `visible_at`, `attempts`, `dependencies`, `awaits_signal` and
+  sees from `claimable_at`, `attempts`, `dependencies`, `awaits_signal` and
   `last_error`. There is deliberately no `status` column: the word names the
   derived answer, and a column of the same name meant something narrower in the
   same statement, which is what a second client stumbles over.
-- `cb_claims` declares its columns widest first, so the fixed-width ones pack
+- `cb_jobs` declares its columns widest first, so the fixed-width ones pack
   with no padding between them: 74 bytes against 78, on the row every claim and
   retry rewrites. A column added in the middle by role rather than by width
   costs padding.
 - The failure writes `last_error` and the claim clears it, which is the only
   thing that tells `StateRunning` from `StateWaitingToRetry`: both are a live
-  claim with `visible_at` in the future and an attempt spent. The write carries
+  claim with `claimable_at` in the future and an attempt spent. The write carries
   matches on `attempts` like the retry it rides on, so a late attempt
-  records no error text either, and the 256-character cut keeps a claim row out
+  records no error text either, and the 256-character cut keeps a job row out
   of TOAST. It is not a run history: the next failure overwrites it and the
   completion deletes it with the row.
 - A workflow is `coalesce(group_id, message_id)` of the job that started it.
   `group_id` is NULL on a job that stands alone, which keeps the volume of
-  single-shot jobs out of `cb_claims_group_idx` and off its write cost.
-- A consumer claims its cursor before it reads: `claimed_until` is set to
+  single-shot jobs out of `cb_jobs_group_idx` and off its write cost.
+- A consumer claims its cursor before it reads: `claimable_at` is set to
   `now() + ClaimDuration` where it has passed, and the ack matches on the value
   the claim returned, as every write on a job matches on `attempts`. A process
   whose claim was taken over moves nothing and releases nothing. Renewal moves
@@ -220,7 +220,7 @@ client exists.
   running at once cannot move a position a reader may already have passed.
 - A scheduled type's tick is one statement with two guards: the deduplication
   key `periodic:<type>:<minute>` makes every process ticking in the same
-  minute one job, and the insert runs only while no live claim of the type
+  minute one job, and the insert runs only while no live job of the type
   exists — at most one job of a scheduled type is live, and a run that
   outlives its schedule swallows the ticks it covers rather than queueing
   them. The guard repeats `dependencies = 0` so its probe stays on the ready
