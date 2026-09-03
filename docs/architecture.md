@@ -10,7 +10,7 @@ The package separates declarations, process machinery, and database operations.
 
 - A `Queue` names the work that competes for the same worker slots. Its settings are `BatchSize`, `ClaimDuration`, `HandlerTimeout`, and `PollInterval`.
 - A `JobType` names a kind of work and its retry policy. Its settings include `Signal`, `Schedule`, backoff, `MaxAttempts`, and `OnDead`.
-- A `Runtime` belongs to one process. It owns the PostgreSQL pool, one `LISTEN` connection, the stream position assigner, and the workers, periodic loops, and triggers registered in that process.
+- A `Runtime` belongs to one process. It owns the PostgreSQL pool, one `LISTEN` connection, the stream position assigner, and the workers, periodic loops, triggers, and consumers registered in that process.
 - Package functions such as `Enqueue`, `Complete`, `Publish`, and `Status` hold no state. They accept a pool, connection, or transaction.
 
 Queue and job-type declarations are plain Go values. They are not stored in the database; only their names are written to job rows. A process claims only the job types it registered.
@@ -21,7 +21,7 @@ The schema has five tables.
 
 - `cb_messages` is the immutable message substrate. It stores every job payload and published stream message. Published messages receive a stream position after commit; job messages do not, so a job never feeds back into the stream.
 - `cb_claims` stores the narrow, mutable state of each live job: queue, job type, claim deadline, retry state, workflow dependencies, signal state, and death time. Completion deletes the claim.
-- `cb_cursors` stores the most recently acknowledged stream position for a named consumer.
+- `cb_cursors` stores the most recently acknowledged stream position for a named consumer, and until when a `Consume` loop holds the cursor.
 - `cb_outputs` stores optional job results. Results are written as part of job completion.
 - `cb_migrations` records applied schema migrations.
 
@@ -58,6 +58,8 @@ A job type with `Signal: true` is a gate. It waits until `Signal` supplies a pay
 Readers use either `ReadAfter` with a caller-held position or `Cursor.Read` and `Cursor.Ack` with a database-held position. Patterns are deliberately limited to an exact topic, a `prefix.#` subtree, or `#`. Each pattern compiles to an individual SQL comparison so PostgreSQL can use the stream indexes.
 
 `Runtime.Trigger` turns matching stream messages into jobs. The read, the job creation, the deduplication, the cursor advance and the worker wake-up are one statement; several processes can run the same trigger, and a batch another process already handled creates no second job.
+
+`Runtime.Consume` hands matching messages to a handler in batches, in position order. Before it reads, a process claims the cursor for `ClaimDuration`; after the handler it acks, and the ack matches on the claim, so a process whose claim lapsed while its handler was still running advances nothing and releases nothing. With `HandlerTimeout` above `ClaimDuration` the process renews the claim every half `ClaimDuration` while the handler's context lives, as the worker renews job claims, so a long batch is not taken over while it runs. One process runs a cursor at a time. The others find it claimed and wait, and take it over when the claim lapses. A handler error leaves the cursor in place and the same batch is handed out again; a consumer has no retry policy of its own.
 
 ## Periodic jobs
 

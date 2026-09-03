@@ -327,36 +327,23 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Start assigner/listener loops so published messages receive stream positions.
-	go catbird.New(pool, catbird.Options{}).Start(ctx)
+	// A consumer claims its cursor, handles a batch, and acks. Every process
+	// running this registers it, and one process at a time holds the cursor.
+	rt := catbird.New(pool, catbird.Options{})
+	rt.Consume("indexer", []string{"record.#"}, func(ctx context.Context, msgs []catbird.Message) error {
+		for _, m := range msgs {
+			log.Printf("position=%d topic=%s payload=%s", m.Position, m.Topic, string(m.Payload))
+		}
+		return nil
+	}, catbird.ConsumeOptions{})
+	// Start runs the consumer and the loops that give published messages their positions.
+	go rt.Start(ctx)
 
 	if _, err := catbird.Publish(ctx, pool, "record.42.updated", map[string]any{"id": 42}, "record:42:v1"); err != nil {
 		log.Fatal(err)
 	}
 
-	cursor := catbird.Cursor{Name: "indexer:records", Patterns: []string{"record.#"}}
-
-	for i := 0; i < 20; i++ {
-		msgs, err := cursor.Read(ctx, pool, 100)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if len(msgs) == 0 {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		for _, m := range msgs {
-			log.Printf("position=%d topic=%s payload=%s", m.Position, m.Topic, string(m.Payload))
-		}
-
-		if err := cursor.Ack(ctx, pool, msgs[len(msgs)-1].Position); err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
-
-	log.Fatal("no stream messages became visible in time")
+	time.Sleep(2 * time.Second)
 }
 ```
 
@@ -424,6 +411,7 @@ func main() {
 
 - Register handlers: `(*Runtime).Handle`, `(*Runtime).HandleFunc`
 - Register stream trigger: `(*Runtime).Trigger`
+- Register stream consumer: `(*Runtime).Consume`
 - Start loops: `(*Runtime).Start`
 
 ### Job and workflow operations

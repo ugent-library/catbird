@@ -55,7 +55,7 @@ It talks to the same database directly and needs no Go build.
 
 ## Layout
 
-Seven files and one migration in the root package, and one package under it:
+Eight files and one migration in the root package, and one package under it:
 
 - `job_type.go` — the two declarations an application writes. `Queue` is a name
   and how work runs under it: `BatchSize`, `ClaimDuration`, `HandlerTimeout`, `PollInterval`.
@@ -82,7 +82,7 @@ Seven files and one migration in the root package, and one package under it:
 - `runtime.go` — `New`, `Handle`, `HandleFunc`, `Start`, and the two loops every process runs
   whether or not anything is registered: the position assigner and the one
   `LISTEN` connection that wakes the rest. One `Runtime` per process owns the
-  pool and one goroutine per queue and trigger.
+  pool and one goroutine per queue, trigger and consumer.
 - `worker.go` — the claim loop, dispatch by job type, completion, retries,
   `OnDead`, and the claim renewal a queue with `HandlerTimeout` above `ClaimDuration` runs.
   One worker per queue, however many job types run on it. The handler
@@ -91,6 +91,11 @@ Seven files and one migration in the root package, and one package under it:
   variable.
 - `trigger.go` — `Runtime.Trigger`: the loop that turns stream messages into
   jobs. The reads it uses live in `client.go` with the other statements.
+- `consumer.go` — `Runtime.Consume`: the loop that hands stream messages to a
+  handler in batches, one process at a time. The claim on the cursor row, its
+  renewal on a consumer whose `HandlerTimeout` exceeds `ClaimDuration`, and the
+  ack that matches on it live here; the read is `ReadAfter`. A consumer has no
+  retry policy: a failed batch is handed out again until it passes.
 - `periodic.go` — the schedule parser and the tick loop `Handle` starts for a
   job type declared with `Schedule`, so a scheduled type ticks in the
   processes that can run it. Its statement lives in `client.go` with the
@@ -197,6 +202,15 @@ client exists.
 - A workflow is `coalesce(group_id, message_id)` of the job that started it.
   `group_id` is NULL on a job that stands alone, which keeps the volume of
   single-shot jobs out of `cb_claims_group_idx` and off its write cost.
+- A consumer claims its cursor before it reads: `claimed_until` is set to
+  `now() + ClaimDuration` where it has passed, and the ack matches on the value
+  the claim returned, as every write on a job matches on `attempts`. A process
+  whose claim was taken over moves nothing and releases nothing. Renewal moves
+  the deadline and returns the new one, and a renewal that matches nothing
+  cancels the handler with `ErrClaimLost`. `ClaimDuration` and `HandlerTimeout`
+  default from each other by the queue's rule, in `defaultDurations`.
+  `Cursor.Ack` takes no claim; it is for a reader that runs in one place, like
+  wire's poll.
 - Stream readers go by `position`, never by `id`. Positions are set after commit
   by the assigner, so they follow commit order.
 - A topic pattern is a topic, a prefix with `.#`, or `#`, and each pattern

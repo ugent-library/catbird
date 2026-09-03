@@ -21,6 +21,8 @@ Each value left unset defaults from the other. Set only `HandlerTimeout` and the
 
 Handlers must observe their context. A handler that ignores a timed-out context may keep its worker slot even after Catbird has retried the job elsewhere.
 
+`Consume` takes the same two settings with the same rule. A consumer whose batches take minutes sets `HandlerTimeout` for the batch and `ClaimDuration` for how soon a crashed process's cursor is taken over; the claim is renewed while the handler runs.
+
 ## Size the connection pool
 
 Workers do not hold a connection while a handler runs. A handler that begins a transaction does.
@@ -63,7 +65,9 @@ For a job type declared with `Signal: true`, arrange for the application to send
 
 Use `Publish` for facts that consumers should see, and `Enqueue` for work that a worker should run. Enqueued jobs are not stream messages.
 
-Use a stable cursor name with one stable pattern set. Sharing a cursor between readers, or changing its patterns, can make one reader acknowledge messages another reader has not processed. General cursor consumers run in one process; use a trigger plus worker for cross-process, at-least-once handling.
+Use a stable cursor name with one stable pattern set. Sharing a cursor between readers, or changing its patterns, can make one reader acknowledge messages another reader has not processed.
+
+`Consume` is the declared consumer. Register it in every process; one process at a time claims the cursor, handles a batch, and acks, and the others take over when a claim lapses. A consumer runs in one process at a time, so more processes give failover, not throughput. Parallel work is a trigger and a job type, or several consumers over disjoint patterns, each with its own cursor. Set `HandlerTimeout` to bound a batch and `ClaimDuration` to how long a crashed process may hold the cursor; with `HandlerTimeout` above `ClaimDuration` the claim is renewed while the handler runs, so a long batch is not taken over while it is still running. A handler error hands the same batch out again every `PollInterval` until it passes, so a handler that meets a message it cannot use logs it and returns nil. Per-message retries and dead jobs are a trigger plus a job type. Delivery is at least once: derive what the handler writes from current state, or key it by the message id.
 
 Set retention according to consumer recovery needs. `GC` removes old stream messages and releases their deduplication keys. A reader that finds `OldestPosition` ahead of its saved position must refetch its source of truth instead of trusting a partial stream catch-up.
 
@@ -73,7 +77,7 @@ Prefix deduplication keys by their domain because published messages and enqueue
 
 Scheduled job types run in UTC. A scheduled type cannot require a signal. A manual enqueue of a scheduled type prevents ticks while that job is live, but two manual enqueues may overlap.
 
-Triggers preserve the source topic and payload and create one job per matching stream message. Triggered jobs can run concurrently, so a trigger does not preserve completion order. Use a single handler over a cursor only when strict in-order batch handling is a real requirement.
+Triggers preserve the source topic and payload and create one job per matching stream message. Triggered jobs can run concurrently, so a trigger does not preserve completion order. Use `Consume` when a batch should be handled in order, or reduced to the records it concerns, in one process at a time.
 
 ## Monitor and clean up
 

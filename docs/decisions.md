@@ -34,13 +34,13 @@ This document records the current boundaries of Catbird. Revisit a decision when
 
 **Revisit when:** Several applications need the same durable deadline and dead-job behavior.
 
-## Cursor consumers are single-process
+## A cursor runs in one process at a time
 
-**Decision:** General stream cursors have no claim. Run one consumer per cursor. Use a trigger and worker when work must be distributed across processes.
+**Decision:** `Consume` claims the cursor for `ClaimDuration` before it reads, renews the claim while a handler runs longer than that, and its ack matches on the claim. Every process may register the consumer; the others find the cursor claimed and wait, and one of them takes it over when the claim lapses. A consumer has no attempts, no backoff and no dead state: a failed batch is handed out again every `PollInterval` until it passes. More processes give failover, not throughput.
 
-**Why:** A claimed cursor would duplicate the job claim and retry machinery. Triggers already make cross-process handling safe through atomic enqueue and deduplication.
+**Why:** The first consumers coalesce on purpose. An indexer reduces a window of five hundred events to the distinct records they concern and indexes each once, so one job per message is the wrong unit, and a batch running in several processes at once would do every batch once per process. Skipping a message whose handler keeps failing would leave a projection missing a record with nobody told, while a cursor that stops moving is visible. Per-message retry state has nowhere to live: a message row is written once and a cursor is one row. The handler decides what it can pass over; a trigger and a job type give a message retries and a dead state.
 
-**Revisit when:** A real consumer needs ordered, once-per-message batch handling across several processes.
+**Revisit when:** A consumer falls behind its stream. The addition is partitioned members: several cursors under one consumer name, each reading the messages whose key hashes to it, so order holds per key and the members run in parallel across processes. The key is a topic prefix, since the topic's last segment names the event; changing the member count is a new consumer.
 
 ## Polling is wire's first transport
 
