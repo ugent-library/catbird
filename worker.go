@@ -151,8 +151,8 @@ func (w *worker) takeFreeSlots(free chan struct{}, backlog bool) int {
 // run executes one job. The worker holds nothing while the handler runs: no
 // transaction, no connection. When the handler returns nil and did not complete
 // the job in a transaction of its own, the worker completes it with one
-// statement; an error schedules a retry or marks the job dead, and a shutdown
-// hands the job back. An attempt that runs past the queue's HandlerTimeout is
+// statement; an error schedules a retry or ends the job as failed, and a
+// shutdown hands the job back. An attempt that runs past the queue's HandlerTimeout is
 // a failed attempt like any other.
 func (w *worker) run(ctx context.Context, job *Job) {
 	registered := w.handlers[job.Type]
@@ -213,7 +213,7 @@ func (w *worker) run(ctx context.Context, job *Job) {
 func (w *worker) interrupted(ctx context.Context, job *Job, cause error) {
 	_, err := w.runtime.pool.Exec(ctx, `
 		UPDATE cb_jobs SET attempts = attempts - 1, claimable_at = now()
-		WHERE message_id = $1 AND attempts = $2 AND died_at IS NULL
+		WHERE message_id = $1 AND attempts = $2
 	`, job.ID, job.Attempts)
 	if err != nil {
 		w.logger.Error("catbird: returning an interrupted job failed", "queue", w.queue.name, "job_id", job.ID, "err", err, "cause", cause)
@@ -222,9 +222,9 @@ func (w *worker) interrupted(ctx context.Context, job *Job, cause error) {
 	w.logger.Info("catbird: job stopped by shutdown, returned to the queue", "queue", w.queue.name, "job_id", job.ID, "err", cause)
 }
 
-// failed schedules a retry, or after the last attempt marks the job dead,
-// cancels its workflow, and runs OnDead. MaxAttempts, MinBackoff, MaxBackoff and
-// OnDead come from the job type, so two kinds of work sharing a queue are
+// failed schedules a retry, or after the last attempt ends the job as failed,
+// cancels its workflow, and runs OnFailed. MaxAttempts, MinBackoff, MaxBackoff
+// and OnFailed come from the job type, so two kinds of work sharing a queue are
 // retried on their own terms.
 //
 // The retry waits at least MinBackoff and at most what doubling that per attempt
@@ -235,10 +235,13 @@ func (w *worker) interrupted(ctx context.Context, job *Job, cause error) {
 //
 // Both writes match on attempts, and a write that finds no row
 // means the claim is not this attempt's any more: the handler completed the job
-// and then returned an error, or the claim expired and another worker has it.
-// Neither is this attempt's failure to record, and the cascade must not run for
-// a job that is finished or running elsewhere. The error text rides on the same
-// two writes, so an attempt that lost its claim records none.
+// and then returned an error, the claim expired and another worker has it, or
+// Cancel ended the job while it ran. None is this attempt's failure to record,
+// and the cascade must not run for a job that is finished or running
+// elsewhere. The error text rides on the same two writes, so an attempt that
+// lost its claim records none. The failure deletes the job row and writes the
+// result in one statement, as the completion does, so a job is in one table or
+// the other and never both.
 func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) {
 	log := w.logger.With("queue", w.queue.name, "job_type", job.Type, "job_id", job.ID, "attempt", job.Attempts)
 
@@ -247,8 +250,8 @@ func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) 
 			UPDATE cb_jobs
 			SET claimable_at = now() + $3::interval
 			    + (least($3::interval * 2 ^ least(attempts - 1, 20), $4::interval) - $3::interval) * random(),
-			    last_error = left($5, 256)
-			WHERE message_id = $1 AND attempts = $2 AND died_at IS NULL
+			    error = left($5, 256)
+			WHERE message_id = $1 AND attempts = $2
 		`, job.ID, job.Attempts, t.opts.MinBackoff, t.opts.MaxBackoff, cause.Error())
 		switch {
 		case err != nil:
@@ -262,25 +265,29 @@ func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) 
 	}
 
 	tag, err := w.runtime.pool.Exec(ctx, `
-		UPDATE cb_jobs SET died_at = now(), last_error = left($3, 256)
-		WHERE message_id = $1 AND attempts = $2
+		WITH failed AS (
+		    DELETE FROM cb_jobs WHERE message_id = $1 AND attempts = $2
+		    RETURNING message_id, group_id, queue, job_type, attempts
+		)
+		INSERT INTO cb_job_results (message_id, group_id, queue, job_type, attempts, state, error)
+		SELECT message_id, group_id, queue, job_type, attempts, 'failed', left($3, 256) FROM failed
 	`, job.ID, job.Attempts, cause.Error())
 	if err != nil {
-		log.Error("catbird: marking dead failed", "err", err, "cause", cause)
+		log.Error("catbird: recording the failed job failed", "err", err, "cause", cause)
 		return
 	}
 	if tag.RowsAffected() == 0 {
-		log.Warn("catbird: handler failed after the claim was gone, not marking it dead", "err", cause)
+		log.Warn("catbird: handler failed after the claim was gone, not ending the job", "err", cause)
 		return
 	}
 
-	log.Error("catbird: job dead", "err", cause)
+	log.Error("catbird: job failed, no attempts left", "err", cause)
 	if err := Cancel(ctx, w.runtime.pool, job.GroupID); err != nil {
 		log.Error("catbird: cancel failed", "group_id", job.GroupID, "err", err)
 	}
-	if t.opts.OnDead != nil {
-		if err := t.opts.OnDead.HandleJob(ctx, job); err != nil {
-			log.Error("catbird: OnDead failed", "err", err)
+	if t.opts.OnFailed != nil {
+		if err := t.opts.OnFailed.HandleJob(ctx, job); err != nil {
+			log.Error("catbird: OnFailed failed", "err", err)
 		}
 	}
 }
@@ -292,7 +299,7 @@ func (w *worker) failed(ctx context.Context, t *JobType, job *Job, cause error) 
 // of a type this process does not know is left for one that does, rather than
 // failing here.
 //
-// The claim clears last_error, so text on a row always belongs to the attempt
+// The claim clears error, so text on a row always belongs to the attempt
 // waiting to retry and never to the one running. That is what Status reads to
 // tell them apart. Clearing a NULL column is free: 372 bytes of WAL per row with
 // the clause and without it. On rows that do carry text it saves, 372 against
@@ -301,10 +308,10 @@ func (w *worker) claimBatch(ctx context.Context, limit int) ([]*Job, error) {
 	rows, err := w.runtime.pool.Query(ctx, `
 		WITH claimed AS (
 			UPDATE cb_jobs
-			SET claimable_at = now() + $2::interval, attempts = attempts + 1, last_error = NULL
+			SET claimable_at = now() + $2::interval, attempts = attempts + 1, error = NULL
 			WHERE message_id IN (
 				SELECT message_id FROM cb_jobs
-				WHERE queue = $1 AND died_at IS NULL AND dependencies = 0 AND claimable_at <= now()
+				WHERE queue = $1 AND dependencies = 0 AND claimable_at <= now()
 				  AND job_type = ANY($4)
 				ORDER BY claimable_at ASC LIMIT $3
 				FOR UPDATE SKIP LOCKED
@@ -387,7 +394,7 @@ func (w *worker) running() []*inFlightJob {
 //
 // The renewal matches on attempts like every other write. One
 // that matches no row means the claim is not this attempt's any more — the
-// claim lapsed and another worker took it, or Cancel marked the job dead —
+// claim lapsed and another worker took it, or Cancel ended the job —
 // so the handler is cancelled with ErrClaimLost to stop work nothing will
 // commit. That is also what lets Cancel reach a running handler on a renewing
 // queue, within about half a ClaimDuration.
@@ -415,7 +422,6 @@ func (w *worker) renewClaims(ctx context.Context) {
 			SET claimable_at = now() + $3::interval
 			FROM unnest($1::bigint[], $2::int[]) AS running (message_id, attempts)
 			WHERE job.message_id = running.message_id AND job.attempts = running.attempts
-			  AND job.died_at IS NULL
 			RETURNING job.message_id
 		`, ids, attempts, w.queue.opts.ClaimDuration)
 		if err == nil {

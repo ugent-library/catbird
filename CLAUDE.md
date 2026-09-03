@@ -61,7 +61,7 @@ Eight files and one migration in the root package, and one package under it:
   and how work runs under it: `BatchSize`, `ClaimDuration`, `HandlerTimeout`, `PollInterval`.
   It decides who competes with whom, and it is the claim key. `JobType` is a kind of job:
   its name, its queue, and how a run of it is retried (`Signal`, `Schedule`,
-  `MaxAttempts`, `MinBackoff`, `MaxBackoff`, `OnDead`). Both are plain Go values; nothing about
+  `MaxAttempts`, `MinBackoff`, `MaxBackoff`, `OnFailed`). Both are plain Go values; nothing about
   them is written to the database, and only their names reach a row. The
   handler is not on either — everything on a job type is written on a job row or
   decided about a run, and a handler is neither, so it is given at
@@ -84,7 +84,7 @@ Eight files and one migration in the root package, and one package under it:
   `LISTEN` connection that wakes the rest. One `Runtime` per process owns the
   pool and one goroutine per queue, trigger and consumer.
 - `worker.go` — the claim loop, dispatch by job type, completion, retries,
-  `OnDead`, and the claim renewal a queue with `HandlerTimeout` above `ClaimDuration` runs.
+  `OnFailed`, and the claim renewal a queue with `HandlerTimeout` above `ClaimDuration` runs.
   One worker per queue, however many job types run on it. The handler
   runs on a context of its own carrying the queue's `HandlerTimeout`; the worker's own
   context is what tells a shutdown from a failure, so the two are never the same
@@ -136,13 +136,16 @@ Eight files and one migration in the root package, and one package under it:
 
 **Tables.** `cb_messages` holds every job's payload and every published message,
 one row, written once. `cb_jobs` holds one narrow row per job that still has
-to run, rewritten on every claim and retry, deleted on completion; it carries
-the queue, the job type, the workflow, what the job waits for, the signal
-payload once one arrives, when it died if no worker will claim it again, and
-what the last failed attempt returned. `cb_cursors` and `cb_job_outputs` are one row each per
-stream consumer and per job result. `cb_migrations` is one row per schema
-change that ran, created by the runner rather than by a migration, and touches
-no hot path.
+to run, rewritten on every claim and retry, deleted by the statement that ends
+the job; it carries the queue, the job type, the workflow, what the job waits
+for, the signal payload once one arrives, and what the last failed attempt
+returned. `cb_job_results` holds one row per job that ended, written by the
+same statement that deleted its job row: how it ended — completed, failed or
+canceled — when it ended, the attempts it spent, the last error, and the
+output it recorded.
+`cb_cursors` is one row per stream consumer. `cb_migrations` is one row per
+schema change that ran, created by the runner rather than by a migration, and
+touches no hot path.
 
 **Queue and job type are two things.** The queue is the claim key and the
 concurrency bound — it decides who competes with whom for `BatchSize` slots.
@@ -158,9 +161,12 @@ client exists.
 
 **Invariants that edits must not break:**
 
-- A job's completion is `DELETE FROM cb_jobs WHERE message_id = $1 AND attempts = $2`.
-  The delete matches on `attempts`, so two workers may run the same job and
-  only the attempt that still holds the claim deletes it. A handler is given no connection: it runs
+- A job's completion is `DELETE FROM cb_jobs WHERE message_id = $1 AND attempts = $2`
+  and, in the same statement, the insert of its result. The delete matches on
+  `attempts`, so two workers may run the same job and only the attempt that
+  still holds the claim deletes it. The last failed attempt and `Cancel` end a
+  job the same way, with a result that says failed or canceled, so a job is in
+  `cb_jobs` or in `cb_job_results` and never in both. A handler is given no connection: it runs
   `Complete` in its own transaction to end the job in the same commit as its
   writes, or returns `nil` and lets the worker complete it afterwards. The
   worker holds no transaction and no connection while a handler runs.
@@ -181,24 +187,33 @@ client exists.
 - A job waiting for a signal has `claimable_at = 'infinity'`, so waiting is a
   delay and needs no place in the ready index. `Signal` writes the payload and
   sets `claimable_at` to `now()`.
-- What a job is doing is not stored. `cb_jobs.died_at` is one timestamp —
-  when the job died, never to be claimed again, and what `GC`'s age test runs
-  from; NULL while it lives — and `Status` derives the eight states a caller
-  sees from `claimable_at`, `attempts`, `dependencies`, `awaits_signal` and
-  `last_error`. There is deliberately no `status` column: the word names the
-  derived answer, and a column of the same name meant something narrower in the
-  same statement, which is what a second client stumbles over.
+- What a live job is doing is not stored. `Status` derives its six states
+  from `claimable_at`, `attempts`, `dependencies`, `awaits_signal` and `error`,
+  because three of them end by the clock and not by a write: scheduled,
+  waiting to retry and a lapsed claim all become queued when `claimable_at`
+  passes. A stored column would be stale across those boundaries or need a
+  sweeper. There is deliberately no `status` column on `cb_jobs`: the word
+  names the derived answer, and a column of the same name meant something
+  narrower in the same statement, which is what a second client stumbles
+  over. How a job ended is stored, as `cb_job_results.state` — `completed`,
+  `failed` or `canceled`, the same words `Status` reports — because nothing
+  about a job that ended changes with time.
+- Retention runs from when a job ended. `GC` deletes results by
+  `cb_job_results.ended_at` and then the messages no job row and no result
+  refers to, so a job that took a month to run is inspectable for as long
+  after it ended as one that took a second. History beyond retention, and
+  anything per attempt, is the application's own table.
 - `cb_jobs` declares its columns widest first, so the fixed-width ones pack
-  with no padding between them: 74 bytes against 78, on the row every claim and
+  with no padding between them: 72 bytes against 75, on the row every claim and
   retry rewrites. A column added in the middle by role rather than by width
   costs padding.
-- The failure writes `last_error` and the claim clears it, which is the only
+- The failure writes `error` and the claim clears it, which is the only
   thing that tells `StateRunning` from `StateWaitingToRetry`: both are a live
   claim with `claimable_at` in the future and an attempt spent. The write carries
   matches on `attempts` like the retry it rides on, so a late attempt
   records no error text either, and the 256-character cut keeps a job row out
-  of TOAST. It is not a run history: the next failure overwrites it and the
-  completion deletes it with the row.
+  of TOAST. It is not a run history: the next failure overwrites it, and the
+  statement that ends the job copies the last one to the result.
 - A workflow is `coalesce(group_id, message_id)` of the job that started it.
   `group_id` is NULL on a job that stands alone, which keeps the volume of
   single-shot jobs out of `cb_jobs_group_idx` and off its write cost.
@@ -226,7 +241,7 @@ client exists.
   them. The guard repeats `dependencies = 0` so its probe stays on the ready
   index instead of scanning the heap.
 - `BatchSize`, `ClaimDuration` and `HandlerTimeout` are queue settings; `Schedule`,
-  `MaxAttempts`, `MinBackoff`, `MaxBackoff` and `OnDead` are job type settings. `ClaimDuration` is on
+  `MaxAttempts`, `MinBackoff`, `MaxBackoff` and `OnFailed` are job type settings. `ClaimDuration` is on
   the queue because the claim sets it for a whole batch in one statement, and
   `HandlerTimeout` because its comparison with `ClaimDuration` is itself a setting: `HandlerTimeout`
   above `ClaimDuration` makes the worker renew the claims of its running jobs every
@@ -259,7 +274,11 @@ changed belongs in the commit message, not in the file.
 **Job, job type and message.** A job is one claimed unit of work; a job type is
 the kind of job it is, declared once and used by both the enqueue and the
 worker; a message is a row of `cb_messages`, and a published message is what a
-consumer reads. The word job belongs where a claim does, and the type carries it
+consumer reads. A result is how a job ended, one row of `cb_job_results`; an
+output is the value a handler recorded with `SetOutput`, a column on the
+result. The two words are never swapped. An attempt fails and the job waits to
+retry; when the last attempt fails the job has failed; `Cancel` cancels a job;
+a job that succeeded completed. The word dead is not used. The word job belongs where a claim does, and the type carries it
 rather than the name: the handler type is `Handler` and takes a `*Job`, and the
 completion is `Complete`. `Signal`, `Cancel` and `GroupStatus` address a
 workflow, so their parameter is `groupID`, while the column it matches stays

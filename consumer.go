@@ -75,7 +75,7 @@ type consumer struct {
 //
 // A handler error leaves the cursor where it was and the same batch comes back
 // after PollInterval, for as long as it fails. A consumer has no attempts and
-// no dead state: a message row is written once and a cursor is one row, so
+// no failed state: a message row is written once and a cursor is one row, so
 // there is nowhere to mark one message of a stream as given up on, and skipping
 // it would leave a projection missing a record with nobody told. The handler
 // decides what it can pass over — it logs the message and returns nil — and

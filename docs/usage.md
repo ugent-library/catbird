@@ -67,7 +67,7 @@ Use `Publish` for facts that consumers should see, and `Enqueue` for work that a
 
 Use a stable cursor name with one stable pattern set. Sharing a cursor between readers, or changing its patterns, can make one reader acknowledge messages another reader has not processed.
 
-`Consume` is the declared consumer. Register it in every process; one process at a time claims the cursor, handles a batch, and acks, and the others take over when a claim lapses. A consumer runs in one process at a time, so more processes give failover, not throughput. Parallel work is a trigger and a job type, or several consumers over disjoint patterns, each with its own cursor. Set `HandlerTimeout` to bound a batch and `ClaimDuration` to how long a crashed process may hold the cursor; with `HandlerTimeout` above `ClaimDuration` the claim is renewed while the handler runs, so a long batch is not taken over while it is still running. A handler error hands the same batch out again every `PollInterval` until it passes, so a handler that meets a message it cannot use logs it and returns nil. Per-message retries and dead jobs are a trigger plus a job type. Delivery is at least once: derive what the handler writes from current state, or key it by the message id.
+`Consume` is the declared consumer. Register it in every process; one process at a time claims the cursor, handles a batch, and acks, and the others take over when a claim lapses. A consumer runs in one process at a time, so more processes give failover, not throughput. Parallel work is a trigger and a job type, or several consumers over disjoint patterns, each with its own cursor. Set `HandlerTimeout` to bound a batch and `ClaimDuration` to how long a crashed process may hold the cursor; with `HandlerTimeout` above `ClaimDuration` the claim is renewed while the handler runs, so a long batch is not taken over while it is still running. A handler error hands the same batch out again every `PollInterval` until it passes, so a handler that meets a message it cannot use logs it and returns nil. Per-message retries and a failed state are a trigger plus a job type. Delivery is at least once: derive what the handler writes from current state, or key it by the message id.
 
 Set retention according to consumer recovery needs. `GC` removes old stream messages and releases their deduplication keys. A reader that finds `OldestPosition` ahead of its saved position must refetch its source of truth instead of trusting a partial stream catch-up.
 
@@ -81,9 +81,11 @@ Triggers preserve the source topic and payload and create one job per matching s
 
 ## Monitor and clean up
 
-Poll `Queues` for queue depth, state counts, dead jobs, and the age of the oldest claimable job. Use application metrics around handlers for throughput and failure rates; Catbird deliberately stores no run history.
+Poll `Queues` for queue depth, state counts, failed jobs, and the age of the oldest claimable job. Use application metrics around handlers for throughput and failure rates.
 
-Run `GC` on an application schedule. It removes dead jobs after the requested retention period, then removes old messages whose jobs have completed. It does not run automatically.
+Read `Status` for one job and `GroupStatus` for a workflow. Both answer from the moment a job is enqueued until a retention period after it ended, and a job that ended reports how: its type, payload, attempts, the error that ended it, when it was created and ended, and the output it recorded. An application that hands a job id to a browser checks `Type` on the way back, so a URL for one kind of run cannot read another. Catbird keeps one result per job and no history of its attempts; a record that must outlive retention is the application's own table, written in the same transaction as `Enqueue` and completed in the same transaction as `Complete`.
+
+Run `GC` on an application schedule. It removes the results of jobs that ended longer than the retention period ago, then removes old messages that no live job and no result refers to. It does not run automatically.
 
 ## Use wire behind application authentication
 

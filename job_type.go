@@ -171,10 +171,10 @@ type JobTypeOptions struct {
 	// schedules or two arguments is two job types sharing one handler.
 	Schedule string
 
-	// MaxAttempts is how many attempts a job gets before it is dead; default
+	// MaxAttempts is how many attempts a job gets before it has failed; default
 	// 15, which with the default backoff rides out about an hour of outage.
-	// Dying is the expensive outcome — the workflow is cancelled, OnDead runs
-	// once, and nothing re-drives a dead job — so the default errs long.
+	// Failing is the expensive outcome — the workflow is canceled, OnFailed
+	// runs once, and nothing re-drives a failed job — so the default errs long.
 	MaxAttempts int
 
 	// MinBackoff is the wait after the first failed attempt and the shortest
@@ -184,7 +184,9 @@ type JobTypeOptions struct {
 	MinBackoff time.Duration
 	MaxBackoff time.Duration
 
-	OnDead Handler // runs once after the last failed attempt
+	// OnFailed runs once, after the last attempt failed and the job has failed
+	// for good. It does not run per failed attempt, and Cancel does not run it.
+	OnFailed Handler
 }
 
 func (o JobTypeOptions) withDefaults() JobTypeOptions {

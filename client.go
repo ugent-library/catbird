@@ -12,13 +12,13 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// ErrNotFound is returned when the addressed job or result does not exist, or
+// ErrNotFound is returned when the addressed job or output does not exist, or
 // the job is not waiting for what was delivered to it.
 var ErrNotFound = errors.New("catbird: not found")
 
 // ErrAmbiguous is returned by Outputs.Get when several jobs of the type asked
 // for recorded outputs. Read them with GetAll.
-var ErrAmbiguous = errors.New("catbird: several results")
+var ErrAmbiguous = errors.New("catbird: several outputs")
 
 // ErrClaimLost is returned by Complete when the job's claim expired and
 // another worker took it. The work of the late attempt is not the queue's any
@@ -29,10 +29,15 @@ var ErrClaimLost = errors.New("catbird: claim lost before completion")
 // a prefix followed by ".#", or "#".
 var ErrBadPattern = errors.New("catbird: invalid topic pattern")
 
-// State is what a job or a whole workflow is doing. No column holds it: the
-// statements in Status and GroupStatus derive it. A job takes any of the eight
-// states; a workflow takes StateRunning, StateDead or StateCompleted, where
-// running means jobs remain — queued, waiting or retrying included.
+// State is what a job is doing, or how it ended. The six states of a live job
+// are derived by the statements in Status and Queues from the job's cb_jobs
+// row, because three of them end by the clock and not by a write: a scheduled
+// job, a job waiting to retry and a job whose claim lapsed are all queued once
+// claimable_at has passed, with nothing written. The three states of a job
+// that ended are stored, in cb_job_results.state, because nothing about a job
+// that ended changes with time. A workflow takes StateRunning, StateFailed,
+// StateCanceled or StateCompleted, where running means jobs remain — queued,
+// waiting or retrying included.
 type State int
 
 const (
@@ -42,15 +47,17 @@ const (
 	StateWaitingToRetry                // an attempt failed, the retry is scheduled
 	StateWaitingForSignal              // waiting for Signal to deliver a payload
 	StateWaitingForJobs                // waiting for the jobs it was enqueued after
-	StateDead                          // failed permanently, or Cancel stopped it
-	StateCompleted                     // the message is here and its job row is gone
+	StateFailed                        // its last attempt failed, and OnFailed runs once
+	StateCanceled                      // Cancel stopped it
+	StateCompleted                     // it succeeded
 )
 
-// stateNames are the words the statements return, in constant order. The
-// statements name the states so another client reads them out of the SQL.
+// stateNames are the words the statements return and cb_job_results.state
+// holds, in constant order. The statements name the states so another client
+// reads them out of the SQL.
 var stateNames = [...]string{
 	"queued", "scheduled", "running", "waiting to retry",
-	"waiting for signal", "waiting for jobs", "dead", "completed",
+	"waiting for signal", "waiting for jobs", "failed", "canceled", "completed",
 }
 
 // String returns the word the statements return, so a log line and a database
@@ -77,7 +84,7 @@ type Job struct {
 	ID   int64
 	Type string // the job type's name
 	// The workflow this job belongs to, and the value Signal, Cancel and the
-	// result reads take. A job that stands alone is its own group.
+	// output reads take. A job that stands alone is its own group.
 	GroupID   int64
 	Topic     string
 	Payload   json.RawMessage
@@ -103,9 +110,9 @@ type newJob struct {
 	signal    bool
 }
 
-// SetOutput records the job's result. Nothing is written here: the completion
-// writes the result in the statement that deletes the job row, so a result cannot
-// outlive an attempt that never finished. Call it and then either complete the
+// SetOutput records the job's output. Nothing is written here: the completion
+// writes the output in the statement that deletes the job row, so an output
+// cannot outlive an attempt that never finished. Call it and then either complete the
 // job or return nil and let the worker complete it. A second call replaces the
 // first.
 //
@@ -127,7 +134,7 @@ func (j *Job) SetOutput(v any) error {
 // handler that fails or crashes halfway records nothing and retries with an
 // empty buffer.
 //
-// The new job joins this job's workflow, so Signal, Cancel and the result reads
+// The new job joins this job's workflow, so Signal, Cancel and the output reads
 // address it by the same group id. A marshal failure is kept and returned by
 // the completion, which fails the attempt.
 func (j *Job) Enqueue(t *JobType, payload any) {
@@ -167,7 +174,7 @@ func (j *Job) record(t *JobType, payload any, dependent bool) {
 // This is the read a joining job makes. It waited for one buffer's jobs and
 // this returns those, where GroupStatus carries every output in the whole
 // workflow — every round of it, and the jobs another handler added. The ids
-// come from the job row, so the read probes cb_job_outputs by primary key.
+// come from the job row, so the read probes cb_job_results by primary key.
 func (j *Job) DependencyOutputs(ctx context.Context, db Conn) (Outputs, error) {
 	if len(j.dependencyIDs) == 0 {
 		return nil, nil
@@ -175,7 +182,8 @@ func (j *Job) DependencyOutputs(ctx context.Context, db Conn) (Outputs, error) {
 	rows, err := db.Query(ctx, `
 		SELECT result.message_id, result.job_type, result.output
 		FROM unnest($1::bigint[]) WITH ORDINALITY AS dependency (job_id, place)
-		JOIN cb_job_outputs result ON result.message_id = dependency.job_id
+		JOIN cb_job_results result ON result.message_id = dependency.job_id
+		WHERE result.output IS NOT NULL
 		ORDER BY dependency.place
 	`, j.dependencyIDs)
 	if err != nil {
@@ -425,7 +433,7 @@ func subtreeLikePattern(prefix string) string {
 
 // Enqueue appends a message and a job row for it, and wakes the queue's workers
 // unless the job cannot run yet. Returns the job's id, which is also the id of
-// the workflow it starts — what Signal, Cancel and the result reads address —
+// the workflow it starts — what Signal, Cancel and the output reads address —
 // or 0 when opts.DeduplicationKey already exists.
 //
 // One statement does all three. The wake CTE calls pg_notify only for a job
@@ -545,7 +553,7 @@ func enqueuePeriodic(ctx context.Context, db Conn, t *JobType, minute time.Time)
 			SELECT $1, $2
 			WHERE NOT EXISTS (
 				SELECT 1 FROM cb_jobs
-				WHERE queue = $3 AND job_type = $1 AND died_at IS NULL AND dependencies = 0
+				WHERE queue = $3 AND job_type = $1 AND dependencies = 0
 			)
 			ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
 			RETURNING id
@@ -564,9 +572,10 @@ func enqueuePeriodic(ctx context.Context, db Conn, t *JobType, minute time.Time)
 	return err
 }
 
-// Complete finishes a job: it deletes the job row, writes the result the handler
-// recorded with SetOutput, counts down the jobs waiting for this one, and
-// creates the jobs the handler recorded with Enqueue and EnqueueAfter. A worker
+// Complete finishes a job: it deletes the job row, writes the job's result with
+// the output the handler recorded with SetOutput, counts down the jobs waiting
+// for this one, and creates the jobs the handler recorded with Enqueue and
+// EnqueueAfter. A worker
 // does this itself when the handler returns nil, so a handler only calls it to
 // put the completion in the same transaction as its own writes, which is what
 // makes the job's work and the job's end one commit. The delete matches on
@@ -576,8 +585,8 @@ func enqueuePeriodic(ctx context.Context, db Conn, t *JobType, minute time.Time)
 //
 // It is one statement, so a job costs one round trip to finish however much it
 // asked for. Everything in it hangs off the row the delete returned, so an
-// attempt that lost its claim writes no result, counts nothing down and creates no
-// jobs.
+// attempt that lost its claim writes no result, counts nothing down and creates
+// no jobs.
 //
 // The new jobs get their ids from the sequence inside the statement, which is
 // what lets one statement point the jobs that are not dependent at the ones
@@ -603,16 +612,16 @@ func Complete(ctx context.Context, db Conn, job *Job) error {
 	err := db.QueryRow(ctx, `
 		WITH completed AS (
 		    DELETE FROM cb_jobs WHERE message_id = $1 AND attempts = $2
-		    RETURNING message_id, job_type, coalesce(group_id, message_id) AS group_id, dependent_job_ids
+		    RETURNING message_id, group_id, queue, job_type, attempts, dependent_job_ids
 		),
-		output AS (
-		    INSERT INTO cb_job_outputs (message_id, group_id, job_type, output)
-		    SELECT message_id, group_id, job_type, $3::jsonb FROM completed WHERE $3::jsonb IS NOT NULL
+		result AS (
+		    INSERT INTO cb_job_results (message_id, group_id, queue, job_type, attempts, state, output)
+		    SELECT message_id, group_id, queue, job_type, attempts, 'completed', $3::jsonb FROM completed
 		),
 		dependent_job AS (
 		    UPDATE cb_jobs SET dependencies = dependencies - 1
 		    WHERE message_id IN (SELECT unnest(dependent_job_ids) FROM completed)
-		      AND died_at IS NULL AND dependencies > 0
+		      AND dependencies > 0
 		    RETURNING queue, dependencies, claimable_at
 		),
 		new_job AS MATERIALIZED (
@@ -627,7 +636,7 @@ func Complete(ctx context.Context, db Conn, job *Job) error {
 		new_job_row AS (
 		    INSERT INTO cb_jobs (message_id, queue, job_type, group_id, claimable_at,
 		                           dependencies, dependency_job_ids, dependent_job_ids, awaits_signal)
-		    SELECT n.id, n.queue, n.job_type, c.group_id,
+		    SELECT n.id, n.queue, n.job_type, coalesce(c.group_id, c.message_id),
 		           CASE WHEN n.signal THEN 'infinity'::timestamptz ELSE now() END,
 		           CASE WHEN n.dependent THEN (SELECT count(*) FROM new_job WHERE NOT dependent) ELSE 0 END::smallint,
 		           CASE WHEN n.dependent THEN (SELECT array_agg(id ORDER BY id) FROM new_job WHERE NOT dependent) END,
@@ -679,7 +688,7 @@ func Signal(ctx context.Context, db Conn, groupID int64, t *JobType, payload any
 		WITH gated AS (
 			UPDATE cb_jobs SET signal = $3, claimable_at = now()
 			WHERE (group_id = $1 OR message_id = $1) AND job_type = $2
-			  AND died_at IS NULL AND awaits_signal AND signal IS NULL
+			  AND awaits_signal AND signal IS NULL
 			RETURNING queue, dependencies
 		),
 		wake AS (
@@ -696,18 +705,26 @@ func Signal(ctx context.Context, db Conn, groupID int64, t *JobType, payload any
 	return nil
 }
 
-// Cancel marks every live job of the workflow dead, the job that started it
-// included. A job that is already running finishes; cancel only stops jobs from
-// starting.
+// Cancel ends every live job of the workflow as canceled, the job that started
+// it included: each job row is deleted and a result is written for it. A job
+// that is running when it is canceled is not interrupted, unless its queue
+// renews claims, but its completion finds no row and writes nothing — no
+// output, no new jobs — as after a lost claim; a handler that completes in its
+// own transaction gets ErrClaimLost and rolls back. Cancel does not undo what
+// a completed job did, and runs no OnFailed.
 func Cancel(ctx context.Context, db Conn, groupID int64) error {
 	_, err := db.Exec(ctx, `
-		UPDATE cb_jobs SET died_at = now()
-		WHERE (group_id = $1 OR message_id = $1) AND died_at IS NULL
+		WITH canceled AS (
+		    DELETE FROM cb_jobs WHERE group_id = $1 OR message_id = $1
+		    RETURNING message_id, group_id, queue, job_type, attempts, error
+		)
+		INSERT INTO cb_job_results (message_id, group_id, queue, job_type, attempts, state, error)
+		SELECT message_id, group_id, queue, job_type, attempts, 'canceled', error FROM canceled
 	`, groupID)
 	return err
 }
 
-// Output is one recorded result: which job recorded it, that job's type, and
+// Output is one recorded output: which job recorded it, that job's type, and
 // the value SetOutput was given. The JSON tags are the names GroupStatus's
 // statement builds, so its rows decode straight into the type.
 type Output struct {
@@ -722,7 +739,7 @@ func (o Output) Scan(dest any) error {
 	return json.Unmarshal(o.Value, dest)
 }
 
-// Outputs holds recorded results in the order the jobs that recorded them were
+// Outputs holds recorded outputs in the order the jobs that recorded them were
 // created. A job that recorded nothing has no element.
 type Outputs []Output
 
@@ -752,118 +769,149 @@ func (os Outputs) GetAll(t *JobType) Outputs {
 	return all
 }
 
-// JobStatus is what Status reports of one job: its state, the attempts it has
-// spent, and what its last failed attempt returned.
+// JobStatus is what Status reports of one job: its state, what kind of job it
+// is and what it was given, the attempts it has spent, what its last failed
+// attempt returned, when it was created and, once it has ended, when it ended
+// and what it recorded.
 //
-// LastError is empty while an attempt runs, because the claim clears it. That
-// is what separates StateRunning from StateWaitingToRetry.
+// Error is what the last failed attempt returned. It is empty while an attempt
+// runs, because the claim clears it, which is what separates StateRunning from
+// StateWaitingToRetry. On a failed job it is the error that ended it; a
+// canceled job keeps the one it was retrying on, if any.
+//
+// EndedAt is zero and Output nil while the job lives. Output is nil on a
+// failed or canceled job too, and on a completed job that recorded nothing.
 type JobStatus struct {
 	State     State
+	Type      string // the job type's name
 	Attempts  int
-	LastError string
+	Error     string
+	CreatedAt time.Time
+	EndedAt   time.Time
+	Payload   json.RawMessage
+	Output    json.RawMessage
 }
 
 // stateCaseSQL is the body of the CASE that derives what a live job is doing,
 // over a cb_jobs row aliased job. It is one constant because Status and Queues both
 // run it, and a copy that drifted — a test reordered, a comparison changed —
 // would let the two reads sort the same job into different states with nothing
-// failing. The words are stateNames; Status alone puts the completed test
-// above these, which is the absence of a row.
+// failing. The words are stateNames. The three states of a job that ended are
+// not derived: cb_job_results.state holds the word.
 const stateCaseSQL = `
-		           WHEN job.died_at IS NOT NULL THEN 'dead'
 		           WHEN job.awaits_signal AND job.signal IS NULL THEN 'waiting for signal'
 		           WHEN job.dependencies > 0 THEN 'waiting for jobs'
 		           WHEN job.claimable_at <= now() THEN 'queued'
 		           WHEN job.attempts = 0 THEN 'scheduled'
-		           WHEN job.last_error IS NOT NULL THEN 'waiting to retry'
+		           WHEN job.error IS NOT NULL THEN 'waiting to retry'
 		           ELSE 'running'`
 
-// Status reports what one job is doing. Two primary-key probes; no column
-// holds a state.
+// Status reports what one job is doing, or how it ended. Three primary-key
+// probes: a live job's state is derived from its cb_jobs row, and a job that
+// ended has its state on its result row. A job is in one of the two tables,
+// never both, so the coalesces below never choose.
 //
-// StateCompleted means the message is here and its job row is gone, so it lasts
-// only as long as the message: after GC the job returns ErrNotFound, as does a
+// A job is inspectable for retention after it ended: GC deletes the result and
+// then the message, and after that the job returns ErrNotFound, as does a
 // published message's id.
 func Status(ctx context.Context, db Conn, id int64) (JobStatus, error) {
 	var status JobStatus
-	var name string
-	var text *string
+	var name, jobType, text *string
+	var endedAt *time.Time
 	err := db.QueryRow(ctx, `
 		SELECT CASE
-		           WHEN job.message_id IS NULL THEN 'completed'`+stateCaseSQL+`
+		           WHEN result.message_id IS NOT NULL THEN result.state
+		           WHEN job.message_id IS NOT NULL THEN
+		               CASE`+stateCaseSQL+`
+		               END
 		       END,
-		       coalesce(job.attempts, 0), job.last_error
+		       coalesce(job.job_type, result.job_type),
+		       coalesce(job.attempts, result.attempts, 0),
+		       coalesce(job.error, result.error),
+		       message.created_at, result.ended_at, message.payload, result.output
 		FROM cb_messages message
 		LEFT JOIN cb_jobs job ON job.message_id = message.id
+		LEFT JOIN cb_job_results result ON result.message_id = message.id
 		WHERE message.id = $1 AND NOT message.stream
-	`, id).Scan(&name, &status.Attempts, &text)
-	if errors.Is(err, pgx.ErrNoRows) {
+	`, id).Scan(&name, &jobType, &status.Attempts, &text,
+		&status.CreatedAt, &endedAt, &status.Payload, &status.Output)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && name == nil) {
+		// No message, or a message whose result GC has deleted and whose
+		// message it is about to: the job is gone either way.
 		return JobStatus{}, ErrNotFound
 	}
 	if err != nil {
 		return JobStatus{}, err
 	}
+	status.Type = *jobType
 	if text != nil {
-		status.LastError = *text
+		status.Error = *text
+	}
+	if endedAt != nil {
+		status.EndedAt = *endedAt
 	}
 	for i, n := range stateNames {
-		if n == name {
+		if n == *name {
 			status.State = State(i)
 			return status, nil
 		}
 	}
-	return JobStatus{}, fmt.Errorf("catbird: unknown job state %q", name)
+	return JobStatus{}, fmt.Errorf("catbird: unknown job state %q", *name)
 }
 
 // JobGroupStatus is what GroupStatus reports of a whole workflow: its state,
-// which job to ask when it is dead, and every output its jobs recorded so far,
+// which job to ask when it failed, and every output its jobs recorded so far,
 // in the order the jobs that recorded them were created.
 //
-// DeadJobID is 0 unless the state is StateDead. It is the job whose failure is
-// recorded when there is one — a job that dies cancels the rest of its
-// workflow, and the jobs the cancel took carry no error to read — so Status on
-// it has the attempts and the error.
+// FailedJobID is 0 unless the state is StateFailed. It is the job whose failure
+// ended the workflow — a job that fails cancels the rest of its workflow, and
+// the jobs the cancel took have no failure to read — so Status on it has the
+// attempts and the error. When several jobs failed before the cancel reached
+// them, it is the first that did.
 type JobGroupStatus struct {
-	State     State
-	DeadJobID int64
-	Outputs   Outputs
+	State       State
+	FailedJobID int64
+	Outputs     Outputs
 }
 
 // GroupStatus reports what a workflow is doing: StateRunning while jobs
-// remain, StateDead once any job died, StateCompleted when every job
-// completed. The outputs ride the same statement, so polling and reading the
-// result is one call.
+// remain, StateFailed once any job failed, StateCanceled when Cancel stopped
+// it and no job had failed, StateCompleted when every job completed. The
+// outputs ride the same statement, so polling and reading the outputs is one
+// call.
 //
 // This is the read for the caller that holds only the id Enqueue returned:
 // handlers decide the fan-out as they run, so that caller cannot name the
-// workflow's jobs, and a job that died runs nothing and publishes nothing —
-// only its row shows it. Like StateCompleted, the completed answer lasts as
-// long as the starting job's message: after GC the workflow returns
-// ErrNotFound.
+// workflow's jobs, and a job that failed runs nothing and publishes nothing —
+// only its result shows it. A workflow is inspectable for retention after its
+// last job ended: GC deletes the results as they age out, the starting job's
+// first, and once every result is gone the workflow returns ErrNotFound.
 func GroupStatus(ctx context.Context, db Conn, groupID int64) (JobGroupStatus, error) {
 	var name *string
 	var status JobGroupStatus
 	var outputs []byte
 	err := db.QueryRow(ctx, `
 		WITH job AS (
-		    SELECT message_id, died_at, last_error
-		    FROM cb_jobs WHERE group_id = $1 OR message_id = $1
+		    SELECT message_id FROM cb_jobs WHERE group_id = $1 OR message_id = $1
+		),
+		result AS (
+		    SELECT message_id, job_type, state, ended_at, output
+		    FROM cb_job_results WHERE group_id = $1 OR message_id = $1
 		)
 		SELECT CASE
-		           WHEN EXISTS (SELECT 1 FROM job WHERE died_at IS NOT NULL) THEN 'dead'
+		           WHEN EXISTS (SELECT 1 FROM result WHERE state = 'failed') THEN 'failed'
+		           WHEN EXISTS (SELECT 1 FROM result WHERE state = 'canceled') THEN 'canceled'
 		           WHEN EXISTS (SELECT 1 FROM job) THEN 'running'
-		           WHEN EXISTS (SELECT 1 FROM cb_messages WHERE id = $1 AND NOT stream) THEN 'completed'
+		           WHEN EXISTS (SELECT 1 FROM result) THEN 'completed'
 		       END,
-		       -- The job whose failure is recorded sorts before the jobs Cancel
-		       -- took with it, which carry no error.
-		       coalesce((SELECT message_id FROM job WHERE died_at IS NOT NULL
-		                 ORDER BY last_error IS NULL, died_at, message_id LIMIT 1), 0),
+		       coalesce((SELECT message_id FROM result WHERE state = 'failed'
+		                 ORDER BY ended_at, message_id LIMIT 1), 0),
 		       (SELECT coalesce(jsonb_agg(jsonb_build_object(
-		                   'job_id', result.message_id,
-		                   'job_type', result.job_type,
-		                   'value', result.output) ORDER BY result.message_id), '[]')
-		        FROM cb_job_outputs result WHERE result.group_id = $1)
-	`, groupID).Scan(&name, &status.DeadJobID, &outputs)
+		                   'job_id', message_id,
+		                   'job_type', job_type,
+		                   'value', output) ORDER BY message_id), '[]')
+		        FROM result WHERE output IS NOT NULL)
+	`, groupID).Scan(&name, &status.FailedJobID, &outputs)
 	if err != nil {
 		return JobGroupStatus{}, err
 	}
@@ -895,15 +943,16 @@ type QueueInfo struct {
 	WaitingToRetry   int
 	WaitingForSignal int
 	WaitingForJobs   int
-	Dead             int // dead jobs GC has not collected yet
+	Failed           int // failed jobs GC has not collected yet
 	LongestQueued    time.Duration
 }
 
 // Queues reports what every queue is doing: one QueueInfo per queue that has
-// live jobs, in name order. Completed jobs have no row, so a drained queue does
-// not appear; a caller exporting a fixed set of queues merges in the ones it
-// declared. It walks every job row — a table this design keeps small — so it
-// is a read to poll on an interval, not a hot-path statement.
+// live jobs or failed ones GC has not collected, in name order. A queue whose
+// every job completed or was canceled does not appear; a caller exporting a
+// fixed set of queues merges in the ones it declared. It walks every job row —
+// a table this design keeps small — and the failed results through their own
+// index, so it is a read to poll on an interval, not a hot-path statement.
 func Queues(ctx context.Context, db Conn) ([]QueueInfo, error) {
 	rows, err := db.Query(ctx, `
 		SELECT queue,
@@ -913,13 +962,16 @@ func Queues(ctx context.Context, db Conn) ([]QueueInfo, error) {
 		       count(*) FILTER (WHERE state = 'waiting to retry'),
 		       count(*) FILTER (WHERE state = 'waiting for signal'),
 		       count(*) FILTER (WHERE state = 'waiting for jobs'),
-		       count(*) FILTER (WHERE state = 'dead'),
+		       count(*) FILTER (WHERE state = 'failed'),
 		       coalesce(extract(epoch FROM now() - min(claimable_at) FILTER (WHERE state = 'queued')), 0)::float8
 		FROM (
 		    SELECT job.queue, job.claimable_at,
 		           CASE`+stateCaseSQL+`
 		           END AS state
 		    FROM cb_jobs job
+		    UNION ALL
+		    SELECT result.queue, NULL, result.state
+		    FROM cb_job_results result WHERE result.state = 'failed'
 		) job
 		GROUP BY queue
 		ORDER BY queue
@@ -933,7 +985,7 @@ func Queues(ctx context.Context, db Conn) ([]QueueInfo, error) {
 		var q QueueInfo
 		var age float64
 		if err := rows.Scan(&q.Queue, &q.Queued, &q.Scheduled, &q.Running,
-			&q.WaitingToRetry, &q.WaitingForSignal, &q.WaitingForJobs, &q.Dead, &age); err != nil {
+			&q.WaitingToRetry, &q.WaitingForSignal, &q.WaitingForJobs, &q.Failed, &age); err != nil {
 			return nil, err
 		}
 		q.LongestQueued = time.Duration(age * float64(time.Second))
@@ -942,21 +994,27 @@ func Queues(ctx context.Context, db Conn) ([]QueueInfo, error) {
 	return queues, rows.Err()
 }
 
-// GC deletes jobs dead longer than retention and messages older than
-// retention. A message whose job row is still here is kept, however old it is.
-// Results go with their message.
+// GC deletes the results of jobs that ended longer than retention ago, and
+// then the messages older than retention that no job row and no result refers
+// to: published messages, and the messages of the jobs whose results just
+// went. A message whose job is still live is kept, however old it is.
+//
+// Retention runs from when a job ended, not from when it was created, so a job
+// that waited a month for a signal can be inspected for the whole retention
+// after it finished rather than for what was left of it.
 func GC(ctx context.Context, db Conn, retention time.Duration) error {
 	_, err := db.Exec(ctx, `
-		DELETE FROM cb_jobs
-		WHERE died_at < now() - $1::interval
+		DELETE FROM cb_job_results
+		WHERE ended_at < now() - $1::interval
 	`, retention)
 	if err != nil {
 		return err
 	}
 	_, err = db.Exec(ctx, `
-		DELETE FROM cb_messages m
+		DELETE FROM cb_messages message
 		WHERE created_at < now() - $1::interval
-		  AND NOT EXISTS (SELECT 1 FROM cb_jobs job WHERE job.message_id = m.id)
+		  AND NOT EXISTS (SELECT 1 FROM cb_jobs job WHERE job.message_id = message.id)
+		  AND NOT EXISTS (SELECT 1 FROM cb_job_results result WHERE result.message_id = message.id)
 	`, retention)
 	return err
 }

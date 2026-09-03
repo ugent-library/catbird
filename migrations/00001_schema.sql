@@ -49,13 +49,16 @@ CREATE TABLE cb_cursors (
     claimable_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity'
 ) WITH (fillfactor = 90);
 
--- One row per job that still has to run. Deleted when the job completes.
--- claimable_at is when a worker may next take the job: the start time of a
--- delayed job, the end of a retry's backoff, and on a claimed job the claim
--- deadline, past which any worker may claim it again.
+-- One row per job that still has to run. The statement that ends the job —
+-- completion, the last failed attempt, or Cancel — deletes the row and writes
+-- the job's result to cb_job_results below, so what a job is doing is here and
+-- how it ended is there, never both. claimable_at is when a worker may next
+-- take the job: the start time of a delayed job, the end of a retry's backoff,
+-- and on a claimed job the claim deadline, past which any worker may claim it
+-- again.
 --
--- Columns run widest first so the fixed-width ones pack without padding: 74
--- bytes a row instead of 78. Grouping them by role costs those 4 bytes on every
+-- Columns run widest first so the fixed-width ones pack without padding: 72
+-- bytes a row instead of 75. Grouping them by role costs those 3 bytes on every
 -- claim and retry, so the comments carry the grouping.
 CREATE TABLE cb_jobs (
     message_id BIGINT PRIMARY KEY REFERENCES cb_messages (id) ON DELETE CASCADE,
@@ -66,12 +69,6 @@ CREATE TABLE cb_jobs (
     -- coalesce(group_id, message_id).
     group_id BIGINT,
     claimable_at TIMESTAMPTZ NOT NULL,
-    -- When the job died: it failed permanently or Cancel stopped it, and no
-    -- worker claims it again. NULL while the job lives. GC's age test runs from
-    -- it; reusing claimable_at for that would never collect a canceled gated job,
-    -- which sits on 'infinity'. Not a state machine: what a job is doing is
-    -- stored nowhere, Status derives it from the columns here.
-    died_at TIMESTAMPTZ,
     -- Incremented on claim, and every write matches on it, so an attempt that
     -- lost its claim writes nothing.
     attempts SMALLINT NOT NULL DEFAULT 0,
@@ -98,49 +95,71 @@ CREATE TABLE cb_jobs (
     -- What the last failed attempt returned, cut to 256 characters. The claim
     -- clears it, so text means the job is waiting to retry and no text means an
     -- attempt is running; both are otherwise a live job with claimable_at in the
-    -- future. Not a run history: the next failure overwrites it and completion
-    -- deletes the row. A job that never failed pays nothing, and 256 characters
-    -- put the tuple at 336 bytes against 74 empty. Past about 1.9 kB every
-    -- failed attempt would compress the text and write it to a toast table.
-    last_error TEXT
+    -- future. Not a run history: the next failure overwrites it, and the
+    -- statement that ends the job copies the last one to cb_job_results. A job
+    -- that never failed pays nothing, and 256 characters put the tuple at 332
+    -- bytes against 72 empty. Past about 1.9 kB every failed attempt would
+    -- compress the text and write it to a toast table.
+    error TEXT
 ) WITH (
     -- This table is small and rewritten constantly; vacuum it when 1% of it changed.
     autovacuum_vacuum_scale_factor = 0.01,
     autovacuum_analyze_scale_factor = 0.01
 );
--- Only claimable rows are in the index; dead and waiting rows leave it on their
--- own, and a job waiting for a signal sits at the far end on 'infinity' where
+-- Only claimable rows are in the index; a job waiting for other jobs stays out
+-- of it, and a job waiting for a signal sits at the far end on 'infinity' where
 -- the claim's LIMIT never reaches it. The claim filters job_type on the heap,
 -- so ready jobs of a type no running process handles are walked by every claim
 -- on their queue: 1015 buffers and 7.2 ms per claim of 50 at 100k such rows,
 -- against 102 and 0.03 ms with none. A job type whose consumer runs
 -- occasionally, or can be down for a while, gets a queue of its own: the queue
 -- leads this index, so its backlog sits in a range no other claim scans.
-CREATE INDEX cb_jobs_ready_idx ON cb_jobs (queue, claimable_at) WHERE died_at IS NULL AND dependencies = 0;
+CREATE INDEX cb_jobs_ready_idx ON cb_jobs (queue, claimable_at) WHERE dependencies = 0;
 -- What Cancel, Signal and GroupStatus probe. A worker cancels the group of
--- every job that dies in one, so without this a downstream outage runs one
--- full scan of cb_jobs per dead job: 834 buffers and 4.9 ms at 100k live
+-- every job that fails in one, so without this a downstream outage runs one
+-- full scan of cb_jobs per failed job: 834 buffers and 4.9 ms at 100k live
 -- jobs, against 6 buffers here. Jobs outside a workflow stay out of a
 -- structure that can never match them: 112 kB against 2128 kB with 1% of jobs
--- grouped. Dead jobs stay in it so GroupStatus can count them; they are few,
--- and they leave with GC.
+-- grouped.
 CREATE INDEX cb_jobs_group_idx ON cb_jobs (group_id) WHERE group_id IS NOT NULL;
 
--- Optional result of a job. The handler records it with SetOutput and the
--- completion writes it here, so a result cannot outlive an attempt that never
--- finished. group_id and job_type are copied from the job row, which is deleted
--- by the same statement: a later job of the same workflow reads an earlier
--- one's result by what it was, not by an id it cannot know.
-CREATE TABLE cb_job_outputs (
+-- One row per job that ended, and how it ended: it completed, it failed
+-- because its last attempt failed, or Cancel stopped it. The statement that
+-- deletes the cb_jobs row writes it, so a result cannot outlive an attempt
+-- that never finished, and a job is never in both tables. Status and
+-- GroupStatus read it for a job that is no longer live, and GC deletes it
+-- retention after ended_at, so how long a job took does not shorten how long
+-- it can be inspected. History beyond retention is the application's own
+-- table. Written once and read by inspection, so its width is not the
+-- concern it is on cb_jobs; the columns still run widest first.
+CREATE TABLE cb_job_results (
     message_id BIGINT PRIMARY KEY REFERENCES cb_messages (id) ON DELETE CASCADE,
-    group_id BIGINT NOT NULL,
+    -- As on cb_jobs: NULL for a job that started a workflow or stands alone.
+    group_id BIGINT,
+    ended_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    attempts SMALLINT NOT NULL, -- how many the job spent
+    -- How the job ended: 'completed', 'failed' or 'canceled', the words Status
+    -- reports. Stored, where a live job's state is derived, because nothing
+    -- about a job that ended changes with time.
+    state TEXT NOT NULL,
+    queue TEXT NOT NULL,
     job_type TEXT NOT NULL,
+    -- What the last failed attempt returned, cut to 256 characters, as on
+    -- cb_jobs. On a failed job it is the error that ended it; a canceled job
+    -- keeps the one it was retrying on, if any. NULL when no attempt failed.
+    error TEXT,
+    -- What the handler recorded with SetOutput. NULL on a job that recorded
+    -- nothing and on every job that did not complete.
     output JSONB
 );
-CREATE INDEX cb_job_outputs_group_idx ON cb_job_outputs (group_id, job_type);
+-- What GroupStatus probes for a workflow's outcome and outputs. Jobs outside a
+-- workflow stay out of it, as on cb_jobs.
+CREATE INDEX cb_job_results_group_idx ON cb_job_results (group_id) WHERE group_id IS NOT NULL;
+-- What Queues counts failed jobs from. Failed jobs are few; the table is not.
+CREATE INDEX cb_job_results_failed_idx ON cb_job_results (queue) WHERE state = 'failed';
 
 -- +goose down
-DROP TABLE cb_job_outputs;
+DROP TABLE cb_job_results;
 DROP TABLE cb_jobs;
 DROP TABLE cb_cursors;
 DROP TABLE cb_messages;
