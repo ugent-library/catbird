@@ -85,7 +85,7 @@ Poll `Queues` for queue depth, state counts, failed jobs, and the age of the old
 
 Read `Status` for one job and `GroupStatus` for a workflow. Both answer from the moment a job is enqueued until a retention period after it ended, and a job that ended reports how: its type, payload, attempts, the error that ended it, when it was created and ended, and the output it recorded. An application that hands a job id to a browser checks `Type` on the way back, so a URL for one kind of run cannot read another. Catbird keeps one result per job and no history of its attempts; a record that must outlive retention is the application's own table, written in the same transaction as `Enqueue` and completed in the same transaction as `Complete`.
 
-Run `GC` on an application schedule. It removes the results of jobs that ended longer than the retention period ago, then removes old messages that no live job and no result refers to. It does not run automatically.
+Set `Options.Retention` and the runtime runs `GC` itself: once at start and then hourly, in every process, with one process at a time doing the deleting. `GC` removes the results of jobs that ended longer than the retention period ago, then removes old messages that no live job and no result refers to. `Retention` is not stored, so processes that disagree give the database the shorter one. Retention has to outlast the longest wait inside a workflow, because a job that waits longer than that for a dependency finds no output for it. An application that leaves `Retention` zero calls `GC` on its own schedule.
 
 ## Use wire behind application authentication
 

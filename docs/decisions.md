@@ -73,3 +73,11 @@ This document records the current boundaries of Catbird. Revisit a decision when
 **Why:** A second uniqueness model complicates the busiest statements and can lose a wake-up for a change that arrives during a running job.
 
 **Revisit when:** An expensive, non-idempotent job needs at-most-one live run and the application cannot cheaply reject a duplicate.
+
+## The runtime runs GC, and GC is not a job
+
+**Decision:** A runtime with `Options.Retention` set runs `GC` hourly in every process, one run at a time behind a try-lock. GC is a loop beside the assigner, not a scheduled job type.
+
+**Why:** Nothing else schedules GC, forgetting it is silent growth, and every application would write the same loop. A job would put a catbird-owned queue in the application's namespace and write rows into the tables GC exists to empty.
+
+**Revisit when:** An application needs GC on a schedule the hourly interval cannot express, or needs to see GC runs where it sees its own jobs.

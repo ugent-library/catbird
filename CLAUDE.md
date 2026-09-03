@@ -79,9 +79,10 @@ Eight files and one migration in the root package, and one package under it:
   either; the status objects `JobStatus` and `JobGroupStatus`, which share the
   one `State` enum, and `QueueInfo`, the per-queue counts `Queues` returns; and `Outputs`, recorded results as rows that unmarshal into
   the caller's types with `Scan`, `Get` and `GetAll`.
-- `runtime.go` — `New`, `Handle`, `HandleFunc`, `Start`, and the two loops every process runs
+- `runtime.go` — `New`, `Handle`, `HandleFunc`, `Start`, the two loops every process runs
   whether or not anything is registered: the position assigner and the one
-  `LISTEN` connection that wakes the rest. One `Runtime` per process owns the
+  `LISTEN` connection that wakes the rest, and the GC loop a process with
+  `Options.Retention` set runs beside them. One `Runtime` per process owns the
   pool and one goroutine per queue, trigger and consumer.
 - `worker.go` — the claim loop, dispatch by job type, completion, retries,
   `OnFailed`, and the claim renewal a queue with `HandlerTimeout` above `ClaimDuration` runs.
@@ -201,8 +202,13 @@ client exists.
 - Retention runs from when a job ended. `GC` deletes results by
   `cb_job_results.ended_at` and then the messages no job row and no result
   refers to, so a job that took a month to run is inspectable for as long
-  after it ended as one that took a second. History beyond retention, and
-  anything per attempt, is the application's own table.
+  after it ended as one that took a second. Both deletes go by an index on
+  that column, so a run that finds nothing reads a few pages. A runtime with
+  `Options.Retention` set runs `GC` once at start and then hourly, in every
+  process, behind `pg_try_advisory_xact_lock` in one transaction so runs never
+  overlap; `Retention` is not stored, so processes that disagree give the
+  database the shorter one. History beyond retention, and anything per
+  attempt, is the application's own table.
 - `cb_jobs` declares its columns widest first, so the fixed-width ones pack
   with no padding between them: 72 bytes against 75, on the row every claim and
   retry rewrites. A column added in the middle by role rather than by width
@@ -253,8 +259,10 @@ client exists.
   queue that set both. The handler belongs to
   neither: it is the process's, and `rt.Handle(jobType, handler)` is where the
   two meet.
-- Hot-path SQL takes no joins, no advisory locks (the assigner's is the one
-  exception), and no N+1 loops.
+- Hot-path SQL takes no joins, no advisory locks, and no N+1 loops. Advisory
+  locks belong to the loops that let one process do a run while the rest skip
+  — the assigner's (key 1) and GC's (key 4) — and to the migration runner
+  (key 3), all under `hashtext('catbird')`; key 2 is the test binaries'.
 - The unique indexes on `deduplication_key` and `position` are partial. Deduplicating
   inserts must name the predicate — `ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING`
   — or they stop matching the index.

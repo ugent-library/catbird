@@ -859,6 +859,49 @@ func TestGCKeepsLiveClaims(t *testing.T) {
 	}
 }
 
+// A runtime with Retention set runs GC on Start; one without leaves the rows
+// to the application.
+func TestRuntimeRunsGC(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	q := catbird.NewQueue("gcq", catbird.QueueOptions{})
+	doomed := catbird.NewJobType("doomed", q, catbird.JobTypeOptions{})
+
+	doomedID, err := catbird.Enqueue(ctx, pool, doomed, nil, catbird.EnqueueOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catbird.Cancel(ctx, pool, doomedID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catbird.Publish(ctx, pool, "event", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	idleCtx, stopIdle := context.WithCancel(ctx)
+	idle := catbird.New(pool, catbird.Options{})
+	idleDone := make(chan struct{})
+	go func() { idle.Start(idleCtx); close(idleDone) }()
+	time.Sleep(50 * time.Millisecond)
+	if n := count(t, pool, "SELECT count(*) FROM cb_job_results"); n != 1 {
+		t.Fatalf("a runtime without Retention collected the result")
+	}
+	stopIdle()
+	<-idleDone
+
+	gcCtx, stopGC := context.WithCancel(ctx)
+	rt := catbird.New(pool, catbird.Options{Retention: 10 * time.Millisecond})
+	done := make(chan struct{})
+	go func() { rt.Start(gcCtx); close(done) }()
+	waitFor(t, 5*time.Second, "runtime did not collect the ended job and the old message", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_job_results") == 0 &&
+			count(t, pool, "SELECT count(*) FROM cb_messages") == 0
+	})
+	stopGC()
+	<-done
+}
+
 // Retention runs from when the job ended, not from when it was created: a job
 // that lived a long time is inspectable for the whole retention after it
 // ended. Measured from created_at, this job's result and message would go in

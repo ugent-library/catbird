@@ -15,7 +15,14 @@ import (
 type Options struct {
 	AssignEvery    time.Duration // how often the position assigner runs; default 250 milliseconds
 	ReconnectAfter time.Duration // wait before reconnecting a dropped LISTEN connection; default 5 seconds
-	Logger         *slog.Logger  // default slog.Default()
+	// How long a job's result, and the messages no job refers to any more, are
+	// kept after the job ended. Set, Start runs GC with it: once at start and
+	// then every hour, in every process, with one process at a time doing the
+	// deleting. Zero, the default, runs no GC; the application calls GC on its
+	// own schedule. Not stored: two processes that disagree give the database
+	// the shorter one.
+	Retention time.Duration
+	Logger    *slog.Logger // default slog.Default()
 }
 
 func (o Options) withDefaults() Options {
@@ -32,7 +39,8 @@ func (o Options) withDefaults() Options {
 }
 
 // Runtime is a process's catbird: the pool, one LISTEN connection, the position
-// assigner, and every job type and trigger registered on it. Register them with
+// assigner, the GC loop when Retention is set, and every job type and trigger
+// registered on it. Register them with
 // Handle and Trigger, then call Start. The statements a caller runs — Enqueue,
 // Publish, Complete, the stream reads and the rest — are package functions and
 // need no runtime: they work on any connection or transaction.
@@ -113,7 +121,7 @@ func (r *Runtime) HandleFunc(t *JobType, handle func(ctx context.Context, job *J
 
 // Start runs everything declared on the runtime until ctx is canceled, then
 // waits for all of it to stop: the LISTEN connection, the position assigner,
-// and one goroutine per worker and trigger.
+// the GC loop when Retention is set, and one goroutine per worker and trigger.
 func (r *Runtime) Start(ctx context.Context) {
 	r.mu.Lock()
 	r.started = true
@@ -123,6 +131,9 @@ func (r *Runtime) Start(ctx context.Context) {
 	var wg sync.WaitGroup
 	wg.Go(func() { assignPositions(ctx, r.pool, r.opts) })
 	wg.Go(func() { r.listen(ctx, channels) })
+	if r.opts.Retention > 0 {
+		wg.Go(func() { collectGarbage(ctx, r.pool, r.opts) })
+	}
 	for _, loop := range loops {
 		wg.Go(func() { loop(ctx) })
 	}
@@ -214,6 +225,56 @@ func assignPositionBatch(ctx context.Context, pool *pgxpool.Pool) (int, error) {
 		SELECT coalesce((SELECT positions FROM announcement), 0)
 	`, assignBatchSize).Scan(&assigned)
 	return assigned, err
+}
+
+// gcEvery is how often a process with Retention set runs GC. Both deletes are
+// index range scans from the old end of their table, so a run that finds
+// nothing reads a few pages, and the interval decides how promptly rows go
+// rather than what a run costs.
+const gcEvery = time.Hour
+
+// collectGarbage runs GC once at start and then every gcEvery until ctx is
+// canceled. Every process runs the loop, and one run at a time does the work:
+// a run takes advisory lock 4 under catbird's namespace for its transaction
+// and skips when another run holds it. A skipped run is not a lost one, since
+// whatever it would have deleted is still there for the next. GC deletes
+// nothing wrong when two runs overlap, but two runs deleting the same rows can
+// lock them in a different order and one is aborted with a deadlock; the lock
+// keeps that from happening.
+func collectGarbage(ctx context.Context, pool *pgxpool.Pool, opts Options) {
+	ticker := time.NewTicker(gcEvery)
+	defer ticker.Stop()
+	for {
+		if err := collectGarbageOnce(ctx, pool, opts.Retention); err != nil && ctx.Err() == nil {
+			opts.Logger.Error("catbird: GC failed", "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// collectGarbageOnce runs GC in one transaction behind the advisory lock, and
+// does nothing when another process holds it.
+func collectGarbageOnce(ctx context.Context, pool *pgxpool.Pool, retention time.Duration) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var held bool
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtext('catbird'), 4)`).Scan(&held); err != nil {
+		return err
+	}
+	if !held {
+		return nil
+	}
+	if err := GC(ctx, tx, retention); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // declare registers a loop for Start to run, and the channel its wake-ups come

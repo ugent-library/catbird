@@ -422,7 +422,7 @@ func main() {
 - Deliver signal payload: `Signal`
 - Cancel live jobs in a workflow: `Cancel`
 - Read status: `Status`, `GroupStatus`, `Queues`
-- Collect old rows: `GC`
+- Collect old rows: `GC`, or set `Options.Retention` and the runtime runs it hourly
 
 ### Stream operations
 

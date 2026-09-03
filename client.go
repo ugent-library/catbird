@@ -1001,7 +1001,13 @@ func Queues(ctx context.Context, db Conn) ([]QueueInfo, error) {
 //
 // Retention runs from when a job ended, not from when it was created, so a job
 // that waited a month for a signal can be inspected for the whole retention
-// after it finished rather than for what was left of it.
+// after it finished rather than for what was left of it. It has to outlast
+// the longest wait inside a workflow: a job that waits longer than retention
+// for a dependency that already ended finds no output for it.
+//
+// A runtime with Options.Retention set runs GC itself, hourly. An application
+// that leaves it zero calls GC on its own schedule; it is safe to run from
+// several places at once.
 func GC(ctx context.Context, db Conn, retention time.Duration) error {
 	_, err := db.Exec(ctx, `
 		DELETE FROM cb_job_results

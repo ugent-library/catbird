@@ -33,6 +33,13 @@ CREATE UNIQUE INDEX cb_messages_deduplication_key_idx ON cb_messages (deduplicat
 CREATE INDEX cb_messages_topic_position_idx ON cb_messages (topic text_pattern_ops, position) WHERE position IS NOT NULL;
 -- The assigner's work list: published messages that have no position yet.
 CREATE INDEX cb_messages_unassigned_idx ON cb_messages (id) WHERE stream AND position IS NULL;
+-- What GC deletes by. Without it every GC run reads the whole table to find
+-- the rows old enough to go, 5,200 buffers per 300k messages when none are;
+-- with it a run reads the rows it deletes and an empty run reads three pages.
+-- One more entry per message written, and one more on the assigner's position
+-- update, which already rewrites every index entry because position is
+-- indexed.
+CREATE INDEX cb_messages_created_at_idx ON cb_messages (created_at);
 
 -- One row per stream consumer: the highest position it has processed.
 CREATE TABLE cb_cursors (
@@ -157,6 +164,10 @@ CREATE TABLE cb_job_results (
 CREATE INDEX cb_job_results_group_idx ON cb_job_results (group_id) WHERE group_id IS NOT NULL;
 -- What Queues counts failed jobs from. Failed jobs are few; the table is not.
 CREATE INDEX cb_job_results_failed_idx ON cb_job_results (queue) WHERE state = 'failed';
+-- What GC deletes by, as cb_messages_created_at_idx is on cb_messages: 2,500
+-- buffers per 300k results to find nothing without it, two pages with it. One
+-- more entry per job that ends, on a row written once.
+CREATE INDEX cb_job_results_ended_at_idx ON cb_job_results (ended_at);
 
 -- +goose down
 DROP TABLE cb_job_results;

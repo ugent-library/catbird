@@ -10,7 +10,7 @@ The package separates declarations, process machinery, and database operations.
 
 - A `Queue` names the work that competes for the same worker slots. Its settings are `BatchSize`, `ClaimDuration`, `HandlerTimeout`, and `PollInterval`.
 - A `JobType` names a kind of work and its retry policy. Its settings include `Signal`, `Schedule`, backoff, `MaxAttempts`, and `OnFailed`.
-- A `Runtime` belongs to one process. It owns the PostgreSQL pool, one `LISTEN` connection, the stream position assigner, and the workers, periodic loops, triggers, and consumers registered in that process.
+- A `Runtime` belongs to one process. It owns the PostgreSQL pool, one `LISTEN` connection, the stream position assigner, the GC loop when `Retention` is set, and the workers, periodic loops, triggers, and consumers registered in that process.
 - Package functions such as `Enqueue`, `Complete`, `Publish`, and `Status` hold no state. They accept a pool, connection, or transaction.
 
 Queue and job-type declarations are plain Go values. They are not stored in the database; only their names are written to job rows. A process claims only the job types it registered.
@@ -53,7 +53,7 @@ A job type with `Signal: true` is a gate. It waits until `Signal` supplies a pay
 
 ## Inspection and retention
 
-A job is inspectable through `Status` from the moment it is enqueued until a retention period after it ended: while it lives, from its `cb_jobs` row; once it ended, from its result. `GroupStatus` reads a workflow the same way. `GC` deletes results by when the job ended and then the messages no row refers to, so how long a job took does not shorten how long it can be inspected. A record that must outlive retention, or hold more than Catbird writes, is the application's own table.
+A job is inspectable through `Status` from the moment it is enqueued until a retention period after it ended: while it lives, from its `cb_jobs` row; once it ended, from its result. `GroupStatus` reads a workflow the same way. `GC` deletes results by when the job ended and then the messages no row refers to, so how long a job took does not shorten how long it can be inspected. A runtime with `Retention` set runs it hourly in every process; a try-lock lets one run at a time do the deleting and the others skip. Both deletes are index range scans from the old end of their table, so a run that finds nothing reads a few pages. A record that must outlive retention, or hold more than Catbird writes, is the application's own table.
 
 ## Streams
 
