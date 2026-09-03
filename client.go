@@ -286,7 +286,10 @@ func (c Cursor) Read(ctx context.Context, db Conn, limit int) ([]Message, error)
 }
 
 // Ack moves the cursor to position. The cursor never moves backwards, so a
-// batch acked out of order cannot undo the progress of a later one.
+// batch acked out of order cannot undo the progress of a later one. Ack takes
+// no claim on the cursor: it is for a reader that runs in one place, like
+// wire's poll. A consumer that several processes run is Runtime.Consume, which
+// claims the cursor before it reads.
 func (c Cursor) Ack(ctx context.Context, db Conn, position int64) error {
 	_, err := db.Exec(ctx, `
 		INSERT INTO cb_cursors (name, last_position) VALUES ($1, $2)

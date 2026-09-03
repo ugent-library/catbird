@@ -94,22 +94,29 @@ func (o QueueOptions) withDefaults() QueueOptions {
 	if o.PollInterval <= 0 {
 		o.PollInterval = 5 * time.Second
 	}
-	// The two durations default from each other. With only HandlerTimeout set,
-	// the claim covers the handler and the completion's few seconds after it:
-	// nothing renews, and a crashed worker's job is claimed again as soon as
-	// its handler could no longer be running.
-	if o.ClaimDuration <= 0 && o.HandlerTimeout > 0 {
-		o.ClaimDuration = o.HandlerTimeout + afterHandlerTimeout
-	}
-	if o.ClaimDuration <= 0 {
-		o.ClaimDuration = 5 * time.Minute
-	}
-	if o.HandlerTimeout <= 0 {
-		// Room for the completion inside the claim, and never less than half of
-		// it, so a short claim still leaves the handler most of its time.
-		o.HandlerTimeout = max(o.ClaimDuration-afterHandlerTimeout, o.ClaimDuration/2)
-	}
+	o.ClaimDuration, o.HandlerTimeout = defaultDurations(o.ClaimDuration, o.HandlerTimeout)
 	return o
+}
+
+// defaultDurations fills in whichever of ClaimDuration and HandlerTimeout is
+// unset from the other, the same way for a queue and for a consumer. With only
+// HandlerTimeout set, the claim covers the handler and the few seconds the
+// completion or the ack needs after it: nothing renews, and a crashed process's
+// work is claimed again as soon as its handler could no longer be running.
+// With only ClaimDuration set, the handler gets the claim minus those seconds,
+// and never less than half the claim, so a short claim still leaves it most of
+// its time. With neither, the claim is five minutes.
+func defaultDurations(claim, handler time.Duration) (time.Duration, time.Duration) {
+	if claim <= 0 && handler > 0 {
+		claim = handler + afterHandlerTimeout
+	}
+	if claim <= 0 {
+		claim = 5 * time.Minute
+	}
+	if handler <= 0 {
+		handler = max(claim-afterHandlerTimeout, claim/2)
+	}
+	return claim, handler
 }
 
 // Queue is a name and how work runs under it: how many jobs run at once, how

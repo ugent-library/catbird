@@ -37,7 +37,15 @@ CREATE INDEX cb_messages_unassigned_idx ON cb_messages (id) WHERE stream AND pos
 -- One row per stream consumer: the highest position it has processed.
 CREATE TABLE cb_cursors (
     name TEXT PRIMARY KEY,
-    last_position BIGINT NOT NULL
+    last_position BIGINT NOT NULL,
+    -- Until when a Consume loop holds the cursor. While it is in the future one
+    -- process reads and acks under the cursor and the others wait, so a batch
+    -- runs in one process at a time; when it passes, another process takes the
+    -- cursor over. The ack matches on the value the claim returned, so a
+    -- process whose claim ran out during its handler moves nothing and releases
+    -- nothing. '-infinity' is free: a cursor that is only ever read and acked
+    -- directly, as wire's are, is never claimed.
+    claimed_until TIMESTAMPTZ NOT NULL DEFAULT '-infinity'
 ) WITH (fillfactor = 90);
 
 -- One row per job that still has to run. Deleted when the job completes.
