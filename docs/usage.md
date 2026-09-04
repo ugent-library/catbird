@@ -17,11 +17,7 @@ func init() {
 const catbirdVersion = 1
 
 func addCatbirdUp(ctx context.Context, tx *sql.Tx) error {
-	migrations, err := catbird.Migrations()
-	if err != nil {
-		return err
-	}
-	for _, m := range migrations {
+	for _, m := range catbird.Migrations() {
 		if m.Version > catbirdVersion {
 			break
 		}
@@ -33,10 +29,7 @@ func addCatbirdUp(ctx context.Context, tx *sql.Tx) error {
 }
 
 func addCatbirdDown(ctx context.Context, tx *sql.Tx) error {
-	migrations, err := catbird.Migrations()
-	if err != nil {
-		return err
-	}
+	migrations := catbird.Migrations()
 	for i := len(migrations) - 1; i >= 0; i-- {
 		if migrations[i].Version > catbirdVersion {
 			continue

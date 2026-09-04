@@ -107,8 +107,9 @@ Eight files and one migration in the root package, and one package under it:
   of their own. Each migration runs in its own transaction with its
   `cb_migrations` row; concurrency is an advisory lock (key 3 under
   `hashtext('catbird')`) plus the insert guard. A migration is two files,
-  `<number>_<name>.up.sql` and `<number>_<name>.down.sql`, each run whole;
-  `Migrations()` pairs them by version and refuses a version missing either.
+  `<number>_<name>.up.sql` and `<number>_<name>.down.sql`, each embedded
+  into a string and listed with its version in the `migrations` slice; a new
+  migration is the two files, two embed directives and one entry.
 - `migrations/00001_schema.up.sql` and `00001_schema.down.sql` — the whole
   schema, and the drops that undo it.
 - `wire/` — the browser layer, a package of its own so the core keeps no

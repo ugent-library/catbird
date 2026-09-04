@@ -2,32 +2,15 @@ package catbird
 
 import (
 	"context"
-	"embed"
+	_ "embed"
 	"fmt"
-	"io/fs"
-	"sort"
-	"strconv"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
 
-//go:embed migrations/*.sql
-var migrationsEmbedFS embed.FS
-
-// migrationsFS is the migration files as they sit on disk, one
-// <number>_<name>.up.sql and one <number>_<name>.down.sql per version.
-var migrationsFS fs.FS = func() fs.FS {
-	sub, err := fs.Sub(migrationsEmbedFS, "migrations")
-	if err != nil {
-		panic(err)
-	}
-	return sub
-}()
-
-// Migration is one schema change, parsed. A caller who runs a migration tool
-// of their own registers UpSQL and DownSQL with it instead of calling
-// MigrateUp; each is a plain script the tool executes whole.
+// Migration is one schema change. A caller who runs a migration tool of their
+// own executes UpSQL and DownSQL with it instead of calling MigrateUp; each is
+// a plain script the tool runs whole.
 type Migration struct {
 	Version int64
 	Name    string
@@ -35,78 +18,23 @@ type Migration struct {
 	DownSQL string
 }
 
-// Migrations returns every migration, sorted by version. Every version has
-// both files: a down that drops what its up created is what MigrateDownTo
-// runs, and a version missing one would only be found when a rollback needs
-// it.
-func Migrations() ([]Migration, error) {
-	entries, err := fs.ReadDir(migrationsFS, ".")
-	if err != nil {
-		return nil, fmt.Errorf("catbird: read migrations: %w", err)
-	}
-	byVersion := map[int64]*migrationFiles{}
-	for _, e := range entries {
-		if err := parseMigrationFile(e.Name(), byVersion); err != nil {
-			return nil, err
-		}
-	}
-	var migrations []Migration
-	for _, f := range byVersion {
-		if !f.hasUp {
-			return nil, fmt.Errorf("catbird: migration %d %s: no up file", f.Version, f.Name)
-		}
-		if !f.hasDown {
-			return nil, fmt.Errorf("catbird: migration %d %s: no down file", f.Version, f.Name)
-		}
-		migrations = append(migrations, f.Migration)
-	}
-	sort.Slice(migrations, func(i, j int) bool { return migrations[i].Version < migrations[j].Version })
-	return migrations, nil
+// Each migration is two files, <number>_<name>.up.sql and
+// <number>_<name>.down.sql, embedded here and listed in migrations below in
+// version order.
+
+//go:embed migrations/00001_schema.up.sql
+var schemaUpSQL string
+
+//go:embed migrations/00001_schema.down.sql
+var schemaDownSQL string
+
+var migrations = []Migration{
+	{Version: 1, Name: "schema", UpSQL: schemaUpSQL, DownSQL: schemaDownSQL},
 }
 
-// migrationFiles is a migration while its files are being read, with which of
-// the two have been seen.
-type migrationFiles struct {
-	Migration
-	hasUp, hasDown bool
-}
-
-// parseMigrationFile reads one file into the migration of its version,
-// creating it on the first file seen.
-func parseMigrationFile(filename string, byVersion map[int64]*migrationFiles) error {
-	malformed := fmt.Errorf("catbird: migration %s: file name is not <number>_<name>.up.sql or <number>_<name>.down.sql", filename)
-	stem, up := strings.CutSuffix(filename, ".up.sql")
-	if !up {
-		var down bool
-		if stem, down = strings.CutSuffix(filename, ".down.sql"); !down {
-			return malformed
-		}
-	}
-	number, name, ok := strings.Cut(stem, "_")
-	if !ok {
-		return malformed
-	}
-	version, err := strconv.ParseInt(number, 10, 64)
-	if err != nil {
-		return malformed
-	}
-	b, err := fs.ReadFile(migrationsFS, filename)
-	if err != nil {
-		return fmt.Errorf("catbird: migration %s: %w", filename, err)
-	}
-	f, seen := byVersion[version]
-	if !seen {
-		f = &migrationFiles{Migration: Migration{Version: version, Name: name}}
-		byVersion[version] = f
-	} else if f.Name != name {
-		return fmt.Errorf("catbird: migrations %d_%s and %s have the same version", version, f.Name, filename)
-	}
-	if up {
-		f.UpSQL, f.hasUp = string(b), true
-	} else {
-		f.DownSQL, f.hasDown = string(b), true
-	}
-	return nil
+// Migrations returns every migration in version order.
+func Migrations() []Migration {
+	return append([]Migration(nil), migrations...)
 }
 
 // TxBeginner is what the runner needs that Conn does not have: each migration
@@ -133,10 +61,6 @@ const createMigrationsTableSQL = `
 // the row and skips. Everything runs in a transaction, so a migration cannot
 // use CREATE INDEX CONCURRENTLY until the runner grows a marker for it.
 func MigrateUp(ctx context.Context, db TxBeginner) error {
-	migrations, err := Migrations()
-	if err != nil {
-		return err
-	}
 	for _, m := range migrations {
 		if err := migrateStep(ctx, db, m.UpSQL,
 			`INSERT INTO cb_migrations (version, name) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
@@ -150,10 +74,6 @@ func MigrateUp(ctx context.Context, db TxBeginner) error {
 // MigrateDownTo reverts every applied migration above version, newest first.
 // MigrateDownTo(ctx, db, 0) reverts everything.
 func MigrateDownTo(ctx context.Context, db TxBeginner, version int64) error {
-	migrations, err := Migrations()
-	if err != nil {
-		return err
-	}
 	for i := len(migrations) - 1; i >= 0; i-- {
 		m := migrations[i]
 		if m.Version <= version {
