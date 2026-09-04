@@ -106,11 +106,11 @@ Eight files and one migration in the root package, and one package under it:
   caller with goose, `Migrations()` (parsed up and down sections) for any
   other tool. Each migration runs in its own transaction with its
   `cb_migrations` row; concurrency is an advisory lock (key 3 under
-  `hashtext('catbird')`) plus the insert guard. The parser is `strings.Cut`
-  on the two markers, which works only while the schema has no PL/pgSQL.
-- `migrations/00001_schema.sql` — the whole schema. Goose markers, no goose
-  dependency; goose reads them as they stand (its comparison is
-  case-insensitive).
+  `hashtext('catbird')`) plus the insert guard. A migration is two files,
+  `<number>_<name>.up.sql` and `<number>_<name>.down.sql`, each run whole;
+  `Migrations()` pairs them by version and refuses a version missing either.
+- `migrations/00001_schema.up.sql` and `00001_schema.down.sql` — the whole
+  schema, and the drops that undo it.
 - `wire/` — the browser layer, a package of its own so the core keeps no
   `net/http`; `docs/architecture.md` and `docs/usage.md` describe its boundary.
   `renderer.go` holds

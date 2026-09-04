@@ -15,10 +15,8 @@ import (
 //go:embed migrations/*.sql
 var migrationsEmbedFS embed.FS
 
-// MigrationsFS is the migration files as they sit on disk:
-// <number>_<name>.sql with -- +goose up and -- +goose down markers, which
-// goose reads as they are. A caller who runs goose points a provider with its
-// own table name at this instead of calling MigrateUp.
+// MigrationsFS is the migration files as they sit on disk, one
+// <number>_<name>.up.sql and one <number>_<name>.down.sql per version.
 var MigrationsFS fs.FS = func() fs.FS {
 	sub, err := fs.Sub(migrationsEmbedFS, "migrations")
 	if err != nil {
@@ -29,8 +27,7 @@ var MigrationsFS fs.FS = func() fs.FS {
 
 // Migration is one schema change, parsed. A caller who runs a migration tool
 // of their own registers UpSQL and DownSQL with it instead of calling
-// MigrateUp; because the schema has no PL/pgSQL, each is plain statements any
-// tool can execute as one script.
+// MigrateUp; each is a plain script the tool executes whole.
 type Migration struct {
 	Version int64
 	Name    string
@@ -38,55 +35,78 @@ type Migration struct {
 	DownSQL string
 }
 
-// Migrations returns every migration, sorted by version.
+// Migrations returns every migration, sorted by version. Every version has
+// both files: a down that drops what its up created is what MigrateDownTo
+// runs, and a version missing one would only be found when a rollback needs
+// it.
 func Migrations() ([]Migration, error) {
 	entries, err := fs.ReadDir(MigrationsFS, ".")
 	if err != nil {
 		return nil, fmt.Errorf("catbird: read migrations: %w", err)
 	}
-	var migrations []Migration
+	byVersion := map[int64]*migrationFiles{}
 	for _, e := range entries {
-		m, err := parseMigration(e.Name())
-		if err != nil {
+		if err := parseMigrationFile(e.Name(), byVersion); err != nil {
 			return nil, err
 		}
-		migrations = append(migrations, m)
+	}
+	var migrations []Migration
+	for _, f := range byVersion {
+		if !f.hasUp {
+			return nil, fmt.Errorf("catbird: migration %d %s: no up file", f.Version, f.Name)
+		}
+		if !f.hasDown {
+			return nil, fmt.Errorf("catbird: migration %d %s: no down file", f.Version, f.Name)
+		}
+		migrations = append(migrations, f.Migration)
 	}
 	sort.Slice(migrations, func(i, j int) bool { return migrations[i].Version < migrations[j].Version })
-	for i := 1; i < len(migrations); i++ {
-		if migrations[i].Version == migrations[i-1].Version {
-			return nil, fmt.Errorf("catbird: migrations %s and %s have the same version", migrations[i-1].Name, migrations[i].Name)
-		}
-	}
 	return migrations, nil
 }
 
-func parseMigration(filename string) (Migration, error) {
-	number, name, ok := strings.Cut(strings.TrimSuffix(filename, ".sql"), "_")
+// migrationFiles is a migration while its files are being read, with which of
+// the two have been seen.
+type migrationFiles struct {
+	Migration
+	hasUp, hasDown bool
+}
+
+// parseMigrationFile reads one file into the migration of its version,
+// creating it on the first file seen.
+func parseMigrationFile(filename string, byVersion map[int64]*migrationFiles) error {
+	malformed := fmt.Errorf("catbird: migration %s: file name is not <number>_<name>.up.sql or <number>_<name>.down.sql", filename)
+	stem, up := strings.CutSuffix(filename, ".up.sql")
+	if !up {
+		var down bool
+		if stem, down = strings.CutSuffix(filename, ".down.sql"); !down {
+			return malformed
+		}
+	}
+	number, name, ok := strings.Cut(stem, "_")
 	if !ok {
-		return Migration{}, fmt.Errorf("catbird: migration %s: file name is not <number>_<name>.sql", filename)
+		return malformed
 	}
 	version, err := strconv.ParseInt(number, 10, 64)
 	if err != nil {
-		return Migration{}, fmt.Errorf("catbird: migration %s: file name is not <number>_<name>.sql", filename)
+		return malformed
 	}
 	b, err := fs.ReadFile(MigrationsFS, filename)
 	if err != nil {
-		return Migration{}, fmt.Errorf("catbird: migration %s: %w", filename, err)
+		return fmt.Errorf("catbird: migration %s: %w", filename, err)
 	}
-	// The schema has no PL/pgSQL, so no statement holds a semicolon inside a
-	// body and each section runs as one script; the markers are all a parser
-	// needs. Both are required: every migration's down drops what its up
-	// created.
-	_, rest, ok := strings.Cut(string(b), "-- +goose up")
-	if !ok {
-		return Migration{}, fmt.Errorf("catbird: migration %s: no -- +goose up marker", filename)
+	f, seen := byVersion[version]
+	if !seen {
+		f = &migrationFiles{Migration: Migration{Version: version, Name: name}}
+		byVersion[version] = f
+	} else if f.Name != name {
+		return fmt.Errorf("catbird: migrations %d_%s and %s have the same version", version, f.Name, filename)
 	}
-	up, down, ok := strings.Cut(rest, "-- +goose down")
-	if !ok {
-		return Migration{}, fmt.Errorf("catbird: migration %s: no -- +goose down marker", filename)
+	if up {
+		f.UpSQL, f.hasUp = string(b), true
+	} else {
+		f.DownSQL, f.hasDown = string(b), true
 	}
-	return Migration{Version: version, Name: name, UpSQL: up, DownSQL: down}, nil
+	return nil
 }
 
 // TxBeginner is what the runner needs that Conn does not have: each migration

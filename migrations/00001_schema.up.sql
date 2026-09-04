@@ -1,6 +1,3 @@
--- +goose up
--- Catbird Lite schema. Plain SQL, no PL/pgSQL.
-
 -- Every job's payload and every published message is one row here.
 CREATE SEQUENCE cb_position_seq;
 
@@ -180,10 +177,3 @@ CREATE INDEX cb_job_results_failed_idx ON cb_job_results (queue) WHERE state = '
 -- buffers per 300k results to find nothing without it, two pages with it. One
 -- more entry per job that ends, on a row written once.
 CREATE INDEX cb_job_results_ended_at_idx ON cb_job_results (ended_at);
-
--- +goose down
-DROP TABLE cb_job_results;
-DROP TABLE cb_jobs;
-DROP TABLE cb_cursors;
-DROP TABLE cb_messages;
-DROP SEQUENCE cb_position_seq;
