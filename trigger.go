@@ -36,7 +36,10 @@ type trigger struct {
 // stream reads take — a topic, a prefix followed by ".#", or "#" — and a pattern
 // that does not compile panics here rather than failing on every round once the
 // runtime is started. So does a job type declared with Signal: a trigger's jobs
-// have no ids for a caller to signal, as with EnqueueBatch.
+// have no ids for a caller to signal, as with EnqueueBatch. So does a scheduled
+// type: its jobs carry the type's name as their unique key, and a trigger cannot
+// give them one, because a trigger never drops the message a duplicate would
+// come from.
 //
 // The jobs carry the stream message's topic, so a handler can see which message
 // caused it; the topic decides nothing, the job type does. The enqueues and the
@@ -49,6 +52,9 @@ func (r *Runtime) Trigger(name string, patterns []string, jobType *JobType, opts
 	}
 	if jobType.opts.Signal {
 		panic("catbird: trigger " + name + ": job type " + jobType.name + " waits for a signal and cannot be enqueued by a trigger")
+	}
+	if jobType.opts.Schedule != "" {
+		panic("catbird: trigger " + name + ": job type " + jobType.name + " is scheduled and cannot be enqueued by a trigger")
 	}
 	t := &trigger{
 		runtime: r,

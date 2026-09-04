@@ -99,8 +99,8 @@ Eight files and one migration in the root package, and one package under it:
   retry policy: a failed batch is handed out again until it passes.
 - `periodic.go` — the schedule parser and the tick loop `Handle` starts for a
   job type declared with `Schedule`, so a scheduled type ticks in the
-  processes that can run it. Its statement lives in `client.go` with the
-  others.
+  processes that can run it. A tick is an `Enqueue` with the minute's
+  deduplication key, in `client.go` with the others.
 - `migrate.go` — the runner and the three ways a caller applies the schema:
   `MigrateUp`/`MigrateDownTo` for a caller with nothing, `MigrationsFS` for a
   caller with goose, `Migrations()` (parsed up and down sections) for any
@@ -240,13 +240,15 @@ client exists.
   cannot be read as index arms and walks the position index instead.
 - The assigner only sets positions that are still empty, so two assigners
   running at once cannot move a position a reader may already have passed.
-- A scheduled type's tick is one statement with two guards: the deduplication
+- A scheduled type's tick is an `Enqueue` with two keys: the deduplication
   key `periodic:<type>:<minute>` makes every process ticking in the same
-  minute one job, and the insert runs only while no live job of the type
-  exists — at most one job of a scheduled type is live, and a run that
-  outlives its schedule swallows the ticks it covers rather than queueing
-  them. The guard repeats `dependencies = 0` so its probe stays on the ready
-  index instead of scanning the heap.
+  minute one job, and the type's name as `UniqueKey`, which `Enqueue` gives
+  every job of a scheduled type, makes a tick during a live run write
+  nothing — at most one job of a scheduled type is live, a run that outlives
+  its schedule swallows the ticks it covers rather than queueing them, and
+  two manual enqueues cannot overlap. A batch, a trigger and a handler's
+  `Enqueue` cannot give a job that key, so they refuse a scheduled type as
+  they refuse a type that waits for a signal.
 - `BatchSize`, `ClaimDuration` and `HandlerTimeout` are queue settings; `Schedule`,
   `MaxAttempts`, `MinBackoff`, `MaxBackoff` and `OnFailed` are job type settings. `ClaimDuration` is on
   the queue because the claim sets it for a whole batch in one statement, and

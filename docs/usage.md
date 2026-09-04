@@ -81,7 +81,7 @@ An enqueue dropped this way is not re-driven. A job type using the key derives i
 
 ## Schedule and trigger work
 
-Scheduled job types run in UTC. A scheduled type cannot require a signal. A manual enqueue of a scheduled type prevents ticks while that job is live, but two manual enqueues may overlap.
+Scheduled job types run in UTC. A scheduled type cannot require a signal. Every job of a scheduled type carries the type's name as its unique key, so a manual enqueue holds off the ticks while it is live and two manual enqueues cannot overlap. A scheduled type cannot be enqueued in a batch, by a trigger or from a handler.
 
 Triggers preserve the source topic and payload and create one job per matching stream message. Triggered jobs can run concurrently, so a trigger does not preserve completion order. Use `Consume` when a batch should be handled in order, or reduced to the records it concerns, in one process at a time.
 

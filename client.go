@@ -96,7 +96,7 @@ type Job struct {
 	completed     bool            // Complete's delete succeeded, so the worker does not repeat it
 	output        json.RawMessage // what SetOutput recorded, written by the completion
 	newJobs       []newJob        // what Enqueue and EnqueueAfter recorded, written by the completion
-	payloadErr    error           // a payload that could not be marshaled, returned by the completion
+	err           error           // returned by the completion: a payload that could not be marshaled, or a type a handler cannot enqueue
 }
 
 // newJob is one job a handler asked for, in the shape the completion writes.
@@ -136,7 +136,9 @@ func (j *Job) SetOutput(v any) error {
 //
 // The new job joins this job's workflow, so Signal, Cancel and the output reads
 // address it by the same group id. A marshal failure is kept and returned by
-// the completion, which fails the attempt.
+// the completion, which fails the attempt. So is a scheduled type: its jobs
+// carry the type's name as their unique key, which the completion cannot give
+// them, so its ticks and Enqueue are the only ways to create one.
 func (j *Job) Enqueue(t *JobType, payload any) {
 	j.record(t, payload, false)
 }
@@ -154,8 +156,11 @@ func (j *Job) EnqueueAfter(t *JobType, payload any) {
 
 func (j *Job) record(t *JobType, payload any, dependent bool) {
 	body, err := json.Marshal(payload)
-	if err != nil && j.payloadErr == nil {
-		j.payloadErr = fmt.Errorf("catbird: job type %s: %w", t.name, err)
+	if err != nil && j.err == nil {
+		j.err = fmt.Errorf("catbird: job type %s: %w", t.name, err)
+	}
+	if t.opts.Schedule != "" && j.err == nil {
+		j.err = fmt.Errorf("catbird: job type %s is scheduled and cannot be enqueued from a handler", t.name)
 	}
 	j.newJobs = append(j.newJobs, newJob{
 		jobType:   t.name,
@@ -443,6 +448,11 @@ func subtreeLikePattern(prefix string) string {
 // or 0 when opts.DeduplicationKey already exists or a live job of the type
 // carries opts.UniqueKey.
 //
+// Every job of a scheduled type carries the type's name as its unique key,
+// whoever enqueues it, so a manual Enqueue holds off the ticks while it is live
+// and two manual enqueues cannot overlap; opts.UniqueKey cannot be set on such
+// a type.
+//
 // One statement does all three. The wake CTE calls pg_notify only for a job
 // that is claimable now, so a delayed job and a job waiting for a signal do not
 // wake workers that can do nothing with them; the final LEFT JOIN references it
@@ -465,6 +475,13 @@ func Enqueue(ctx context.Context, db Conn, t *JobType, payload any, opts Enqueue
 	topic := opts.Topic
 	if topic == "" {
 		topic = t.name
+	}
+	uniqueKey := opts.UniqueKey
+	if t.opts.Schedule != "" {
+		if uniqueKey != "" {
+			return 0, fmt.Errorf("catbird: job type %s is scheduled and its jobs carry the type's name as their unique key; UniqueKey cannot be set", t.name)
+		}
+		uniqueKey = t.name
 	}
 	var id int64
 	err = db.QueryRow(ctx, `
@@ -490,7 +507,7 @@ func Enqueue(ctx context.Context, db Conn, t *JobType, payload any, opts Enqueue
 		)
 		SELECT message_id FROM job LEFT JOIN wake ON true
 	`, topic, body, nullString(opts.DeduplicationKey), t.queue.name, t.name, t.opts.Signal, opts.Delay,
-		nullString(opts.UniqueKey)).Scan(&id)
+		nullString(uniqueKey)).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil
 	}
@@ -505,7 +522,9 @@ func Enqueue(ctx context.Context, db Conn, t *JobType, payload any, opts Enqueue
 // This is the volume path — what a trigger uses. Every job in the batch takes
 // the same options, and none of them starts a workflow or waits for anything: a
 // job type declared with Signal cannot be enqueued this way, because a batch has
-// no ids for a caller to signal.
+// no ids for a caller to signal. Neither can a scheduled type: its jobs carry
+// the type's name as their unique key, and at most one of them is live, which
+// is not what a batch of them can mean.
 //
 // The job rows come from the messages that were written, so a deduplicated
 // message produces no job. The wake CTE reads the job rows through LIMIT 1, which
@@ -520,6 +539,9 @@ func EnqueueBatch(ctx context.Context, db Conn, t *JobType, msgs []BatchMessage,
 	}
 	if t.opts.Signal {
 		return 0, fmt.Errorf("catbird: job type %s waits for a signal and cannot be enqueued in a batch", t.name)
+	}
+	if t.opts.Schedule != "" {
+		return 0, fmt.Errorf("catbird: job type %s is scheduled and cannot be enqueued in a batch", t.name)
 	}
 	topics, payloads, deduplicationKeys, err := batchArrays(msgs)
 	if err != nil {
@@ -549,46 +571,17 @@ func EnqueueBatch(ctx context.Context, db Conn, t *JobType, msgs []BatchMessage,
 	return created, err
 }
 
-// enqueuePeriodic writes one tick of a scheduled job type: the job whose
-// deduplication key names the minute, unless that key is taken or a live job
-// of the type exists. Two guards in one statement. The key,
-// periodic:<type>:<minute> with the minute in UTC as YYYY-MM-DDTHH:MMZ,
-// collapses every process ticking in the same minute into one job; the format
-// is fixed because every process must produce the same key. The NOT EXISTS
-// makes a tick during a live run write nothing at all — no message row, no
-// key — so a run that outlives its schedule swallows the ticks it covers and
-// no backlog of stale ticks can form.
-//
-// The guard counts every live job of the type, not only ticks, so a manual
-// Enqueue of the type holds it too — "run it now" composes — but is not
-// itself guarded: two manual enqueues can overlap. It repeats the ready
-// index's dependencies = 0 so the probe stays on that index instead of
-// scanning the heap; the cost is that a job of the type created inside a
-// workflow is not counted while it still waits for other jobs.
+// enqueuePeriodic writes one tick of a scheduled job type: an Enqueue whose
+// deduplication key names the minute. The key, periodic:<type>:<minute> with
+// the minute in UTC as YYYY-MM-DDTHH:MMZ, collapses every process ticking in
+// the same minute into one job; the format is fixed because every process must
+// produce the same key. The type's own unique key, which Enqueue gives every
+// job of a scheduled type, makes a tick during a live run write nothing at all
+// — no message row, no key — so a run that outlives its schedule swallows the
+// ticks it covers and no backlog of stale ticks can form.
 func enqueuePeriodic(ctx context.Context, db Conn, t *JobType, minute time.Time) error {
 	key := "periodic:" + t.name + ":" + minute.UTC().Format("2006-01-02T15:04") + "Z"
-	_, err := db.Exec(ctx, `
-		WITH message AS (
-			INSERT INTO cb_messages (topic, deduplication_key)
-			SELECT $1, $2
-			WHERE NOT EXISTS (
-				SELECT 1 FROM cb_jobs
-				WHERE queue = $3 AND job_type = $1 AND dependencies = 0
-			)
-			ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
-			RETURNING id
-		),
-		job AS (
-			INSERT INTO cb_jobs (message_id, queue, job_type, claimable_at)
-			SELECT id, $3, $1, now()
-			FROM message
-			RETURNING message_id
-		),
-		wake AS (
-			SELECT pg_notify('cb_queue_' || $3, '') FROM job
-		)
-		SELECT message_id FROM job LEFT JOIN wake ON true
-	`, t.name, key, t.queue.name)
+	_, err := Enqueue(ctx, db, t, nil, EnqueueOptions{DeduplicationKey: key})
 	return err
 }
 
@@ -624,8 +617,8 @@ func enqueuePeriodic(ctx context.Context, db Conn, t *JobType, minute time.Time)
 // transaction back, and then returns nil leaves a job row nothing deletes until
 // the claim expires and the job runs again.
 func Complete(ctx context.Context, db Conn, job *Job) error {
-	if job.payloadErr != nil {
-		return job.payloadErr
+	if job.err != nil {
+		return job.err
 	}
 	types, queues, payloads, dependents, signals := newJobArrays(job.newJobs)
 	var completed, woken int

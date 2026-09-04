@@ -162,13 +162,15 @@ type JobTypeOptions struct {
 	// restricted a day matching either one counts.
 	//
 	// The schedule is on the type rather than given at registration so that
-	// two processes cannot disagree on it, for the same reason Signal is. At
-	// most one job of a scheduled type is live at a time: a tick during a
-	// live run — a tick's job or a manual Enqueue of the type — writes
-	// nothing, so a run that outlives its schedule swallows the ticks it
-	// covers and the next run starts on the first matching minute after it
-	// ends. A scheduled job takes no payload; the same code under two
-	// schedules or two arguments is two job types sharing one handler.
+	// two processes cannot disagree on it, for the same reason Signal is. Every
+	// job of a scheduled type carries the type's name as its UniqueKey, so at
+	// most one is live at a time: a tick or an Enqueue during a live run writes
+	// nothing, a run that outlives its schedule swallows the ticks it covers,
+	// and the next run starts on the first matching minute after it ends. The
+	// ticks and Enqueue are the only ways to create such a job — not a batch, a
+	// trigger or a handler's Enqueue, which cannot give it the key. A scheduled
+	// job takes no payload; the same code under two schedules or two arguments
+	// is two job types sharing one handler.
 	Schedule string
 
 	// MaxAttempts is how many attempts a job gets before it has failed; default

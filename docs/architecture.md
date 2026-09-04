@@ -67,7 +67,7 @@ Readers use either `ReadAfter` with a caller-held position or `Cursor.Read` and 
 
 ## Periodic jobs
 
-`JobTypeOptions.Schedule` uses a five-field UTC cron expression. Every process that handles the type ticks it, but a minute-specific deduplication key gives each matching minute one job. A second guard allows at most one live job of the type, so long runs swallow missed ticks rather than accumulating stale work.
+`JobTypeOptions.Schedule` uses a five-field UTC cron expression. Every process that handles the type ticks it, but a minute-specific deduplication key gives each matching minute one job, and every job of the type carries the type's name as its unique key, so at most one is live and long runs swallow missed ticks rather than accumulating stale work.
 
 ## Browser delivery
 

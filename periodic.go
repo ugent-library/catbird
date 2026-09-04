@@ -152,8 +152,9 @@ func (s schedule) next(t time.Time) time.Time {
 // periodic enqueues a scheduled job type on its matching minutes. Handle
 // declares one for every scheduled type it registers, so the processes that
 // can run the type are the ones that tick it, and every one of them ticks:
-// there is no leader, and the statement's two guards keep the result single.
-// See enqueuePeriodic in client.go.
+// there is no leader, and the tick's two keys keep the result single — the
+// minute's deduplication key and the type's unique key. See enqueuePeriodic in
+// client.go.
 type periodic struct {
 	runtime *Runtime
 	jobType *JobType
