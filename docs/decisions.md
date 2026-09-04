@@ -66,13 +66,13 @@ This document records the current boundaries of Catbird. Revisit a decision when
 
 **Revisit when:** A caller needs to see what an attempt before the last one returned, or when it ran, and cannot record that from its own handler.
 
-## There is no live-only uniqueness key
+## A unique key holds one live job of a type
 
-**Decision:** Catbird has durable `DeduplicationKey`, not a key that becomes free when a job completes or fails.
+**Decision:** `EnqueueOptions.UniqueKey` admits at most one live job of a type per key. It is a column on `cb_jobs` under a partial unique index, set only by `Enqueue`, and it is free again when the job ends, whichever way it ended, because the statement that ends a job deletes its row. `DeduplicationKey` stays the durable key on the message. Triggers and `EnqueueBatch` take no unique key.
 
-**Why:** A second uniqueness model complicates the busiest statements and can lose a wake-up for a change that arrives during a running job.
+**Why:** One pass at a time per record, started by hand and deriving its work from state, is a common job, and without the key an application rejects a duplicate only with a marker table, a `Status` check and a lock around the enqueue. Because a job row exists exactly while the job is live, the key costs one nullable column, one partial index and one `ON CONFLICT` on the enqueue, and the claim, the retries and the completion do not change. An enqueue dropped by the key is not re-driven, so a job type using it must derive its work from state; the option says so. A trigger must never drop a message, so a triggered job cannot carry the key, and many messages about one record becoming one run is `Consume`.
 
-**Revisit when:** An expensive, non-idempotent job needs at-most-one live run and the application cannot cheaply reject a duplicate.
+**Revisit when:** A triggered job needs its enqueues coalesced without losing a change, which is a hold that lasts until the job is claimed rather than until it ends.
 
 ## The runtime runs GC, and GC is not a job
 

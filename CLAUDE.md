@@ -139,8 +139,9 @@ Eight files and one migration in the root package, and one package under it:
 one row, written once. `cb_jobs` holds one narrow row per job that still has
 to run, rewritten on every claim and retry, deleted by the statement that ends
 the job; it carries the queue, the job type, the workflow, what the job waits
-for, the signal payload once one arrives, and what the last failed attempt
-returned. `cb_job_results` holds one row per job that ended, written by the
+for, the signal payload once one arrives, what the last failed attempt
+returned, and the key at most one live job of its type carries.
+`cb_job_results` holds one row per job that ended, written by the
 same statement that deleted its job row: how it ended — completed, failed or
 canceled — when it ended, the attempts it spent, the last error, and the
 output it recorded.
@@ -263,9 +264,20 @@ client exists.
   locks belong to the loops that let one process do a run while the rest skip
   — the assigner's (key 1) and GC's (key 4) — and to the migration runner
   (key 3), all under `hashtext('catbird')`; key 2 is the test binaries'.
-- The unique indexes on `deduplication_key` and `position` are partial. Deduplicating
-  inserts must name the predicate — `ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING`
+- The unique indexes on `deduplication_key`, `position` and `unique_key` are
+  partial. Deduplicating inserts must name the predicate —
+  `ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING`,
+  `ON CONFLICT (job_type, unique_key) WHERE unique_key IS NOT NULL DO NOTHING`
   — or they stop matching the index.
+- `UniqueKey` is unique among live jobs because a job row exists only while
+  the job is live: the statement that ends a job frees the key by deleting the
+  row, so no ending writes anything for it and the claim, retry and completion
+  statements never see it. Only `Enqueue` sets it. Its message insert probes
+  the index first, so the common duplicate writes nothing, and the job
+  insert's `ON CONFLICT` catches two enqueues racing on one key; the loser
+  leaves a message with no job, which GC deletes with the rest. Triggers and
+  `EnqueueBatch` leave the column NULL: a trigger must never drop a message,
+  and many messages about one record becoming one run is `Consume`.
 
 ## Conventions
 

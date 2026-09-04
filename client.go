@@ -212,9 +212,15 @@ type Conn interface {
 
 // EnqueueOptions are the optional parts of Enqueue.
 type EnqueueOptions struct {
-	DeduplicationKey string        // when set, a second Enqueue with the same key does nothing
-	Delay            time.Duration // earliest start, measured from now
-	Topic            string        // what the job is about; the job type's name when empty
+	DeduplicationKey string // when set, a second Enqueue with the same key does nothing
+	// UniqueKey: when set, at most one live job of this type carries it. A
+	// second Enqueue with the same key does nothing while that job is live and
+	// enqueues normally once it has ended, whichever way it ended. A job
+	// dropped this way is not re-driven, so a job type using the key derives
+	// its work from state rather than from the enqueue that was dropped.
+	UniqueKey string
+	Delay     time.Duration // earliest start, measured from now
+	Topic     string        // what the job is about; the job type's name when empty
 }
 
 // Publish appends a message to the stream: consumers see it, no worker runs it.
@@ -434,7 +440,8 @@ func subtreeLikePattern(prefix string) string {
 // Enqueue appends a message and a job row for it, and wakes the queue's workers
 // unless the job cannot run yet. Returns the job's id, which is also the id of
 // the workflow it starts — what Signal, Cancel and the output reads address —
-// or 0 when opts.DeduplicationKey already exists.
+// or 0 when opts.DeduplicationKey already exists or a live job of the type
+// carries opts.UniqueKey.
 //
 // One statement does all three. The wake CTE calls pg_notify only for a job
 // that is claimable now, so a delayed job and a job waiting for a signal do not
@@ -442,6 +449,14 @@ func subtreeLikePattern(prefix string) string {
 // so that it runs, since an unreferenced SELECT CTE is never executed. The
 // notification is delivered when the caller's transaction commits, together
 // with the row.
+//
+// A unique key is checked twice. The message insert runs only while no live
+// job of the type carries the key, so the common duplicate writes nothing at
+// all. Two enqueues racing on one key can both pass that check, because
+// neither sees the other's uncommitted row, and then the job insert's ON
+// CONFLICT keeps the second one out: it leaves a message with no job, which GC
+// deletes with the other messages nothing refers to. The key is free again
+// when the job ends, because the ending deletes the row it is on.
 func Enqueue(ctx context.Context, db Conn, t *JobType, payload any, opts EnqueueOptions) (int64, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -455,22 +470,27 @@ func Enqueue(ctx context.Context, db Conn, t *JobType, payload any, opts Enqueue
 	err = db.QueryRow(ctx, `
 		WITH message AS (
 			INSERT INTO cb_messages (topic, payload, deduplication_key)
-			VALUES ($1, $2, $3)
+			SELECT $1::text, $2::jsonb, $3::text
+			WHERE $8::text IS NULL OR NOT EXISTS (
+				SELECT 1 FROM cb_jobs WHERE job_type = $5 AND unique_key = $8
+			)
 			ON CONFLICT (deduplication_key) WHERE deduplication_key IS NOT NULL DO NOTHING
 			RETURNING id
 		),
 		job AS (
-			INSERT INTO cb_jobs (message_id, queue, job_type, claimable_at, awaits_signal)
-			SELECT id, $4, $5,
+			INSERT INTO cb_jobs (message_id, queue, job_type, unique_key, claimable_at, awaits_signal)
+			SELECT id, $4, $5, $8,
 			       CASE WHEN $6 THEN 'infinity'::timestamptz ELSE now() + $7::interval END, $6
 			FROM message
+			ON CONFLICT (job_type, unique_key) WHERE unique_key IS NOT NULL DO NOTHING
 			RETURNING message_id, claimable_at
 		),
 		wake AS (
 			SELECT pg_notify('cb_queue_' || $4, '') FROM job WHERE claimable_at <= now()
 		)
 		SELECT message_id FROM job LEFT JOIN wake ON true
-	`, topic, body, nullString(opts.DeduplicationKey), t.queue.name, t.name, t.opts.Signal, opts.Delay).Scan(&id)
+	`, topic, body, nullString(opts.DeduplicationKey), t.queue.name, t.name, t.opts.Signal, opts.Delay,
+		nullString(opts.UniqueKey)).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil
 	}

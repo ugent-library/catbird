@@ -274,6 +274,138 @@ func TestExactlyOnceDeduplication(t *testing.T) {
 	}
 }
 
+// A unique key admits one live job of its type. A second Enqueue with the key
+// does nothing while that job is queued, running or waiting to retry, and it
+// enqueues again once the job ended, whether it completed, failed or was
+// canceled. The key is per type, so two types may carry the same one.
+func TestUniqueKeyKeepsOneLiveJobOfAType(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	queue := catbird.NewQueue("unique", catbird.QueueOptions{PollInterval: 25 * time.Millisecond})
+	// The retry is an hour out, so a failed attempt leaves the job waiting to
+	// retry for as long as the test looks at it.
+	flaky := catbird.NewJobType("flaky", queue, catbird.JobTypeOptions{MinBackoff: time.Hour})
+	finishes := catbird.NewJobType("finishes", queue, catbird.JobTypeOptions{})
+	doomed := catbird.NewJobType("doomed", queue, catbird.JobTypeOptions{MaxAttempts: 1})
+	// Nothing handles this type, so its jobs stay queued.
+	idle := catbird.NewJobType("idle", queue, catbird.JobTypeOptions{})
+
+	enqueue := func(jt *catbird.JobType, key string) int64 {
+		t.Helper()
+		id, err := catbird.Enqueue(ctx, pool, jt, nil, catbird.EnqueueOptions{UniqueKey: key})
+		if err != nil {
+			t.Fatalf("enqueue with key %q: %v", key, err)
+		}
+		return id
+	}
+	state := func(id int64) catbird.State {
+		t.Helper()
+		js, err := catbird.Status(ctx, pool, id)
+		if err != nil {
+			t.Fatalf("status of %d: %v", id, err)
+		}
+		return js.State
+	}
+
+	// Queued.
+	first := enqueue(flaky, "user-1")
+	if first == 0 {
+		t.Fatal("the first enqueue with a key was dropped")
+	}
+	if id := enqueue(flaky, "user-1"); id != 0 {
+		t.Errorf("a second enqueue while the job is queued created job %d, want none", id)
+	}
+	if id := enqueue(idle, "user-1"); id == 0 {
+		t.Error("the same key on another type was held back; the key is per type")
+	}
+	// The dropped enqueue wrote no message either.
+	if n := count(t, pool, "SELECT count(*) FROM cb_messages WHERE topic = 'flaky'"); n != 1 {
+		t.Errorf("%d messages for the type after a dropped enqueue, want 1", n)
+	}
+
+	// Running, then waiting to retry.
+	release := make(chan struct{})
+	started := make(chan struct{}, 2)
+	rt := catbird.New(pool, catbird.Options{})
+	rt.HandleFunc(flaky, func(ctx context.Context, job *catbird.Job) error {
+		started <- struct{}{}
+		<-release
+		return errors.New("the service is down")
+	})
+	rt.HandleFunc(finishes, func(ctx context.Context, job *catbird.Job) error { return nil })
+	rt.HandleFunc(doomed, func(ctx context.Context, job *catbird.Job) error {
+		return errors.New("this handler never succeeds")
+	})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go rt.Start(runCtx)
+
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("the job never ran")
+	}
+	if id := enqueue(flaky, "user-1"); id != 0 {
+		t.Errorf("a second enqueue while the job runs created job %d, want none", id)
+	}
+	close(release)
+	waitFor(t, 5*time.Second, "the failed attempt did not leave the job waiting to retry", func() bool {
+		return state(first) == catbird.StateWaitingToRetry
+	})
+	if id := enqueue(flaky, "user-1"); id != 0 {
+		t.Errorf("a second enqueue while the job waits to retry created job %d, want none", id)
+	}
+
+	// Canceled, completed and failed all free the key.
+	if err := catbird.Cancel(ctx, pool, first); err != nil {
+		t.Fatal(err)
+	}
+	if id := enqueue(flaky, "user-1"); id == 0 {
+		t.Error("after the job was canceled the enqueue was dropped")
+	}
+	done := enqueue(finishes, "user-1")
+	waitFor(t, 5*time.Second, "the job never completed", func() bool {
+		return state(done) == catbird.StateCompleted
+	})
+	if id := enqueue(finishes, "user-1"); id == 0 {
+		t.Error("after the job completed the enqueue was dropped")
+	}
+	lost := enqueue(doomed, "user-1")
+	waitFor(t, 5*time.Second, "the job never failed", func() bool {
+		return state(lost) == catbird.StateFailed
+	})
+	if id := enqueue(doomed, "user-1"); id == 0 {
+		t.Error("after the job failed the enqueue was dropped")
+	}
+
+	// Enqueues racing on one key create one job. A racer that passed the check
+	// before the winner committed leaves a message with no job, which GC deletes
+	// with the other messages nothing refers to.
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := catbird.Enqueue(ctx, pool, idle, nil, catbird.EnqueueOptions{UniqueKey: "race"}); err != nil {
+				t.Errorf("racing enqueue: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := count(t, pool, "SELECT count(*) FROM cb_jobs WHERE job_type = 'idle' AND unique_key = 'race'"); n != 1 {
+		t.Errorf("%d live jobs carry the key after ten racing enqueues, want 1", n)
+	}
+	if err := catbird.GC(ctx, pool, 0); err != nil {
+		t.Fatal(err)
+	}
+	jobs := count(t, pool, "SELECT count(*) FROM cb_jobs WHERE job_type = 'idle'")
+	if n := count(t, pool, "SELECT count(*) FROM cb_messages WHERE topic = 'idle'"); n != jobs {
+		t.Errorf("%d messages for %d live jobs after GC, want the same number", n, jobs)
+	}
+}
+
 // A handler's follow-on work is written by the statement that ends it: the jobs
 // it asked for with Enqueue run next, the one it asked for with EnqueueAfter
 // runs when those finished, and all of them join the workflow of the job that

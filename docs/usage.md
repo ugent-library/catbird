@@ -73,6 +73,12 @@ Set retention according to consumer recovery needs. `GC` removes old stream mess
 
 Prefix deduplication keys by their domain because published messages and enqueued jobs share one key namespace. Retention must outlast the period in which a key must prevent duplicate work.
 
+## Keep one live job per record
+
+Give a job that must run one pass at a time per record, such as a user's backfill, a `UniqueKey` naming the record. A second `Enqueue` with the key does nothing while a job of the type carries it and enqueues normally once that job ended, whether it completed, failed or was canceled. The key is per job type, and it is free the moment the job ends, unlike a deduplication key, which stays taken for retention.
+
+An enqueue dropped this way is not re-driven. A job type using the key derives its work from state, so the live run, or the next one, covers what the dropped enqueue was about. Triggers and `EnqueueBatch` take no unique key: a trigger must never drop a message, and many messages about one record becoming one run is `Consume`.
+
 ## Schedule and trigger work
 
 Scheduled job types run in UTC. A scheduled type cannot require a signal. A manual enqueue of a scheduled type prevents ticks while that job is live, but two manual enqueues may overlap.

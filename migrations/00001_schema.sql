@@ -87,6 +87,14 @@ CREATE TABLE cb_jobs (
     awaits_signal BOOLEAN NOT NULL DEFAULT false,
     queue TEXT NOT NULL, -- the claim key: which workers may take this job
     job_type TEXT NOT NULL, -- which handler runs it
+    -- The key at most one live job of the type carries, from
+    -- EnqueueOptions.UniqueKey. It is unique among live jobs and nothing more
+    -- because this row exists only while the job is live: the statement that
+    -- ends the job frees the key by deleting the row, whichever way the job
+    -- ended, so no ending writes anything for it. NULL on a job enqueued
+    -- without one, so the volume of single-shot jobs stays out of
+    -- cb_jobs_unique_key_idx below.
+    unique_key TEXT,
     -- Which jobs it waits for, in the order they were enqueued, so a handler
     -- reads the results of exactly the jobs it waited for instead of every job
     -- of their type in the workflow. NULL on a job that waited for nothing.
@@ -129,6 +137,10 @@ CREATE INDEX cb_jobs_ready_idx ON cb_jobs (queue, claimable_at) WHERE dependenci
 -- structure that can never match them: 112 kB against 2128 kB with 1% of jobs
 -- grouped.
 CREATE INDEX cb_jobs_group_idx ON cb_jobs (group_id) WHERE group_id IS NOT NULL;
+-- What Enqueue probes and conflicts on for a job with a unique key. Unique per
+-- job type, so two types may carry the same key. Jobs without a key stay out
+-- of it, as they stay out of cb_jobs_group_idx.
+CREATE UNIQUE INDEX cb_jobs_unique_key_idx ON cb_jobs (job_type, unique_key) WHERE unique_key IS NOT NULL;
 
 -- One row per job that ended, and how it ended: it completed, it failed
 -- because its last attempt failed, or Cancel stopped it. The statement that

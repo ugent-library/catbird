@@ -20,7 +20,7 @@ Queue and job-type declarations are plain Go values. They are not stored in the 
 The schema has five tables.
 
 - `cb_messages` is the immutable message substrate. It stores every job payload and published stream message. Published messages receive a stream position after commit; job messages do not, so a job never feeds back into the stream.
-- `cb_jobs` stores the narrow, mutable state of each live job: queue, job type, claim deadline, retry state, workflow dependencies, and signal state. The statement that ends the job deletes the row.
+- `cb_jobs` stores the narrow, mutable state of each live job: queue, job type, claim deadline, retry state, workflow dependencies, signal state, and the unique key at most one live job of the type carries. The statement that ends the job deletes the row, which is what frees the key.
 - `cb_cursors` stores the most recently acknowledged stream position for a named consumer, and until when a `Consume` loop holds the cursor.
 - `cb_job_results` stores one row per job that ended: how it ended, completed, failed or canceled, when it ended, the attempts it spent, the last error, and the output it recorded. The statement that deletes the job row writes it, so a job is in one of the two tables and never both. `Status` and `GroupStatus` read it for a job that is no longer live, and `GC` deletes it a retention period after the job ended.
 - `cb_migrations` records applied schema migrations.
