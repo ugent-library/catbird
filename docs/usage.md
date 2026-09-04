@@ -2,6 +2,55 @@
 
 This guide covers the choices an application needs to make when operating Catbird. Start by deciding whether you are publishing a durable stream message or enqueueing work: both use immutable messages, but only published messages are readable from the stream and only jobs have claims and retries.
 
+## Apply the schema
+
+`MigrateUp` applies every migration not yet applied, each in its own transaction with its `cb_migrations` row, and is safe to call from every process at start: two deploying at once queue on an advisory lock and the second finds the rows and skips. It takes anything with pgx's `Begin`, so a pool, a connection or a transaction, and it is the whole of what a caller with no migration tool needs.
+
+An application that already runs a migration tool keeps one tool and one version table. `Migrations()` returns every version's up and down SQL as plain scripts, and the tool executes them on its own transaction; `cb_migrations` is then never created. Pin the catbird version the migration applies, so it produces the same schema whatever catbird version the build carries, and give a catbird release that adds a migration a migration of your own with a higher pin, bounded below by the old one. As a goose Go migration:
+
+```go
+func init() {
+	goose.AddMigrationContext(addCatbirdUp, addCatbirdDown)
+}
+
+// Catbird's schema, pinned at its migration 1.
+const catbirdVersion = 1
+
+func addCatbirdUp(ctx context.Context, tx *sql.Tx) error {
+	migrations, err := catbird.Migrations()
+	if err != nil {
+		return err
+	}
+	for _, m := range migrations {
+		if m.Version > catbirdVersion {
+			break
+		}
+		if _, err := tx.ExecContext(ctx, m.UpSQL); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func addCatbirdDown(ctx context.Context, tx *sql.Tx) error {
+	migrations, err := catbird.Migrations()
+	if err != nil {
+		return err
+	}
+	for i := len(migrations) - 1; i >= 0; i-- {
+		if migrations[i].Version > catbirdVersion {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, migrations[i].DownSQL); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+```
+
+The scripts are plain DDL with no concurrent index builds, so they run inside the tool's transaction and the whole deploy rolls back as one. A down drops every catbird table, so a rollback discards queued jobs and stream messages.
+
 ## Start with a queue and job type
 
 Put work with the same concurrency and runtime characteristics on one queue. `BatchSize` is the number of jobs one process may run from that queue at once. More processes multiply that concurrency.

@@ -15,9 +15,9 @@ import (
 //go:embed migrations/*.sql
 var migrationsEmbedFS embed.FS
 
-// MigrationsFS is the migration files as they sit on disk, one
+// migrationsFS is the migration files as they sit on disk, one
 // <number>_<name>.up.sql and one <number>_<name>.down.sql per version.
-var MigrationsFS fs.FS = func() fs.FS {
+var migrationsFS fs.FS = func() fs.FS {
 	sub, err := fs.Sub(migrationsEmbedFS, "migrations")
 	if err != nil {
 		panic(err)
@@ -40,7 +40,7 @@ type Migration struct {
 // runs, and a version missing one would only be found when a rollback needs
 // it.
 func Migrations() ([]Migration, error) {
-	entries, err := fs.ReadDir(MigrationsFS, ".")
+	entries, err := fs.ReadDir(migrationsFS, ".")
 	if err != nil {
 		return nil, fmt.Errorf("catbird: read migrations: %w", err)
 	}
@@ -90,7 +90,7 @@ func parseMigrationFile(filename string, byVersion map[int64]*migrationFiles) er
 	if err != nil {
 		return malformed
 	}
-	b, err := fs.ReadFile(MigrationsFS, filename)
+	b, err := fs.ReadFile(migrationsFS, filename)
 	if err != nil {
 		return fmt.Errorf("catbird: migration %s: %w", filename, err)
 	}

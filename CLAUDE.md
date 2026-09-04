@@ -101,10 +101,10 @@ Eight files and one migration in the root package, and one package under it:
   job type declared with `Schedule`, so a scheduled type ticks in the
   processes that can run it. A tick is an `Enqueue` with the minute's
   deduplication key, in `client.go` with the others.
-- `migrate.go` — the runner and the three ways a caller applies the schema:
-  `MigrateUp`/`MigrateDownTo` for a caller with nothing, `MigrationsFS` for a
-  caller with goose, `Migrations()` (parsed up and down sections) for any
-  other tool. Each migration runs in its own transaction with its
+- `migrate.go` — the runner and the two ways a caller applies the schema:
+  `MigrateUp`/`MigrateDownTo` for a caller with nothing, and `Migrations()`,
+  the up and down SQL of every version, for a caller inside a migration tool
+  of their own. Each migration runs in its own transaction with its
   `cb_migrations` row; concurrency is an advisory lock (key 3 under
   `hashtext('catbird')`) plus the insert guard. A migration is two files,
   `<number>_<name>.up.sql` and `<number>_<name>.down.sql`, each run whole;

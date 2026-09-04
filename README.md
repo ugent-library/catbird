@@ -436,8 +436,7 @@ func main() {
 
 - Apply: `MigrateUp`
 - Roll back to version: `MigrateDownTo`
-- Read parsed migrations: `Migrations`
-- Embedded migration FS for external tools: `MigrationsFS`
+- Read parsed migrations, for a caller inside a migration tool: `Migrations`
 
 ### wire package
 

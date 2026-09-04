@@ -75,4 +75,4 @@ The optional `wire` package depends only on the exported stream API. Its `Render
 
 ## Migrations
 
-Migrations are embedded SQL files, one up and one down file per version, in a layout of catbird's own. `MigrateUp` and `MigrateDownTo` apply them in individual transactions under an advisory lock. Callers using another migration tool can consume `MigrationsFS` or parsed `Migrations()` instead.
+Migrations are embedded SQL files, one up and one down file per version, in a layout of catbird's own. `MigrateUp` and `MigrateDownTo` apply them in individual transactions under an advisory lock. A caller inside a migration tool of their own runs the up and down SQL from `Migrations()` on that tool's transaction instead; `docs/usage.md` shows the shape.
