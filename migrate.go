@@ -5,7 +5,7 @@ import (
 	_ "embed"
 	"fmt"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Migration is one schema change. A caller who runs a migration tool of their
@@ -37,14 +37,6 @@ func Migrations() []Migration {
 	return append([]Migration(nil), migrations...)
 }
 
-// TxBeginner is what the runner needs that Conn does not have: each migration
-// runs in its own transaction, and BEGIN as a plain statement on a pool may
-// land on a different connection than the statements after it. *pgx.Conn,
-// *pgxpool.Pool and pgx.Tx all satisfy it.
-type TxBeginner interface {
-	Begin(ctx context.Context) (pgx.Tx, error)
-}
-
 // cb_migrations records which migrations ran. The runner creates it on first
 // use, so no migration has to; it is written once per schema change and read
 // by nothing on a hot path.
@@ -60,9 +52,9 @@ const createMigrationsTableSQL = `
 // deploying at once queue on an advisory lock, and the one that waited sees
 // the row and skips. Everything runs in a transaction, so a migration cannot
 // use CREATE INDEX CONCURRENTLY until the runner grows a marker for it.
-func MigrateUp(ctx context.Context, db TxBeginner) error {
+func MigrateUp(ctx context.Context, pool *pgxpool.Pool) error {
 	for _, m := range migrations {
-		if err := migrateStep(ctx, db, m.UpSQL,
+		if err := migrateStep(ctx, pool, m.UpSQL,
 			`INSERT INTO cb_migrations (version, name) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
 			m.Version, m.Name); err != nil {
 			return fmt.Errorf("catbird: migration %d %s: %w", m.Version, m.Name, err)
@@ -72,14 +64,14 @@ func MigrateUp(ctx context.Context, db TxBeginner) error {
 }
 
 // MigrateDownTo reverts every applied migration above version, newest first.
-// MigrateDownTo(ctx, db, 0) reverts everything.
-func MigrateDownTo(ctx context.Context, db TxBeginner, version int64) error {
+// MigrateDownTo(ctx, pool, 0) reverts everything.
+func MigrateDownTo(ctx context.Context, pool *pgxpool.Pool, version int64) error {
 	for i := len(migrations) - 1; i >= 0; i-- {
 		m := migrations[i]
 		if m.Version <= version {
 			break
 		}
-		if err := migrateStep(ctx, db, m.DownSQL,
+		if err := migrateStep(ctx, pool, m.DownSQL,
 			`DELETE FROM cb_migrations WHERE version = $1`,
 			m.Version); err != nil {
 			return fmt.Errorf("catbird: migration %d %s: %w", m.Version, m.Name, err)
@@ -92,8 +84,8 @@ func MigrateDownTo(ctx context.Context, db TxBeginner, version int64) error {
 // the step, and only when the record changed a row — nobody did it first —
 // run its SQL. Lock 3 under catbird's namespace; the assigner's transaction
 // lock is 1 and the test binaries' session lock is 2.
-func migrateStep(ctx context.Context, db TxBeginner, sql, record string, args ...any) error {
-	tx, err := db.Begin(ctx)
+func migrateStep(ctx context.Context, pool *pgxpool.Pool, sql, record string, args ...any) error {
+	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
