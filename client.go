@@ -69,6 +69,12 @@ func (s State) String() string {
 	return stateNames[s]
 }
 
+// Ended reports whether the job, or the workflow, ended, whichever way it
+// did: completed, failed or canceled. Every other state is live.
+func (s State) Ended() bool {
+	return s == StateCompleted || s == StateFailed || s == StateCanceled
+}
+
 // Message is a published message, as a consumer reads it.
 type Message struct {
 	ID        int64

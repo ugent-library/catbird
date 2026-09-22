@@ -2656,6 +2656,17 @@ func TestStatusReportsHowAJobEnded(t *testing.T) {
 // claim with claimable_at in the future and an attempt spent. The claim clears the
 // text, so what is there belongs to the attempt that is waiting and never to the
 // one running.
+// TestStateEnded checks that the three states of a job that ended answer
+// true and the six live states false.
+func TestStateEnded(t *testing.T) {
+	ended := map[catbird.State]bool{catbird.StateCompleted: true, catbird.StateFailed: true, catbird.StateCanceled: true}
+	for s := catbird.StateQueued; s <= catbird.StateCompleted; s++ {
+		if s.Ended() != ended[s] {
+			t.Errorf("%s: Ended() = %v, want %v", s, s.Ended(), ended[s])
+		}
+	}
+}
+
 func TestStatusTellsARunningJobFromOneWaitingToRetry(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
