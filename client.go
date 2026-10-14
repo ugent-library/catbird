@@ -311,14 +311,31 @@ func (c Cursor) Read(ctx context.Context, db Conn, limit int) ([]Message, error)
 }
 
 // Ack moves the cursor to position. The cursor never moves backwards, so a
-// batch acked out of order cannot undo the progress of a later one. Ack takes
-// no claim on the cursor: it is for a reader that runs in one place, like
-// wire's poll. A consumer that several processes run is Runtime.Consume, which
-// claims the cursor before it reads.
+// batch acked out of order cannot undo the progress of a later one. Seek
+// moves it back. Ack takes no claim on the cursor: it is for a reader that
+// runs in one place, like wire's poll. A consumer that several processes run
+// is Runtime.Consume, which claims the cursor before it reads.
 func (c Cursor) Ack(ctx context.Context, db Conn, position int64) error {
 	_, err := db.Exec(ctx, `
 		INSERT INTO cb_cursors (name, last_position) VALUES ($1, $2)
 		ON CONFLICT (name) DO UPDATE SET last_position = GREATEST(cb_cursors.last_position, EXCLUDED.last_position)
+	`, c.Name, position)
+	return err
+}
+
+// Seek moves the cursor to position, backwards as well as forwards, to read
+// the stream again from a point the cursor has passed or to skip to the end.
+// Any position is accepted, and a cursor with no row yet is created at it.
+//
+// Seek takes the claim away from a Consume loop that holds the cursor, so the
+// ack of the batch in flight matches nothing and the next claim reads from
+// position. Without that the ack would write over the seek and undo it. A
+// reader that acks directly has no claim to take, so it seeks only between
+// its own reads.
+func (c Cursor) Seek(ctx context.Context, db Conn, position int64) error {
+	_, err := db.Exec(ctx, `
+		INSERT INTO cb_cursors (name, last_position, claimable_at) VALUES ($1, $2, '-infinity')
+		ON CONFLICT (name) DO UPDATE SET last_position = EXCLUDED.last_position, claimable_at = '-infinity'
 	`, c.Name, position)
 	return err
 }

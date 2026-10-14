@@ -275,7 +275,9 @@ func (c *consumer) claim(ctx context.Context) (position int64, claimableAt time.
 // cursor over, the ack writes nothing and returns ErrClaimLost. Without the
 // match, a late ack would release the other process's claim while its batch is
 // still running, and a third process would start the next batch beside it.
-// GREATEST keeps the cursor from moving backwards, as Cursor.Ack does.
+// GREATEST keeps the cursor from moving backwards, as Cursor.Ack does. A Seek
+// on the cursor takes the claim away, so the ack of the batch that was in
+// flight is refused here too and the seek is not undone.
 func (c *consumer) ack(ctx context.Context, position int64, claimableAt time.Time) error {
 	tag, err := c.runtime.pool.Exec(ctx, `
 		UPDATE cb_cursors

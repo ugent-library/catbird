@@ -288,11 +288,99 @@ client exists.
 `<thing>_id`; no abbreviations. Every migration's `down` section drops
 everything its `up` created.
 
-**Names and comments.** Plain language, no metaphors, no coined vocabulary. Name
-what a thing does in the sentence a reader would use for it. A comment states
-the rule and then, when it earns its place, the concrete failure it prevents —
-with the measurement when there is one. Comments never narrate history: what
-changed belongs in the commit message, not in the file.
+**Writing.** Write like a developer talking to another developer: concrete
+subject, plain verb, say what happens. This applies everywhere: code
+comments, doc comments, SQL comments, the files under `docs/`, commit
+messages, pull request bodies, and chat.
+
+Never write:
+
+- "X is what Y": say "Y does X". Not "the claim is what orders the acks" but
+  "the claim orders the acks".
+- Possessive abstractions: "the ack's obligation", "that is mine to write".
+  Say "the ack has to match the claim".
+- Metaphors of cost or worth: "the price of", "costs more than its own lines".
+- Sentences that read like maxims. If it would fit on a poster, rewrite it.
+- Verbless fragments standing as sentences.
+- Metaphors for structure, risk or importance: "load-bearing", "gate",
+  "seam", "spine", "substrate", "blast radius", "friction", "headline",
+  "land mine", "blessed", "baseline". The literal technical term stays.
+- Proverbs: "footgun", "yak shaving", "belt-and-suspenders", "smoking gun",
+  "classic trap", "carve-out".
+- Inflated words: "tapestry", "delve", "testament to", "beacon",
+  "underscore", "mandate", "demands", "honestly", "honest take", "worth
+  saying".
+- "That's not just X, it's Y."
+- A generic programming term in place of the condition it stands for:
+  "invariant", "contract", "idempotent", "side effect". Say "only the attempt
+  that still holds the claim deletes the row", not "the claim invariant". The
+  term is fine when the same sentence states the condition.
+- A mechanism word as the noun for a thing: a job has a claim, not a lease or
+  a token, and a write matches on `attempts`, it does not carry a token.
+
+In practice:
+
+- Lead with the point. The first sentence gives the answer, the fix, or what
+  the function does.
+- Say what happens before what it means. Name the actor and the steps: "A
+  worker claims a batch, runs the handler, and completes the job. The
+  completion deletes the job row and matches on attempts, so an attempt that
+  lost its claim deletes nothing." The consequence comes after, in its own
+  sentence.
+- One idea per sentence. A sentence held together by a dash or a semicolon is
+  two sentences.
+- Do not coin words. If a concept has no name here, describe it in full each
+  time. The moment you are defining a word in bold, stop and describe
+  instead. This includes abbreviations and hyphenated shorthand.
+- State the rule first, then the cases where it does not hold, and name those
+  cases.
+- Spell out consequences. Not "fragile", but what breaks, for whom, after
+  which action: "a seek that leaves the claim in place is undone by the ack
+  of the batch in flight".
+- Call a check by what it does: "`go test ./...` passes", not "the suite is
+  green".
+- Use the domain's nouns and plain verbs, as the glossary below fixes them: a
+  job, a job type, a message, a result, an output, a claim, a cursor. A
+  worker claims, runs, completes and retries; a consumer claims, reads and
+  acks.
+- Do not point at earlier text. Write the rule out where it is used.
+- Put a concrete case next to every rule, in the same paragraph, with the
+  measurement when there is one: "188 buffer hits against 72".
+- Cases go in a table, one row per case. How something works goes in prose.
+- Concise means fewer topics, not denser sentences. Cut a topic whole; never
+  compress the explanation of one that stays.
+- No commentary on the conversation itself: not "you were right", not "in one
+  sentence", not "it's worth noting".
+
+Comments:
+
+- Comment the why, not the what: why a thing exists or why it is done the
+  unobvious way, then the concrete failure it prevents. Delete a comment that
+  adds nothing. Don't shorten it instead.
+- A doc comment on an exported identifier starts with its name and says what
+  the thing does before what it returns or how it fails. Leave out what the
+  signature already says.
+- Comment the thing, not its callers. A comment on a type or field states the
+  data and its constraints, not where they are checked. A comment on a
+  function states what it does, not who calls it, unless it deliberately
+  leaves a rule to that caller.
+- Say a rule once, at the level where it holds. A reason given on a type is
+  not repeated on its methods.
+- Describe what the code does and why it must be so. Don't argue trade-offs
+  or alternatives not taken. An open design question goes in a GitHub issue,
+  and a ruling goes in `docs/decisions.md`.
+- Mention something left out only when a reader would expect it, it is left
+  out on purpose, and adding it would break something.
+- Comments never narrate history: what changed belongs in the commit message,
+  not in the file.
+- In tests, comment the unusual setup and the regression a test protects
+  against. Don't repeat the test name or its assertions.
+
+**Names.** Name what a thing does in the sentence a reader would use for it,
+with the domain's own word: `enqueueNextBatch`, not `processBatch`. Generic
+verbs such as apply, process, handle, resolve and manage say only that code
+runs, so a reader has to open the body to find out what happens. A Go name
+holding SQL text ends in `SQL`, as `matchSQL` and `startSQL` do.
 
 **Job, job type and message.** A job is one claimed unit of work; a job type is
 the kind of job it is, declared once and used by both the enqueue and the

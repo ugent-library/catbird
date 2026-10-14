@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2378,6 +2379,159 @@ func TestStreamWindow(t *testing.T) {
 	}
 	if oldest <= 0+1 {
 		t.Errorf("oldest position %d does not report the gap after position 0", oldest)
+	}
+}
+
+// readPositions reads what comes next under cursor and returns the positions.
+func readPositions(t *testing.T, ctx context.Context, pool *pgxpool.Pool, cursor catbird.Cursor) []int64 {
+	t.Helper()
+	msgs, err := cursor.Read(ctx, pool, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var positions []int64
+	for _, m := range msgs {
+		positions = append(positions, m.Position)
+	}
+	return positions
+}
+
+// Seek moves a cursor backwards: after it, Read returns what the cursor had
+// passed, and Ack still never moves it back from there.
+func TestSeekMovesTheCursorBackwards(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for _, payload := range []string{"first", "second", "third"} {
+		if _, err := catbird.Publish(ctx, pool, "ev", payload, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	go rt.Start(ctx)
+	waitForPositions(t, ctx, pool, 3)
+
+	cursor := catbird.Cursor{Name: "replay", Patterns: []string{"ev"}}
+	if err := cursor.Ack(ctx, pool, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := cursor.Ack(ctx, pool, 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := readPositions(t, ctx, pool, cursor); len(got) != 0 {
+		t.Fatalf("an ack to 1 moved the cursor back: read %v", got)
+	}
+
+	if err := cursor.Seek(ctx, pool, 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := readPositions(t, ctx, pool, cursor); !slices.Equal(got, []int64{2, 3}) {
+		t.Fatalf("after a seek to 1 read %v, want [2 3]", got)
+	}
+	if err := cursor.Ack(ctx, pool, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := readPositions(t, ctx, pool, cursor); !slices.Equal(got, []int64{2, 3}) {
+		t.Fatalf("an ack to 0 after the seek moved the cursor: read %v, want [2 3]", got)
+	}
+}
+
+// A seek on a cursor with no row yet creates it at the position, released, so
+// a cursor can be placed before anything reads with it.
+func TestSeekCreatesTheCursor(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for _, payload := range []string{"first", "second", "third"} {
+		if _, err := catbird.Publish(ctx, pool, "ev", payload, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	go rt.Start(ctx)
+	waitForPositions(t, ctx, pool, 3)
+
+	cursor := catbird.Cursor{Name: "placed", Patterns: []string{"ev"}}
+	if err := cursor.Seek(ctx, pool, 2); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_cursors WHERE name = 'placed' AND last_position = 2 AND claimable_at = '-infinity'"); n != 1 {
+		t.Fatal("the seek did not create the cursor at 2, released")
+	}
+	if got := readPositions(t, ctx, pool, cursor); !slices.Equal(got, []int64{3}) {
+		t.Fatalf("read %v after the seek, want [3]", got)
+	}
+}
+
+// A position below the oldest message GC has kept reads from that message, as
+// a cursor that was never acked does. OldestPosition reports the gap.
+func TestSeekBelowTheOldestMessageReadsFromTheOldest(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for _, payload := range []string{"first", "second", "third"} {
+		if _, err := catbird.Publish(ctx, pool, "ev", payload, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	go rt.Start(ctx)
+	waitForPositions(t, ctx, pool, 3)
+
+	cursor := catbird.Cursor{Name: "late", Patterns: []string{"ev"}}
+	if err := cursor.Ack(ctx, pool, 3); err != nil {
+		t.Fatal(err)
+	}
+	// What GC does to the start of the stream.
+	if _, err := pool.Exec(ctx, `DELETE FROM cb_messages WHERE position <= 2`); err != nil {
+		t.Fatal(err)
+	}
+	if err := cursor.Seek(ctx, pool, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := readPositions(t, ctx, pool, cursor); !slices.Equal(got, []int64{3}) {
+		t.Fatalf("read %v after a seek below the oldest message, want [3]", got)
+	}
+	if oldest, err := catbird.OldestPosition(ctx, pool); err != nil || oldest != 3 {
+		t.Fatalf("oldest position %d (%v), want 3", oldest, err)
+	}
+}
+
+// A position past the end of the stream is allowed: the next read is empty
+// and starts with whatever gets that position, so a cursor can skip ahead of
+// what is published now.
+func TestSeekPastTheEndSkipsToIt(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for _, payload := range []string{"first", "second", "third"} {
+		if _, err := catbird.Publish(ctx, pool, "ev", payload, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond})
+	go rt.Start(ctx)
+	waitForPositions(t, ctx, pool, 3)
+
+	cursor := catbird.Cursor{Name: "ahead", Patterns: []string{"ev"}}
+	if err := cursor.Seek(ctx, pool, 5); err != nil {
+		t.Fatal(err)
+	}
+	if got := readPositions(t, ctx, pool, cursor); len(got) != 0 {
+		t.Fatalf("read %v after a seek past the end, want nothing", got)
+	}
+	for _, payload := range []string{"fourth", "fifth", "sixth"} {
+		if _, err := catbird.Publish(ctx, pool, "ev", payload, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitForPositions(t, ctx, pool, 6)
+	if got := readPositions(t, ctx, pool, cursor); !slices.Equal(got, []int64{6}) {
+		t.Fatalf("read %v once the stream passed the seek, want [6]", got)
 	}
 }
 
