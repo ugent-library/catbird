@@ -59,7 +59,7 @@ A job is inspectable through `Status` from the moment it is enqueued until a ret
 
 `Publish` writes a stream message; it does not create a job. The runtime's position assigner gives committed messages monotonically increasing positions. Readers advance by position, never by message ID, so a long transaction cannot be skipped because another transaction committed first.
 
-Readers use either `ReadAfter` with a caller-held position or `Cursor.Read` and `Cursor.Ack` with a database-held position. Patterns are deliberately limited to an exact topic, a `prefix.#` subtree, or `#`. Each pattern compiles to an individual SQL comparison so PostgreSQL can use the stream indexes.
+Readers use either `ReadAfter` with a caller-held position or `Cursor.Read` and `Cursor.Ack` with a database-held position. `Cursor.Ack` never moves a cursor backwards. `Cursor.Seek` moves it to any position and takes the claim of a `Consume` loop that holds it, so the batch in flight is not acked on top of the seek. Patterns are deliberately limited to an exact topic, a `prefix.#` subtree, or `#`. Each pattern compiles to an individual SQL comparison so PostgreSQL can use the stream indexes.
 
 `Runtime.Trigger` turns matching stream messages into jobs. The read, the job creation, the deduplication, the cursor advance and the worker wake-up are one statement; several processes can run the same trigger, and a batch another process already handled creates no second job.
 

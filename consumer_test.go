@@ -348,6 +348,160 @@ func TestConsumeTakesOverAnExpiredClaim(t *testing.T) {
 	}
 }
 
+// A seek on a cursor a consumer holds takes the claim away: the handler on the
+// batch in flight is cancelled with ErrClaimLost, nothing is acked on top of
+// the seek, and the next batch starts from the new position.
+func TestSeekTakesTheClaimFromARunningConsumer(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for _, n := range []int{1, 2} {
+		if _, err := catbird.Publish(ctx, pool, "record.work", n, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var mu sync.Mutex
+	var batches [][]int64 // the positions of every handler call
+	var cause error       // why the interrupted call's context ended
+	interrupted := false
+	started := make(chan struct{}, 1)
+	var logs lockedBuffer
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	rt.Consume("indexer", []string{"record.#"}, func(ctx context.Context, batch []catbird.Message) error {
+		positions := make([]int64, len(batch))
+		for i, m := range batch {
+			positions[i] = m.Position
+		}
+		mu.Lock()
+		batches = append(batches, positions)
+		// The first call that reaches the third message is the one interrupted.
+		block := positions[len(positions)-1] == 3 && !interrupted
+		if block {
+			interrupted = true
+		}
+		mu.Unlock()
+		if !block {
+			return nil
+		}
+		started <- struct{}{}
+		<-ctx.Done()
+		mu.Lock()
+		cause = context.Cause(ctx)
+		mu.Unlock()
+		return ctx.Err()
+	}, catbird.ConsumeOptions{ClaimDuration: 300 * time.Millisecond, HandlerTimeout: 5 * time.Second, PollInterval: 20 * time.Millisecond})
+	go rt.Start(ctx)
+
+	waitFor(t, 5*time.Second, "the first messages were not handled", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_cursors WHERE name = 'consumer:indexer' AND last_position = 2 AND claimable_at = '-infinity'") == 1
+	})
+	if _, err := catbird.Publish(ctx, pool, "record.work", 3, ""); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler never started on the third message")
+	}
+
+	if err := (catbird.Cursor{Name: "consumer:indexer"}).Seek(ctx, pool, 0); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "the stream was not handled again from the start", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(batches) > 0 && slices.Equal(batches[len(batches)-1], []int64{1, 2, 3})
+	})
+	time.Sleep(200 * time.Millisecond) // let that batch's ack land
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !errors.Is(cause, catbird.ErrClaimLost) {
+		t.Errorf("the interrupted handler was cancelled with %v, want ErrClaimLost", cause)
+	}
+	if !strings.Contains(logs.String(), "claim lost during the handler") {
+		t.Errorf("the lost claim was not logged:\n%s", logs.String())
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_cursors WHERE name = 'consumer:indexer' AND last_position = 3 AND claimable_at = '-infinity'"); n != 1 {
+		t.Errorf("the cursor is not past the replayed batch and released")
+	}
+}
+
+// Without renewal the interrupted handler runs on, and its ack is refused
+// afterwards: the seek took the claim, so the ack matches nothing, and the
+// cursor is claimable at once rather than for the rest of ClaimDuration.
+func TestSeekRefusesTheAckOfTheBatchItInterrupted(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for _, n := range []int{1, 2} {
+		if _, err := catbird.Publish(ctx, pool, "record.work", n, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var mu sync.Mutex
+	var batches [][]int64 // the positions of every handler call
+	interrupted := false
+	started := make(chan struct{}, 1)
+	proceed := make(chan struct{})
+	var logs lockedBuffer
+	rt := catbird.New(pool, catbird.Options{AssignEvery: 20 * time.Millisecond, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	rt.Consume("indexer", []string{"record.#"}, func(ctx context.Context, batch []catbird.Message) error {
+		positions := make([]int64, len(batch))
+		for i, m := range batch {
+			positions[i] = m.Position
+		}
+		mu.Lock()
+		batches = append(batches, positions)
+		block := positions[len(positions)-1] == 3 && !interrupted
+		if block {
+			interrupted = true
+		}
+		mu.Unlock()
+		if block {
+			started <- struct{}{}
+			<-proceed // ignoring ctx: the handler finishes after the seek
+		}
+		return nil
+	}, catbird.ConsumeOptions{ClaimDuration: 5 * time.Second, HandlerTimeout: time.Second, PollInterval: 20 * time.Millisecond})
+	go rt.Start(ctx)
+
+	waitFor(t, 5*time.Second, "the first messages were not handled", func() bool {
+		return count(t, pool, "SELECT count(*) FROM cb_cursors WHERE name = 'consumer:indexer' AND last_position = 2 AND claimable_at = '-infinity'") == 1
+	})
+	if _, err := catbird.Publish(ctx, pool, "record.work", 3, ""); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler never started on the third message")
+	}
+
+	if err := (catbird.Cursor{Name: "consumer:indexer"}).Seek(ctx, pool, 0); err != nil {
+		t.Fatal(err)
+	}
+	close(proceed)
+	// Well inside ClaimDuration: the seek released the cursor as well.
+	waitFor(t, 3*time.Second, "the stream was not handled again from the start", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(batches) > 0 && slices.Equal(batches[len(batches)-1], []int64{1, 2, 3})
+	})
+	time.Sleep(200 * time.Millisecond) // let that batch's ack land
+
+	if !strings.Contains(logs.String(), "cursor claim lost before the ack") {
+		t.Errorf("the refused ack was not logged:\n%s", logs.String())
+	}
+	if n := count(t, pool, "SELECT count(*) FROM cb_cursors WHERE name = 'consumer:indexer' AND last_position = 3 AND claimable_at = '-infinity'"); n != 1 {
+		t.Errorf("the cursor is not past the replayed batch and released")
+	}
+}
+
 // A pattern that does not compile, or no handler, is refused at registration.
 func TestConsumeRefusesBadRegistration(t *testing.T) {
 	handle := func(context.Context, []catbird.Message) error { return nil }

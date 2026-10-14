@@ -429,6 +429,7 @@ func main() {
 - Publish one: `Publish`
 - Publish many: `PublishBatch`
 - Read with named cursor: `Cursor.Read`, `Cursor.Ack`
+- Move a named cursor to any position: `Cursor.Seek`
 - Read with caller-held position: `ReadAfter`
 - Stream bounds: `LastPosition`, `OldestPosition`
 
